@@ -10,7 +10,7 @@ env:
 jobs:
   macos-app:
     name: macOS app bundle
-    runs-on: macos-26-arm64
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
 

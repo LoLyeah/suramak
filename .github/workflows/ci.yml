@@ -116,8 +116,8 @@ jobs:
           ./target/release/suramak-cli library list | grep -q "en.wav" && echo LIBRARY-OK
 
   macos:
-    name: macos (macos-26-arm64)
-    runs-on: macos-26-arm64
+    name: macos (macos-26)
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
 
