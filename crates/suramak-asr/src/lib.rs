@@ -10,6 +10,7 @@
 
 pub mod capture;
 pub mod engine;
+pub mod mix;
 pub mod pipeline;
 pub mod whisper;
 pub mod worker;

@@ -1,8 +1,9 @@
 //! Non-macOS stub: the crate's API compiles everywhere; system audio is unsupported.
 //!
-//! The Linux error path is unit-tested in `lib.rs` (`start_reports_unsupported_off_macos`).
+//! The Linux error paths are unit-tested in `lib.rs` (`start_reports_unsupported_off_macos`,
+//! `listing_audio_processes_reports_unsupported_off_macos`).
 
-use crate::{TapConfig, TapError};
+use crate::{AudioProcessInfo, TapConfig, TapError};
 
 /// Placeholder for platforms without CoreAudio taps; can never be constructed.
 pub struct TapInner {
@@ -34,4 +35,10 @@ impl TapInner {
     pub fn stop(&mut self) -> Result<(), TapError> {
         Ok(())
     }
+}
+
+/// Listing audio processes is unsupported off macOS — always
+/// [`TapError::Unsupported`].
+pub fn list_audio_processes() -> Result<Vec<AudioProcessInfo>, TapError> {
+    Err(TapError::Unsupported)
 }

@@ -29,18 +29,22 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use suramak_asr::capture;
+use suramak_asr::mix;
 use suramak_asr::worker::{Job, Worker, WorkerEvent};
 use suramak_core::models as core_models;
 use suramak_core::paths;
 use suramak_core::polish::{OpenAiCompat, PolishBackend};
 use suramak_core::resample;
-use suramak_core::settings::{LangMode, PolishSettings, Settings};
+use suramak_core::settings::{LangMode, PolishSettings, RecordSource, Settings};
 use suramak_core::store::Store;
 use suramak_core::transcript::{Segment, Transcript};
 use suramak_playback::{Command as PlaybackCommand, Engine, Status as PlaybackStatus};
 use uuid::Uuid;
 
-use crate::app::{self, model_manager, polish, settings_form, AppState, Effect, ExportFormat};
+use crate::app::{
+    self, model_manager, polish, record_source_label, settings_form, AppState, Effect,
+    ExportFormat, RecordState,
+};
 
 /// Subdirectory of the system temp dir used for transient recordings
 /// (`keep_audio` off — deleted once the transcript is saved).
@@ -57,8 +61,9 @@ pub struct Runtime {
     next_job_id: u64,
     /// Store/settings problems found at startup (shown as a status line).
     pub startup_error: Option<String>,
-    /// Live capture session (`!Send` — stays on the UI thread).
-    recorder: Option<capture::Recorder>,
+    /// Live capture session(s) (`!Send` — stays on the UI thread). M6: one
+    /// `MultiRecorder` holding a recorder per selected source.
+    session: Option<capture::MultiRecorder>,
     /// Background model download (one at a time).
     download: Option<DownloadJob>,
     /// Background polish run (one at a time, M4).
@@ -124,7 +129,7 @@ impl Runtime {
             ctx,
             next_job_id: 0,
             startup_error,
-            recorder: None,
+            session: None,
             download: None,
             polish: None,
             playback: None,
@@ -159,9 +164,10 @@ impl Runtime {
         settings_form::SettingsForm::from_settings(&self.settings)
     }
 
-    /// Live rolling RMS of the capture session (`None` when not recording).
+    /// Live rolling RMS of the capture session (`None` when not recording);
+    /// M6: the loudest of the live sources (see `MultiRecorder::rms`).
     pub fn capture_rms(&self) -> Option<f32> {
-        self.recorder.as_ref().map(|recorder| recorder.rms())
+        self.session.as_ref().map(|session| session.rms())
     }
 
     /// Per-frame poll of the playback engine (M8): position, duration, the
@@ -325,6 +331,21 @@ impl Runtime {
                     };
                     state.on_audio_devices(devices, error);
                 }
+                Effect::RefreshAudioProcesses => {
+                    let (processes, error) = match capture::list_audio_processes() {
+                        Ok(processes) => (processes, None),
+                        Err(suramak_asr::AsrError::CaptureUnsupported) => (
+                            Vec::new(),
+                            Some(
+                                "needs a macOS build with capture (CoreAudio process taps, \
+                                 macOS 14.2+)"
+                                    .to_string(),
+                            ),
+                        ),
+                        Err(err) => (Vec::new(), Some(err.to_string())),
+                    };
+                    state.on_audio_processes(processes, error);
+                }
                 Effect::SaveSettings { form } => {
                     form.apply(&mut self.settings);
                     let result = self.persist_settings(&form);
@@ -396,37 +417,110 @@ impl Runtime {
         }
     }
 
-    /// Opens the microphone / system-audio tap on this thread (cpal streams are
-    /// `!Send`), reporting the device + any resolution warning.
+    /// Opens the capture session(s) on this thread (cpal streams are `!Send`):
+    /// one recorder per selected source, per-app keys resolved to live pids,
+    /// reporting the source labels + any resolution warnings.
     fn start_capture(&mut self, state: &mut AppState) {
-        match capture::start_recording_with(&self.settings.recording.audio_source) {
-            Ok(recorder) => {
-                state.record_device(recorder.device_name().to_string());
-                if let Some(warning) = recorder.warning() {
-                    state.set_status(warning.to_string(), false);
+        let sources = self.settings.recording.effective_sources();
+        let inputs = match resolve_capture_inputs(&sources) {
+            Ok(inputs) => inputs,
+            Err(message) => {
+                state.record_failed(message);
+                return;
+            }
+        };
+        match capture::start_recording_multi(&inputs) {
+            Ok(session) => {
+                state.record_sources(sources.iter().map(record_source_label).collect());
+                let warnings = session.warnings();
+                if !warnings.is_empty() {
+                    state.set_status(warnings.join(" · "), false);
                 }
-                self.recorder = Some(recorder);
+                self.session = Some(session);
             }
             Err(err) => state.record_failed(err.to_string()),
         }
     }
 
-    /// Stops the session, resamples to 16 kHz and writes the recording wav —
-    /// to `<data>/recordings/` when `keep_audio` is on, else to a temp dir
+    /// Stops every session, mixes the sources into the one 16 kHz mono stream
+    /// (per-source gain/mute from the record view, clock-drift correction from
+    /// the session span) and writes the recording wav — to
+    /// `<data>/recordings/` when `keep_audio` is on, else to a temp dir
     /// (deleted once the transcript is saved; see `AppState::on_transcript_saved`).
     fn stop_capture(&mut self, title: &str, state: &mut AppState) -> Vec<Effect> {
-        let Some(recorder) = self.recorder.take() else {
+        let Some(session) = self.session.take() else {
             state.record_failed("no recording in progress".to_string());
             return Vec::new();
         };
-        let buffer = recorder.stop();
-        let samples = match capture::resample_16k(&buffer.samples, buffer.rate) {
-            Ok(samples) => samples,
+        let (buffers, duration) = session.stop();
+        // The record view's per-source gain/mute (unity when it holds none or a
+        // different source count — e.g. a scripted stop).
+        let (labels, gains, mutes) = match &state.record {
+            RecordState::Recording(recording) if recording.sources.len() == buffers.len() => (
+                recording
+                    .sources
+                    .iter()
+                    .map(|source| source.label.clone())
+                    .collect::<Vec<_>>(),
+                recording
+                    .sources
+                    .iter()
+                    .map(|source| source.gain)
+                    .collect::<Vec<_>>(),
+                recording
+                    .sources
+                    .iter()
+                    .map(|source| source.muted)
+                    .collect::<Vec<_>>(),
+            ),
+            _ => (
+                (1..=buffers.len())
+                    .map(|index| format!("source {index}"))
+                    .collect(),
+                vec![1.0; buffers.len()],
+                vec![false; buffers.len()],
+            ),
+        };
+        let tracks: Vec<mix::MixTrack<'_>> = buffers
+            .iter()
+            .zip(labels.iter())
+            .zip(gains.iter().zip(mutes.iter()))
+            .map(|((buffer, label), (gain, muted))| mix::MixTrack {
+                label: label.clone(),
+                rate: buffer.rate,
+                samples: &buffer.samples,
+                gain: *gain,
+                muted: *muted,
+            })
+            .collect();
+        let outcome = match mix::mix(&tracks, Some(duration)) {
+            Ok(outcome) => outcome,
             Err(err) => {
-                state.record_failed(format!("could not resample the recording: {err}"));
+                state.record_failed(format!("could not mix the recording: {err}"));
                 return Vec::new();
             }
         };
+        // The mix's honesty line: per-source measured clocks + saturation.
+        for report in &outcome.reports {
+            tracing::info!(
+                source = %report.label,
+                rate = report.rate,
+                samples = report.captured_samples,
+                seconds = report.captured_seconds,
+                drift_ppm = report.drift_ppm,
+                gain = report.applied_gain,
+                muted = report.muted,
+                clamped = report.clamped,
+                "capture source mixed"
+            );
+        }
+        if outcome.clipped_samples > 0 {
+            tracing::warn!(
+                clipped_samples = outcome.clipped_samples,
+                peak = outcome.peak,
+                "the mix exceeded full scale and saturated at the PCM boundary"
+            );
+        }
         let keep = self.settings.storage.keep_audio;
         let dir = if keep {
             match paths::recordings_dir() {
@@ -441,7 +535,7 @@ impl Runtime {
         };
         let stem = app::recording_file_stem(title);
         let path = dir.join(format!("{stem}.wav"));
-        match capture::write_recording_wav(&path, &samples, resample::TARGET_RATE) {
+        match capture::write_recording_wav(&path, &outcome.samples, resample::TARGET_RATE) {
             Ok(()) => state.on_recording_stopped(path, keep),
             Err(err) => {
                 state.record_failed(format!("could not write the recording: {err}"));
@@ -632,6 +726,37 @@ fn open_store() -> Result<Store, String> {
     paths::ensure_dirs().map_err(|err| err.to_string())?;
     let db = paths::db_path().map_err(|err| err.to_string())?;
     Store::open(&db).map_err(|err| err.to_string())
+}
+
+/// Maps the settings source list to capture inputs (M6).
+///
+/// Per-app entries resolve their stored keys (bundle ids / `pid:<pid>`) against
+/// the live process list — a key with no running process is a clear error,
+/// never a silent widening to full system audio.
+fn resolve_capture_inputs(sources: &[RecordSource]) -> Result<Vec<capture::CaptureInput>, String> {
+    let mut inputs = Vec::with_capacity(sources.len());
+    for source in sources {
+        match source {
+            RecordSource::Default => inputs.push(capture::CaptureInput::Default),
+            RecordSource::Device { name } => {
+                inputs.push(capture::CaptureInput::Device(name.clone()));
+            }
+            RecordSource::SystemAudio => inputs.push(capture::CaptureInput::SystemAudio),
+            RecordSource::AppAudio { apps } => {
+                let processes = capture::list_audio_processes().map_err(|err| match err {
+                    suramak_asr::AsrError::CaptureUnsupported => {
+                        "per-app capture needs a macOS build with capture (CoreAudio process taps, \
+                         macOS 14.2+)"
+                            .to_string()
+                    }
+                    other => other.to_string(),
+                })?;
+                let pids = capture::resolve_app_processes(apps, &processes)?;
+                inputs.push(capture::CaptureInput::AppAudio(pids));
+            }
+        }
+    }
+    Ok(inputs)
 }
 
 /// Whether an API key is available for polish: the OS keychain on

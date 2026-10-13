@@ -13,6 +13,10 @@
 //! | `kAudioTapPropertyUID` (`'tuid'`) | macOS 14.2+ | tap object property, `AudioHardwareTapping.h` |
 //! | `kAudioDevicePropertyDeviceUID` (`'uid '`) / `kAudioDevicePropertyDeviceNameCFString` (`'lnam'`) | macOS 10.0+ | device properties, `AudioHardware.h` |
 //! | `kAudioHardwarePropertyTranslatePIDToProcessObject` (selector `0x69643270`) | macOS 14.2+ | pid → process audio-object id; the tap exclusion array wants **process objects**, not pids |
+//! | `kAudioHardwarePropertyProcessObjectList` (`'prs#'`, `0x70727323`) | macOS 14.2+ | every HAL process object, for the M6 per-app picker |
+//! | `kAudioProcessPropertyPID` (`'ppid'`) / `…BundleID` (`'pbid'`) / `…IsRunningInput` (`'piri'`) / `…IsRunningOutput` (`'piro'`) | macOS 14.2+ | process-object fields; the `pbid`/`piri`/`piro` values are verbatim from the SDK-generated `objc2-core-audio` bindings |
+//! | `AudioObjectGetPropertyDataSize` | macOS 10.0+ | size query for the variable-length process-object list |
+//! | `-initStereoGlobalTapButExcludeProcesses:` (all except) / `-initStereoMixdownOfProcesses:` (only these — M6) | macOS 14.2+ | `CATapDescription` initializers, `CoreAudio/AudioHardwareTapping.h` |
 //! | `kAudioAggregateDeviceNameKey` / `…UIDKey` / `…IsPrivateKey` / `…TapListKey`, `kAudioSubTapUIDKey` | macOS 10.9+/14.2 | aggregate-device description keys — **string-literal macros** on the macOS 27 SDK (`"uid"` / `"name"` / `"private"` / `"taps"` / `"uid"`); see the note below |
 //!
 //! The two **14.2+ functions are resolved with `dlsym(RTLD_DEFAULT, …)` at call
@@ -50,7 +54,7 @@ use objc2::rc::{Allocated, Retained};
 use objc2::runtime::{AnyClass, AnyObject};
 use objc2_foundation::{NSArray, NSNumber, NSString, NSUUID};
 
-use crate::{ProcessSelection, TapConfig, TapError};
+use crate::{AudioProcessInfo, ProcessSelection, TapConfig, TapError};
 
 /// `AudioObjectID` / `AudioDeviceID` (CoreAudio `UInt32`).
 type AudioObjectId = u32;
@@ -74,6 +78,20 @@ const K_AUDIO_HARDWARE_PROPERTY_TRANSLATE_UID_TO_DEVICE: u32 = fourcc(*b"uidd");
 /// has no audio object. Value `0x69643270`, verbatim from the SDK-generated
 /// `objc2-core-audio` bindings (same value in the `core-audio` crate).
 const K_AUDIO_HARDWARE_PROPERTY_TRANSLATE_PID_TO_PROCESS_OBJECT: u32 = 0x6964_3270;
+/// `kAudioHardwarePropertyProcessObjectList` (`'prs#'`, macOS 14.2+): every HAL
+/// process object (processes CoreAudio knows to have audio). Value verbatim from
+/// `objc2-core-audio` (`kAudioHardwarePropertyProcessObjectList = 0x70727323`).
+const K_AUDIO_HARDWARE_PROPERTY_PROCESS_OBJECT_LIST: u32 = 0x7072_7323;
+/// `kAudioProcessPropertyPID` (`'ppid'`, macOS 14.2+): a process object's pid.
+const K_AUDIO_PROCESS_PROPERTY_PID: u32 = 0x7070_6964;
+/// `kAudioProcessPropertyBundleID` (`'pbid'`, macOS 14.2+): a process object's
+/// bundle id (a CFString; may be absent for CLI helpers). Value verbatim from
+/// `objc2-core-audio` — note it is `pbid`, not `pidb`.
+const K_AUDIO_PROCESS_PROPERTY_BUNDLE_ID: u32 = 0x7062_6964;
+/// `kAudioProcessPropertyIsRunningInput` (`'piri'`, macOS 14.2+).
+const K_AUDIO_PROCESS_PROPERTY_IS_RUNNING_INPUT: u32 = 0x7069_7269;
+/// `kAudioProcessPropertyIsRunningOutput` (`'piro'`, macOS 14.2+).
+const K_AUDIO_PROCESS_PROPERTY_IS_RUNNING_OUTPUT: u32 = 0x7069_726f;
 
 /// Aggregate-device description keys — string-literal macros in the macOS 27 SDK
 /// (`CoreAudio/AudioHardware.h`): `#define kAudioAggregateDeviceUIDKey "uid"`,
@@ -124,6 +142,15 @@ extern "C" {
         io_size: *mut u32,
         out: *mut c_void,
     ) -> OsStatus;
+    /// CoreAudio/AudioHardware.h, macOS 10.0+ (variable-size properties, e.g.
+    /// the process-object list).
+    fn AudioObjectGetPropertyDataSize(
+        object: AudioObjectId,
+        address: *const AudioObjectPropertyAddress,
+        qualifier_size: u32,
+        qualifier: *const c_void,
+        out_size: *mut u32,
+    ) -> OsStatus;
 }
 
 /// Resolves the macOS 14.2+ tap entry points at runtime (see module docs).
@@ -152,20 +179,25 @@ fn tap_entry_points() -> Result<(CreateProcessTapFn, DestroyProcessTapFn), TapEr
 
 /// Builds the `CATapDescription` for `config` (macOS 14.2+).
 ///
-/// `initStereoGlobalTapButExcludeProcesses:` creates a tap over the *entire*
-/// system minus the listed pids; mute behavior `0` (`CATapMuteBehaviorUnmuted`)
-/// keeps the tapped audio audible to the user, `privateTap = YES` keeps the
-/// aggregate device out of other apps' device lists.
+/// `AllExcept` → `initStereoGlobalTapButExcludeProcesses:` (the whole system
+/// minus the listed processes); `Only` → `initStereoMixdownOfProcesses:` (a
+/// stereo mixdown of exactly the listed processes — M6 per-app capture).
+/// Mute behavior `0` (`CATapMuteBehaviorUnmuted`) keeps the tapped audio
+/// audible to the user, `privateTap = YES` keeps the aggregate device out of
+/// other apps' device lists.
 fn tap_description(config: &TapConfig) -> Result<Retained<AnyObject>, TapError> {
     let Some(cls) = AnyClass::get(c"CATapDescription") else {
         return Err(TapError::OsTooOld);
     };
-    let ProcessSelection::AllExcept(pids) = &config.processes;
-    // Apple: this array holds *audio process object* ids, **not** pids. Passing a
+    // Apple: these arrays hold *audio process object* ids, **not** pids. Passing a
     // raw pid made tap creation fail with `kAudioHardwareBadObjectError` (`'!obj'`,
     // OSStatus 560947818) on the first real macOS run (2026-10-13). Translate
     // first; a pid with no audio object yet is not in the HAL's process list
     // (not an error — the same nil contract Apple's samples use) and is skipped.
+    let pids = match &config.processes {
+        ProcessSelection::AllExcept(pids) => pids,
+        ProcessSelection::Only(pids) => pids,
+    };
     let objects: Vec<AudioObjectId> = pids
         .iter()
         .filter_map(|pid| process_object_for_pid(*pid))
@@ -174,7 +206,7 @@ fn tap_description(config: &TapConfig) -> Result<Retained<AnyObject>, TapError> 
         .iter()
         .map(|object| NSNumber::new_u32(*object))
         .collect();
-    let excluded = NSArray::from_retained_slice(&numbers);
+    let selected = NSArray::from_retained_slice(&numbers);
     let name = NSString::from_str(&config.name);
     let uuid = NSUUID::new();
 
@@ -182,8 +214,16 @@ fn tap_description(config: &TapConfig) -> Result<Retained<AnyObject>, TapError> 
     // property setters match the documented `CATapDescription` properties.
     unsafe {
         let allocated: Allocated<AnyObject> = msg_send![cls, alloc];
-        let description: Retained<AnyObject> =
-            msg_send![allocated, initStereoGlobalTapButExcludeProcesses: &*excluded];
+        let description: Retained<AnyObject> = match &config.processes {
+            ProcessSelection::AllExcept(_) => {
+                msg_send![allocated, initStereoGlobalTapButExcludeProcesses: &*selected]
+            }
+            // `-initStereoMixdownOfProcesses:` — "only these processes"
+            // (verified against CATapDescription's documented initializers).
+            ProcessSelection::Only(_) => {
+                msg_send![allocated, initStereoMixdownOfProcesses: &*selected]
+            }
+        };
         let _: () = msg_send![&*description, setName: &*name];
         let _: () = msg_send![&*description, setUUID: &*uuid];
         let _: () = msg_send![&*description, setMuteBehavior: 0isize];
@@ -231,6 +271,152 @@ fn string_property(object: AudioObjectId, selector: u32) -> Result<String, TapEr
     }
     // SAFETY: non-null CFStringRef owned by CoreAudio; `wrap_under_get_rule` retains.
     Ok(unsafe { CFString::wrap_under_get_rule(value) }.to_string())
+}
+
+/// Reads an optional CFString-valued property, `None` when the object does not
+/// have it (a process object without a bundle id) or the read fails.
+///
+/// Uses the **create rule**: CoreAudio property reads hand the caller a +1
+/// CFStringRef (the same contract `corti-coreaudio`/`side-huddle` use for
+/// `kAudioProcessPropertyBundleID`), so `wrap_under_create_rule` takes that
+/// reference instead of leaking it.
+fn optional_string_property(object: AudioObjectId, selector: u32) -> Option<String> {
+    let address = AudioObjectPropertyAddress {
+        m_selector: selector,
+        m_scope: SCOPE_GLOBAL,
+        m_element: ELEMENT_MAIN,
+    };
+    let mut value: CFStringRef = ptr::null();
+    let mut size = std::mem::size_of::<CFStringRef>() as u32;
+    // SAFETY: `value` is a CFStringRef slot with the matching size; the address
+    // is a live stack value for the duration of the call.
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            object,
+            &address,
+            0,
+            ptr::null(),
+            &mut size,
+            &mut value as *mut CFStringRef as *mut c_void,
+        )
+    };
+    if status != 0 || value.is_null() {
+        return None;
+    }
+    // SAFETY: non-null CFStringRef owned by us (+1, create rule).
+    Some(unsafe { CFString::wrap_under_create_rule(value) }.to_string())
+}
+
+/// Reads an optional `UInt32`-valued property (`None` on any failure).
+fn optional_u32_property(object: AudioObjectId, selector: u32) -> Option<u32> {
+    let address = AudioObjectPropertyAddress {
+        m_selector: selector,
+        m_scope: SCOPE_GLOBAL,
+        m_element: ELEMENT_MAIN,
+    };
+    let mut value: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    // SAFETY: `value` is a u32 slot with the matching size; the address is a
+    // live stack value for the duration of the call.
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            object,
+            &address,
+            0,
+            ptr::null(),
+            &mut size,
+            &mut value as *mut u32 as *mut c_void,
+        )
+    };
+    (status == 0).then_some(value)
+}
+
+/// Every HAL process object (`kAudioHardwarePropertyProcessObjectList`,
+/// macOS 14.2+). Empty (not an error) when the property is absent — there are
+/// no process objects before the tap API exists.
+fn process_object_list() -> Result<Vec<AudioObjectId>, TapError> {
+    let address = AudioObjectPropertyAddress {
+        m_selector: K_AUDIO_HARDWARE_PROPERTY_PROCESS_OBJECT_LIST,
+        m_scope: SCOPE_GLOBAL,
+        m_element: ELEMENT_MAIN,
+    };
+    let mut size: u32 = 0;
+    // SAFETY: the address is a live stack value; `size` is a matching out slot.
+    let status = unsafe {
+        AudioObjectGetPropertyDataSize(
+            AUDIO_OBJECT_SYSTEM_OBJECT,
+            &address,
+            0,
+            ptr::null(),
+            &mut size,
+        )
+    };
+    if status != 0 {
+        // The property does not exist on this OS (pre-14.2): no process objects.
+        return Ok(Vec::new());
+    }
+    let count = size as usize / std::mem::size_of::<AudioObjectId>();
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut objects = vec![0 as AudioObjectId; count];
+    let mut read_size = size;
+    // SAFETY: `objects` holds `count` AudioObjectIds and `read_size` matches the
+    // buffer; the address is a live stack value for the call.
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            AUDIO_OBJECT_SYSTEM_OBJECT,
+            &address,
+            0,
+            ptr::null(),
+            &mut read_size,
+            objects.as_mut_ptr() as *mut c_void,
+        )
+    };
+    if status != 0 {
+        return Err(TapError::CoreAudio {
+            call: "AudioObjectGetPropertyData",
+            status,
+        });
+    }
+    objects.truncate(read_size as usize / std::mem::size_of::<AudioObjectId>());
+    Ok(objects)
+}
+
+/// Lists the running processes with audio (M6 per-app picker): every HAL
+/// process object with its pid, bundle id and running state.
+///
+/// Unreadable fields degrade to defaults (no bundle id, not running) rather
+/// than failing the whole listing. Suramak's own process is skipped — a tap
+/// must never capture itself. Sorted by pid for a stable UI order.
+pub fn list_audio_processes() -> Result<Vec<AudioProcessInfo>, TapError> {
+    let own_pid = std::process::id();
+    let mut processes = Vec::new();
+    for object in process_object_list()? {
+        let Some(pid) = optional_u32_property(object, K_AUDIO_PROCESS_PROPERTY_PID) else {
+            continue;
+        };
+        if pid == own_pid {
+            continue;
+        }
+        processes.push(AudioProcessInfo {
+            pid,
+            bundle_id: optional_string_property(object, K_AUDIO_PROCESS_PROPERTY_BUNDLE_ID)
+                .unwrap_or_default(),
+            is_running_output: optional_u32_property(
+                object,
+                K_AUDIO_PROCESS_PROPERTY_IS_RUNNING_OUTPUT,
+            )
+            .is_some_and(|value| value != 0),
+            is_running_input: optional_u32_property(
+                object,
+                K_AUDIO_PROCESS_PROPERTY_IS_RUNNING_INPUT,
+            )
+            .is_some_and(|value| value != 0),
+        });
+    }
+    processes.sort_by_key(|process| process.pid);
+    Ok(processes)
 }
 
 /// Creates the private aggregate device that exposes `tap_uid` as an input device.
@@ -475,5 +661,17 @@ mod tests {
             !responds_bogus,
             "setPrivateTap: unexpectedly exists; revisit the fix if so"
         );
+    }
+
+    /// The M6 per-app path builds a *mixdown* description for exactly the listed
+    /// processes; the message-send sequence must not raise (a bad selector aborts
+    /// the process). No permission is needed to construct the description.
+    #[test]
+    fn tap_description_builds_for_an_only_selection() {
+        let config = TapConfig::app_audio(vec![std::process::id()]);
+        let description = tap_description(&config).expect("CATapDescription builds");
+        let responds_private: bool =
+            unsafe { msg_send![&*description, respondsToSelector: sel!(setPrivate:)] };
+        assert!(responds_private);
     }
 }

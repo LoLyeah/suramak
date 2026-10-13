@@ -7,6 +7,7 @@ Local-first transcription app. Fully native, written in Rust. **macOS first; Win
 - On-device transcription (whisper.cpp via whisper-rs) — English + Indonesian first.
 - Fast path on Apple Silicon: the Whisper encoder runs on the Neural Engine via the official Core ML encoder package (`--engine coreml`; `auto` picks it when installed).
 - Import files + microphone recording, timestamped segments, editable transcript.
+- **Multi-source recording** (M6): the record source picker is a **checkbox list** — tick two mics, or **mic + system audio** (the meeting-transcription combo), and the inputs are mixed into the one 16 kHz recording by a pure mixing engine (per-source gain/mute at record time; measured-clock drift correction keeps the sources aligned — never clicks, bounded over long runs). **Per-app capture**: "Only an app…" records just one running app's audio (CoreAudio process-tap mixdown), picked from a running-audio-processes list.
 - Import **video** (`.mp4` / `.mov` / `.m4v` / `.mkv`): the first audio track is transcribed through the identical pipeline — library row → transcribe → editor → exports (SRT/VTT become video subtitles). Unsupported audio (e.g. WebM/Opus) fails with an actionable conversion hint (`ffmpeg -i in.webm out.mp4`), never a raw decoder error (M5).
 - In-app playback with segment follow: play/pause on the waveform strip, click-to-seek, and the active segment highlighted and kept in view while playing; a clean “no audio / no output device” state when either is missing.
 - Floating record control: a bottom-center Liquid Glass pill on macOS 26+ (a real `NSGlassEffectView` behind the egui-drawn glyph and live `mm:ss` clock), an honest painted pill on Linux/Windows/older macOS; it is the record entry point — click to start, click to stop — and stays bottom-centered on resize (M8.5).
@@ -20,10 +21,11 @@ Local-first transcription app. Fully native, written in Rust. **macOS first; Win
 ## Status
 
 - ✅ `suramak-core` — types, storage (sqlite), export, model download w/ sha256, decode, resample, polish client — fully tested
-- ✅ `suramak-asr` — whisper-rs pipeline + worker thread (record-then-transcribe), verified end-to-end
+- ✅ `suramak-asr` — whisper-rs pipeline + worker thread (record-then-transcribe), verified end-to-end; multi-source mixing engine (M6) compiled and tested on every platform
 - ✅ `suramak-cli` — `models` / `transcribe` / `export` / `library` / `polish` / `doctor`
 - ✅ engine tiers — CPU / Metal / Core ML-ANE (`--engine`, `doctor` reports the stack; M1.5)
-- ✅ `suramak-ui` — the app: import/record → transcript → edit → export, model manager, settings, in-app polish (M4; polish round-trip + all Mac-only behavior are user-smoke items)
+- ✅ `suramak-ui` — the app: import/record → transcript → edit → export, model manager, settings (incl. the M6 checkbox source list + per-app picker), in-app polish (M4; polish round-trip + all Mac-only behavior are user-smoke items)
+- ✅ `suramak-taps` — macOS system-audio taps (CoreAudio 14.2+, incl. the M6 per-app `Only` mixdown + process listing); pure Rust, darwin-checked from Linux
 - ✅ `suramak-glass` — AppKit materials (macOS) + real DWM backdrop (Windows, compile-checked from Linux) + Linux no-op
 - 📋 release handoff — `scripts/mac-smoke.sh` + `docs/USER_SMOKE.md` (run by the owner on the Mac)
 
@@ -31,7 +33,8 @@ Local-first transcription app. Fully native, written in Rust. **macOS first; Win
 
 ```
 crates/suramak-core   portable domain logic (no UI, no whisper)
-crates/suramak-asr    whisper-rs pipeline + worker (feature-gated mic capture)
+crates/suramak-asr    whisper-rs pipeline + worker (feature-gated mic capture) + pure multi-source mixer
+crates/suramak-taps   macOS system-audio taps (CoreAudio 14.2+; per-app mixdown + process listing)
 crates/suramak-glass  AppKit glass integration (objc2; incl. the M8.5 floating record-control surface) + DWM backdrop (Windows) + Linux no-op
 crates/suramak-ui     the app window (winit + egui, no webview)
 crates/suramak-playback  in-app playback engine (cpal output + transport state; M8)

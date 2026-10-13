@@ -11,7 +11,7 @@ use egui::{
 use crate::theme::Palette;
 
 use super::views::{pane_caption, pane_title, PANE_PAD_X};
-use super::{format_elapsed, AppState, Effect, RecordState, RECORD_WAVEFORM_BARS};
+use super::{format_elapsed, AppState, Effect, RecordState, RecordingSource, RECORD_WAVEFORM_BARS};
 
 pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &mut Vec<Effect>) {
     let rect = ui.max_rect();
@@ -25,6 +25,7 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
             let rms = recording.rms;
             let waveform = recording.waveform.clone();
             let device = recording.device.clone();
+            let sources = recording.sources.clone();
             let stopping = recording.stopping;
             recording_body(
                 ui,
@@ -39,6 +40,7 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
                 rms,
                 &waveform,
                 device.as_deref(),
+                &sources,
                 stopping,
             );
         }
@@ -89,6 +91,7 @@ fn recording_body(
     rms: f32,
     waveform: &[f32],
     device: Option<&str>,
+    sources: &[RecordingSource],
     stopping: bool,
 ) {
     let painter = ui.painter().clone();
@@ -167,8 +170,76 @@ fn recording_body(
     );
     draw_waveform(&painter, wave, waveform, palette);
 
+    // ---- per-source rows (M6) -----------------------------------------------
+    // One row per live source: label, mute, gain. Gain/mute are applied by the
+    // mixing engine when the recording is finalised (documented: they apply to
+    // the whole recording).
+    let mut controls_top = card.bottom() + 18.0;
+    if !sources.is_empty() {
+        let rows = sources.len() as f32;
+        let sources_card = Rect::from_min_size(
+            pos2(left, card.bottom() + 14.0),
+            vec2(right - left, 30.0 + rows * 26.0),
+        );
+        painter.rect_filled(sources_card, CornerRadius::same(10), palette.card);
+        painter.rect_stroke(
+            sources_card,
+            CornerRadius::same(10),
+            Stroke::new(1.0_f32, palette.hairline),
+            StrokeKind::Inside,
+        );
+        painter.text(
+            pos2(sources_card.left() + 18.0, sources_card.top() + 9.0),
+            Align2::LEFT_TOP,
+            "sources — gain and mute are applied to the whole recording",
+            FontId::new(11.0, FontFamily::Proportional),
+            palette.text_dim,
+        );
+        for (index, source) in sources.iter().enumerate() {
+            let row = Rect::from_min_size(
+                pos2(
+                    sources_card.left() + 18.0,
+                    sources_card.top() + 28.0 + index as f32 * 26.0,
+                ),
+                vec2(sources_card.width() - 36.0, 24.0),
+            );
+            let mut gain = source.gain;
+            let mut muted = source.muted;
+            ui.scope_builder(egui::UiBuilder::new().max_rect(row), |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [220.0, 20.0],
+                        egui::Label::new(
+                            egui::RichText::new(&source.label)
+                                .family(FontFamily::Monospace)
+                                .size(11.5)
+                                .color(palette.text),
+                        )
+                        .truncate(),
+                    );
+                    if ui
+                        .add_enabled(!stopping, egui::Checkbox::new(&mut muted, "mute"))
+                        .changed()
+                    {
+                        state.set_source_muted(index, muted);
+                    }
+                    let slider = egui::Slider::new(
+                        &mut gain,
+                        RecordingSource::MIN_GAIN..=RecordingSource::MAX_GAIN,
+                    )
+                    .fixed_decimals(2)
+                    .suffix("×");
+                    if ui.add_enabled(!stopping, slider).changed() {
+                        state.set_source_gain(index, gain);
+                    }
+                });
+            });
+        }
+        controls_top = sources_card.bottom() + 18.0;
+    }
+
     // ---- controls -----------------------------------------------------------
-    let controls = Rect::from_min_size(pos2(left, card.bottom() + 18.0), vec2(right - left, 30.0));
+    let controls = Rect::from_min_size(pos2(left, controls_top), vec2(right - left, 30.0));
     let mut stop_clicked = false;
     ui.scope_builder(egui::UiBuilder::new().max_rect(controls), |ui| {
         ui.horizontal(|ui| {
@@ -198,7 +269,7 @@ fn recording_body(
     if let Some(status) = &state.status {
         ui.scope_builder(
             egui::UiBuilder::new().max_rect(Rect::from_min_size(
-                pos2(left, card.bottom() + 56.0),
+                pos2(left, controls_top + 38.0),
                 vec2(right - left, 20.0),
             )),
             |ui| {

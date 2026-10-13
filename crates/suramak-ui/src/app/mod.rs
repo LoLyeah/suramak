@@ -15,7 +15,7 @@ use suramak_asr::worker::WorkerEvent;
 use suramak_asr::EngineId;
 use suramak_core::export as core_export;
 use suramak_core::models as core_models;
-use suramak_core::settings::EngineSetting;
+use suramak_core::settings::{EngineSetting, RecordSource};
 use suramak_core::transcript::Transcript;
 use suramak_playback::{
     resolve_playback_source, transcript_duration_ms, Command as PlaybackCommand, Playback,
@@ -91,8 +91,42 @@ pub struct Recording {
     pub waveform: Vec<f32>,
     /// Input device name, reported by the runtime once capture starts.
     pub device: Option<String>,
+    /// M6: one row per live source (label + gain/mute). Empty until the
+    /// runtime reports the session's sources; the record view draws the rows
+    /// and the runtime reads the gains at stop.
+    pub sources: Vec<RecordingSource>,
     /// Set while the runtime is finalising the wav (Stop pressed once).
     pub stopping: bool,
+}
+
+/// One live recording source shown in the record view (M6).
+///
+/// `gain`/`muted` are applied by the mixing engine at finalize — the mix is
+/// computed from the captured per-source buffers, so adjusting a control while
+/// recording applies to the whole recording (documented in the M6 report).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordingSource {
+    pub label: String,
+    /// Per-source gain applied before the sum (1.0 = unity).
+    pub gain: f32,
+    pub muted: bool,
+}
+
+impl RecordingSource {
+    /// Gain slider range (0× = silent … 2× = +6 dB).
+    pub const MIN_GAIN: f32 = 0.0;
+    pub const MAX_GAIN: f32 = 2.0;
+}
+
+/// User-facing label for one settings source (the record view's rows and the
+/// runtime's mix reports).
+pub fn record_source_label(source: &RecordSource) -> String {
+    match source {
+        RecordSource::Default => "Default microphone".to_string(),
+        RecordSource::Device { name } => name.clone(),
+        RecordSource::SystemAudio => "System audio (all processes except Suramak)".to_string(),
+        RecordSource::AppAudio { apps } => format!("App audio ({})", apps.join(", ")),
+    }
 }
 
 /// Filesystem-safe file stem for a recording title:
@@ -362,10 +396,14 @@ pub struct AppState {
     pub model_manager: ModelManager,
     /// Settings-form state (M3).
     pub settings_form: SettingsForm,
-    /// Enumerated input device names (for the Audio source dropdown).
+    /// Enumerated input device names (for the Audio sources checkbox list).
     pub audio_devices: Vec<String>,
     /// Enumeration problem (no capture compiled / no host support), shown as a note.
     pub audio_devices_error: Option<String>,
+    /// M6: running processes with audio (the "Only an app…" picker).
+    pub audio_processes: Vec<capture::AudioProcessInfo>,
+    /// Process-listing problem (macOS-only; shown as a note in the picker).
+    pub audio_processes_error: Option<String>,
     /// A temp recording to delete once its transcript is saved (`keep_audio` off).
     pub pending_recording_cleanup: Option<PathBuf>,
     /// Whether this build has capture compiled in — the record control's enable
@@ -430,8 +468,10 @@ pub enum Effect {
     DeleteTranscript { id: Uuid },
     /// Write `settings.model_id = id`.
     SetDefaultModel { id: String },
-    /// Enumerate input devices for the Audio source dropdown.
+    /// Enumerate input devices for the Audio sources checkbox list.
     RefreshAudioDevices,
+    /// M6: list the running processes with audio (the per-app picker).
+    RefreshAudioProcesses,
     /// Persist the settings form (toml; keychain on macOS/Windows).
     SaveSettings { form: Box<SettingsForm> },
     /// Run the polish call for this transcript on a background thread
@@ -469,6 +509,8 @@ impl AppState {
             settings_form: SettingsForm::from_settings(&suramak_core::settings::Settings::default()),
             audio_devices: Vec::new(),
             audio_devices_error: None,
+            audio_processes: Vec::new(),
+            audio_processes_error: None,
             pending_recording_cleanup: None,
             capture_available: capture::CAPTURE_COMPILED,
             polish: PolishState::Idle,
@@ -567,6 +609,7 @@ impl AppState {
             rms: 0.0,
             waveform: Vec::new(),
             device: None,
+            sources: Vec::new(),
             stopping: false,
         });
         self.route = Route::Record;
@@ -574,10 +617,42 @@ impl AppState {
         effects
     }
 
-    /// Runtime: capture is live on this device.
-    pub fn record_device(&mut self, device: String) {
+    /// Runtime: capture is live on these sources (M6) — the record view shows
+    /// one row per source; gains start at unity, nothing muted.
+    ///
+    /// The labels' order is the runtime's recorder order; the runtime reads the
+    /// gains back from here at stop.
+    pub fn record_sources(&mut self, labels: Vec<String>) {
         if let RecordState::Recording(recording) = &mut self.record {
-            recording.device = Some(device);
+            if !labels.is_empty() {
+                recording.device = Some(labels.join(" + "));
+            }
+            recording.sources = labels
+                .into_iter()
+                .map(|label| RecordingSource {
+                    label,
+                    gain: 1.0,
+                    muted: false,
+                })
+                .collect();
+        }
+    }
+
+    /// Record view: per-source gain (clamped to the slider range).
+    pub fn set_source_gain(&mut self, index: usize, gain: f32) {
+        if let RecordState::Recording(recording) = &mut self.record {
+            if let Some(source) = recording.sources.get_mut(index) {
+                source.gain = gain.clamp(RecordingSource::MIN_GAIN, RecordingSource::MAX_GAIN);
+            }
+        }
+    }
+
+    /// Record view: per-source mute toggle.
+    pub fn set_source_muted(&mut self, index: usize, muted: bool) {
+        if let RecordState::Recording(recording) = &mut self.record {
+            if let Some(source) = recording.sources.get_mut(index) {
+                source.muted = muted;
+            }
         }
     }
 
@@ -773,16 +848,27 @@ impl AppState {
 
     // ---- settings (M3) ------------------------------------------------------
 
-    /// Home → Settings (also re-enumerates the audio devices for the dropdown).
+    /// Home → Settings (also re-enumerates the audio devices and, M6, the
+    /// running audio processes for the per-app picker).
     pub fn open_settings(&mut self) -> Vec<Effect> {
         self.route = Route::Settings;
-        vec![Effect::RefreshAudioDevices]
+        vec![Effect::RefreshAudioDevices, Effect::RefreshAudioProcesses]
     }
 
-    /// Runtime: enumerated input devices for the Audio source dropdown.
+    /// Runtime: enumerated input devices for the Audio sources checkbox list.
     pub fn on_audio_devices(&mut self, devices: Vec<String>, error: Option<String>) {
         self.audio_devices = devices;
         self.audio_devices_error = error;
+    }
+
+    /// Runtime: running audio processes for the "Only an app…" picker.
+    pub fn on_audio_processes(
+        &mut self,
+        processes: Vec<capture::AudioProcessInfo>,
+        error: Option<String>,
+    ) {
+        self.audio_processes = processes;
+        self.audio_processes_error = error;
     }
 
     /// Save pressed: the runtime applies the form (toml write + keychain).
@@ -1764,7 +1850,7 @@ mod tests {
         }
 
         // Meter samples + the timer.
-        state.record_device("MacBook Microphone".to_string());
+        state.record_sources(vec!["MacBook Microphone".to_string()]);
         state.record_sample(0.4);
         state.record_sample(0.6);
         state.tick(t0 + Duration::from_millis(7_300));
@@ -1846,6 +1932,112 @@ mod tests {
         assert!(!plain.can_record());
         assert!(plain.start_recording(Instant::now(), "d").is_empty());
         assert!(matches!(plain.record, RecordState::Idle));
+    }
+
+    // ---- M6: multi-source record state --------------------------------------
+
+    #[test]
+    fn recording_sources_flow_into_the_record_view_with_gain_and_mute() {
+        let mut state = recording_state();
+        state.start_recording(Instant::now(), "2026-10-14 09:00:00");
+        state.record_sources(vec![
+            "Default microphone".to_string(),
+            "System audio (all processes except Suramak)".to_string(),
+        ]);
+        match &state.record {
+            RecordState::Recording(rec) => {
+                assert_eq!(rec.sources.len(), 2, "one row per source");
+                assert_eq!(rec.sources[0].label, "Default microphone");
+                assert_eq!(rec.sources[0].gain, 1.0);
+                assert!(!rec.sources[0].muted);
+                assert_eq!(
+                    rec.device.as_deref(),
+                    Some("Default microphone + System audio (all processes except Suramak)"),
+                    "the summary line lists every source"
+                );
+            }
+            other => panic!("expected a recording, got {other:?}"),
+        }
+
+        // The record view's controls (gain slider / mute checkbox).
+        state.set_source_gain(0, 0.5);
+        state.set_source_muted(1, true);
+        match &state.record {
+            RecordState::Recording(rec) => {
+                assert_eq!(rec.sources[0].gain, 0.5);
+                assert!(rec.sources[1].muted);
+            }
+            other => panic!("expected a recording, got {other:?}"),
+        }
+        // Gain is clamped to the slider range; out-of-range indices are no-ops.
+        state.set_source_gain(0, 9.0);
+        state.set_source_gain(7, 0.5);
+        match &state.record {
+            RecordState::Recording(rec) => assert_eq!(rec.sources[0].gain, 2.0),
+            other => panic!("expected a recording, got {other:?}"),
+        }
+
+        // Stop keeps the state (the runtime reads the gains back from here).
+        let effects = state.stop_recording();
+        assert!(matches!(effects.as_slice(), [Effect::StopCapture { .. }]));
+        match &state.record {
+            RecordState::Recording(rec) => {
+                assert!(rec.stopping);
+                assert_eq!(rec.sources.len(), 2, "gains survive the stop request");
+                assert_eq!(rec.sources[0].gain, 2.0);
+            }
+            other => panic!("expected a recording, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_source_labels_cover_every_kind() {
+        assert_eq!(
+            record_source_label(&RecordSource::Default),
+            "Default microphone"
+        );
+        assert_eq!(
+            record_source_label(&RecordSource::Device {
+                name: "BlackHole 2ch".to_string()
+            }),
+            "BlackHole 2ch"
+        );
+        assert_eq!(
+            record_source_label(&RecordSource::SystemAudio),
+            "System audio (all processes except Suramak)"
+        );
+        assert_eq!(
+            record_source_label(&RecordSource::AppAudio {
+                apps: vec!["us.zoom.xos".to_string(), "com.google.Chrome".to_string()]
+            }),
+            "App audio (us.zoom.xos, com.google.Chrome)"
+        );
+    }
+
+    #[test]
+    fn a_recording_without_reported_sources_keeps_the_old_shape() {
+        // The runtime always reports sources on a successful start; before that
+        // (or on an old scripted flow) the rows are empty and nothing breaks.
+        let mut state = recording_state();
+        state.start_recording(Instant::now(), "2026-10-14 09:00:00");
+        match &state.record {
+            RecordState::Recording(rec) => {
+                assert!(rec.sources.is_empty());
+                assert!(rec.device.is_none(), "starting capture…");
+            }
+            other => panic!("expected a recording, got {other:?}"),
+        }
+        state.record_sources(Vec::new());
+        match &state.record {
+            RecordState::Recording(rec) => {
+                assert!(rec.sources.is_empty());
+                assert!(
+                    rec.device.is_none(),
+                    "an empty report never invents a source line"
+                );
+            }
+            other => panic!("expected a recording, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2166,7 +2358,10 @@ mod tests {
     fn settings_save_and_reset_flow() {
         let mut state = AppState::new();
         let effects = state.open_settings();
-        assert!(matches!(effects.as_slice(), [Effect::RefreshAudioDevices]));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::RefreshAudioDevices, Effect::RefreshAudioProcesses]
+        ));
         assert_eq!(state.route, Route::Settings);
 
         state.on_audio_devices(
@@ -2177,6 +2372,17 @@ mod tests {
             None,
         );
         assert_eq!(state.audio_devices.len(), 2);
+        state.on_audio_processes(
+            vec![capture::AudioProcessInfo {
+                pid: 700,
+                bundle_id: "us.zoom.xos".to_string(),
+                is_running_output: true,
+                is_running_input: true,
+            }],
+            None,
+        );
+        assert_eq!(state.audio_processes.len(), 1);
+        assert_eq!(state.audio_processes[0].settings_key(), "us.zoom.xos");
 
         // Save carries the current form values.
         state.settings_form.keep_audio = true;

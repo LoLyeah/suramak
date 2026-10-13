@@ -10,8 +10,9 @@
 //! ## API shape (and why)
 //!
 //! [`SystemTap::start`] takes a [`TapConfig`] carrying a [`ProcessSelection`] —
-//! *one parameter*, so the future per-app milestone ("only this Zoom call") is a
-//! new `ProcessSelection` variant, not a reshape of this API.
+//! *one parameter*, which is exactly how the per-app milestone (M6, "only this
+//! Zoom call") landed as a new `ProcessSelection` variant, not a reshape of
+//! this API. [`TapConfig::app_audio`] is the per-app constructor.
 //!
 //! ```no_run
 //! # fn main() -> Result<(), suramak_taps::TapError> {
@@ -24,6 +25,10 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! [`list_audio_processes`] (M6) enumerates the HAL's process objects — every
+//! process CoreAudio knows to have audio — so a UI can offer a per-app picker.
+//! Suramak's own process is never listed (a tap must never capture itself).
 //!
 //! ## Platforms
 //!
@@ -55,11 +60,14 @@ use stub as imp;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessSelection {
     /// Every process **except** the listed pids. An empty list captures everything.
-    ///
-    /// The per-app milestone ("only this Zoom call") adds a sibling variant here;
-    /// [`TapConfig`] already carries the selection as one parameter, so that is a
-    /// one-line extension of `macos.rs`, not an API reshape.
     AllExcept(Vec<u32>),
+    /// **Only** the listed pids (M6 per-app capture) — a stereo mixdown of just
+    /// those processes. An empty list captures nothing, which is a caller bug;
+    /// `suramak-asr` refuses it before a tap is created.
+    ///
+    /// Pids are matched through the HAL's process objects, like `AllExcept`:
+    /// a pid with no audio object yet is skipped (see `macos.rs`).
+    Only(Vec<u32>),
 }
 
 /// Configuration for one system-audio tap.
@@ -75,6 +83,12 @@ pub struct TapConfig {
 /// Default aggregate-device name (`Suramak System Audio`).
 pub const DEFAULT_TAP_DEVICE_NAME: &str = "Suramak System Audio";
 
+/// Aggregate-device name for per-app taps (`Suramak App Audio`, M6). Distinct
+/// from [`DEFAULT_TAP_DEVICE_NAME`] on purpose: both taps can run at once
+/// (system audio + one app), and the capture layer matches the aggregate device
+/// by name.
+pub const APP_TAP_DEVICE_NAME: &str = "Suramak App Audio";
+
 impl TapConfig {
     /// System audio = every process except Suramak itself.
     pub fn system_audio() -> Self {
@@ -88,6 +102,56 @@ impl TapConfig {
             name: DEFAULT_TAP_DEVICE_NAME.to_string(),
         }
     }
+
+    /// Per-app audio (M6): a stereo mixdown of exactly `pids` ("transcribe only
+    /// this Zoom call"). The caller resolves pids from
+    /// [`list_audio_processes`] output — pids are only valid while those
+    /// processes live.
+    pub fn app_audio(pids: Vec<u32>) -> Self {
+        Self {
+            processes: ProcessSelection::Only(pids),
+            name: APP_TAP_DEVICE_NAME.to_string(),
+        }
+    }
+}
+
+/// One process the HAL knows to have audio (M6 per-app picker).
+///
+/// This is a snapshot: pids are only valid while the process lives, which is
+/// why the settings store the [`settings_key`](AudioProcessInfo::settings_key)
+/// (a bundle id) and resolve it to live pids at record time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioProcessInfo {
+    /// BSD process id (valid now, not across app restarts).
+    pub pid: u32,
+    /// Bundle id (e.g. `us.zoom.xos`); empty for processes without one
+    /// (CLI helpers, …).
+    pub bundle_id: String,
+    /// The process is currently rendering output audio.
+    pub is_running_output: bool,
+    /// The process is currently capturing input audio.
+    pub is_running_input: bool,
+}
+
+impl AudioProcessInfo {
+    /// Settings key for this process: the bundle id when present (stable across
+    /// restarts), else `pid:<pid>` (matches only while that pid lives).
+    pub fn settings_key(&self) -> String {
+        if self.bundle_id.is_empty() {
+            format!("pid:{}", self.pid)
+        } else {
+            self.bundle_id.clone()
+        }
+    }
+}
+
+/// Lists the running processes with audio (HAL process objects), for the
+/// per-app picker (M6). Suramak's own process is excluded.
+///
+/// Fails with [`TapError::Unsupported`] off macOS; on macOS < 14.2 the list is
+/// empty (there are no process objects before the tap API exists).
+pub fn list_audio_processes() -> Result<Vec<AudioProcessInfo>, TapError> {
+    imp::list_audio_processes()
 }
 
 /// Errors raised by tap setup/teardown.
@@ -170,6 +234,40 @@ mod tests {
         assert_eq!(explicit.processes, ProcessSelection::AllExcept(vec![4242]));
     }
 
+    #[test]
+    fn app_audio_config_selects_only_the_listed_processes() {
+        let config = TapConfig::app_audio(vec![11, 22]);
+        assert_eq!(config.processes, ProcessSelection::Only(vec![11, 22]));
+        assert_eq!(config.name, APP_TAP_DEVICE_NAME);
+        assert_ne!(
+            APP_TAP_DEVICE_NAME, DEFAULT_TAP_DEVICE_NAME,
+            "the two taps can run at once and are told apart by device name"
+        );
+
+        // The empty selection is expressible but means "capture nothing"; the
+        // capture layer refuses it before a tap is created.
+        let empty = TapConfig::app_audio(Vec::new());
+        assert_eq!(empty.processes, ProcessSelection::Only(Vec::new()));
+    }
+
+    #[test]
+    fn audio_process_settings_keys_prefer_the_bundle_id() {
+        let zoom = AudioProcessInfo {
+            pid: 700,
+            bundle_id: "us.zoom.xos".to_string(),
+            is_running_output: true,
+            is_running_input: true,
+        };
+        assert_eq!(zoom.settings_key(), "us.zoom.xos");
+        let helper = AudioProcessInfo {
+            pid: 701,
+            bundle_id: String::new(),
+            is_running_output: true,
+            is_running_input: false,
+        };
+        assert_eq!(helper.settings_key(), "pid:701");
+    }
+
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn start_reports_unsupported_off_macos() {
@@ -181,5 +279,12 @@ mod tests {
             err.to_string().contains("macOS 14.2"),
             "the error must say what is missing: {err}"
         );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn listing_audio_processes_reports_unsupported_off_macos() {
+        let err = list_audio_processes().expect_err("listing must fail off macOS");
+        assert!(matches!(err, TapError::Unsupported));
     }
 }

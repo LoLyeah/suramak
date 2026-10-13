@@ -1,13 +1,16 @@
-//! Settings route (M3): engine, default model/language, keep_audio + Audio source,
-//! the recordings folder, and the polish section (base URL / model / keychain key).
+//! Settings route (M3; M6 multi-source list): engine, default model/language,
+//! keep_audio + the **checkbox list of recording inputs** (devices, system
+//! audio, "Only an app…" with its running-audio-process picker), the recordings
+//! folder, and the polish section (base URL / model / keychain key).
 //!
 //! All form rules live in `app::settings_form` (egui-free, unit-tested); this view
 //! edits that form and asks the runtime to persist it (`Effect::SaveSettings`).
 
 use egui::{pos2, vec2, Align2, FontFamily, FontId, Rect};
 
+use suramak_asr::capture::AudioProcessInfo;
 use suramak_core::models as core_models;
-use suramak_core::settings::{AudioSource, EngineSetting};
+use suramak_core::settings::{EngineSetting, RecordSource};
 
 use crate::theme::Palette;
 
@@ -39,10 +42,13 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
         });
     });
 
-    // The form sections borrow only `state.settings_form`; device snapshots are
+    // The form sections borrow only `state.settings_form`; snapshots are
     // copied out first so the borrows stay disjoint.
     let devices = state.audio_devices.clone();
     let device_error = state.audio_devices_error.clone();
+    let processes = state.audio_processes.clone();
+    let processes_error = state.audio_processes_error.clone();
+    let capture_available = state.capture_available;
     let mut y = rect.top() + 96.0;
 
     let mut dirty = false;
@@ -55,6 +61,10 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
             form,
             &devices,
             device_error.as_deref(),
+            &processes,
+            processes_error.as_deref(),
+            capture_available,
+            effects,
             left,
             right,
             &mut y,
@@ -236,7 +246,10 @@ fn transcription_section(
     dirty
 }
 
-/// Audio source dropdown (Addendum A) + enumeration notes.
+/// The M6 checkbox list of recording inputs: default mic, enumerated devices,
+/// system audio (macOS), and "Only an app…" with its running-audio-process
+/// picker. Everything ticked is recorded together and mixed into one file;
+/// ≥1 source is required to save (the inline hint shows the refusal).
 #[allow(clippy::too_many_arguments)]
 fn audio_source_section(
     ui: &mut egui::Ui,
@@ -244,39 +257,115 @@ fn audio_source_section(
     form: &mut SettingsForm,
     devices: &[String],
     device_error: Option<&str>,
+    processes: &[AudioProcessInfo],
+    processes_error: Option<&str>,
+    capture_available: bool,
+    effects: &mut Vec<Effect>,
     left: f32,
     right: f32,
     y: &mut f32,
 ) -> bool {
     let mut dirty = false;
-    section(ui, palette, left, y, "Audio source");
+    section(ui, palette, left, y, "Audio sources");
 
-    label(ui, palette, left, *y, "Input");
-    let current = settings_form::audio_source_key(&form.audio_source);
-    let mut chosen = current.clone();
+    label(ui, palette, left, *y, "Inputs");
     inside(ui, left, right, *y, |ui| {
-        egui::ComboBox::from_id_salt("suramak-audio-source")
-            .selected_text(audio_source_label(&form.audio_source))
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut chosen, "default".to_string(), "Default microphone");
-                for name in devices {
-                    ui.selectable_value(&mut chosen, format!("device:{name}"), name);
-                }
-                if SYSTEM_AUDIO_OFFERED {
-                    ui.selectable_value(
-                        &mut chosen,
-                        "system".to_string(),
-                        "System audio (all processes except Suramak)",
-                    );
-                }
-            });
+        pane_caption(
+            ui,
+            "pick one or more — everything ticked is recorded together into one 16 kHz recording",
+            palette,
+            false,
+        );
     });
-    if chosen != current {
-        form.audio_source = settings_form::audio_source_from_key(&chosen);
-        dirty = true;
-    }
     *y += ROW_H;
 
+    // Default microphone.
+    dirty |= source_checkbox(
+        ui,
+        left,
+        right,
+        y,
+        capture_available,
+        "Default microphone",
+        form.is_checked(&RecordSource::Default),
+        |checked| form.set_checked(RecordSource::Default, checked),
+    );
+
+    // Enumerated input devices.
+    for name in devices {
+        let source = RecordSource::Device { name: name.clone() };
+        let checked = form.is_checked(&source);
+        dirty |= source_checkbox(
+            ui,
+            left,
+            right,
+            y,
+            capture_available,
+            name,
+            checked,
+            |checked| form.set_checked(RecordSource::Device { name: name.clone() }, checked),
+        );
+    }
+
+    // System audio (macOS builds only — hidden elsewhere, Addendum A).
+    if SYSTEM_AUDIO_OFFERED {
+        dirty |= source_checkbox(
+            ui,
+            left,
+            right,
+            y,
+            capture_available,
+            "System audio (all processes except Suramak)",
+            form.is_checked(&RecordSource::SystemAudio),
+            |checked| form.set_checked(RecordSource::SystemAudio, checked),
+        );
+
+        // "Only an app…" — the per-app entry + its process picker (M6).
+        dirty |= source_checkbox(
+            ui,
+            left,
+            right,
+            y,
+            capture_available,
+            "Only an app…",
+            form.app_audio_apps().is_some(),
+            |checked| form.set_app_audio_checked(checked),
+        );
+        if let Some(apps) = form.app_audio_apps() {
+            let apps = apps.to_vec();
+            dirty |= app_picker(
+                ui,
+                palette,
+                form,
+                processes,
+                processes_error,
+                capture_available,
+                &apps,
+                effects,
+                left,
+                right,
+                y,
+            );
+        }
+    }
+
+    // Validation hint (never zero sources; the app entry needs ≥1 app).
+    if let Some(problem) = form.sources_problem() {
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(Rect::from_min_size(
+                pos2(left, *y),
+                vec2(right - left, 20.0),
+            )),
+            |ui| {
+                ui.horizontal(|ui| {
+                    pane_caption(ui, &problem, palette, true);
+                });
+            },
+        );
+        *y += 22.0;
+    }
+
+    // Enumeration notes (the existing copy, capture-less builds included).
     ui.scope_builder(
         egui::UiBuilder::new().max_rect(Rect::from_min_size(
             pos2(left, *y),
@@ -305,12 +394,11 @@ fn audio_source_section(
                     );
                 }
             });
-            if matches!(form.audio_source, AudioSource::SystemAudio) && !SYSTEM_AUDIO_OFFERED {
+            if !capture_available {
                 ui.horizontal(|ui| {
                     pane_caption(
                         ui,
-                        "system audio capture needs a macOS build (CoreAudio process taps, macOS 14.2+) — \
-                         recording fails with that message here",
+                        "recording is not compiled into this build (feature `capture`) — the input list is read-only",
                         palette,
                         true,
                     );
@@ -320,6 +408,152 @@ fn audio_source_section(
     );
     *y += 46.0;
     dirty
+}
+
+/// One checkbox row of the source list. Returns whether the value changed.
+#[allow(clippy::too_many_arguments)]
+fn source_checkbox(
+    ui: &mut egui::Ui,
+    left: f32,
+    right: f32,
+    y: &mut f32,
+    enabled: bool,
+    label: &str,
+    checked: bool,
+    on_change: impl FnOnce(bool),
+) -> bool {
+    let mut value = checked;
+    inside(ui, left, right, *y, |ui| {
+        ui.add_enabled(enabled, egui::Checkbox::new(&mut value, label));
+    });
+    *y += ROW_H;
+    if value != checked {
+        on_change(value);
+        true
+    } else {
+        false
+    }
+}
+
+/// The running-audio-process picker under "Only an app…" (M6): one checkbox per
+/// process, keyed by its settings key (bundle id, else `pid:<pid>`).
+#[allow(clippy::too_many_arguments)]
+fn app_picker(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    form: &mut SettingsForm,
+    processes: &[AudioProcessInfo],
+    processes_error: Option<&str>,
+    capture_available: bool,
+    apps: &[String],
+    effects: &mut Vec<Effect>,
+    left: f32,
+    right: f32,
+    y: &mut f32,
+) -> bool {
+    let mut dirty = false;
+    let mut cursor = *y;
+    let indent = left + 24.0;
+    ui.scope_builder(
+        egui::UiBuilder::new().max_rect(Rect::from_min_size(
+            pos2(indent, cursor),
+            vec2((right - indent).max(160.0), ROW_H),
+        )),
+        |ui| {
+            ui.horizontal(|ui| {
+                pane_caption(
+                    ui,
+                    "the tap captures only the ticked apps (a stereo mixdown of exactly those processes)",
+                    palette,
+                    false,
+                );
+                if ui.small_button("Refresh").clicked() {
+                    effects.push(Effect::RefreshAudioProcesses);
+                }
+            });
+        },
+    );
+    cursor += ROW_H;
+
+    if let Some(error) = processes_error {
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(Rect::from_min_size(
+                pos2(indent, cursor),
+                vec2((right - indent).max(160.0), ROW_H),
+            )),
+            |ui| {
+                ui.horizontal(|ui| {
+                    pane_caption(
+                        ui,
+                        &format!("running audio processes: {error}"),
+                        palette,
+                        true,
+                    );
+                });
+            },
+        );
+        cursor += ROW_H;
+    } else if processes.is_empty() {
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(Rect::from_min_size(
+                pos2(indent, cursor),
+                vec2((right - indent).max(160.0), ROW_H),
+            )),
+            |ui| {
+                ui.horizontal(|ui| {
+                    pane_caption(
+                        ui,
+                        "no app is producing audio right now — start playback, then Refresh",
+                        palette,
+                        false,
+                    );
+                });
+            },
+        );
+        cursor += ROW_H;
+    }
+
+    for process in processes {
+        let key = process.settings_key();
+        let checked = apps.iter().any(|app| app == &key);
+        let mut value = checked;
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(Rect::from_min_size(
+                pos2(indent, cursor),
+                vec2((right - indent).max(160.0), ROW_H),
+            )),
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_enabled(
+                        capture_available,
+                        egui::Checkbox::new(&mut value, process_label(process)),
+                    );
+                });
+            },
+        );
+        if value != checked {
+            form.set_app_checked(&key, value);
+            dirty = true;
+        }
+        cursor += ROW_H;
+    }
+
+    *y = cursor + 4.0;
+    dirty
+}
+
+/// Display label for one process row (`us.zoom.xos (pid 700) — playing`).
+fn process_label(process: &AudioProcessInfo) -> String {
+    let name = if process.bundle_id.is_empty() {
+        format!("pid {}", process.pid)
+    } else {
+        format!("{} (pid {})", process.bundle_id, process.pid)
+    };
+    if process.is_running_output {
+        format!("{name} — playing")
+    } else {
+        name
+    }
 }
 
 /// Polish section: base URL / model / keychain key (macOS/Windows only).
@@ -383,15 +617,6 @@ fn polish_section(
     });
     *y += ROW_H + 12.0;
     dirty
-}
-
-/// The dropdown label for the current audio source.
-fn audio_source_label(source: &AudioSource) -> String {
-    match source {
-        AudioSource::Default => "Default microphone".to_string(),
-        AudioSource::Device { name } => name.clone(),
-        AudioSource::SystemAudio => "System audio (all processes except Suramak)".to_string(),
-    }
 }
 
 /// Model dropdown options: `auto` + every manifest id (+ a custom value if the

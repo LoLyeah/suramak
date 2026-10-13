@@ -5,17 +5,28 @@
 //! Two layers:
 //!
 //! * **Pure helpers** — [`mono_mixdown`], [`resample_16k`], [`RollingRms`],
-//!   [`write_recording_wav`], [`resolve_input_source`] — compiled and unit-tested
-//!   on *every* build (no cpal, no device, no ALSA runtime).
-//! * **The cpal session** — [`start_recording`] / [`start_recording_with`],
-//!   [`list_input_devices`] / [`list_input_devices_detailed`], [`Recorder`] —
-//!   only with the `capture` feature. Without it this module still compiles and
-//!   reports capture as unsupported ([`CAPTURE_COMPILED`] is the compile-time
-//!   probe), so dependents can call it unconditionally.
+//!   [`write_recording_wav`], [`resolve_input_source`], [`resolve_app_processes`]
+//!   — compiled and unit-tested on *every* build (no cpal, no device, no ALSA
+//!   runtime).
+//! * **The cpal session** — [`start_recording`] / [`start_recording_with`] /
+//!   [`start_recording_multi`], [`list_input_devices`] /
+//!   [`list_input_devices_detailed`] / [`list_audio_processes`], [`Recorder`] /
+//!   [`MultiRecorder`] — only with the `capture` feature. Without it this
+//!   module still compiles and reports capture as unsupported
+//!   ([`CAPTURE_COMPILED`] is the compile-time probe), so dependents can call
+//!   it unconditionally.
 //!
 //! Addendum A: [`AudioSource`] settings select the input — default microphone, a
 //! named device (case-insensitive enumeration match, documented fallback), or
 //! macOS system audio through `suramak-taps` (CoreAudio process taps).
+//!
+//! M6: [`CaptureInput`] generalises that to a **list** of inputs recorded
+//! concurrently (two mics, mic + system audio, per-app system audio) — one
+//! [`Recorder`] per input, combined at stop by the pure mixing engine
+//! ([`crate::mix`]), which also measures each source's clock drift from the
+//! session span. [`list_audio_processes`] + [`resolve_app_processes`] back the
+//! per-app picker: settings store app keys (bundle ids), live pids are
+//! resolved at record time.
 
 use std::path::Path;
 
@@ -219,11 +230,7 @@ pub fn resolve_input_source(
         }
         AudioSource::SystemAudio => {
             if !system_audio_available {
-                return Err(AsrError::Capture(
-                    "system audio capture needs macOS 14.2+ (CoreAudio process taps) — \
-                     this build/platform has no tap support; pick a microphone in Settings"
-                        .to_string(),
-                ));
+                return Err(system_audio_unavailable_error());
             }
             Ok(SourceResolution {
                 source: ResolvedSource::SystemAudio,
@@ -231,6 +238,130 @@ pub fn resolve_input_source(
             })
         }
     }
+}
+
+/// The one error for "this build/platform has no tap support" (Addendum A
+/// wording; shared by `resolve_input_source` and the M6 per-app path).
+fn system_audio_unavailable_error() -> AsrError {
+    AsrError::Capture(
+        "system audio capture needs macOS 14.2+ (CoreAudio process taps) — \
+         this build/platform has no tap support; pick a microphone in Settings"
+            .to_string(),
+    )
+}
+
+/// One input the M6 multi-source recorder opens (a generalisation of
+/// [`AudioSource`] to per-app taps and to lists).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureInput {
+    /// The system default input device.
+    Default,
+    /// A named input device, matched case-insensitively (documented fallback:
+    /// a missing name uses the default with a warning).
+    Device(String),
+    /// macOS system audio: every process except Suramak (Addendum A).
+    SystemAudio,
+    /// macOS system audio restricted to these pids (M6 per-app capture) —
+    /// resolved from settings app keys by [`resolve_app_processes`].
+    AppAudio(Vec<u32>),
+}
+
+impl From<&AudioSource> for CaptureInput {
+    fn from(source: &AudioSource) -> Self {
+        match source {
+            AudioSource::Default => CaptureInput::Default,
+            AudioSource::Device { name } => CaptureInput::Device(name.clone()),
+            AudioSource::SystemAudio => CaptureInput::SystemAudio,
+        }
+    }
+}
+
+/// One process the HAL knows to have audio (M6 per-app picker). Mirror of
+/// `suramak_taps::AudioProcessInfo` so this module's type surface exists in
+/// builds without the `capture` feature (where the tap crate is not compiled).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioProcessInfo {
+    /// BSD process id (valid now, not across app restarts).
+    pub pid: u32,
+    /// Bundle id (e.g. `us.zoom.xos`); empty for processes without one.
+    pub bundle_id: String,
+    /// The process is currently rendering output audio.
+    pub is_running_output: bool,
+    /// The process is currently capturing input audio.
+    pub is_running_input: bool,
+}
+
+impl AudioProcessInfo {
+    /// Settings key for this process: the bundle id when present (stable across
+    /// restarts), else `pid:<pid>` (matches only while that pid lives).
+    pub fn settings_key(&self) -> String {
+        if self.bundle_id.is_empty() {
+            format!("pid:{}", self.pid)
+        } else {
+            self.bundle_id.clone()
+        }
+    }
+}
+
+#[cfg(feature = "capture")]
+impl From<suramak_taps::AudioProcessInfo> for AudioProcessInfo {
+    fn from(info: suramak_taps::AudioProcessInfo) -> Self {
+        Self {
+            pid: info.pid,
+            bundle_id: info.bundle_id,
+            is_running_output: info.is_running_output,
+            is_running_input: info.is_running_input,
+        }
+    }
+}
+
+/// Resolves settings app keys to live pids (M6 per-app capture). **Pure** —
+/// unit-tested on every platform.
+///
+/// Keys are what [`AudioProcessInfo::settings_key`] produced when the user
+/// picked the app: a bundle id (`us.zoom.xos`, matched case-insensitively) or
+/// `pid:<pid>` (matches only while that exact pid lives). Every key must match
+/// a listed process; a key with no running process is an error — never a
+/// silent widening to full system audio.
+pub fn resolve_app_processes(
+    apps: &[String],
+    processes: &[AudioProcessInfo],
+) -> Result<Vec<u32>, String> {
+    if apps.is_empty() {
+        return Err("no apps selected for the app-audio source".to_string());
+    }
+    let mut pids = Vec::new();
+    let mut missing = Vec::new();
+    for key in apps {
+        let key = key.trim();
+        let found = match key.strip_prefix("pid:") {
+            Some(pid) => pid
+                .parse::<u32>()
+                .ok()
+                .and_then(|pid| processes.iter().find(|process| process.pid == pid)),
+            None => processes
+                .iter()
+                .find(|process| process.bundle_id.eq_ignore_ascii_case(key)),
+        };
+        match found {
+            Some(process) => pids.push(process.pid),
+            None => missing.push(key.to_string()),
+        }
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "no running audio process matches {} — start the app (and play audio), \
+             refresh the list, and retry",
+            missing
+                .iter()
+                .map(|key| format!("'{key}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    Ok(pids)
 }
 
 #[cfg(feature = "capture")]
@@ -244,8 +375,8 @@ mod imp {
     use suramak_core::settings::AudioSource;
 
     use super::{
-        mono_mixdown, resolve_input_source, system_audio_available, InputDeviceInfo,
-        ResolvedSource, RollingRms, RMS_WINDOW,
+        mono_mixdown, resolve_input_source, system_audio_available, AudioProcessInfo, CaptureInput,
+        InputDeviceInfo, ResolvedSource, RollingRms, RMS_WINDOW,
     };
     use crate::whisper::AsrError;
 
@@ -347,21 +478,93 @@ mod imp {
 
     /// Starts capture for the settings' [`AudioSource`] (Addendum A).
     pub fn start_recording_with(source: &AudioSource) -> Result<Recorder, AsrError> {
+        start_one(&CaptureInput::from(source))
+    }
+
+    /// Starts **one capture session per input** (M6): two mics, mic + system
+    /// audio, per-app system audio. The first failure tears down the sessions
+    /// already started (dropping a `Recorder` stops its stream/tap) — never a
+    /// half-open multi session.
+    ///
+    /// The returned [`MultiRecorder`] carries the session's start instant; the
+    /// mixer measures each source's clock drift from the span between it and
+    /// [`MultiRecorder::stop`].
+    pub fn start_recording_multi(inputs: &[CaptureInput]) -> Result<MultiRecorder, AsrError> {
+        if inputs.is_empty() {
+            return Err(AsrError::Capture("no input sources selected".to_string()));
+        }
+        let started = std::time::Instant::now();
+        let mut recorders = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            recorders.push(start_one(input)?);
+        }
+        Ok(MultiRecorder { recorders, started })
+    }
+
+    /// Lists the running processes with audio (M6 per-app picker): macOS
+    /// process taps only. Every other build reports
+    /// [`AsrError::CaptureUnsupported`].
+    pub fn list_audio_processes() -> Result<Vec<AudioProcessInfo>, AsrError> {
+        match suramak_taps::list_audio_processes() {
+            Ok(processes) => Ok(processes.into_iter().map(AudioProcessInfo::from).collect()),
+            Err(suramak_taps::TapError::Unsupported) => Err(AsrError::CaptureUnsupported),
+            Err(err) => Err(AsrError::Capture(err.to_string())),
+        }
+    }
+
+    /// Starts one capture session (the shared body of
+    /// [`start_recording_with`] and [`start_recording_multi`]).
+    fn start_one(input: &CaptureInput) -> Result<Recorder, AsrError> {
         let host = cpal::default_host();
         let devices = list_input_devices_detailed()?;
-        let resolution = resolve_input_source(source, &devices, system_audio_available())?;
 
         // System audio keeps its tap alive for the whole session (the aggregate
         // device disappears with it), so it is created before the stream and moved
         // into the `Recorder` on success.
-        let (device, tap) = match &resolution.source {
-            ResolvedSource::Default => (default_input_device(&host)?, None),
-            ResolvedSource::Device(name) => (device_by_name(&host, name)?, None),
-            ResolvedSource::SystemAudio => {
+        let (device, tap, warning) = match input {
+            CaptureInput::Default => (default_input_device(&host)?, None, None),
+            CaptureInput::Device(name) => {
+                // Addendum A's documented resolution: case-insensitive match,
+                // missing name → system default *with a warning*.
+                let resolution = resolve_input_source(
+                    &AudioSource::Device { name: name.clone() },
+                    &devices,
+                    system_audio_available(),
+                )?;
+                match resolution.source {
+                    ResolvedSource::Device(canonical) => {
+                        (device_by_name(&host, &canonical)?, None, None)
+                    }
+                    _ => (default_input_device(&host)?, None, resolution.warning),
+                }
+            }
+            CaptureInput::SystemAudio => {
+                let resolution = resolve_input_source(
+                    &AudioSource::SystemAudio,
+                    &devices,
+                    system_audio_available(),
+                )?;
+                debug_assert_eq!(resolution.source, ResolvedSource::SystemAudio);
                 let tap = suramak_taps::SystemTap::start(&suramak_taps::TapConfig::system_audio())
                     .map_err(|err| AsrError::Capture(err.to_string()))?;
                 let device = device_for_tap(&host, &tap)?;
-                (device, Some(tap))
+                (device, Some(tap), None)
+            }
+            CaptureInput::AppAudio(pids) => {
+                if pids.is_empty() {
+                    return Err(AsrError::Capture(
+                        "the app-audio source has no processes — pick at least one app".to_string(),
+                    ));
+                }
+                if !system_audio_available() {
+                    return Err(super::system_audio_unavailable_error());
+                }
+                let tap = suramak_taps::SystemTap::start(&suramak_taps::TapConfig::app_audio(
+                    pids.clone(),
+                ))
+                .map_err(|err| AsrError::Capture(err.to_string()))?;
+                let device = device_for_tap(&host, &tap)?;
+                (device, Some(tap), None)
             }
         };
 
@@ -450,9 +653,67 @@ mod imp {
             rms_bits,
             device_name,
             sample_rate: config.sample_rate.0,
-            warning: resolution.warning,
+            warning,
             tap,
         })
+    }
+
+    /// A running multi-source capture session (M6): one [`Recorder`] per input
+    /// plus the session's start instant — the wall-clock span the mixer's
+    /// clock-drift measurement uses.
+    pub struct MultiRecorder {
+        recorders: Vec<Recorder>,
+        started: std::time::Instant,
+    }
+
+    impl MultiRecorder {
+        /// Number of live sessions.
+        pub fn len(&self) -> usize {
+            self.recorders.len()
+        }
+
+        /// Whether no session is live (cannot happen; a `MultiRecorder` always
+        /// holds ≥1 recorder — the constructor refuses an empty list).
+        pub fn is_empty(&self) -> bool {
+            self.recorders.is_empty()
+        }
+
+        /// Device names of the open sessions (enumeration spelling), in input
+        /// order.
+        pub fn device_names(&self) -> Vec<String> {
+            self.recorders
+                .iter()
+                .map(|recorder| recorder.device_name().to_string())
+                .collect()
+        }
+
+        /// Combined live level: the **loudest source's** rolling RMS. A true
+        /// post-mix meter would need the mix, which happens at stop (M6
+        /// decision, documented in the report) — the loudest source is the
+        /// honest cheap stand-in.
+        pub fn rms(&self) -> f32 {
+            self.recorders
+                .iter()
+                .map(Recorder::rms)
+                .fold(0.0f32, f32::max)
+        }
+
+        /// Non-fatal warnings from source resolution, in input order.
+        pub fn warnings(&self) -> Vec<String> {
+            self.recorders
+                .iter()
+                .filter_map(|recorder| recorder.warning().map(str::to_string))
+                .collect()
+        }
+
+        /// Stops every session (each stream, then its tap) and returns each
+        /// source's accumulated mono samples plus the session's wall-clock
+        /// span — exactly what [`crate::mix::mix`] consumes.
+        pub fn stop(self) -> (Vec<AudioBuffer>, std::time::Duration) {
+            let duration = self.started.elapsed();
+            let buffers = self.recorders.into_iter().map(Recorder::stop).collect();
+            (buffers, duration)
+        }
     }
 
     /// The system host's default input device or a clear error.
@@ -537,8 +798,8 @@ mod imp {
 
 #[cfg(feature = "capture")]
 pub use imp::{
-    list_input_devices, list_input_devices_detailed, start_recording, start_recording_with,
-    Recorder,
+    list_audio_processes, list_input_devices, list_input_devices_detailed, start_recording,
+    start_recording_multi, start_recording_with, MultiRecorder, Recorder,
 };
 
 #[cfg(not(feature = "capture"))]
@@ -607,12 +868,64 @@ mod imp {
     pub fn start_recording_with(_source: &AudioSource) -> Result<Recorder, AsrError> {
         Err(AsrError::CaptureUnsupported)
     }
+
+    /// Placeholder for builds without the `capture` feature; can never be
+    /// constructed (`start_recording_multi` always fails), but it carries the
+    /// real session's method surface so callers type-check everywhere.
+    pub struct MultiRecorder {
+        _private: (),
+    }
+
+    impl MultiRecorder {
+        /// Never reached (no instance can exist).
+        pub fn len(&self) -> usize {
+            0
+        }
+
+        /// Never reached (no instance can exist).
+        pub fn is_empty(&self) -> bool {
+            true
+        }
+
+        /// Never reached (no instance can exist).
+        pub fn device_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        /// Never reached (no instance can exist).
+        pub fn rms(&self) -> f32 {
+            0.0
+        }
+
+        /// Never reached (no instance can exist).
+        pub fn warnings(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        /// Never reached (no instance can exist): empty buffers keep the stub
+        /// panic-free for any caller that ignores the error path.
+        pub fn stop(self) -> (Vec<AudioBuffer>, std::time::Duration) {
+            (Vec::new(), std::time::Duration::ZERO)
+        }
+    }
+
+    /// Capture support is not compiled in — reports unsupported.
+    pub fn start_recording_multi(
+        _inputs: &[super::CaptureInput],
+    ) -> Result<MultiRecorder, AsrError> {
+        Err(AsrError::CaptureUnsupported)
+    }
+
+    /// Process taps are macOS-only; this build has no listing.
+    pub fn list_audio_processes() -> Result<Vec<super::AudioProcessInfo>, AsrError> {
+        Err(AsrError::CaptureUnsupported)
+    }
 }
 
 #[cfg(not(feature = "capture"))]
 pub use imp::{
-    list_input_devices, list_input_devices_detailed, start_recording, start_recording_with,
-    Recorder,
+    list_audio_processes, list_input_devices, list_input_devices_detailed, start_recording,
+    start_recording_multi, start_recording_with, MultiRecorder, Recorder,
 };
 
 #[cfg(test)]
@@ -841,5 +1154,91 @@ mod tests {
         // The plain-name list is the same enumeration.
         let names = list_input_devices().expect("enumeration must not fail");
         assert_eq!(names.len(), devices.len());
+    }
+
+    // ---- M6: per-app selection plumbing -------------------------------------
+
+    fn process(pid: u32, bundle_id: &str) -> AudioProcessInfo {
+        AudioProcessInfo {
+            pid,
+            bundle_id: bundle_id.to_string(),
+            is_running_output: true,
+            is_running_input: false,
+        }
+    }
+
+    #[test]
+    fn resolve_app_processes_matches_bundle_ids_case_insensitively() {
+        let processes = [
+            process(700, "us.zoom.xos"),
+            process(701, "com.google.Chrome"),
+            process(702, "com.spotify.client"),
+        ];
+        let pids = resolve_app_processes(
+            &["US.Zoom.XOS".to_string(), "com.google.chrome".to_string()],
+            &processes,
+        )
+        .expect("both apps are running");
+        assert_eq!(pids, vec![700, 701]);
+    }
+
+    #[test]
+    fn resolve_app_processes_supports_pid_keys_and_dedupes() {
+        let processes = [process(700, "us.zoom.xos"), process(704, "")];
+        // A pid key matches that exact pid; a bundle key the same process.
+        let pids = resolve_app_processes(
+            &[
+                "pid:704".to_string(),
+                "us.zoom.xos".to_string(),
+                "us.zoom.xos".to_string(),
+            ],
+            &processes,
+        )
+        .expect("resolve");
+        assert_eq!(pids, vec![700, 704], "sorted and deduped");
+        // A process without a bundle id keys by pid (the settings-key rule).
+        assert_eq!(processes[1].settings_key(), "pid:704");
+    }
+
+    #[test]
+    fn resolve_app_processes_reports_missing_apps() {
+        let processes = [process(700, "us.zoom.xos")];
+        let err = resolve_app_processes(
+            &["us.zoom.xos".to_string(), "com.unknown.app".to_string()],
+            &processes,
+        )
+        .expect_err("a key with no running process must fail");
+        assert!(err.contains("com.unknown.app"), "unexpected: {err}");
+        assert!(
+            err.contains("no running audio process"),
+            "unexpected: {err}"
+        );
+
+        // No keys at all is refused too (the tap would capture nothing).
+        let err = resolve_app_processes(&[], &processes).expect_err("empty keys");
+        assert!(err.contains("no apps selected"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn capture_input_maps_from_the_legacy_audio_source() {
+        assert_eq!(
+            CaptureInput::from(&AudioSource::Default),
+            CaptureInput::Default
+        );
+        assert_eq!(
+            CaptureInput::from(&AudioSource::Device {
+                name: "BlackHole 2ch".to_string()
+            }),
+            CaptureInput::Device("BlackHole 2ch".to_string())
+        );
+        assert_eq!(
+            CaptureInput::from(&AudioSource::SystemAudio),
+            CaptureInput::SystemAudio
+        );
+        // App audio has no legacy spelling — it is M6-only.
+        match CaptureInput::AppAudio(vec![700]) {
+            CaptureInput::AppAudio(pids) => assert_eq!(pids, vec![700]),
+            other => panic!("expected app audio, got {other:?}"),
+        }
     }
 }

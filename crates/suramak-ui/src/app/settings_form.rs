@@ -5,7 +5,7 @@
 //! [`Effect::SaveSettings`](super::Effect::SaveSettings); `crate::runtime`
 //! applies it (toml write + keychain on macOS/Windows).
 
-use suramak_core::settings::{AudioSource, EngineSetting, LangMode, PolishSettings, Settings};
+use suramak_core::settings::{EngineSetting, LangMode, PolishSettings, RecordSource, Settings};
 
 /// Language selector values offered in the UI (PLAN-NOTES §4 — Indonesian needs a
 /// forced language; auto-detect translated it to English).
@@ -59,30 +59,17 @@ pub fn lang_mode(selector: &str) -> LangMode {
     }
 }
 
-/// Stable dropdown key for an [`AudioSource`] (`default`, `device:<name>`, `system`).
-pub fn audio_source_key(source: &AudioSource) -> String {
-    match source {
-        AudioSource::Default => "default".to_string(),
-        AudioSource::Device { name } => format!("device:{name}"),
-        AudioSource::SystemAudio => "system".to_string(),
-    }
-}
-
-/// Inverse of [`audio_source_key`] (unknown keys → [`AudioSource::Default`]).
-pub fn audio_source_from_key(key: &str) -> AudioSource {
-    if key == "system" {
-        AudioSource::SystemAudio
-    } else if let Some(name) = key.strip_prefix("device:") {
-        if name.is_empty() {
-            AudioSource::Default
-        } else {
-            AudioSource::Device {
-                name: name.to_string(),
-            }
-        }
-    } else {
-        AudioSource::Default
-    }
+/// Canonical, deterministic order of an M6 source list: default mic, named
+/// devices (case-insensitive by name), system audio, app audio. Keeps the
+/// settings round-trip and the record view's rows stable regardless of the
+/// order the user ticked the boxes.
+pub fn order_sources(sources: &mut [RecordSource]) {
+    sources.sort_by_key(|source| match source {
+        RecordSource::Default => (0u8, String::new()),
+        RecordSource::Device { name } => (1, name.to_lowercase()),
+        RecordSource::SystemAudio => (2, String::new()),
+        RecordSource::AppAudio { .. } => (3, String::new()),
+    });
 }
 
 /// Editable settings-form state (a copy of what the screen shows).
@@ -98,7 +85,10 @@ pub struct SettingsForm {
     /// Free-text draft for the custom language code; validated on save.
     pub language_draft: String,
     pub keep_audio: bool,
-    pub audio_source: AudioSource,
+    /// M6: the checked recording sources (canonical order). This is what the
+    /// record pipeline reads at start; ≥1 entry is required to save
+    /// ([`SettingsForm::sources_problem`]).
+    pub sources: Vec<RecordSource>,
     pub polish_base_url: String,
     pub polish_model: String,
     /// Transient API-key input; **never** written to settings.toml (macOS/Windows
@@ -123,6 +113,10 @@ impl SettingsForm {
         } else {
             String::new()
         };
+        // M6: the effective source list (legacy `audio_source` when the file
+        // predates the list), in canonical order.
+        let mut sources = settings.recording.effective_sources();
+        order_sources(&mut sources);
         Self {
             engine: settings.asr.engine,
             model_id: settings.asr.model_id.clone(),
@@ -130,7 +124,7 @@ impl SettingsForm {
             language_custom,
             language_draft,
             keep_audio: settings.storage.keep_audio,
-            audio_source: settings.recording.audio_source.clone(),
+            sources,
             polish_base_url: settings
                 .polish
                 .as_ref()
@@ -145,6 +139,75 @@ impl SettingsForm {
             dirty: false,
             status: None,
         }
+    }
+
+    // ---- M6: the multi-select source list -----------------------------------
+
+    /// Whether a source entry of this shape is checked.
+    pub fn is_checked(&self, source: &RecordSource) -> bool {
+        self.sources.iter().any(|checked| checked == source)
+    }
+
+    /// Ticks/untickets one entry and restores the canonical order.
+    pub fn set_checked(&mut self, source: RecordSource, checked: bool) {
+        self.sources.retain(|entry| entry != &source);
+        if checked {
+            self.sources.push(source);
+        }
+        order_sources(&mut self.sources);
+    }
+
+    /// Ticks/untickets the "Only an app…" entry. Ticking starts with no apps
+    /// (the picker is empty until one is chosen — [`SettingsForm::sources_problem`]
+    /// refuses to save that state); unticking discards the app list with the
+    /// entry.
+    pub fn set_app_audio_checked(&mut self, checked: bool) {
+        self.sources
+            .retain(|entry| !matches!(entry, RecordSource::AppAudio { .. }));
+        if checked {
+            self.sources
+                .push(RecordSource::AppAudio { apps: Vec::new() });
+        }
+        order_sources(&mut self.sources);
+    }
+
+    /// The app keys of the "Only an app…" entry (`None` when it is not ticked).
+    pub fn app_audio_apps(&self) -> Option<&[String]> {
+        self.sources.iter().find_map(|source| match source {
+            RecordSource::AppAudio { apps } => Some(apps.as_slice()),
+            _ => None,
+        })
+    }
+
+    /// Ticks/untickets one app key inside the "Only an app…" entry (keys are
+    /// [`AudioProcessInfo::settings_key`](suramak_asr::capture::AudioProcessInfo::settings_key)
+    /// values). A no-op when the entry is not ticked.
+    pub fn set_app_checked(&mut self, key: &str, checked: bool) {
+        for source in &mut self.sources {
+            if let RecordSource::AppAudio { apps } = source {
+                apps.retain(|app| app != key);
+                if checked {
+                    apps.push(key.to_string());
+                }
+                apps.sort();
+            }
+        }
+    }
+
+    /// Validation of the source list as an inline hint (M6: **never zero
+    /// sources**, and the app entry needs at least one app). `None` = valid.
+    pub fn sources_problem(&self) -> Option<String> {
+        if self.sources.is_empty() {
+            return Some("select at least one input source".to_string());
+        }
+        if self
+            .sources
+            .iter()
+            .any(|source| matches!(source, RecordSource::AppAudio { apps } if apps.is_empty()))
+        {
+            return Some("pick at least one app for the \"Only an app…\" entry".to_string());
+        }
+        None
     }
 
     /// The language selector value [`SettingsForm::apply`] will persist: the
@@ -181,7 +244,9 @@ impl SettingsForm {
     /// Writes the form's values into `settings` (non-UI fields are left alone).
     ///
     /// An invalid custom language draft refuses to persist: the previous
-    /// `settings.asr.language` stays (the view shows the inline hint).
+    /// `settings.asr.language` stays (the view shows the inline hint). The same
+    /// rule guards the M6 source list: an empty list (or an app entry without
+    /// apps) refuses, the previous list stays.
     pub fn apply(&self, settings: &mut Settings) {
         settings.asr.engine = self.engine;
         settings.asr.model_id = self.model_id.trim().to_string();
@@ -189,7 +254,15 @@ impl SettingsForm {
             settings.asr.language = lang_mode(&code);
         }
         settings.storage.keep_audio = self.keep_audio;
-        settings.recording.audio_source = self.audio_source.clone();
+        if self.sources_problem().is_none() {
+            settings.recording.sources = self.sources.clone();
+            // The legacy single-source field follows the first entry, so older
+            // readers keep a sane view of the file (documented; the list is
+            // authoritative in M6+ builds).
+            if let Some(first) = self.sources.first() {
+                settings.recording.audio_source = first.legacy_audio_source();
+            }
+        }
         let base = self.polish_base_url.trim();
         let model = self.polish_model.trim();
         settings.polish = if base.is_empty() && model.is_empty() {
@@ -215,7 +288,7 @@ impl SettingsForm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use suramak_core::settings::GlassMode;
+    use suramak_core::settings::{AudioSource, GlassMode};
 
     fn temp_path(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("suramak-form-{tag}-{}", std::process::id()));
@@ -230,9 +303,12 @@ mod tests {
         settings.asr.model_id = "small".to_string();
         settings.asr.language = LangMode::Fixed("id".to_string());
         settings.storage.keep_audio = true;
-        settings.recording.audio_source = AudioSource::Device {
-            name: "BlackHole 2ch".to_string(),
-        };
+        settings.recording.sources = vec![
+            RecordSource::Device {
+                name: "BlackHole 2ch".to_string(),
+            },
+            RecordSource::SystemAudio,
+        ];
         settings.polish = Some(PolishSettings {
             base_url: "http://localhost:11434/v1".to_string(),
             model: "llama3".to_string(),
@@ -242,6 +318,15 @@ mod tests {
         let form = SettingsForm::from_settings(&settings);
         assert_eq!(form.language, "id");
         assert_eq!(form.polish_base_url, "http://localhost:11434/v1");
+        assert_eq!(
+            form.sources,
+            vec![
+                RecordSource::Device {
+                    name: "BlackHole 2ch".to_string()
+                },
+                RecordSource::SystemAudio
+            ]
+        );
 
         let mut target = Settings::default();
         form.apply(&mut target);
@@ -249,6 +334,16 @@ mod tests {
         assert_eq!(target.asr.model_id, "small");
         assert_eq!(target.asr.language, LangMode::Fixed("id".to_string()));
         assert!(target.storage.keep_audio);
+        assert_eq!(
+            target.recording.sources,
+            vec![
+                RecordSource::Device {
+                    name: "BlackHole 2ch".to_string()
+                },
+                RecordSource::SystemAudio
+            ]
+        );
+        // The legacy single-source field follows the list's first entry.
         assert_eq!(
             target.recording.audio_source,
             AudioSource::Device {
@@ -269,7 +364,7 @@ mod tests {
         assert_eq!(form.model_id, "turbo-q5-0");
         assert_eq!(form.language, "auto");
         assert!(!form.keep_audio);
-        assert_eq!(form.audio_source, AudioSource::Default);
+        assert_eq!(form.sources, vec![RecordSource::Default]);
         assert!(form.polish_base_url.is_empty() && form.polish_model.is_empty());
         assert!(form.api_key.is_empty(), "the key field always starts empty");
         assert!(!form.dirty);
@@ -493,28 +588,180 @@ mod tests {
         );
     }
 
+    // ---- M6: the multi-select source list -----------------------------------
+
     #[test]
-    fn audio_source_dropdown_keys_roundtrip() {
-        for source in [
-            AudioSource::Default,
-            AudioSource::Device {
+    fn multi_select_roundtrips_through_settings_in_canonical_order() {
+        let mut form = SettingsForm::from_settings(&Settings::default());
+        assert_eq!(form.sources, vec![RecordSource::Default]);
+
+        // Toggle in a deliberately non-canonical order: system, then a device,
+        // then a second device, and untick the default.
+        form.set_checked(RecordSource::SystemAudio, true);
+        form.set_checked(
+            RecordSource::Device {
+                name: "USB Mic".to_string(),
+            },
+            true,
+        );
+        form.set_checked(
+            RecordSource::Device {
                 name: "BlackHole 2ch".to_string(),
             },
-            AudioSource::SystemAudio,
-        ] {
-            let key = audio_source_key(&source);
-            assert_eq!(audio_source_from_key(&key), source, "key {key}");
-        }
-        assert_eq!(audio_source_key(&AudioSource::Default), "default");
-        assert_eq!(
-            audio_source_key(&AudioSource::Device {
-                name: "BlackHole 2ch".to_string()
-            }),
-            "device:BlackHole 2ch"
+            true,
         );
-        // Unknown / degenerate keys never explode and never lose the safe default.
-        assert_eq!(audio_source_from_key(""), AudioSource::Default);
-        assert_eq!(audio_source_from_key("nonsense"), AudioSource::Default);
-        assert_eq!(audio_source_from_key("device:"), AudioSource::Default);
+        form.set_checked(RecordSource::Default, false);
+        assert_eq!(
+            form.sources,
+            vec![
+                RecordSource::Device {
+                    name: "BlackHole 2ch".to_string()
+                },
+                RecordSource::Device {
+                    name: "USB Mic".to_string()
+                },
+                RecordSource::SystemAudio,
+            ],
+            "canonical order: devices (by name), then system audio"
+        );
+        assert!(form.sources_problem().is_none());
+
+        // Save → toml → reload → the same list (ordered, stable).
+        let path = temp_path("m6-sources");
+        let mut settings = Settings::default();
+        form.apply(&mut settings);
+        settings.save(&path).expect("save");
+        let reloaded = Settings::load(&path).expect("reload");
+        assert_eq!(reloaded.recording.sources, form.sources);
+        let form2 = SettingsForm::from_settings(&reloaded);
+        assert_eq!(form2.sources, form.sources);
+        // The legacy field follows the first entry.
+        assert_eq!(
+            reloaded.recording.audio_source,
+            AudioSource::Device {
+                name: "BlackHole 2ch".to_string()
+            }
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn never_zero_sources_is_refused_on_save() {
+        let mut settings = Settings::default();
+        settings.recording.sources = vec![RecordSource::SystemAudio];
+        let mut form = SettingsForm::from_settings(&settings);
+
+        // Unticking the last source is allowed in the form (the user is mid-
+        // decision), but it must not save.
+        form.set_checked(RecordSource::SystemAudio, false);
+        assert!(form.sources.is_empty());
+        assert_eq!(
+            form.sources_problem().as_deref(),
+            Some("select at least one input source")
+        );
+        form.apply(&mut settings);
+        assert_eq!(
+            settings.recording.sources,
+            vec![RecordSource::SystemAudio],
+            "an empty list never persists — the previous list stays"
+        );
+
+        // Ticking anything again clears the hint and saves (the unticked
+        // system-audio entry stays unticked — the list is what the user sees).
+        form.set_checked(RecordSource::Default, true);
+        assert!(form.sources_problem().is_none());
+        form.apply(&mut settings);
+        assert_eq!(settings.recording.sources, vec![RecordSource::Default]);
+    }
+
+    #[test]
+    fn app_audio_entry_plumbing() {
+        let mut form = SettingsForm::from_settings(&Settings::default());
+        assert_eq!(form.app_audio_apps(), None);
+
+        // Tick "Only an app…": the entry appears with no apps yet — invalid
+        // until the picker ticks one.
+        form.set_app_audio_checked(true);
+        assert_eq!(form.app_audio_apps(), Some([].as_slice()));
+        assert_eq!(
+            form.sources_problem().as_deref(),
+            Some("pick at least one app for the \"Only an app…\" entry")
+        );
+        let mut settings = Settings::default();
+        form.apply(&mut settings);
+        assert!(
+            settings.recording.sources.is_empty(),
+            "the app entry without apps never persists — the stored list stays untouched"
+        );
+        assert_eq!(
+            settings.recording.effective_sources(),
+            vec![RecordSource::Default],
+            "the legacy default remains effective until a list is saved"
+        );
+
+        // Tick two apps (keys from the process picker); they are stored sorted.
+        form.set_app_checked("us.zoom.xos", true);
+        form.set_app_checked("com.google.Chrome", true);
+        assert_eq!(
+            form.app_audio_apps(),
+            Some(["com.google.Chrome".to_string(), "us.zoom.xos".to_string()].as_slice())
+        );
+        assert!(form.sources_problem().is_none());
+        form.apply(&mut settings);
+        assert_eq!(
+            settings.recording.sources,
+            vec![
+                RecordSource::Default,
+                RecordSource::AppAudio {
+                    apps: vec!["com.google.Chrome".to_string(), "us.zoom.xos".to_string()]
+                }
+            ]
+        );
+        // The legacy field degrades AppAudio to full system audio (documented).
+        assert_eq!(settings.recording.audio_source, AudioSource::Default);
+
+        // Untick one app; untick the entry (its app list goes with it — the
+        // picker starts fresh when the entry is ticked again).
+        form.set_app_checked("us.zoom.xos", false);
+        assert_eq!(
+            form.app_audio_apps(),
+            Some(["com.google.Chrome".to_string()].as_slice())
+        );
+        form.set_app_audio_checked(false);
+        assert_eq!(form.app_audio_apps(), None);
+        form.set_app_audio_checked(true);
+        assert_eq!(
+            form.app_audio_apps(),
+            Some([].as_slice()),
+            "a re-ticked entry starts with no apps (the validation prompts)"
+        );
+    }
+
+    #[test]
+    fn sources_roundtrip_through_the_settings_file() {
+        // The exact settings.toml shape the acceptance greps for.
+        let dir = std::env::temp_dir().join("suramak-acceptance-m6-sources");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("settings.toml");
+        let mut settings = Settings::default();
+        settings.recording.sources = vec![
+            RecordSource::Default,
+            RecordSource::Device {
+                name: "BlackHole 2ch".to_string(),
+            },
+            RecordSource::SystemAudio,
+            RecordSource::AppAudio {
+                apps: vec!["us.zoom.xos".to_string()],
+            },
+        ];
+        settings.save(&path).expect("save");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[[recording.sources]]"), "unexpected: {text}");
+        assert!(text.contains("kind = \"app_audio\""), "unexpected: {text}");
+        assert_eq!(
+            Settings::load(&path).unwrap().recording.sources,
+            settings.recording.sources
+        );
+        println!("m6 sources acceptance file: {}", path.display());
     }
 }

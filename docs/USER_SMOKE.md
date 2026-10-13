@@ -136,6 +136,17 @@ Data lives in `~/Library/Application Support/dev.suramak.Suramak/` (db, settings
 - Export the video transcript as `SRT`/`VTT`.
   Expected: valid subtitle files with the same timestamps as the audio (the editor and exports are unchanged — a video import is unremarkable).
 
+## 17. Multi-source recording (M6): mic + system audio, and "Only an app…"
+
+- Settings → **Audio sources** → tick **two** entries, e.g. `Default microphone` **and** `System audio (all processes except Suramak)` (any combination works: two mics, a mic + a loopback device, …). The hint line shows `pick one or more — everything ticked is recorded together into one 16 kHz recording`; untick everything and press Save — expected: a red `select at least one input source` line and **nothing is written** (the previous list stays). Save with two entries ticked.
+- Start a call (Zoom/Meet/whatever) so **both sides** have audio, press the floating **Record** control, speak ~5 s, press **Stop**.
+  Expected: the record view shows a `sources` card with **one row per source** (name, `mute`, gain slider ×1.00), the level meter moves, and after Stop the transcript contains **both sides of the call** (your voice and the remote side), in one `Recording <date>` item.
+  - While recording, drag one source's gain slider down (or tick `mute`) — expected: it stays visibly changed; the final recording reflects it (gain/mute apply to the whole recording — the mix happens at Stop). A source that is not producing audio contributes silence, never an error.
+- **(b) "Only an app…"** — Settings → Audio sources → tick **`Only an app…`**. Expected: the process picker opens below it; start playback in the app you want (e.g. a Zoom call or Music) and press **Refresh** — the app appears as `us.zoom.xos (pid 1234) — playing`. Tick it (and only it), untick every other source, Save.
+  - Record ~5 s while that app plays and another app plays something else (e.g. a browser video). Expected: the transcript contains **only the ticked app's audio**; the other app's audio is absent; Suramak's own playback never appears.
+  - With the ticked app **not running**, press Record — expected: a red, actionable line (`no running audio process matches 'us.zoom.xos' — start the app (and play audio), refresh the list, and retry`) instead of a silent fallback to full system audio.
+  - Note: the picker needs a macOS build (14.2+ process taps); on Linux it shows `needs a macOS build with capture …` and the list stays read-only.
+
 ## Report
 
 Anything that deviates from an expected result, with: what you did, what happened, what you expected.
