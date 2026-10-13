@@ -36,6 +36,8 @@ Technical plan: `docs/PLAN.md` · verified engineering notes: `docs/PLAN-NOTES.m
 
 ## Build (dev)
 
+macOS prerequisites: Xcode command line tools, Rust (rustup), and CMake (`brew install cmake`) — CMake is what builds whisper.cpp.
+
 ```bash
 cargo build --release -p suramak-cli   # CLI
 cargo build --release -p suramak-ui    # the app

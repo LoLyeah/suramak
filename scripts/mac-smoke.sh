@@ -7,10 +7,25 @@
 # CLI e2e on fixtures/audio/en.wav -> pointer to docs/USER_SMOKE.md -> open the app.
 #
 # Plain bash, no sudo, fails loudly: every step must exit 0 or the script stops
-# (set -euo pipefail). Needs Xcode command line tools (codesign/iconutil) and
-# network for the one-time tiny model download.
+# (set -euo pipefail). Prerequisites: Xcode command line tools (codesign/iconutil),
+# Rust (rustup), CMake (`brew install cmake`), and network for the one-time tiny
+# model download.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# Preflight: fail fast with a fix hint instead of a cryptic build-script panic.
+for tool in cmake cargo; do
+  command -v "$tool" >/dev/null || {
+    echo "error: '$tool' not found on PATH." >&2
+    echo "  cmake  -> brew install cmake   (or https://cmake.org/download)" >&2
+    echo "  cargo  -> https://rustup.rs" >&2
+    exit 1
+  }
+done
+xcode-select -p >/dev/null 2>&1 || {
+  echo "error: Xcode command line tools missing. Run: xcode-select --install" >&2
+  exit 1
+}
 
 CLI="target/release/suramak-cli"
 APP="dist/Suramak.app/Contents/MacOS/suramak"

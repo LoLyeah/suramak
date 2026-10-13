@@ -3,7 +3,7 @@
 For the owner, on the Mac, from the repo root. ~15 minutes.
 Every item lists the expected observable result. Anything else: see **Report** at the end.
 
-Prep (once):
+Prep (once — prerequisites: Xcode command line tools, Rust via rustup, CMake via `brew install cmake`):
 
 ```bash
 bash scripts/mac-smoke.sh          # release build + app bundle + CLI e2e; must end "mac smoke complete."
