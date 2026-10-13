@@ -1,0 +1,129 @@
+DIRECTION CONCEPT SEED (key: b7306df5; mode: operate; source: api; approved pool: c3b204a1eed6; 306/564 human-approved; rerun with --scope direction --mode operate --from b7306df5 --candidate-count 7 to reproduce this roll against this catalog revision)
+ASSIGNED INDEX: 4
+  After ordering the grounded directions by resonance, build candidate
+  4 of your own grounded list; the assignment never points at a
+  challenger. The assignment is the roll, not a suggestion: your top-ranked
+  direction is what every run would ship, so the script decides which grounded
+  direction gets built. Each direction joins a durable visual system to a
+  concrete expression for the requested first surface, decided as one. It must
+  survive the current task plus navigation, quiet and dense content,
+  interaction and state, and a substantially different future surface. In an
+  attended run, present the assigned direction fully committed and offer
+  re-roll. You may add ONE card for your top-ranked grounded candidate when
+  it is not the assigned direction, kicker IMPECCABLE’S PICK, with an honest risk line
+  naming its familiarity; one pick card, never a ranked lineup, and the pick
+  never takes the lead position. When the assignment IS your top candidate,
+  there is no pick card. Re-roll yourself only
+  on named factual grounds, when the assignment cannot carry the product's
+  truth or task; taste is never grounds.
+  The assignment exists to refuse the model's ranking rut, never to outrank
+  the user or the brief. Never expose assignment metadata in user-facing labels.
+CHALLENGERS:
+  1. a data-sublime field, where dense barcode columns and sine lattices strobe in pure black and white
+     SOURCE ID: ikeda-datamatics
+     CREATIVE SPARK: A wall of hairline vertical bars, some black, some white, holds like a frozen barcode. Dense monospace numbers pack the margin. A single sine curve traces the lattice, and for one frame the whole field snaps to its negative.
+     SYSTEM GRAMMAR:
+       - Palette/material: Pure black and pure white only, no grey and no color; flat pixel-crisp bars, hairline rules, and monospace numerics; the occasional full-frame inversion.
+       - Type/composition: One monospace face at data density, set in tight tabular columns; barcode bar-fields and sine curves structure the page
+       - Topology/navigation: Move by data column, by frequency band, and by frame index.
+       - Controls/state: Scan, sample, and invert; selecting a column pulls its numbers into focus while the surrounding field drops to a faint bar pattern.
+       - Responsive/motion: Columns thin and drop from the edges as width shrinks; reduced-motion disables all strobing and holds a single high-contrast still.
+     WEB LEVERAGE: Render the barcode and sine lattice on canvas from a seeded sequence, stepping frames on requestAnimationFrame that halts entirely under prefers-reduced-motion.
+     QUALITY BAR: board https://impeccable.style/worlds/cards/ikeda-datamatics.webp · hero https://impeccable.style/worlds/cards/ikeda-datamatics-hero.webp
+  2. an Emigre bitmap type specimen, where coarse pixel letterforms are set proudly at poster scale and the low resolution is the aesthetic
+     SOURCE ID: emigre-bitmap-specimen
+     CREATIVE SPARK: A headline built from visible pixels towers over dense justified columns; the same face repeats at five sizes, and at the smallest the pixels dissolve into smooth gray text.
+     SYSTEM GRAMMAR:
+       - Palette/material: newsprint white and rich black with one synthetic accent; halftone and dot-matrix textures as legitimate surfaces
+       - Type/composition: coarse bitmap display faces against fine text grotesks; specimen-style repetition of one form at many sizes
+       - Topology/navigation: Move by typeface, by size step, and by issue spread.
+       - Controls/state: Scale, compare, and toggle bitmap versus smooth rendering as an honest state.
+       - Responsive/motion: Pixel letterforms scale only in whole-pixel multiples; nothing antialiases unless the reader asks.
+     WEB LEVERAGE: Pixel-honest display type via image-rendering rules and font sizes locked to integer multiples
+     QUALITY BAR: board https://impeccable.style/worlds/cards/emigre-bitmap-specimen.webp · hero https://impeccable.style/worlds/cards/emigre-bitmap-specimen-hero.webp
+  3. a zoo and gardens guide map, where every area is a swelling lobe of flat colour and the coastline between lobes does all the dividing, and where a lobe can open in its middle so the page ground shows through it as water
+     SOURCE ID: aww2-zoo-gardens-guide-map
+     CREATIVE SPARK: A summer opening-morning guide map creased into eight panels: an apple-green headland swelling across the fold, a coral flamingo standing right on its edge with one foot out over the cream, and a yellow capsule pinned to the coastline reading GATE.
+     SYSTEM GRAMMAR:
+       - Palette/material: Flat unmodulated colour, no grain: green #8ED462 land on cream #F5F1E4 water, ink #2C2E2A. Photographs keep their own colour, cropped to a lobe, never tinted.
+       - Type/composition: One grotesk at one weight; display at 0.95 leading, -0.06em. Prose is ink on cream, white, green or yellow; coral and blue carry labels only.
+       - Topology/navigation: One lobe dominates each screen, swelling until its coast leaves the frame on two sides; a lobe may open in its middle and let the ground through as water.
+       - Controls/state: Controls are capsules in yellow #F5E211, coral #FF705D, blue #2BA0FF, lilac #EBC1FF; a round chip rides its trailing edge and crosses to the leading edge when live.
+       - Responsive/motion: Everything that moves takes 0.4s and overshoots before settling. Scroll redraws the coastline continuously; at narrow widths the coast runs down the frame.
+     WEB LEVERAGE: Every area is one SVG path; scroll advances a single timeline that morphs the coastline, and the same path clips the illustration and the type, so one geometry drives layout, art and state together.
+     QUALITY BAR: board https://impeccable.style/worlds/cards/aww2-zoo-gardens-guide-map.webp · hero https://impeccable.style/worlds/cards/aww2-zoo-gardens-guide-map-hero.webp
+  4. a boxed-software reference manual lying open at a tabbed section, where the coloured divider board carries no mark at all and every paragraph, figure and keystroke sits on a punched acetate leaf hinged a millimetre above it, the whole book's extent drawn as a stepped tab rail down the fore edge
+     SOURCE ID: rw-manual-acetate-tab-board
+     CREATIVE SPARK: A clear die-cut keyboard template lies across an open manual; its printed legends float above the chrome-yellow divider page beneath, two punch holes at its bound edge and one short hard shadow along its cut side.
+     SYSTEM GRAMMAR:
+       - Palette/material: milk acetate over a board of one section hue at full strength: oxide orange, chrome yellow, grass, teal, ultramarine, violet, sienna; vermilion held out.
+       - Type/composition: one size does the work: Sabon 17/26 at a 62-character measure; Univers heads hang in the fifth margin column of a four-column grid, machine voice in mono.
+       - Topology/navigation: a stepped tab rail down the fore edge, one tab per division, height proportional to extent, hue from the wheel; the current tab extends and is the board.
+       - Controls/state: ply is the only rank, and only a top-ply leaf may be clear. Selected is a punched hole, disabled face-down, pending half-hinged, error a vermilion errata slip.
+       - Responsive/motion: nothing eases or fades; every change is a 90ms two-frame step hinged at the punched edge. Width deals fewer leaves, four columns to two to one.
+     WEB LEVERAGE: Solve leaf alpha at runtime: binary search sRGB source-over compositing against the board hue until the reading field lands in a fixed luminance band, then publish as a custom property. Hinges are steps(2) at 90ms; no easing curve anywhere.
+     QUALITY BAR: board https://impeccable.style/worlds/cards/rw-manual-acetate-tab-board.webp · hero https://impeccable.style/worlds/cards/rw-manual-acetate-tab-board-hero.webp
+  5. a full-bleed vertical media surface where one item owns the entire viewport, a right rail of stacked action affordances, an author line and caption anchored low, and the next item already waiting one snap away
+     SOURCE ID: pop-culture-shelf-vertical-video-feed-surface
+     CREATIVE SPARK: One thing fills the whole screen, four glyphs stacked down the right, and the next one is exactly one flick away and already loaded.
+     SYSTEM GRAMMAR:
+       - Palette/material: media fills the frame edge to edge with a soft bottom scrim carrying the text, and pure white glyphs as the only interface color
+       - Type/composition: an author line and caption anchored to the lower left, a vertical stack of action glyphs on the right, and nothing in the center
+       - Topology/navigation: one item at a time occupies everything, so navigation is a single vertical snap between complete states
+       - Controls/state: controls are rail glyphs, an engaged one fills and counts up, and the caption expands in place when truncated
+       - Responsive/motion: the item always fills the viewport whatever its aspect, and motion is a hard snap with no partial scroll position
+     WEB LEVERAGE: scroll-snap paging with preloading, engagement counts in live state, and full-viewport media fitting at any aspect
+     QUALITY BAR: board https://impeccable.style/worlds/cards/pop-culture-shelf-vertical-video-feed-surface.webp · hero https://impeccable.style/worlds/cards/pop-culture-shelf-vertical-video-feed-surface-hero.webp
+  6. a Wim Crouwel gridded type specimen, where letterforms are built cell by cell on a visible construction grid and the poster is the proof
+     SOURCE ID: crouwel-grid-specimen
+     CREATIVE SPARK: Faint blue gridlines cover the sheet like graph paper; enormous letterforms assemble themselves from its cells, and one diagonal is the only rebellion the system permits.
+     SYSTEM GRAMMAR:
+       - Palette/material: white or one stark saturated ground, faint construction-grid hairlines, one accent plane earned by the headline
+       - Type/composition: monumental grid-constructed letterforms over small neutral grotesk; the layout grid stays visible as part of the design
+       - Topology/navigation: Move by cell, by letter, and by catalog entry.
+       - Controls/state: Reveal construction, snap to cells, and toggle grid visibility as a real state.
+       - Responsive/motion: The page reflows by whole cells; letterforms rebuild cell by cell when content changes.
+     WEB LEVERAGE: CSS grid as the literal visible armature with display letterforms drawn from the same grid tokens
+     QUALITY BAR: board https://impeccable.style/worlds/cards/crouwel-grid-specimen.webp · hero https://impeccable.style/worlds/cards/crouwel-grid-specimen-hero.webp
+Fuse each challenger before judging it: the challenger supplies the form
+  and its system grammar, the product supplies every fact, and clarity wins
+  conflicts. Weigh the fused result against the assigned direction on exactly
+  two axes, audience identification and product clarity. Losing to strong
+  grounded material is a valid outcome; beating a thin or tool-monoculture
+  list is the point. A fused challenger that wins both axes becomes the build.
+  Close the weighing with a verdict per challenger, decided before any
+  borrowing is considered: wins (beats the assigned direction on both axes),
+  competitive (holds one axis), or declined (loses both). A declined
+  challenger is not spent: name the one discipline of its system the assigned
+  direction lacks, and raise the assigned direction to match before
+  presenting it. A donation transfers ambition and system discipline, never
+  the challenger's clothes; one world owns the page. Write each raise as its
+  own named line on the presented direction, and carry every verdict, kept
+  line, and raise into the decision page payload.
+When you can view images, open the QUALITY BAR board and hero for any
+challenger you weigh seriously and for the world you build. They exist as a
+craft bar, the finish level and commitment the build is expected to reach,
+never as a mockup to copy; your surface serves this product, not that render.
+PRODUCT.md and explicit incumbent brand commitments constrain every direction.
+The seed never chooses exact colors, fonts, tokens, or a user preference, and
+it never permits the world and first surface to be selected independently.
+The CREATIVE SPARK is a complete visual system, not a theme or decorative
+reference. Translate every supplied system rule into the product: palette and
+material, type and composition, topology, controls and states, and adaptation.
+Keep the source's visible character, scale, rhythm, and interaction instead of
+reducing vivid grammar to generic nouns. When the source is already a credible
+interface language, commit to it across navigation, content, controls, and
+states. Otherwise keep a literal carrier only when it becomes functional.
+Ambitious motion, spatial media, or interaction is welcome when it strengthens
+the product without weakening semantics, performance, or fallback behavior.
+TELEMETRY: after the user's choice resolves, rerun this script once with
+  --kind <assigned|pick|challenger|canon> --from b7306df5 --scope direction --mode operate,
+  adding --chosen <challenger-id> when a dealt challenger won and keeping
+  --register <safer|bolder> when the resolved round came from a steered hand.
+  One ping per resolved attended round. The ping is anonymous, the card kind
+  plus the catalog id when one won; your grounded candidates' names never
+  leave the machine, and the ping is skipped automatically when DO_NOT_TRACK
+  or IMPECCABLE_NO_TELEMETRY is set.
+A user- or brief-pinned decision beats the roll, always.
+ASSIGNED INDEX (restated for truncated readers): 4. Build candidate
+4 of your own grounded list; seed key b7306df5.

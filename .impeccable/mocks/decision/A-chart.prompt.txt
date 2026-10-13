@@ -1,0 +1,9 @@
+Render a high-fidelity UI design comp: a landscape macOS app window (16:9) for 'Suramak', a private on-device transcription app. The window fills the frame almost entirely, with only a sliver of softly blurred dark blue-violet desktop wallpaper visible at the edges; the window material is clearly translucent frosted glass — the wallpaper's light glows through the window chrome with a luminous edge highlight. Standard macOS traffic lights top-left.
+Layout, top to bottom:
+1) Thin toolbar: 'Suramak' at left; centered title; at right three small round icon buttons (record red dot, play, export) and a small rounded chip.
+2) Upper 40 percent: a chart-recorder trace band on pale warm-white chart paper with a very faint fine grid: one bold continuous dark ink line with fine seismograph amplitude jitter running edge to edge, ending at the right at a pen head marked with a small red dot; the final stretch of the line is red.
+3) Lower part: the transcript as a calm single column of horizontal serif text lines (like New York), generous leading, each line preceded by a small grey mono timestamp, with a hairline vertical connector rising from each timestamp into the trace band above.
+4) A narrow left shelf (about 140px) of four slim stacked recording rows, separated by hairlines, each with one short label line.
+Flat ink-on-paper aesthetic inside the field; hairline rules; no rounded cards; no shadows; nothing rotated.
+Text to render EXACTLY (and no other words anywhere): toolbar title 'Voice memo — Kamis 13 Okt'; chip 'turbo'; transcript lines: '00:00  The quick brown fox jumps over the lazy dog.' / '00:04  Selamat pagi! Nama saya Suramak, aplikasi transkripsi lokal.' / '00:09  Terima kasih sudah mencoba.'; trace label 'REC'; shelf labels: 'Wawancara 24:10', 'Rapat tim 1:15:03', 'Catatan 4:20', 'Ide pagi 0:42'.
+Crisp, correctly spelled text. Calm density, one dominant move: the continuous trace, with every transcript line hanging from it.
