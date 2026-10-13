@@ -17,13 +17,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system dependencies (cmake for whisper.cpp)
+      - name: Install system dependencies (cmake for whisper.cpp; xvfb + software GL/Vulkan for the UI smoke)
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake
+          sudo apt-get install -y cmake xvfb libgl1-mesa-dri mesa-vulkan-drivers
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
+
+      - name: Add cross-check targets (pure-Rust glass crate; no Apple/Windows SDK needed for check)
+        run: rustup target add aarch64-apple-darwin x86_64-pc-windows-msvc
 
       - name: Format check
         run: cargo fmt --all --check
@@ -33,6 +36,17 @@ jobs:
 
       - name: Tests (debug profile)
         run: cargo test --workspace
+
+      - name: Cross-check suramak-glass (aarch64-apple-darwin)
+        run: cargo check -p suramak-glass --target aarch64-apple-darwin
+
+      - name: Cross-check suramak-glass (x86_64-pc-windows-msvc)
+        run: cargo check -p suramak-glass --target x86_64-pc-windows-msvc
+
+      - name: UI smoke (xvfb, software Vulkan → GL)
+        run: |
+          SURAMAK_SMOKE_SECS=3 xvfb-run -a cargo run -p suramak-ui
+          test -f build/smoke_ok.txt && echo SMOKE-OK
 
       - name: Build release CLI
         run: cargo build --release -p suramak-cli
@@ -89,3 +103,19 @@ jobs:
         env:
           SURAMAK_REQUIRE_MODEL: "1"
         run: cargo test --workspace --release -- --ignored
+
+      - name: Build UI (release)
+        run: cargo build --release -p suramak-ui
+
+      - name: Package dist/Suramak.app (ad-hoc codesign)
+        run: ./scripts/make-app.sh
+
+      - name: Smoke test the bundle
+        run: SURAMAK_SMOKE_SECS=3 ./dist/Suramak.app/Contents/MacOS/suramak
+
+      - name: Upload Suramak.app
+        uses: actions/upload-artifact@v4
+        with:
+          name: Suramak.app
+          path: dist/Suramak.app
+          if-no-files-found: error
