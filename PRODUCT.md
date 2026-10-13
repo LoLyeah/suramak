@@ -54,3 +54,12 @@ No testimonials, benchmarks, or screenshots. Measured, verifiable facts exist in
 4. Indonesian is a first-class language, not an afterthought — forced-language support, sensible id defaults, quality-first model tier.
 5. Standalone by design — every cloud/LLM feature is optional and user-owned.
 6. Best local engine per language — different languages may run different on-device engines (English can be faster than Indonesian; both stay on-device). Engine routing is a product feature, not an accident.
+
+## Roadmap (post-MVP, agreed direction)
+
+- **Video files (M5)** — this completes the original brief ("import audio/video files"): import `.mp4 / .mov / .m4v / .mkv` (screen recordings, downloaded videos) and transcribe the audio track. Native-first decode: macOS uses **AVFoundation** (objc2, zero new deps — handles everything QuickTime does, incl. `.mov` screen recordings); cross-platform and Matroska go through symphonia (`isomp4`/`mkv` features). WebM/Opus gets a clear, actionable error (convert, or install ffmpeg), with optional **ffmpeg sidecar** detection (never bundled) as the power-user escape hatch. Same library/editor/export flow — SRT/VTT exports become video subtitles.
+- **File associations** — declare supported audio+video document types (CFBundleDocumentTypes) so double-click / "Open With…" opens Suramak; Open Recent; macOS Services later.
+- **Recordings** — optional "save compressed (FLAC)" toggle (symphonia already decodes FLAC); kept audio stays 16 kHz mono 16-bit WAV, transient temp file by default.
+- **Audio sources** — per-app capture ("transcribe only this Zoom call") as a parameter of the existing process-taps crate (designed for it); virtual loopback devices (BlackHole etc.) already work via the input-device picker.
+- **Icons / brand** — macOS 26 layered/tinted icon variants via Icon Composer; optional wordmark optical pass.
+- **Windows / Linux** — bring-up per the platform roadmap (the DWM frosted-glass stub is already compile-checked).
