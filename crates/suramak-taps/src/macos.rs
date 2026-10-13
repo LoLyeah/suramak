@@ -4,7 +4,7 @@
 //!
 //! | Call | Availability | Source |
 //! |---|---|---|
-//! | `CATapDescription` (`-initStereoGlobalTapButExcludeProcesses:`, `setName:`, `setUUID:`, `setMuteBehavior:`, `setPrivateTap:`) | macOS 14.2+ | `CoreAudio/AudioHardwareTapping.h` (Objective-C class; reached via `objc2` message sends — there is no Rust binding crate for the 14.2 tap API, so `objc2::msg_send!` is used) |
+//! | `CATapDescription` (`-initStereoGlobalTapButExcludeProcesses:`, `setName:`, `setUUID:`, `setMuteBehavior:`, `setPrivate:`) | macOS 14.2+ | `CoreAudio/AudioHardwareTapping.h` (Objective-C class; reached via `objc2` message sends — there is no Rust binding crate for the 14.2 tap API, so `objc2::msg_send!` is used). Header truth: `@property (…, getter=isPrivate, setter=setPrivate:) BOOL privateTap` — the setter is `setPrivate:`, *not* `setPrivateTap:` |
 //! | `AudioHardwareCreateProcessTap(CATapDescription*, AudioObjectID*)` | macOS 14.2+ | `CoreAudio/AudioHardwareTapping.h` |
 //! | `AudioHardwareDestroyProcessTap(AudioObjectID)` | macOS 14.2+ | `CoreAudio/AudioHardwareTapping.h` |
 //! | `AudioHardwareCreateAggregateDevice(CFDictionaryRef, AudioDeviceID*)` | macOS 10.9+ | `CoreAudio/AudioHardware.h` |
@@ -169,7 +169,12 @@ fn tap_description(config: &TapConfig) -> Result<Retained<AnyObject>, TapError> 
         let _: () = msg_send![&*description, setName: &*name];
         let _: () = msg_send![&*description, setUUID: &*uuid];
         let _: () = msg_send![&*description, setMuteBehavior: 0isize];
-        let _: () = msg_send![&*description, setPrivateTap: true];
+        // Apple's header: `@property (…, getter=isPrivate, setter=setPrivate:) BOOL privateTap`
+        // — the setter is `setPrivate:`. `setPrivateTap:` does not exist and raises an
+        // unrecognized-selector NSException, which aborts the process via objc2
+        // ("Rust cannot catch foreign exceptions"). Caught by the user's first real
+        // system-audio record (2026-10-13); regression-guarded by `tests::tap_description…`.
+        let _: () = msg_send![&*description, setPrivate: true];
         Ok(description)
     }
 }
@@ -385,5 +390,36 @@ impl TapInner {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use objc2::sel;
+
+    /// The `CATapDescription` message-send sequence must not raise ObjC
+    /// exceptions: a bad selector aborts the whole process ("Rust cannot catch
+    /// foreign exceptions") — that is exactly how `setPrivateTap:` (nonexistent,
+    /// real setter is `setPrivate:`) killed the app on the first real
+    /// system-audio record. Constructing the description needs no permission;
+    /// only `AudioHardwareCreateProcessTap` does, so this test stays prompt-free.
+    #[test]
+    fn tap_description_builds_and_the_fixed_setter_exists() {
+        let config = TapConfig::system_audio();
+        let description = tap_description(&config).expect("CATapDescription builds");
+        // Header truth: `@property (…, getter=isPrivate, setter=setPrivate:) BOOL privateTap`.
+        let responds_private: bool =
+            unsafe { msg_send![&*description, respondsToSelector: sel!(setPrivate:)] };
+        assert!(
+            responds_private,
+            "CATapDescription must respond to setPrivate: — did Apple change the setter again?"
+        );
+        let responds_bogus: bool =
+            unsafe { msg_send![&*description, respondsToSelector: sel!(setPrivateTap:)] };
+        assert!(
+            !responds_bogus,
+            "setPrivateTap: unexpectedly exists; revisit the fix if so"
+        );
     }
 }
