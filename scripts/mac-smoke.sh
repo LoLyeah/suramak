@@ -42,6 +42,7 @@ step "3/7 model check (tiny — short-circuits when already installed)"
 "$CLI" models download tiny
 
 step "4/7 bundle smoke (3 s)"
+mkdir -p build
 SURAMAK_SMOKE_SECS=3 "$APP"
 
 step "5/7 doctor (engine stack + encoder pairing)"

@@ -42,6 +42,17 @@ const SMOKE_JOB_FILE: &str = "build/smoke_job_ok.txt";
 /// Watchdog fallback when `SURAMAK_SMOKE_JOB` is set without `SURAMAK_SMOKE_SECS`.
 const SMOKE_JOB_DEFAULT_WATCHDOG_SECS: u64 = 600;
 
+/// Writes a smoke status file, creating `build/` when needed — the directory is
+/// gitignored, so fresh clones (CI, the owner's Mac) do not have it.
+fn write_smoke_file(path: &str, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(path, content)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
     let smoke = Smoke::from_env();
@@ -243,7 +254,7 @@ impl App {
             self.failed = true;
         } else if let Some(shell) = &self.shell {
             let report = shell.smoke_report(frames, smoke.secs);
-            match std::fs::write(SMOKE_FILE, report) {
+            match write_smoke_file(SMOKE_FILE, &report) {
                 Ok(()) => println!("suramak: smoke ok — {frames} frames, wrote {SMOKE_FILE}"),
                 Err(err) => {
                     eprintln!("suramak: smoke FAILED — cannot write {SMOKE_FILE}: {err}");
@@ -325,7 +336,7 @@ impl App {
             outcome.transcript.model,
             engine.as_deref().unwrap_or("unknown"),
         );
-        if let Err(err) = std::fs::write(SMOKE_JOB_FILE, &content) {
+        if let Err(err) = write_smoke_file(SMOKE_JOB_FILE, &content) {
             self.smoke_job_failed(event_loop, &format!("cannot write {SMOKE_JOB_FILE}: {err}"));
             return;
         }

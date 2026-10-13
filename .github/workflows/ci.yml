@@ -70,6 +70,7 @@ jobs:
 
       - name: UI smoke (xvfb, software Vulkan → GL)
         run: |
+          mkdir -p build
           SURAMAK_SMOKE_SECS=3 xvfb-run -a cargo run -p suramak-ui
           test -f build/smoke_ok.txt && echo SMOKE-OK
 
