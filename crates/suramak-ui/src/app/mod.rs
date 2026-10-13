@@ -16,7 +16,7 @@ use suramak_asr::EngineId;
 use suramak_core::export as core_export;
 use suramak_core::models as core_models;
 use suramak_core::settings::{EngineSetting, RecordSource};
-use suramak_core::transcript::Transcript;
+use suramak_core::transcript::{Segment, Transcript};
 use suramak_playback::{
     resolve_playback_source, transcript_duration_ms, Command as PlaybackCommand, Playback,
     Status as PlaybackStatus,
@@ -95,6 +95,15 @@ pub struct Recording {
     /// runtime reports the session's sources; the record view draws the rows
     /// and the runtime reads the gains at stop.
     pub sources: Vec<RecordingSource>,
+    /// M7: the live provisional transcript (session timeline), grown by the
+    /// runtime's live decoder while the recording runs. **Always cleared on
+    /// Stop** — the final pass replaces it, and only the final transcript is
+    /// ever saved.
+    pub provisional: Vec<Segment>,
+    /// M7: windows skipped by the live backlog guard (skip-and-merge; the
+    /// decoder could not keep up). Surfaced subtly in the record view; reset
+    /// with the provisional list.
+    pub provisional_skipped: u64,
     /// Set while the runtime is finalising the wav (Stop pressed once).
     pub stopping: bool,
 }
@@ -610,6 +619,8 @@ impl AppState {
             waveform: Vec::new(),
             device: None,
             sources: Vec::new(),
+            provisional: Vec::new(),
+            provisional_skipped: 0,
             stopping: false,
         });
         self.route = Route::Record;
@@ -672,11 +683,31 @@ impl AppState {
         }
     }
 
+    /// Runtime: the live provisional transcript changed (M7) — the decoder
+    /// merged new segments (or the skipped-window count moved).
+    ///
+    /// Ignored once Stop was pressed: provisional content is **always**
+    /// discarded on Stop and the final pass takes over.
+    pub fn record_provisional(&mut self, segments: Vec<Segment>, skipped_windows: u64) {
+        if let RecordState::Recording(recording) = &mut self.record {
+            if !recording.stopping {
+                recording.provisional = segments;
+                recording.provisional_skipped = skipped_windows;
+            }
+        }
+    }
+
     /// Stop pressed in the record view (idempotent until the runtime answers).
+    ///
+    /// The provisional transcript is discarded right here — the final pass
+    /// (running after the wav is written) is the only source of the saved
+    /// transcript, so no provisional text can leak into the library.
     pub fn stop_recording(&mut self) -> Vec<Effect> {
         match &mut self.record {
             RecordState::Recording(recording) if !recording.stopping => {
                 recording.stopping = true;
+                recording.provisional.clear();
+                recording.provisional_skipped = 0;
                 vec![Effect::StopCapture {
                     title: recording.title.clone(),
                 }]
@@ -2210,6 +2241,109 @@ mod tests {
         );
         state.on_recording_stopped(temp_wav("float-clock"), false);
         assert!(state.busy(), "…and the job it hands over to is running");
+    }
+
+    // ---- M7: the live provisional transcript ---------------------------------
+
+    #[test]
+    fn provisional_transcript_grows_then_is_discarded_on_stop() {
+        let mut state = recording_state();
+        state.start_recording(Instant::now(), "2026-10-14 09:00:00");
+        match &state.record {
+            RecordState::Recording(recording) => {
+                assert!(recording.provisional.is_empty());
+                assert_eq!(recording.provisional_skipped, 0);
+            }
+            other => panic!("expected a recording, got {other:?}"),
+        }
+
+        // The live decoder answers window by window: the list grows.
+        state.record_provisional(vec![segment(0, "The quick brown fox")], 0);
+        state.record_provisional(
+            vec![
+                segment(0, "The quick brown fox"),
+                segment(1, "jumps over the lazy dog"),
+            ],
+            1,
+        );
+        match &state.record {
+            RecordState::Recording(recording) => {
+                assert_eq!(recording.provisional.len(), 2);
+                assert_eq!(recording.provisional[1].text, "jumps over the lazy dog");
+                assert_eq!(
+                    recording.provisional_skipped, 1,
+                    "the backlog note is surfaced"
+                );
+            }
+            other => panic!("expected a recording, got {other:?}"),
+        }
+
+        // Stop: the provisional content is ALWAYS discarded — the effect is the
+        // unchanged StopCapture the job flow already knows.
+        let effects = state.stop_recording();
+        match effects.as_slice() {
+            [Effect::StopCapture { title }] => assert_eq!(title, "Recording 2026-10-14 09:00:00"),
+            other => panic!("expected a stop effect, got {other:?}"),
+        }
+        match &state.record {
+            RecordState::Recording(recording) => {
+                assert!(recording.stopping);
+                assert!(
+                    recording.provisional.is_empty(),
+                    "provisional content is discarded on Stop"
+                );
+                assert_eq!(recording.provisional_skipped, 0);
+            }
+            other => panic!("expected a recording, got {other:?}"),
+        }
+
+        // A late live update cannot resurrect it.
+        state.record_provisional(vec![segment(0, "late")], 3);
+        match &state.record {
+            RecordState::Recording(recording) => assert!(recording.provisional.is_empty()),
+            other => panic!("expected a recording, got {other:?}"),
+        }
+
+        // The runtime wrote the wav → the existing job flow takes over.
+        let wav = temp_wav("live-record");
+        let effects = state.on_recording_stopped(wav, false);
+        assert!(matches!(effects.as_slice(), [Effect::SubmitJob { .. }]));
+        assert!(matches!(state.record, RecordState::Idle));
+        assert_eq!(state.route, Route::Transcribe);
+        assert!(matches!(state.job, Job::Running(_)));
+
+        // The final transcript — and only the final transcript — reaches the
+        // editor; no provisional text survives anywhere.
+        let final_transcript = transcript("Recording 2026-10-14 09-00-00.wav");
+        state.on_worker_event(finished_event(final_transcript.clone()));
+        let editor = state
+            .editor
+            .as_ref()
+            .expect("the editor opens from the final");
+        assert_eq!(
+            editor.transcript.segments.len(),
+            final_transcript.segments.len()
+        );
+        assert!(editor
+            .transcript
+            .segments
+            .iter()
+            .all(|segment| segment.text != "late" && segment.text != "jumps over the lazy dog"));
+    }
+
+    #[test]
+    fn provisional_updates_are_ignored_outside_a_recording() {
+        // No recording at all (and a failed one): the runtime's live poll must
+        // never invent a provisional transcript.
+        let mut state = AppState::new();
+        state.record_provisional(vec![segment(0, "nope")], 1);
+        assert!(matches!(state.record, RecordState::Idle));
+
+        let mut failed = recording_state();
+        failed.start_recording(Instant::now(), "2026-10-14 09:00:00");
+        failed.record_failed("no default input device".to_string());
+        failed.record_provisional(vec![segment(0, "nope")], 1);
+        assert!(matches!(failed.record, RecordState::Failed { .. }));
     }
 
     // ---- M3: model manager ---------------------------------------------------

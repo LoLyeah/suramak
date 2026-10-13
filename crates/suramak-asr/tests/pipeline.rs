@@ -25,6 +25,7 @@
 use std::path::{Path, PathBuf};
 
 use suramak_asr::engine::{EngineAvailability, EngineId};
+use suramak_asr::live::{LiveConfig, LiveSession};
 use suramak_asr::pipeline::{model_id_from_path, parse_lang, transcribe_file};
 use suramak_asr::whisper::{self, ContextCache};
 use suramak_asr::worker::{Job, Worker, WorkerEvent};
@@ -68,8 +69,12 @@ fn source_sample_mp3() -> PathBuf {
 
 /// The words of a transcript, normalized for comparison: lowercased, single spaces.
 fn words(transcript: &suramak_core::transcript::Transcript) -> String {
-    transcript
-        .segments
+    segment_words(&transcript.segments)
+}
+
+/// The words of a segment list, normalized the same way (M7 live e2e).
+fn segment_words(segments: &[suramak_core::transcript::Segment]) -> String {
+    segments
         .iter()
         .map(|segment| segment.text.to_lowercase())
         .collect::<Vec<_>>()
@@ -383,6 +388,149 @@ fn e2e_video_fixture_matches_the_source_mp3_words() {
     );
     if !cfg!(target_os = "macos") {
         assert_eq!(video.engine_used, EngineId::Cpu);
+    }
+}
+
+/// M7 end-to-end (Linux, tiny model): the fixture is fed through the **live
+/// scheduler** on a simulated capture clock — every window decodes through the
+/// same whisper path the session uses — and provisional segments appear; the
+/// full pass then runs and its transcript **replaces** the provisional one.
+///
+/// The final pass is pinned byte-for-byte across the live session: it runs
+/// once before the live machinery (the baseline today's flow produces) and
+/// once after, and every segment (idx, timestamps, text) must match — the live
+/// machinery shares no state with the final pipeline.
+#[test]
+#[ignore = "release-only e2e: debug whisper is ~50x too slow (run with --release -- --ignored)"]
+fn e2e_live_partials_then_the_final_pass_replaces_them() {
+    let _serial = e2e_serial();
+    let Some(model_path) = tiny_model_or_skip() else {
+        return;
+    };
+
+    // The fixture as the capture layer would deliver it: 16 kHz mono f32.
+    let buffer = suramak_core::decode::decode_file(&fixture("en.wav")).expect("decode en.wav");
+    let samples = suramak_core::resample::to_16khz_mono(&buffer).expect("resample");
+    let lang = LangMode::Fixed("en".to_string());
+    let plan = resolve_for(&model_path, EngineSetting::Auto, Some("en"));
+    let mut cache = ContextCache::new();
+    let ctx = cache
+        .get_or_load(&model_path, plan.engine.use_gpu())
+        .expect("load tiny model");
+
+    // The final pass, run BEFORE any live machinery — the baseline this input
+    // always produces (today's record-then-transcribe artifact).
+    let baseline = transcribe_file(
+        ctx,
+        &fixture("en.wav"),
+        &model_path,
+        &lang,
+        None,
+        whisper::default_threads(),
+        &plan,
+        |_| {},
+    )
+    .expect("baseline final pass");
+    eprintln!(
+        "[live] final pass (baseline): {}",
+        words(&baseline.transcript)
+    );
+
+    // ---- the live session on a simulated capture clock ----------------------
+    let config = LiveConfig::default();
+    let mut live = LiveSession::new(config.clone()).expect("live config");
+    let tick = (config.sample_rate / 10) as usize; // 100 ms of audio per tick
+    let mut decoded_windows = 0usize;
+    let mut index = 0usize;
+    while index < samples.len() {
+        let end = (index + tick).min(samples.len());
+        // The simulated decoder is synchronous: it is never busy when a window
+        // closes (the skip-and-merge path is unit-tested; here every window
+        // decodes, exactly as a fast machine behaves).
+        for window in live.push_audio(&samples[index..end], false) {
+            let outcome = whisper::transcribe(
+                ctx,
+                &model_path,
+                &window.samples,
+                &lang,
+                None,
+                whisper::default_threads(),
+                &plan,
+                |_| {},
+            )
+            .expect("live window decode");
+            eprintln!(
+                "[live] window {} [{:.2}–{:.2} s]: {}",
+                window.seq,
+                window.start_ms(config.sample_rate) as f64 / 1000.0,
+                window.end_ms(config.sample_rate) as f64 / 1000.0,
+                segment_words(&outcome.segments)
+            );
+            decoded_windows += 1;
+            live.ingest_decoded(&window, &outcome.segments);
+        }
+        index = end;
+    }
+    assert!(
+        decoded_windows >= 2,
+        "the 9 s fixture must close at least two windows"
+    );
+    eprintln!(
+        "[live] provisional ({} window(s), {} segment(s), {} skipped): {}",
+        decoded_windows,
+        live.segments().len(),
+        live.skipped_windows(),
+        live.text()
+    );
+    assert!(
+        !live.segments().is_empty(),
+        "provisional segments must appear while the audio streams"
+    );
+    assert!(
+        live.text().to_lowercase().contains("fox"),
+        "the provisional words must include the fixture's sentence: {}",
+        live.text()
+    );
+
+    // ---- the final pass replaces the provisional text ------------------------
+    let final_outcome = transcribe_file(
+        ctx,
+        &fixture("en.wav"),
+        &model_path,
+        &lang,
+        None,
+        whisper::default_threads(),
+        &plan,
+        |_| {},
+    )
+    .expect("final pass after the live session");
+    eprintln!(
+        "[live] final pass (after the live session): {}",
+        words(&final_outcome.transcript)
+    );
+    assert!(words(&final_outcome.transcript).contains("fox"));
+
+    // Byte-identical pin: the same input produces the same final segments
+    // whether or not the live machinery ran (idx, timestamps and text all
+    // compared — the provisional list is display-only and discarded).
+    assert_eq!(
+        final_outcome.transcript.segments.len(),
+        baseline.transcript.segments.len(),
+        "the final pass must produce the same segment count across a live session"
+    );
+    for (after, before) in final_outcome
+        .transcript
+        .segments
+        .iter()
+        .zip(baseline.transcript.segments.iter())
+    {
+        assert_eq!(
+            after, before,
+            "the final pass must be byte-identical across a live session"
+        );
+    }
+    if !cfg!(target_os = "macos") {
+        assert_eq!(final_outcome.engine_used, EngineId::Cpu);
     }
 }
 

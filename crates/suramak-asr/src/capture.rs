@@ -498,7 +498,11 @@ mod imp {
         for input in inputs {
             recorders.push(start_one(input)?);
         }
-        Ok(MultiRecorder { recorders, started })
+        Ok(MultiRecorder {
+            live_cursors: vec![0; recorders.len()],
+            recorders,
+            started,
+        })
     }
 
     /// Lists the running processes with audio (M6 per-app picker): macOS
@@ -664,6 +668,8 @@ mod imp {
     pub struct MultiRecorder {
         recorders: Vec<Recorder>,
         started: std::time::Instant,
+        /// Per-source read cursors for [`MultiRecorder::take_live_chunk`] (M7).
+        live_cursors: Vec<usize>,
     }
 
     impl MultiRecorder {
@@ -703,6 +709,31 @@ mod imp {
             self.recorders
                 .iter()
                 .filter_map(|recorder| recorder.warning().map(str::to_string))
+                .collect()
+        }
+
+        /// New mono samples (device rate) per source since the previous call —
+        /// the live scheduler's feed (M7).
+        ///
+        /// Read-only: the accumulated buffers (and therefore the final
+        /// recording) are untouched; only the per-source read cursor moves.
+        /// Each entry is `(rate, new samples)` in recorder order; a source with
+        /// no new audio yields an empty chunk, so the caller's index mapping
+        /// never shifts.
+        pub fn take_live_chunk(&mut self) -> Vec<(u32, Vec<f32>)> {
+            self.recorders
+                .iter()
+                .zip(self.live_cursors.iter_mut())
+                .map(|(recorder, cursor)| {
+                    let samples = recorder
+                        .samples
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let from = (*cursor).min(samples.len());
+                    let chunk = samples[from..].to_vec();
+                    *cursor = samples.len();
+                    (recorder.sample_rate, chunk)
+                })
                 .collect()
         }
 
@@ -899,6 +930,11 @@ mod imp {
 
         /// Never reached (no instance can exist).
         pub fn warnings(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        /// Never reached (no instance can exist): no live audio without capture.
+        pub fn take_live_chunk(&mut self) -> Vec<(u32, Vec<f32>)> {
             Vec::new()
         }
 

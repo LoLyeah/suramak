@@ -1,12 +1,20 @@
-//! Record route (M3): the live recording view — auto title, elapsed clock, RMS
-//! meter and the rolling waveform painter, all in the calm M1 style.
+//! Record route (M3, live transcript M7): the live recording view — auto title,
+//! elapsed clock, RMS meter, the rolling waveform painter and the growing
+//! **provisional** transcript, all in the calm M1 style.
 //!
-//! The runtime owns the cpal session; this view reads [`AppState::record`] (fed by
-//! the runtime's meter samples) and only ever asks for [`Effect::StopCapture`].
+//! The runtime owns the cpal session; this view reads [`AppState::record`] (fed
+//! by the runtime's meter samples and live decodes) and only ever asks for
+//! [`Effect::StopCapture`].
+//!
+//! M7: the live transcript card is explicitly labeled provisional — the final
+//! pass runs on Stop and replaces it; the card auto-scrolls (stick to bottom)
+//! and surfaces the backlog note when the decoder had to skip windows.
 
 use egui::{
     pos2, vec2, Align2, CornerRadius, FontFamily, FontId, Painter, Rect, Stroke, StrokeKind,
 };
+
+use suramak_core::transcript::Segment;
 
 use crate::theme::Palette;
 
@@ -26,6 +34,8 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
             let waveform = recording.waveform.clone();
             let device = recording.device.clone();
             let sources = recording.sources.clone();
+            let provisional = recording.provisional.clone();
+            let provisional_skipped = recording.provisional_skipped;
             let stopping = recording.stopping;
             recording_body(
                 ui,
@@ -41,6 +51,8 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
                 &waveform,
                 device.as_deref(),
                 &sources,
+                &provisional,
+                provisional_skipped,
                 stopping,
             );
         }
@@ -92,6 +104,8 @@ fn recording_body(
     waveform: &[f32],
     device: Option<&str>,
     sources: &[RecordingSource],
+    provisional: &[Segment],
+    provisional_skipped: u64,
     stopping: bool,
 ) {
     let painter = ui.painter().clone();
@@ -279,6 +293,106 @@ fn recording_body(
             },
         );
     }
+
+    // ---- live provisional transcript (M7) ------------------------------------
+    draw_provisional(
+        ui,
+        palette,
+        left,
+        right,
+        rect,
+        controls_top + 64.0,
+        provisional,
+        provisional_skipped,
+        stopping,
+    );
+}
+
+/// The live transcript card: clearly labeled **provisional**, auto-scrolling as
+/// words arrive, with the backlog note when windows had to be skipped.
+///
+/// The final pass runs on Stop and replaces this list — the label says so.
+#[allow(clippy::too_many_arguments)]
+fn draw_provisional(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    left: f32,
+    right: f32,
+    rect: Rect,
+    top: f32,
+    provisional: &[Segment],
+    skipped: u64,
+    stopping: bool,
+) {
+    let height = rect.bottom() - 14.0 - top;
+    if height < 80.0 {
+        // Too little room (small window): the rest of the view keeps working.
+        return;
+    }
+    let painter = ui.painter().clone();
+    let card = Rect::from_min_size(pos2(left, top), vec2(right - left, height));
+    painter.rect_filled(card, CornerRadius::same(10), palette.card);
+    painter.rect_stroke(
+        card,
+        CornerRadius::same(10),
+        Stroke::new(1.0_f32, palette.hairline),
+        StrokeKind::Inside,
+    );
+
+    // The clear provisional label (M7): what this list is, and what replaces it.
+    painter.text(
+        pos2(card.left() + 18.0, card.top() + 9.0),
+        Align2::LEFT_TOP,
+        "live transcript — provisional · the final pass runs on Stop",
+        FontId::new(11.0, FontFamily::Proportional),
+        palette.text_dim,
+    );
+
+    // The backlog note: subtle, only when the decoder had to skip windows.
+    let mut list_top = card.top() + 26.0;
+    if skipped > 0 {
+        painter.text(
+            pos2(card.left() + 18.0, card.top() + 24.0),
+            Align2::LEFT_TOP,
+            format!(
+                "{skipped} window(s) skipped to keep up — live updates may lag; the final pass is unaffected"
+            ),
+            FontId::new(11.0, FontFamily::Proportional),
+            palette.text_dim,
+        );
+        list_top = card.top() + 44.0;
+    }
+
+    let inner = Rect::from_min_max(
+        pos2(card.left() + 18.0, list_top),
+        pos2(card.right() - 18.0, card.bottom() - 10.0),
+    );
+    ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            // Auto-scroll: the list sticks to the newest words as they arrive
+            // (the user can still scroll back; egui re-sticks at the bottom).
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                if provisional.is_empty() {
+                    let hint = if stopping {
+                        "finishing the recording — the final pass starts next"
+                    } else {
+                        "words appear here while you speak"
+                    };
+                    ui.label(egui::RichText::new(hint).size(12.0).color(palette.text_dim));
+                    return;
+                }
+                for segment in provisional {
+                    ui.label(
+                        egui::RichText::new(&segment.text)
+                            .size(13.0)
+                            .color(palette.text),
+                    );
+                    ui.add_space(2.0);
+                }
+            });
+    });
 }
 
 /// Rolling waveform painter: one centered bar per meter sample (oldest first,

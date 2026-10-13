@@ -258,6 +258,13 @@ impl App {
                     shell.app.record_sample(rms);
                 }
             }
+
+            // Live provisional transcript (M7): per-frame while recording —
+            // feed new audio through the live scheduler and publish what the
+            // decoder merged. Stop tears it down; the final pass is unaffected.
+            if let (Some(shell), Some(runtime)) = (self.shell.as_mut(), self.runtime.as_mut()) {
+                runtime.live_tick(&mut shell.app);
+            }
         }
 
         let effects = match self.shell.as_mut() {

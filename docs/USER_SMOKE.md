@@ -147,6 +147,15 @@ Data lives in `~/Library/Application Support/dev.suramak.Suramak/` (db, settings
   - With the ticked app **not running**, press Record — expected: a red, actionable line (`no running audio process matches 'us.zoom.xos' — start the app (and play audio), refresh the list, and retry`) instead of a silent fallback to full system audio.
   - Note: the picker needs a macOS build (14.2+ process taps); on Linux it shows `needs a macOS build with capture …` and the list stays read-only.
 
+## 18. Live transcription while recording (M7)
+
+- Press the floating **Record** control and speak a sentence or two.
+  Expected: after a few seconds the record view's **live transcript** card starts filling in with your words, under the label `live transcript — provisional · the final pass runs on Stop`; the list auto-scrolls as new words arrive.
+- Keep talking, then press **Stop** (or the floating control).
+  Expected: the provisional list is discarded the moment you press Stop and the app runs the usual final pass — `transcribing on this machine…`, then the editor with the **final** transcript (the one saved to the library; the provisional text never reaches it, and words may differ slightly from what the live pass showed).
+- On a slower machine, or with a big model (`turbo-q5-0`), a note like `N window(s) skipped to keep up — live updates may lag; the final pass is unaffected` may appear in the card and live words may fall behind the speech — **that is fine**: live updates degrade, the recording and the final transcript never do.
+- The live pass uses the same model / language / initial prompt as the final one and never uploads anything (like everything else in the app). The first live words appear after ~4 s of speech (the window cadence) plus the model load.
+
 ## Report
 
 Anything that deviates from an expected result, with: what you did, what happened, what you expected.

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 /// A single transcribed time-aligned segment.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Segment {
     pub idx: u32,
     pub start_ms: i64,

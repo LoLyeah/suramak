@@ -29,6 +29,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use suramak_asr::capture;
+use suramak_asr::live;
 use suramak_asr::mix;
 use suramak_asr::worker::{Job, Worker, WorkerEvent};
 use suramak_core::models as core_models;
@@ -64,6 +65,11 @@ pub struct Runtime {
     /// Live capture session(s) (`!Send` — stays on the UI thread). M6: one
     /// `MultiRecorder` holding a recorder per selected source.
     session: Option<capture::MultiRecorder>,
+    /// Live transcription machinery for the running session (M7): the pure
+    /// scheduler session + provisional transcript, the decode thread and the
+    /// per-source device-rate buffers waiting to be flushed into the 16 kHz
+    /// live stream. `None` while not recording (or when live is unavailable).
+    live: Option<LiveCapture>,
     /// Background model download (one at a time).
     download: Option<DownloadJob>,
     /// Background polish run (one at a time, M4).
@@ -130,6 +136,7 @@ impl Runtime {
             next_job_id: 0,
             startup_error,
             session: None,
+            live: None,
             download: None,
             polish: None,
             playback: None,
@@ -437,9 +444,143 @@ impl Runtime {
                     state.set_status(warnings.join(" · "), false);
                 }
                 self.session = Some(session);
+                // M7: live partials ride the session just opened (best-effort —
+                // a recording without them is still a working recording).
+                self.start_live();
             }
             Err(err) => state.record_failed(err.to_string()),
         }
+    }
+
+    /// Starts the live transcription machinery for the session just opened (M7).
+    ///
+    /// Best-effort by design: a recording without live partials is still a
+    /// working recording, and the final pass at Stop is unaffected either way —
+    /// problems are logged, never fatal. The decode thread loads the model
+    /// lazily on the first window (~`step_ms` into the recording).
+    fn start_live(&mut self) {
+        let config = live::LiveConfig::default();
+        let session = match live::LiveSession::new(config.clone()) {
+            Ok(session) => session,
+            Err(err) => {
+                tracing::warn!("live transcription unavailable: {err}");
+                return;
+            }
+        };
+        let model_path =
+            match app::resolve_model_path(&self.settings.asr.model_id, &self.models_dir) {
+                Ok(path) => path,
+                Err(err) => {
+                    tracing::info!("live transcription unavailable: {err}");
+                    return;
+                }
+            };
+        let lang = self.settings.asr.language.clone();
+        let language = match &lang {
+            LangMode::Auto => None,
+            LangMode::Fixed(code) => Some(code.as_str()),
+        };
+        let plan = suramak_asr::resolve_for(&model_path, self.settings.asr.engine, language);
+        let decoder = live::LiveDecoder::spawn(
+            live::LiveDecodeSettings {
+                model_path,
+                lang,
+                initial_prompt: self.settings.asr.initial_prompt.clone(),
+                plan,
+                n_threads: suramak_asr::whisper::default_threads(),
+            },
+            config.max_queued,
+        );
+        tracing::info!(
+            step_ms = config.step_ms,
+            overlap_ms = config.overlap_ms,
+            max_queued = config.max_queued,
+            "live transcription armed for this recording"
+        );
+        self.live = Some(LiveCapture {
+            session,
+            decoder,
+            pending: Vec::new(),
+            published_revision: 0,
+            published_skipped: 0,
+        });
+    }
+
+    /// One frame's worth of the live machinery (M7): drains finished decodes
+    /// into the provisional transcript, feeds new capture audio through the
+    /// same mix the final pass uses, and hands windows to the decode thread.
+    ///
+    /// Called from the frame pump while a recording runs; a no-op otherwise.
+    /// Stop tears the machinery down here and in [`Runtime::stop_capture`] —
+    /// provisional content never outlives the recording.
+    pub fn live_tick(&mut self, state: &mut AppState) {
+        let stopping = matches!(&state.record, RecordState::Recording(rec) if rec.stopping);
+        if stopping || self.session.is_none() {
+            self.live = None;
+            return;
+        }
+        let Some(mut live) = self.live.take() else {
+            return;
+        };
+        match self.live_step(&mut live, state) {
+            LiveStep::Keep => self.live = Some(live),
+            LiveStep::Stop(reason) => {
+                tracing::warn!("live transcription stopped for this recording: {reason}");
+            }
+        }
+    }
+
+    /// The body of [`Runtime::live_tick`], factored out so the machinery can be
+    /// taken out of `self` (and dropped on failure) without borrow conflicts.
+    fn live_step(&mut self, live: &mut LiveCapture, state: &mut AppState) -> LiveStep {
+        // 1. Finished decodes → the provisional transcript.
+        for result in live.decoder.take_results() {
+            if let Some(error) = result.error {
+                return LiveStep::Stop(error);
+            }
+            live.session
+                .ingest_decoded(&result.window, &result.segments);
+        }
+
+        // 2. New capture audio → per-source device-rate buffers.
+        let Some(session) = self.session.as_mut() else {
+            return LiveStep::Stop("capture session gone".to_string());
+        };
+        let chunks = session.take_live_chunk();
+        if !chunks.is_empty() {
+            if live.pending.len() != chunks.len() {
+                live.pending = chunks
+                    .iter()
+                    .map(|(rate, _)| PendingSource {
+                        rate: *rate,
+                        samples: Vec::new(),
+                    })
+                    .collect();
+            }
+            for (slot, (_, samples)) in live.pending.iter_mut().zip(chunks.iter()) {
+                slot.samples.extend_from_slice(samples);
+            }
+        }
+
+        // 3. Flush the accumulated chunk through the one mixing engine.
+        if live.should_flush() {
+            live.flush(state);
+        }
+
+        // 4. Publish to the record view when the provisional content or the
+        //    backlog count changed (a skip can move before the next decode
+        //    answers).
+        if live.session.revision() != live.published_revision
+            || live.session.skipped_windows() != live.published_skipped
+        {
+            live.published_revision = live.session.revision();
+            live.published_skipped = live.session.skipped_windows();
+            state.record_provisional(
+                live.session.segments().to_vec(),
+                live.session.skipped_windows(),
+            );
+        }
+        LiveStep::Keep
     }
 
     /// Stops every session, mixes the sources into the one 16 kHz mono stream
@@ -447,7 +588,15 @@ impl Runtime {
     /// the session span) and writes the recording wav — to
     /// `<data>/recordings/` when `keep_audio` is on, else to a temp dir
     /// (deleted once the transcript is saved; see `AppState::on_transcript_saved`).
+    ///
+    /// M7: the live machinery is torn down first — the decode thread is
+    /// signalled and detached (an in-flight window finishes on its own), so the
+    /// final pass runs against exactly the pre-M7 pipeline: the captured
+    /// buffers, the mix, the wav write and the job flow are untouched.
     fn stop_capture(&mut self, title: &str, state: &mut AppState) -> Vec<Effect> {
+        if self.live.take().is_some() {
+            tracing::info!("live transcription: recording stopped — provisional content discarded");
+        }
         let Some(session) = self.session.take() else {
             state.record_failed("no recording in progress".to_string());
             return Vec::new();
@@ -719,6 +868,121 @@ impl Runtime {
             },
             None => (Vec::new(), Some("library database unavailable".to_string())),
         }
+    }
+}
+
+/// One live step's outcome (see [`Runtime::live_step`]).
+enum LiveStep {
+    /// Keep the machinery running.
+    Keep,
+    /// Tear the machinery down; the reason is logged.
+    Stop(String),
+}
+
+/// The live transcription machinery for one recording (M7).
+struct LiveCapture {
+    /// The pure scheduler session + provisional transcript.
+    session: live::LiveSession,
+    /// The decode thread (windows in, results out; its own model context).
+    decoder: live::LiveDecoder,
+    /// Per-source device-rate samples not yet flushed into the 16 kHz stream,
+    /// in recorder order.
+    pending: Vec<PendingSource>,
+    /// The provisional revision the record view has already seen.
+    published_revision: u64,
+    /// The skipped-window count the record view has already seen.
+    published_skipped: u64,
+}
+
+/// One source's pending device-rate audio (M7).
+struct PendingSource {
+    rate: u32,
+    samples: Vec<f32>,
+}
+
+/// Seconds of new audio per source that trigger a live-stream flush.
+const LIVE_FLUSH_SECS: usize = 1;
+
+impl LiveCapture {
+    /// Whether any source has accumulated enough new audio to flush (all
+    /// sources are flushed together so the live mix stays time-aligned).
+    fn should_flush(&self) -> bool {
+        self.pending
+            .iter()
+            .any(|slot| slot.rate > 0 && slot.samples.len() >= slot.rate as usize * LIVE_FLUSH_SECS)
+    }
+
+    /// Mixes the pending per-source chunks into the one 16 kHz stream (the
+    /// same [`mix`] engine the final pass uses — chunk-wise and without the
+    /// session, i.e. no clock-drift correction: provisional only) and hands the
+    /// scheduler's windows to the decoder.
+    ///
+    /// Per-source gain/mute come from the record view's rows, exactly like the
+    /// final mix; a source with nothing pending contributes nothing (a few ms
+    /// of sub-tick skew at most — the final mix stays the authoritative one).
+    fn flush(&mut self, state: &AppState) {
+        let (gains, mutes) = live_gains(state, self.pending.len());
+        let tracks: Vec<mix::MixTrack<'_>> = self
+            .pending
+            .iter()
+            .enumerate()
+            .map(|(index, slot)| mix::MixTrack {
+                label: format!("source {}", index + 1),
+                rate: slot.rate,
+                samples: &slot.samples,
+                gain: gains[index],
+                muted: mutes[index],
+            })
+            .collect();
+        let mixed = match mix::mix(&tracks, None) {
+            Ok(outcome) => outcome.samples,
+            Err(err) => {
+                tracing::warn!("live mix failed: {err}");
+                for slot in &mut self.pending {
+                    slot.samples.clear();
+                }
+                return;
+            }
+        };
+        for slot in &mut self.pending {
+            slot.samples.clear();
+        }
+
+        let skipped_before = self.session.skipped_windows();
+        let busy = self.decoder.is_decoding();
+        for window in self.session.push_audio(&mixed, busy) {
+            if let Some(evicted) = self.decoder.submit(window) {
+                tracing::warn!(
+                    seq = evicted.seq,
+                    dropped = self.decoder.dropped_windows(),
+                    "live: dropped the oldest window (the decoder queue is full)"
+                );
+            }
+        }
+        let skipped = self.session.skipped_windows();
+        if skipped != skipped_before {
+            tracing::info!(
+                skipped,
+                "live: backlog — the previous decode was still running; window(s) skipped and merged into the next"
+            );
+        }
+    }
+}
+
+/// The record view's per-source gain/mute for the live mix — unity when the
+/// view holds none or a different source count (the same rule the final mix
+/// uses at Stop).
+fn live_gains(state: &AppState, count: usize) -> (Vec<f32>, Vec<bool>) {
+    match &state.record {
+        RecordState::Recording(recording) if recording.sources.len() == count => (
+            recording.sources.iter().map(|source| source.gain).collect(),
+            recording
+                .sources
+                .iter()
+                .map(|source| source.muted)
+                .collect(),
+        ),
+        _ => (vec![1.0; count], vec![false; count]),
     }
 }
 

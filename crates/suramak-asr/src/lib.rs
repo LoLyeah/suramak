@@ -7,15 +7,21 @@
 //! Engine tiers (docs/ENGINES.md): CPU, Metal and — on macOS builds — Core ML with the
 //! official encoder package on the ANE. `engine` resolves the tier from
 //! `(setting, language, availability)`; `whisper` reports which engine actually ran.
+//!
+//! M7: `live` is the windowed live-transcription machinery (pure scheduler +
+//! bounded queue + provisional merging on every platform; the decode thread
+//! rides the whisper machinery) — the final pass stays exactly the worker's.
 
 pub mod capture;
 pub mod engine;
+pub mod live;
 pub mod mix;
 pub mod pipeline;
 pub mod whisper;
 pub mod worker;
 
 pub use engine::{resolve_engine, resolve_for, EngineAvailability, EngineDecision, EngineId};
+pub use live::{LiveConfig, LiveDecodeSettings, LiveDecoder, LiveResult, LiveSession, LiveWindow};
 pub use pipeline::{model_id_from_path, parse_lang, transcribe_file, PipelineOutcome};
 pub use whisper::{coreml_compiled, metal_compiled, system_info, AsrError, ContextCache};
 pub use worker::{Job, Worker, WorkerEvent};
