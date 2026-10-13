@@ -7,8 +7,8 @@ use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowAttributes};
 
+use crate::app::{self, AppState};
 use crate::theme;
-use crate::view::{self, ViewState};
 
 const WINDOW_TITLE: &str = "Suramak";
 const INITIAL_SIZE: LogicalSize<f64> = LogicalSize::new(1280.0, 800.0);
@@ -23,12 +23,13 @@ pub struct Shell {
     pub adapter_info: String,
     pub backend: &'static str,
     pub config: wgpu::SurfaceConfiguration,
+    /// App state (routes, job, editor, library) drawn every frame.
+    pub app: AppState,
     egui_ctx: egui::Context,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     renderer: egui_wgpu::Renderer,
-    view_state: ViewState,
 }
 
 impl Shell {
@@ -105,6 +106,15 @@ impl Shell {
         theme::install_fonts(egui_ctx);
         egui_ctx.set_theme(egui::ThemePreference::Dark);
 
+        // Wake the winit loop for egui-side repaint requests (worker events
+        // arrive on the bridge thread and call `Context::request_repaint`).
+        {
+            let window = window.clone();
+            egui_ctx.set_request_repaint_callback(move |_info| {
+                window.request_redraw();
+            });
+        }
+
         #[cfg(target_os = "macos")]
         apply_glass(&window);
 
@@ -118,12 +128,12 @@ impl Shell {
             ),
             backend: init.backend,
             config,
+            app: AppState::new(),
             egui_ctx: egui_ctx.clone(),
             surface: init.surface,
             device,
             queue,
             renderer,
-            view_state: ViewState::new(),
         })
     }
 
@@ -138,14 +148,19 @@ impl Shell {
     }
 
     /// Renders one frame; recoverable surface errors reconfigure and skip.
-    pub fn redraw_or_log(&mut self) {
+    /// Returns the effects the frame requested (empty when the frame was skipped).
+    pub fn redraw_or_log(&mut self) -> Vec<app::Effect> {
         match self.render() {
-            Ok(()) => {}
+            Ok(effects) => effects,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                 self.surface.configure(&self.device, &self.config);
                 self.window.request_redraw();
+                Vec::new()
             }
-            Err(err) => tracing::warn!("frame skipped: {err}"),
+            Err(err) => {
+                tracing::warn!("frame skipped: {err}");
+                Vec::new()
+            }
         }
     }
 
@@ -163,11 +178,16 @@ impl Shell {
         )
     }
 
-    fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+    fn render(&mut self) -> Result<Vec<app::Effect>, wgpu::SurfaceError> {
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let egui_ctx = self.egui_ctx.clone();
-        let view_state = &mut self.view_state;
-        let full_output = egui_ctx.run(raw_input, |ctx| view::draw(ctx, view_state));
+        let app = &mut self.app;
+        // egui may run the UI closure more than once per frame (passes); the
+        // last pass's effects win (assignment, not accumulation).
+        let mut effects = Vec::new();
+        let full_output = egui_ctx.run(raw_input, |ctx| {
+            effects = app::views::draw(ctx, app);
+        });
 
         // Viewport commands first (they borrow `full_output`), then the moved
         // platform output.
@@ -237,7 +257,7 @@ impl Shell {
             self.renderer.free_texture(id);
         }
         self.frames += 1;
-        Ok(())
+        Ok(effects)
     }
 }
 

@@ -88,6 +88,18 @@ jobs:
           SURAMAK_REQUIRE_MODEL: "1"
         run: cargo test --workspace --release -- --ignored
 
+      # M2: the scripted in-app job — import → transcribe (resolved default
+      # model) → save to the sqlite library → assert the DB row, all inside the
+      # real app under xvfb. SURAMAK_SMOKE_SECS is the watchdog (exit 1 + no
+      # file when the job has not completed by then).
+      - name: UI scripted smoke job (in-app pipeline → sqlite library)
+        run: |
+          rm -f build/smoke_job_ok.txt
+          SURAMAK_SMOKE_SECS=120 SURAMAK_SMOKE_JOB=fixtures/audio/en.wav xvfb-run -a cargo run -p suramak-ui
+          test -f build/smoke_job_ok.txt && echo SMOKE-JOB-OK
+          ./target/release/suramak-cli library list
+          ./target/release/suramak-cli library list | grep -q "en.wav" && echo LIBRARY-OK
+
   macos:
     name: macos (macos-26-arm64)
     runs-on: macos-26-arm64
@@ -130,6 +142,15 @@ jobs:
 
       - name: Smoke test the bundle
         run: SURAMAK_SMOKE_SECS=3 ./dist/Suramak.app/Contents/MacOS/suramak
+
+      # M2: the scripted in-app job on the real (Metal/Core ML) build — import →
+      # transcribe → sqlite library → DB assertion → SMOKE-JOB-OK.
+      - name: UI scripted smoke job (in-app pipeline → sqlite library)
+        run: |
+          rm -f build/smoke_job_ok.txt
+          SURAMAK_SMOKE_SECS=120 SURAMAK_SMOKE_JOB=fixtures/audio/en.wav ./dist/Suramak.app/Contents/MacOS/suramak
+          test -f build/smoke_job_ok.txt && echo SMOKE-JOB-OK
+          ./target/release/suramak-cli library list | grep -q "en.wav" && echo LIBRARY-OK
 
       - name: Upload Suramak.app
         uses: actions/upload-artifact@v4
