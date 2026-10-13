@@ -53,3 +53,4 @@ No testimonials, benchmarks, or screenshots. Measured, verifiable facts exist in
 3. Export is first-class — the user's data always leaves in open, portable formats.
 4. Indonesian is a first-class language, not an afterthought — forced-language support, sensible id defaults, quality-first model tier.
 5. Standalone by design — every cloud/LLM feature is optional and user-owned.
+6. Best local engine per language — different languages may run different on-device engines (English can be faster than Indonesian; both stay on-device). Engine routing is a product feature, not an accident.

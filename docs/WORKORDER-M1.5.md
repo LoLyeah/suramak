@@ -28,6 +28,7 @@ You are a senior Rust engineer working **inside this repository**. Read first: `
 - Do not modify `suramak-ui`/`suramak-glass` (parallel workstream); `core`/`asr`/`cli` only as scoped.
 - New dependency: `zip` only (pure-Rust), justified. Everything else per existing manifests.
 - Honest verification: if the encoder pairing cannot be validated from Linux for a given model, say exactly that in the report.
+- Engine selection is a pure function of `(language, installed engines, platform availability)` → engine id, even though only Whisper variants exist now; future engines (Parakeet via sherpa-rs/FluidAudio, Apple SpeechTranscriber) must slot in as a new variant + routing rule without reshaping call sites. Diagnostics always expose the engine that actually ran.
 
 ## Acceptance
 

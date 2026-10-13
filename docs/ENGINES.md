@@ -35,3 +35,13 @@ Key facts:
 
 - Encoder packages are fp16 and external to the ggml decoder, so `turbo` and `turbo-q5-0` decoders can both pair with the `large-v3-turbo` encoder package (verify pairing at implementation; `doctor` exposes it).
 - The encoder zip's sha256 + size get pinned in the model manifest the same way ggml files are (extend `scripts/pin-model-hashes.sh`).
+
+## Multi-engine strategy (agreed direction, 2026-10-13)
+
+Verdict: **different engines per language is the right end state** — it is where the mature apps converge (MacWhisper ships Whisper and Parakeet side by side). Phase it:
+
+- **Architecture now (M1.5)**: engine selection is a pure function of `(language, installed engines, platform availability)` → engine id. Adding an engine is a new variant + a routing rule, never a reshape of call sites. The result always records the engine that actually ran.
+- **Phase 1 (M1.5, now)**: Whisper engines — CPU / Metal / CoreML-ANE. Covers English **and** Indonesian with the big speed unlock.
+- **Phase 2 (after the app works, post-M2)**: add **Parakeet TDT** as the English/EU fast path (~an order of magnitude faster than Whisper on ANE; TDT v2 English-only 1.69% WER; TDT v3 = 25 EU languages at ~5.4% English WER). Two candidate integrations, decide by bake-off: **sherpa-rs** (Rust-native, ONNX Runtime + CoreML EP — no Swift bridge) vs **FluidAudio** (Swift, best measured ANE numbers, needs a small Swift shim). Default routing once present: English → Parakeet if installed, else Whisper-ANE; Indonesian → Whisper-ANE; everything else → Whisper.
+- **Watch list**: Apple SpeechTranscriber (add when it gains `id`, or for ja/ko/zh coverage), ANEForge, Parakeet multilingual expansion.
+- Every added engine carries: model-asset download/verify, `doctor` reporting, a per-language quality note, and its own acceptance run. One engine at a time.
