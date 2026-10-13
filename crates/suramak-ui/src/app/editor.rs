@@ -1,10 +1,14 @@
 //! Editor route: the editable transcript — per-segment row = mono timestamp
 //! label + `TextEdit`, autosave via the debounced dirty tracking in
-//! `super::Editor`, the "saved" indicator, the timeline strip (M1 composition,
-//! static — playback lands in M3) and the export panel.
+//! `super::Editor`, the "saved" indicator, the playback strip (M8: transport
+//! control + moving playhead + click-to-seek + `mm:ss / mm:ss`) and the export
+//! panel.
 //!
-//! Playback does not exist in the app yet, so selection-follows-playback is
-//! deliberately skipped (documented in the M2 report).
+//! M8 playback in the editor: the **active segment** (the one containing the
+//! playhead — `suramak_playback::segment_index_at`) is highlighted and scrolled
+//! into view *while playing only*; clicking a timestamp seeks to that segment's
+//! start, clicking the strip seeks anywhere. The audio itself is played by the
+//! runtime's engine (`suramak_playback`), never from a view.
 //!
 //! M4 (additive): the polish bar (action + status, gated on configuration) and
 //! the polish panel that replaces the transcript rows while a run is in flight
@@ -13,6 +17,7 @@
 use std::time::Instant;
 
 use egui::{pos2, vec2, Align2, CornerRadius, FontFamily, FontId, Rect, Stroke, StrokeKind};
+use suramak_playback::{format_mmss, segment_index_at};
 
 use crate::theme::Palette;
 
@@ -21,7 +26,7 @@ use super::views::{pane_caption, pane_title, PANE_PAD_X};
 use super::{export, AppState, Effect};
 
 pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &mut Vec<Effect>) {
-    let (title, meta, duration_ms) = match &state.editor {
+    let (title, meta) = match &state.editor {
         Some(editor) => (
             editor.transcript.title.clone(),
             format!(
@@ -31,14 +36,8 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
                 editor.transcript.segments.len(),
                 editor.transcript.created_at.format("%d %b %Y %H:%M")
             ),
-            editor
-                .transcript
-                .segments
-                .last()
-                .map(|seg| seg.end_ms)
-                .unwrap_or(0),
         ),
-        None => ("No transcript open".to_string(), String::new(), 0),
+        None => ("No transcript open".to_string(), String::new()),
     };
 
     ui.horizontal(|ui| {
@@ -88,13 +87,8 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
     // ---- polish bar (M4, additive) ------------------------------------------
     polish_bar(ui, palette, state, effects);
 
-    // ---- timeline strip (M1 scrubber composition, static) --------------------
-    let (outer, _) = ui.allocate_exact_size(vec2(ui.available_width(), 66.0), egui::Sense::hover());
-    let strip = Rect::from_min_max(
-        pos2(outer.left() + PANE_PAD_X, outer.top()),
-        pos2(outer.right() - PANE_PAD_X, outer.bottom() - 6.0),
-    );
-    timeline_strip(ui, strip, palette, duration_ms);
+    // ---- playback strip (M8: control + playhead + click-to-seek + readout) ---
+    playback_strip(ui, palette, state, effects);
 
     // ---- export panel (bottom card) ----------------------------------------
     egui::TopBottomPanel::bottom("suramak-export")
@@ -130,6 +124,17 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
         })
         .unwrap_or_default();
 
+    // M8: the active segment is the one containing the playhead, and the list
+    // only follows it **while playing** — a paused playhead never yanks the
+    // scroll out from under a reader.
+    let position_ms = i64::from(state.playback.position_ms());
+    let following = state.playback.is_playing();
+    let active = state
+        .editor
+        .as_ref()
+        .and_then(|editor| segment_index_at(&editor.transcript.segments, position_ms));
+
+    let mut seek_to: Option<u32> = None;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -150,35 +155,60 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
                 return;
             };
             for (index, (idx, start_ms)) in rows.iter().enumerate() {
-                ui.horizontal_top(|ui| {
-                    ui.add_space(PANE_PAD_X - 8.0);
-                    ui.add_sized(
-                        [86.0, 18.0],
-                        egui::Label::new(
-                            egui::RichText::new(suramak_core::time::fmt_ms(*start_ms))
-                                .monospace()
-                                .size(11.0)
-                                .color(palette.text_dim),
-                        ),
-                    );
-                    let width = (ui.available_width() - 16.0).max(120.0);
-                    let response = ui.add(
-                        egui::TextEdit::multiline(&mut editor.buffers[index])
-                            .id_salt(("segment", *idx))
-                            .desired_width(width)
-                            .desired_rows(1)
-                            .font(FontId::new(15.0, crate::theme::serif_family())),
-                    );
-                    if response.changed() {
-                        edited = Some((*idx, editor.buffers[index].clone()));
-                    }
-                });
+                let is_active = active == Some(index);
+                let row = egui::Frame::NONE
+                    .fill(if is_active {
+                        palette.accent.gamma_multiply(0.12)
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    })
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(2, 1))
+                    .show(ui, |ui| {
+                        ui.horizontal_top(|ui| {
+                            ui.add_space(PANE_PAD_X - 10.0);
+                            // M8: the timestamp seeks to the segment's start.
+                            let stamp = ui.add_sized(
+                                [86.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new(suramak_core::time::fmt_ms(*start_ms))
+                                        .monospace()
+                                        .size(11.0)
+                                        .color(palette.text_dim),
+                                )
+                                .sense(egui::Sense::click()),
+                            );
+                            if stamp.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if stamp.clicked() {
+                                seek_to = Some((*start_ms).clamp(0, i64::from(u32::MAX)) as u32);
+                            }
+                            let width = (ui.available_width() - 16.0).max(120.0);
+                            let response = ui.add(
+                                egui::TextEdit::multiline(&mut editor.buffers[index])
+                                    .id_salt(("segment", *idx))
+                                    .desired_width(width)
+                                    .desired_rows(1)
+                                    .font(FontId::new(15.0, crate::theme::serif_family())),
+                            );
+                            if response.changed() {
+                                edited = Some((*idx, editor.buffers[index].clone()));
+                            }
+                        });
+                    });
+                if is_active && following {
+                    ui.scroll_to_rect(row.response.rect, Some(egui::Align::Center));
+                }
                 ui.add_space(2.0);
             }
             if let Some((idx, text)) = edited {
                 editor.edit(idx, text, Instant::now());
             }
         });
+    if let Some(ms) = seek_to {
+        effects.extend(state.seek_playback(ms));
+    }
 }
 
 /// The editor header's trash affordance (M4.5): a discreet wastebasket that
@@ -412,9 +442,110 @@ fn polish_panel(ui: &mut egui::Ui, palette: &Palette, state: &AppState) {
         });
 }
 
-/// The M1 scrubber strip: deterministic bar silhouette + linear time ticks from
-/// the real transcript duration + the playhead parked at the start.
-fn timeline_strip(ui: &egui::Ui, strip: Rect, palette: &Palette, total_ms: i64) {
+/// The M8 playback strip: the play/pause control, the waveform with the moving
+/// playhead, click-to-seek anywhere on it, and the `mm:ss / mm:ss` readout.
+/// The strip keeps the M1 silhouette; when the audio cannot be played (missing
+/// file, not kept, no output device) the playhead is replaced by the reason and
+/// the control dims.
+fn playback_strip(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    state: &mut AppState,
+    effects: &mut Vec<Effect>,
+) {
+    let total_ms = state.playback.duration_ms();
+    let position_ms = state.playback.position_ms();
+    let playing = state.playback.is_playing();
+    let can_play = state.playback.can_play();
+    let hint = state.playback.hint().map(str::to_string);
+
+    ui.horizontal(|ui| {
+        ui.add_space(PANE_PAD_X - 8.0);
+        let (glyph_rect, glyph) = ui.allocate_exact_size(vec2(28.0, 28.0), egui::Sense::click());
+        transport_glyph(ui, glyph_rect, palette, playing, can_play);
+        if glyph.hovered() && can_play {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if glyph.clicked() {
+            effects.extend(state.toggle_playback());
+        }
+        ui.add_space(10.0);
+
+        let readout = format!("{} / {}", format_mmss(position_ms), format_mmss(total_ms));
+        let strip_width = (ui.available_width() - 118.0).max(200.0);
+        let (strip_rect, strip) =
+            ui.allocate_exact_size(vec2(strip_width, 62.0), egui::Sense::click());
+        timeline_strip(
+            ui,
+            strip_rect,
+            palette,
+            total_ms,
+            position_ms,
+            hint.as_deref(),
+        );
+        if strip.hovered() && hint.is_none() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if strip.clicked() && hint.is_none() && total_ms > 0 {
+            if let Some(pointer) = strip.interact_pointer_pos() {
+                effects.extend(state.seek_playback(strip_ms_at(strip_rect, pointer.x, total_ms)));
+            }
+        }
+        ui.add_space(10.0);
+        ui.label(
+            egui::RichText::new(readout)
+                .monospace()
+                .size(12.0)
+                .color(palette.text_dim),
+        );
+    });
+}
+
+/// The transport glyph (painted, so it never depends on an emoji font): a play
+/// triangle while idle/paused, two bars while playing — dimmed when the
+/// transport cannot play (missing audio).
+fn transport_glyph(ui: &egui::Ui, rect: Rect, palette: &Palette, playing: bool, enabled: bool) {
+    let color = if enabled {
+        palette.text
+    } else {
+        palette.text_dim.gamma_multiply(0.5)
+    };
+    let painter = ui.painter();
+    let center = rect.center();
+    if playing {
+        let bar = vec2(4.0, 14.0);
+        for offset in [-4.5_f32, 4.5] {
+            painter.rect_filled(
+                Rect::from_center_size(pos2(center.x + offset, center.y), bar),
+                CornerRadius::same(1),
+                color,
+            );
+        }
+    } else {
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                pos2(center.x - 5.0, center.y - 8.0),
+                pos2(center.x - 5.0, center.y + 8.0),
+                pos2(center.x + 8.0, center.y),
+            ],
+            color,
+            Stroke::NONE,
+        ));
+    }
+}
+
+/// The M1 scrubber strip, now driven by the real position: the deterministic bar
+/// silhouette and linear time ticks stay; the playhead line follows
+/// `position_ms` in `palette.accent`, and an unavailable source replaces it with
+/// the reason (the one thing the strip can say about audio it does not have).
+fn timeline_strip(
+    ui: &egui::Ui,
+    strip: Rect,
+    palette: &Palette,
+    total_ms: u32,
+    position_ms: u32,
+    unavailable: Option<&str>,
+) {
     let painter = ui.painter();
     painter.rect_filled(strip, CornerRadius::same(10), palette.card);
     painter.rect_stroke(
@@ -424,7 +555,7 @@ fn timeline_strip(ui: &egui::Ui, strip: Rect, palette: &Palette, total_ms: i64) 
         StrokeKind::Inside,
     );
 
-    let bars = strip.shrink2(vec2(16.0, 8.0));
+    let bars = strip_bars(strip);
     let tick_row = 14.0;
     let center_y = bars.center().y - tick_row * 0.5;
     let max_half = (bars.height() - tick_row) * 0.5 - 4.0;
@@ -459,19 +590,18 @@ fn timeline_strip(ui: &egui::Ui, strip: Rect, palette: &Palette, total_ms: i64) 
             ),
             (
                 0.5,
-                suramak_core::time::fmt_plain(total_ms / 2),
+                suramak_core::time::fmt_plain(i64::from(total_ms) / 2),
                 Align2::CENTER_CENTER,
             ),
             (
                 1.0,
-                suramak_core::time::fmt_plain(total_ms),
+                suramak_core::time::fmt_plain(i64::from(total_ms)),
                 Align2::RIGHT_CENTER,
             ),
         ];
         for (t, label, anchor) in ticks {
-            let tick_x = bars.left() + (bars.width() - 22.0) * t;
             painter.text(
-                pos2(tick_x, tick_y),
+                pos2(axis_x(bars, t), tick_y),
                 anchor,
                 label,
                 FontId::new(10.5, FontFamily::Monospace),
@@ -480,12 +610,46 @@ fn timeline_strip(ui: &egui::Ui, strip: Rect, palette: &Palette, total_ms: i64) 
         }
     }
 
-    // No playback yet (M3): the playhead stays parked at the start.
-    let playhead = Rect::from_min_max(
-        pos2(bars.left() + 1.0, bars.top() - 2.0),
-        pos2(bars.left() + 3.0, bars.bottom() - 2.0),
-    );
-    painter.rect_filled(playhead, CornerRadius::same(1), palette.accent);
+    if let Some(hint) = unavailable {
+        // M8 unavailable state: no playhead, the reason in words.
+        painter.text(
+            strip.center(),
+            Align2::CENTER_CENTER,
+            hint,
+            FontId::new(11.5, FontFamily::Proportional),
+            palette.text_dim,
+        );
+        return;
+    }
+
+    if total_ms > 0 {
+        let t = (position_ms as f32 / total_ms as f32).clamp(0.0, 1.0);
+        let x = axis_x(bars, t);
+        let playhead = Rect::from_min_max(
+            pos2(x - 1.0, bars.top() - 2.0),
+            pos2(x + 1.0, bars.bottom() - 2.0),
+        );
+        painter.rect_filled(playhead, CornerRadius::same(1), palette.accent);
+    }
+}
+
+/// The waveform area inside the strip (the tick labels live in its lower band).
+fn strip_bars(strip: Rect) -> Rect {
+    strip.shrink2(vec2(16.0, 8.0))
+}
+
+/// The strip's time axis: `t` (0..=1) → x. Shared by the ticks, the playhead and
+/// click-to-seek, so the three can never drift apart.
+fn axis_x(bars: Rect, t: f32) -> f32 {
+    bars.left() + (bars.width() - 22.0).max(1.0) * t
+}
+
+/// A click position on the strip → milliseconds (the inverse of [`axis_x`]).
+fn strip_ms_at(strip: Rect, x: f32, total_ms: u32) -> u32 {
+    let bars = strip_bars(strip);
+    let axis = (bars.width() - 22.0).max(1.0);
+    let t = ((x - bars.left()) / axis).clamp(0.0, 1.0);
+    (t * total_ms as f32).round() as u32
 }
 
 /// Deterministic pseudo-random bar silhouette (no RNG dependency; M1 generator).

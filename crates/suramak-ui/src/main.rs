@@ -229,6 +229,20 @@ impl App {
             self.apply(effects);
         }
 
+        // Playback position (M8): polled per frame while an engine exists — the
+        // capture-RMS pattern, but for the moving playhead.
+        let playback = self
+            .runtime
+            .as_mut()
+            .and_then(|runtime| runtime.playback_status());
+        if let Some(status) = playback {
+            let effects = match self.shell.as_mut() {
+                Some(shell) => shell.app.on_playback_status(status),
+                None => Vec::new(),
+            };
+            self.apply(effects);
+        }
+
         // Capture meter sample (only while a session is live).
         let recording = self
             .shell

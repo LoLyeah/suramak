@@ -14,6 +14,12 @@
 //! M4: the polish call (core's client is blocking HTTP) runs on its own
 //! detached `suramak-polish` thread — never the ASR worker, never the UI
 //! thread — and reports through the same poll-and-repaint pattern.
+//!
+//! M8: playback. The cpal output engine lives in [`suramak_playback`]'s own
+//! thread (the stream is `!Send`); the runtime opens it on the first `Play`,
+//! forwards transport commands and exposes the polled position so the frame
+//! loop can draw the playhead — [`Runtime::playback_status`], like
+//! [`Runtime::capture_rms`].
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -31,6 +37,7 @@ use suramak_core::resample;
 use suramak_core::settings::{LangMode, PolishSettings, Settings};
 use suramak_core::store::Store;
 use suramak_core::transcript::{Segment, Transcript};
+use suramak_playback::{Command as PlaybackCommand, Engine, Status as PlaybackStatus};
 use uuid::Uuid;
 
 use crate::app::{self, model_manager, polish, settings_form, AppState, Effect, ExportFormat};
@@ -56,6 +63,11 @@ pub struct Runtime {
     download: Option<DownloadJob>,
     /// Background polish run (one at a time, M4).
     polish: Option<PolishJob>,
+    /// The live output engine (M8), keyed by the file it was opened for.
+    playback: Option<PlaybackSession>,
+    /// A playback session that could not even be started (thread spawn);
+    /// reported to the UI once through [`Runtime::playback_status`].
+    playback_error: Option<String>,
 }
 
 /// A model download running on a detached thread; the UI polls it.
@@ -76,6 +88,13 @@ struct PolishJob {
 /// exactly once when the call finished (Ok = validated segments, Err = the raw
 /// backend/reply error shown to the user).
 type PolishSlot = Arc<Mutex<Option<Result<Vec<Segment>, String>>>>;
+
+/// A live playback engine and the file it was opened for (M8). The engine's
+/// thread owns the cpal stream; the runtime only sends it commands.
+struct PlaybackSession {
+    path: PathBuf,
+    engine: Engine,
+}
 
 /// One poll of the model download (see [`Runtime::download_status`]).
 pub struct DownloadStatus {
@@ -108,6 +127,8 @@ impl Runtime {
             recorder: None,
             download: None,
             polish: None,
+            playback: None,
+            playback_error: None,
         }
     }
 
@@ -141,6 +162,61 @@ impl Runtime {
     /// Live rolling RMS of the capture session (`None` when not recording).
     pub fn capture_rms(&self) -> Option<f32> {
         self.recorder.as_ref().map(|recorder| recorder.rms())
+    }
+
+    /// Per-frame poll of the playback engine (M8): position, duration, the
+    /// finished flag and a terminal-once error (`None` while no engine exists).
+    pub fn playback_status(&mut self) -> Option<PlaybackStatus> {
+        if let Some(message) = self.playback_error.take() {
+            return Some(PlaybackStatus::failure(message, true));
+        }
+        let session = self.playback.as_ref()?;
+        Some(session.engine.poll())
+    }
+
+    /// Executes a playback transport command (M8).
+    ///
+    /// `Play` opens (or replaces) the engine for the file it carries — the
+    /// engine thread decodes and opens the output device on that first command,
+    /// so a headless machine lands in a clean error state instead of failing to
+    /// start. `Stop` also releases the session: leaving the editor must not keep
+    /// a decoded buffer parked.
+    fn playback_command(&mut self, source: Option<PathBuf>, command: PlaybackCommand) {
+        if matches!(command, PlaybackCommand::Stop) {
+            if let Some(session) = self.playback.take() {
+                if let Err(err) = session.engine.send(PlaybackCommand::Stop) {
+                    tracing::warn!("playback: {err}");
+                }
+            }
+            return;
+        }
+        if let Some(path) = source {
+            let stale = self
+                .playback
+                .as_ref()
+                .is_none_or(|session| session.path != path);
+            if stale {
+                self.playback = None;
+                match Engine::start(path.clone()) {
+                    Ok(engine) => {
+                        self.playback = Some(PlaybackSession { path, engine });
+                    }
+                    Err(err) => {
+                        tracing::warn!("playback: {err}");
+                        self.playback_error = Some(err);
+                        return;
+                    }
+                }
+            }
+        }
+        let Some(session) = self.playback.as_ref() else {
+            // Pause/resume/seek without a session (it was never opened, or the
+            // load failed): nothing to do — the UI's own position stands.
+            return;
+        };
+        if let Err(err) = session.engine.send(command) {
+            self.playback_error = Some(err);
+        }
     }
 
     /// Progress of the model download, if one is running.
@@ -262,6 +338,7 @@ impl Runtime {
                         queue.extend(state.on_polish_done(Err(err)));
                     }
                 }
+                Effect::Playback { source, command } => self.playback_command(source, command),
             }
         }
     }

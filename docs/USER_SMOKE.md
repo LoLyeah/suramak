@@ -101,6 +101,21 @@ Data lives in `~/Library/Application Support/dev.suramak.Suramak/` (db, settings
 - Quit and relaunch the app.
   Expected: the row is still gone and its segments with it (the delete is permanent).
 
+## 14. Playback with segment follow
+
+- Open a transcript made from an **imported file** (e.g. the mp3 from item 4). In the editor, press the play control left of the waveform strip.
+  Expected: audio plays; the playhead moves along the strip; the readout shows `mm:ss / mm:ss`; the segment containing the playhead is highlighted and scrolls into view as playback moves down the transcript.
+- Press the control again (it now shows the pause bars).
+  Expected: playback pauses; the highlight stays where it is and the list stops following until you play again.
+- Click in the middle of the waveform strip.
+  Expected: playback jumps there (still playing if it was playing); the highlight follows.
+- Click a segment's timestamp (the mono column at the left of a row).
+  Expected: playback seeks to that segment's start.
+- Press **Home**, switch transcripts, or start a recording.
+  Expected: playback stops and the playhead resets; opening that transcript again starts from the beginning.
+- **Missing audio**: open a transcript recorded with `Keep recordings` **off** (item 11 ✗). Expected: the strip shows the reason (`keep audio was off — the recording's file is gone …`) instead of the playhead and the play control is dimmed — pressing it does nothing (there is no file to play).
+- **No output device**: press play with no output device available (unplug headphones/speakers, or a VM without audio). Expected: the strip shows `no audio output device on this machine`; the app keeps working and the rest of the editor is unaffected. Connect a device and press play again to retry.
+
 ## Report
 
 Anything that deviates from an expected result, with: what you did, what happened, what you expected.

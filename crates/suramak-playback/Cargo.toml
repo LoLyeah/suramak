@@ -1,0 +1,17 @@
+[package]
+name = "suramak-playback"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Suramak playback: cpal output engine, source resolution and the transport state (M8)"
+
+[dependencies]
+suramak-core = { path = "../suramak-core" }
+# Output only — no capture: cpal's ALSA backend builds on Linux with
+# libasound2-dev (CI + VPS have it), coreaudio on macOS (pure Rust + frameworks).
+cpal = "0.15.3"
+rubato = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+chrono = { workspace = true }   # `Source::Recording { started_at }` in the resolution tests

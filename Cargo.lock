@@ -3935,6 +3935,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "suramak-playback"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "cpal",
+ "rubato",
+ "suramak-core",
+ "tracing",
+]
+
+[[package]]
 name = "suramak-taps"
 version = "0.1.0"
 dependencies = [
@@ -3959,6 +3970,7 @@ dependencies = [
  "suramak-asr",
  "suramak-core",
  "suramak-glass",
+ "suramak-playback",
  "tracing",
  "tracing-subscriber",
  "uuid",

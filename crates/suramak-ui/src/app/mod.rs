@@ -17,6 +17,10 @@ use suramak_core::export as core_export;
 use suramak_core::models as core_models;
 use suramak_core::settings::EngineSetting;
 use suramak_core::transcript::Transcript;
+use suramak_playback::{
+    resolve_playback_source, transcript_duration_ms, Command as PlaybackCommand, Playback,
+    Status as PlaybackStatus,
+};
 use uuid::Uuid;
 
 use self::model_manager::{ModelManager, ModelRow};
@@ -377,6 +381,11 @@ pub struct AppState {
     /// Polish action's enable. Seeded by the runtime at startup and refreshed
     /// after a settings save; a field so the state machine is testable headless.
     pub polish_configured: bool,
+    /// In-app playback transport for the open transcript (M8): resolved source,
+    /// state, playhead and duration. The runtime owns the cpal engine; this is
+    /// the state the strip draws from and the machine that decides what the
+    /// engine is told.
+    pub playback: Playback,
 }
 
 /// Side effects the runtime executes after a frame (or an event).
@@ -422,6 +431,13 @@ pub enum Effect {
     /// Run the polish call for this transcript on a background thread
     /// (core's client is blocking HTTP; never the ASR worker). M4.
     PolishTranscript { transcript: Box<Transcript> },
+    /// Execute a playback transport command (M8). `source` is set on `Play` so
+    /// the runtime opens (or replaces) the engine for exactly this file;
+    /// pause/resume/seek/stop go to the engine it already owns.
+    Playback {
+        source: Option<PathBuf>,
+        command: PlaybackCommand,
+    },
 }
 
 impl Default for AppState {
@@ -454,6 +470,7 @@ impl AppState {
             // Seeded by the runtime at startup (`Runtime::polish_configured`);
             // false until then so the action can never fire half-configured.
             polish_configured: false,
+            playback: Playback::none(),
         }
     }
 
@@ -463,12 +480,13 @@ impl AppState {
     }
 
     /// Whether the UI wants the periodic tick (job running / dirty edits /
-    /// recording / a polish run polling for its result).
+    /// recording / a polish run polling for its result / the playhead moving).
     pub fn busy(&self) -> bool {
         matches!(self.job, Job::Running(_))
             || self.editor.as_ref().is_some_and(|e| e.dirty)
             || matches!(self.record, RecordState::Recording(_))
             || self.polish.is_running()
+            || self.playback.is_playing()
     }
 
     pub fn set_status(&mut self, text: impl Into<String>, error: bool) {
@@ -497,6 +515,8 @@ impl AppState {
         if !self.can_record() {
             return Vec::new();
         }
+        // M8: the capture session owns the audio — playback stops first.
+        let mut effects = self.stop_playback();
         self.status = None;
         self.home.error = None;
         self.last_insert = None;
@@ -510,7 +530,8 @@ impl AppState {
             stopping: false,
         });
         self.route = Route::Record;
-        vec![Effect::StartCapture]
+        effects.push(Effect::StartCapture);
+        effects
     }
 
     /// Runtime: capture is live on this device.
@@ -579,6 +600,68 @@ impl AppState {
         self.record = RecordState::Idle;
         self.route = Route::Home;
         Vec::new()
+    }
+
+    // ---- playback (M8) ------------------------------------------------------
+
+    /// The waveform strip's play/pause control.
+    pub fn toggle_playback(&mut self) -> Vec<Effect> {
+        let Some(command) = self.playback.toggle() else {
+            return Vec::new();
+        };
+        vec![self.playback_effect(command)]
+    }
+
+    /// Click-to-seek: the waveform strip or a segment's timestamp.
+    pub fn seek_playback(&mut self, ms: u32) -> Vec<Effect> {
+        let Some(command) = self.playback.seek(ms) else {
+            return Vec::new();
+        };
+        vec![self.playback_effect(command)]
+    }
+
+    /// The runtime's per-frame poll of the playback engine: the playhead (and,
+    /// once, the reason playback cannot start).
+    pub fn on_playback_status(&mut self, status: PlaybackStatus) -> Vec<Effect> {
+        if let Some(error) = status.error {
+            self.playback.on_failure(error.message, error.retryable);
+            return Vec::new();
+        }
+        self.playback
+            .on_status(status.position_ms, status.duration_ms, status.finished);
+        Vec::new()
+    }
+
+    /// Stops and resets the transport — leaving the editor, switching
+    /// transcripts, deleting one, importing, starting a recording. Emits a
+    /// `Stop` only when a session was live.
+    fn stop_playback(&mut self) -> Vec<Effect> {
+        let Some(command) = self.playback.stop() else {
+            return Vec::new();
+        };
+        vec![self.playback_effect(command)]
+    }
+
+    /// The effect for a transport command: a `Play` carries the file the engine
+    /// must open; the rest are addressed to the engine the runtime owns.
+    fn playback_effect(&self, command: PlaybackCommand) -> Effect {
+        let source = match command {
+            PlaybackCommand::Play { .. } => self.playback.ready_path().map(Path::to_path_buf),
+            _ => None,
+        };
+        Effect::Playback { source, command }
+    }
+
+    /// Rebuilds the transport for the open transcript (source resolution +
+    /// duration estimate), or clears it when no editor is open.
+    fn reset_playback(&mut self) {
+        self.playback = match &self.editor {
+            Some(editor) => Playback::new(
+                resolve_playback_source(&editor.transcript),
+                transcript_duration_ms(&editor.transcript),
+            ),
+            None => Playback::none(),
+        };
     }
 
     // ---- model manager (M3) -------------------------------------------------
@@ -696,6 +779,8 @@ impl AppState {
         self.home.error = None;
         self.status = None;
         self.last_insert = None;
+        // M8: the editor view is being left — playback stops and resets.
+        let mut effects = self.stop_playback();
         self.route = Route::Transcribe;
         self.job = Job::Running(RunningJob {
             input: input.clone(),
@@ -705,7 +790,8 @@ impl AppState {
             planned_engine: None,
             warnings: Vec::new(),
         });
-        vec![Effect::SubmitJob { input }]
+        effects.push(Effect::SubmitJob { input });
+        effects
     }
 
     /// Import from the home path field (Enter / Import button).
@@ -874,7 +960,9 @@ impl AppState {
             self.route = Route::Editor;
             return Vec::new();
         }
-        let mut effects = self.flush_edits();
+        // M8: switching transcripts stops the old one's playback.
+        let mut effects = self.stop_playback();
+        effects.extend(self.flush_edits());
         effects.push(Effect::LoadTranscript(Box::new(item)));
         effects
     }
@@ -916,11 +1004,15 @@ impl AppState {
             .unwrap_or_else(|| id.to_string());
         match result {
             Ok(()) => {
+                let mut effects = Vec::new();
                 if self
                     .editor
                     .as_ref()
                     .is_some_and(|editor| editor.transcript.id == id)
                 {
+                    // M8: the open transcript is going away — stop and reset.
+                    effects.extend(self.stop_playback());
+                    self.playback = Playback::none();
                     self.editor = None;
                     // A pending polish review / undo belongs to the transcript
                     // that just went away (same rule as `open_editor`).
@@ -929,7 +1021,8 @@ impl AppState {
                     self.route = Route::Home;
                 }
                 self.set_status(format!("deleted {title}"), false);
-                vec![Effect::RefreshLibrary]
+                effects.push(Effect::RefreshLibrary);
+                effects
             }
             Err(err) => {
                 self.set_status(format!("could not delete {title}: {err}"), true);
@@ -938,10 +1031,13 @@ impl AppState {
         }
     }
 
-    /// Back to the home route (pending edits are flushed first).
+    /// Back to the home route (pending edits are flushed first; M8: playback
+    /// stops and the playhead resets).
     pub fn back_home(&mut self) -> Vec<Effect> {
         self.route = Route::Home;
-        self.flush_edits()
+        let mut effects = self.stop_playback();
+        effects.extend(self.flush_edits());
+        effects
     }
 
     /// The periodic tick: recording clock + autosave debounce.
@@ -1071,6 +1167,9 @@ impl AppState {
         self.polish = PolishState::Idle;
         self.polish_undo = None;
         self.route = Route::Editor;
+        // M8: the transport is rebuilt for this transcript's source (a previous
+        // transcript's playback never leaks across).
+        self.reset_playback();
     }
 }
 
@@ -1981,5 +2080,336 @@ mod tests {
         }
         plain.capture_available = false;
         assert!(!plain.can_record());
+    }
+
+    // ---- M8: playback --------------------------------------------------------
+
+    fn playback_status(position_ms: u32, duration_ms: u32, finished: bool) -> PlaybackStatus {
+        PlaybackStatus {
+            position_ms,
+            duration_ms,
+            finished,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn opening_a_transcript_resolves_its_playback_source() {
+        let wav = temp_wav("playback-open");
+        let mut state = AppState::new();
+        assert!(
+            state.playback.hint().is_some(),
+            "no transcript open → nothing to play"
+        );
+
+        state.on_transcript_loaded(transcript_with_audio("open.wav", &wav));
+        assert_eq!(state.playback.ready_path(), Some(wav.as_path()));
+        assert!(state.playback.can_play());
+        assert_eq!(
+            state.playback.duration_ms(),
+            1_900,
+            "the last segment end is the pre-engine estimate"
+        );
+        assert!(!state.busy(), "a parked transport keeps no tick");
+        assert_eq!(state.playback.position_ms(), 0);
+    }
+
+    #[test]
+    fn playback_idle_playing_paused_then_stop_on_leave() {
+        let wav = temp_wav("playback-leave");
+        let mut state = AppState::new();
+        state.on_transcript_loaded(transcript_with_audio("leave.wav", &wav));
+
+        // idle → playing: the Play effect carries the file the engine must open.
+        let effects = state.toggle_playback();
+        match effects.as_slice() {
+            [Effect::Playback { source, command }] => {
+                assert_eq!(source.as_deref(), Some(wav.as_path()));
+                assert_eq!(*command, PlaybackCommand::Play { from_ms: 0 });
+            }
+            other => panic!("expected a play effect, got {other:?}"),
+        }
+        assert!(state.playback.is_playing());
+        assert!(state.busy(), "the moving playhead must keep frames coming");
+
+        // The polled position drives the playhead.
+        assert!(state
+            .on_playback_status(playback_status(900, 1_900, false))
+            .is_empty());
+        assert_eq!(state.playback.position_ms(), 900);
+
+        // playing → paused.
+        let effects = state.toggle_playback();
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Playback {
+                source: None,
+                command: PlaybackCommand::Pause
+            }]
+        ));
+        assert!(state.playback.is_paused());
+        assert!(
+            !state.busy(),
+            "a paused transport releases the tick (no yanking while paused)"
+        );
+
+        // paused → playing (resume, no file needed).
+        let effects = state.toggle_playback();
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Playback {
+                command: PlaybackCommand::Resume,
+                ..
+            }]
+        ));
+
+        // stop-on-leave: Home stops the engine and resets the playhead.
+        let effects = state.back_home();
+        assert!(
+            matches!(
+                effects.first(),
+                Some(Effect::Playback {
+                    command: PlaybackCommand::Stop,
+                    ..
+                })
+            ),
+            "expected a stop first, got {effects:?}"
+        );
+        assert!(state.playback.is_idle());
+        assert_eq!(state.playback.position_ms(), 0);
+        assert!(!state.busy());
+        assert_eq!(
+            state.playback.state(),
+            &suramak_playback::PlaybackState::Idle,
+            "the source stays resolved (ready) after a stop"
+        );
+    }
+
+    #[test]
+    fn an_unavailable_source_shows_the_hint_and_never_plays() {
+        let mut state = AppState::new();
+        let mut gone = transcript("gone.wav");
+        gone.audio_path = Some(PathBuf::from("/definitely/not/here.wav"));
+        state.on_transcript_loaded(gone);
+
+        let hint = state.playback.hint().expect("unavailable").to_string();
+        assert!(hint.contains("import"), "unexpected hint: {hint}");
+        assert!(!state.playback.can_play());
+        assert!(
+            state.toggle_playback().is_empty(),
+            "the control emits nothing"
+        );
+        assert!(
+            state.seek_playback(1_200).is_empty(),
+            "seeking is a no-op too"
+        );
+        assert!(!state.busy());
+    }
+
+    #[test]
+    fn a_recording_without_kept_audio_hints_at_the_setting() {
+        let mut state = AppState::new();
+        let mut recorded = transcript("Recording x.wav");
+        recorded.source = Source::Recording {
+            started_at: chrono::Utc::now(),
+            duration_ms: 1_900,
+        };
+        // `keep_audio` off: no path survived the save.
+        state.on_transcript_loaded(recorded);
+        let hint = state.playback.hint().expect("unavailable").to_string();
+        assert!(hint.contains("keep audio"), "unexpected hint: {hint}");
+        assert!(!state.playback.can_play());
+    }
+
+    #[test]
+    fn a_device_failure_lands_in_the_strip_and_play_retries() {
+        let wav = temp_wav("playback-device");
+        let mut state = AppState::new();
+        state.on_transcript_loaded(transcript_with_audio("device.wav", &wav));
+        state.toggle_playback();
+        assert!(state.playback.is_playing());
+
+        state.on_playback_status(PlaybackStatus::failure(
+            "no audio output device on this machine",
+            true,
+        ));
+        let hint = state.playback.hint().expect("unavailable").to_string();
+        assert!(hint.contains("output device"), "unexpected hint: {hint}");
+        assert!(
+            state.playback.can_play(),
+            "a device error is retryable — plug in and press play again"
+        );
+        assert!(!state.busy(), "nothing is moving while it cannot play");
+
+        let effects = state.toggle_playback();
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Playback {
+                    command: PlaybackCommand::Play { .. },
+                    ..
+                }]
+            ),
+            "the retry opens a session again: {effects:?}"
+        );
+        assert!(state.playback.is_playing());
+    }
+
+    #[test]
+    fn seeking_moves_the_playhead_and_tells_a_live_engine() {
+        let wav = temp_wav("playback-seek");
+        let mut state = AppState::new();
+        state.on_transcript_loaded(transcript_with_audio("seek.wav", &wav));
+
+        // Idle: the position is remembered for the next Play (no engine yet).
+        assert!(state.seek_playback(1_000).is_empty());
+        assert_eq!(state.playback.position_ms(), 1_000);
+
+        // Playing: the engine is told; the playhead clamps to the duration.
+        state.toggle_playback();
+        let effects = state.seek_playback(99_000);
+        match effects.as_slice() {
+            [Effect::Playback { source, command }] => {
+                assert_eq!(*source, None, "a seek addresses the open engine");
+                assert_eq!(*command, PlaybackCommand::Seek { ms: 1_900 });
+            }
+            other => panic!("expected a seek effect, got {other:?}"),
+        }
+        assert_eq!(state.playback.position_ms(), 1_900);
+    }
+
+    #[test]
+    fn starting_a_recording_stops_playback_first() {
+        let mut state = recording_state();
+        let wav = temp_wav("playback-record");
+        state.on_transcript_loaded(transcript_with_audio("rec.wav", &wav));
+        state.toggle_playback();
+        assert!(state.playback.is_playing());
+
+        let effects = state.start_recording(Instant::now(), "2026-10-13 14:05:33");
+        match effects.as_slice() {
+            [Effect::Playback {
+                command: PlaybackCommand::Stop,
+                ..
+            }, Effect::StartCapture] => {}
+            other => panic!("expected stop-then-capture, got {other:?}"),
+        }
+        assert!(state.playback.is_idle());
+        assert_eq!(state.route, Route::Record);
+    }
+
+    #[test]
+    fn deleting_the_open_transcript_stops_playback_and_clears_it() {
+        let wav = temp_wav("playback-delete");
+        let open = transcript_with_audio("bye.wav", &wav);
+        let id = open.id;
+        let mut state = AppState::new();
+        state.on_transcript_loaded(open);
+        state.toggle_playback();
+
+        let effects = state.on_transcript_deleted(id, Ok(()));
+        match effects.as_slice() {
+            [Effect::Playback {
+                command: PlaybackCommand::Stop,
+                ..
+            }, Effect::RefreshLibrary] => {}
+            other => panic!("expected stop + refresh, got {other:?}"),
+        }
+        assert_eq!(state.route, Route::Home);
+        assert!(state.playback.hint().is_some());
+        assert!(!state.playback.can_play(), "the transport was cleared");
+    }
+
+    #[test]
+    fn switching_transcripts_stops_the_old_playback() {
+        let first = temp_wav("playback-switch-first");
+        let second = temp_wav("playback-switch-second");
+        let mut state = AppState::new();
+        let open = transcript_with_audio("first.wav", &first);
+        let other = transcript_with_audio("second.wav", &second);
+        state.on_transcript_loaded(open.clone());
+        state.on_library_loaded(vec![open, other.clone()], None);
+        state.toggle_playback();
+        assert!(state.playback.is_playing());
+
+        let effects = state.select_library(1);
+        assert!(
+            matches!(
+                effects.first(),
+                Some(Effect::Playback {
+                    command: PlaybackCommand::Stop,
+                    ..
+                })
+            ),
+            "the old session stops before the load: {effects:?}"
+        );
+        state.on_transcript_loaded(other.clone());
+        assert!(state.playback.is_idle());
+        assert_eq!(state.playback.ready_path(), Some(second.as_path()));
+        assert_eq!(state.playback.position_ms(), 0);
+    }
+
+    #[test]
+    fn the_engine_status_parks_the_playhead_at_the_end() {
+        let wav = temp_wav("playback-end");
+        let mut state = AppState::new();
+        state.on_transcript_loaded(transcript_with_audio("end.wav", &wav));
+        state.toggle_playback();
+
+        state.on_playback_status(playback_status(1_900, 4_000, true));
+        assert!(state.playback.is_idle(), "finished → idle");
+        assert_eq!(state.playback.position_ms(), 4_000, "parked at the end");
+        assert_eq!(
+            state.playback.duration_ms(),
+            4_000,
+            "the engine's real duration replaced the estimate"
+        );
+        assert!(!state.busy());
+
+        // Play again starts from the top.
+        let effects = state.toggle_playback();
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Playback {
+                command: PlaybackCommand::Play { from_ms: 0 },
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn importing_stops_playback_before_the_job_starts() {
+        let wav = temp_wav("playback-import");
+        let mut state = AppState::new();
+        state.on_transcript_loaded(transcript_with_audio("open.wav", &wav));
+        state.toggle_playback();
+
+        let input = temp_wav("playback-import-input");
+        let effects = state.begin_import(input);
+        match effects.as_slice() {
+            [Effect::Playback {
+                command: PlaybackCommand::Stop,
+                ..
+            }, Effect::SubmitJob { .. }] => {}
+            other => panic!("expected stop-then-submit, got {other:?}"),
+        }
+        assert!(state.playback.is_idle());
+        assert_eq!(state.route, Route::Transcribe);
+    }
+
+    #[test]
+    fn the_editor_paints_the_active_segment_from_the_playhead() {
+        // The editor's highlight is `segment_index_at(segments, position)` on the
+        // transcript rows; this pins the mapping the view uses (start 0/1000,
+        // ends 900/1900 from the test fixture).
+        let wav = temp_wav("playback-active");
+        let mut state = AppState::new();
+        state.on_transcript_loaded(transcript_with_audio("active.wav", &wav));
+        let segments = &state.editor.as_ref().unwrap().transcript.segments;
+        assert_eq!(suramak_playback::segment_index_at(segments, 0), Some(0));
+        assert_eq!(suramak_playback::segment_index_at(segments, 599), Some(0));
+        assert_eq!(suramak_playback::segment_index_at(segments, 900), None);
+        assert_eq!(suramak_playback::segment_index_at(segments, 1_000), Some(1));
+        assert_eq!(suramak_playback::segment_index_at(segments, 5_000), None);
     }
 }
