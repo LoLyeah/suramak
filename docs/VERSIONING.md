@@ -20,7 +20,7 @@ One source of truth: **`Cargo.toml` → `[workspace.package] version`** (semver)
 2. `python3 scripts/bump_version.py X.Y.Z` — updates `Cargo.toml`, `packaging/Info.plist`, and rotates the CHANGELOG (`[Unreleased]` → `[X.Y.Z] — date`).
 3. Commit `release: X.Y.Z`; then annotated tag `vX.Y.Z` and push both.
 4. The **Release workflow** (`.github/workflows/release.yml`, tag-triggered) builds the macOS app bundle **and the Linux app tarball** (app + CLI + `.desktop` + icon + LICENSE), and attaches both to the GitHub Release. The release body comes from the CHANGELOG section; the unsigned-build note is appended automatically.
-5. Artifacts: `Suramak-vX.Y.Z-macos-arm64.zip`, `suramak-vX.Y.Z-linux-x86_64.tar.gz`. Windows joins when the port lands.
+5. Artifacts: `Suramak-vX.Y.Z-macos-arm64.zip` **+ `Suramak-vX.Y.Z-macos-arm64.dmg`** (plain layout with an `/Applications` drag target), `suramak-vX.Y.Z-linux-x86_64.tar.gz`. Windows joins when the port lands.
 
 ## Distribution caveats
 
