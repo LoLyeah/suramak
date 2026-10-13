@@ -18,6 +18,7 @@
 //!   completed by then.
 
 mod app;
+mod instance;
 mod runtime;
 mod shell;
 mod theme;
@@ -56,6 +57,8 @@ fn write_smoke_file(path: &str, content: &str) -> std::io::Result<()> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
     let smoke = Smoke::from_env();
+    // One Suramak at a time (skipped in smoke modes — transient runs).
+    acquire_instance_lock(smoke.is_none());
     let event_loop = EventLoop::new()?;
     let mut app = App::new(smoke);
     event_loop.run_app(&mut app)?;
@@ -63,6 +66,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Exits with code 2 when another instance holds the data-directory lock; a
+/// lock that cannot even be created only warns (an unusual data dir should not
+/// block the app).
+fn acquire_instance_lock(active: bool) {
+    if !active {
+        return;
+    }
+    match paths::data_dir() {
+        Ok(dir) => match instance::acquire(&dir.join("suramak.lock")) {
+            Ok(()) => {}
+            Err(instance::GuardError::AlreadyRunning) => {
+                eprintln!(
+                    "suramak: another Suramak instance is already running — quit it and start again."
+                );
+                std::process::exit(2);
+            }
+            Err(err) => {
+                eprintln!("suramak: warning: {err} — continuing without the instance guard");
+            }
+        },
+        Err(err) => {
+            eprintln!(
+                "suramak: warning: cannot resolve the data directory ({err}) — continuing without the instance guard"
+            );
+        }
+    }
 }
 
 fn init_tracing() {

@@ -55,7 +55,11 @@ echo "CLI e2e OK — build/out/en.json"
 
 step "7/7 handoff"
 echo "Full checklist for the owner: docs/USER_SMOKE.md"
-open dist/Suramak.app
+echo "Launch the app yourself — from a terminal keeps its logs visible:"
+echo "  ./dist/Suramak.app/Contents/MacOS/suramak"
+echo "  (or: open dist/Suramak.app)"
+# NOTE: this script deliberately does NOT launch the app: `open` here + a
+# terminal launch by the owner produced two instances at once (2026-10-13).
 
 echo
 echo "mac smoke complete."

@@ -3953,6 +3953,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "libc",
  "pollster",
  "rfd",
  "suramak-asr",

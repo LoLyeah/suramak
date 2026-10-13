@@ -30,3 +30,8 @@ rfd = "0.15"
 # M3: recording (cpal) + macOS system audio (suramak-taps) are compiled in on the
 # desktop platforms only — Linux keeps a capture-free build (no ALSA runtime).
 suramak-asr = { path = "../suramak-asr", features = ["capture"] }
+
+[target.'cfg(unix)'.dependencies]
+# Single-instance guard (flock on the data-dir lock file, `src/instance.rs`).
+# Unix-only; the Windows port will need its own mechanism (no-op stub for now).
+libc = "0.2"
