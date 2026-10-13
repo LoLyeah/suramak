@@ -14,6 +14,12 @@ jobs:
   linux:
     name: linux (ubuntu-latest)
     runs-on: ubuntu-latest
+    env:
+      # whisper sessions are not concurrency-safe in-process (concurrent init
+      # corrupts the heap; reproduced in CI as SIGABRT "double free or
+      # corruption (out)"). Serialize the whole test run — the app itself
+      # keeps one session at a time.
+      RUST_TEST_THREADS: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -118,6 +124,9 @@ jobs:
   macos:
     name: macos (macos-26)
     runs-on: macos-26
+    env:
+      # same in-process whisper-session constraint as the linux job
+      RUST_TEST_THREADS: "1"
     steps:
       - uses: actions/checkout@v4
 
