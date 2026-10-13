@@ -10,17 +10,26 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use suramak_asr::capture;
 use suramak_asr::worker::WorkerEvent;
 use suramak_asr::EngineId;
 use suramak_core::export as core_export;
-use suramak_core::models;
+use suramak_core::models as core_models;
 use suramak_core::settings::EngineSetting;
 use suramak_core::transcript::Transcript;
+
+use self::model_manager::{ModelManager, ModelRow};
+use self::settings_form::SettingsForm;
 
 pub mod editor;
 pub mod export;
 pub mod home;
 pub mod library;
+pub mod model_manager;
+pub mod models;
+pub mod record;
+pub mod settings;
+pub mod settings_form;
 pub mod transcribe;
 pub mod views;
 
@@ -42,6 +51,62 @@ pub enum Route {
     Transcribe,
     /// Editable transcript + export.
     Editor,
+    /// Live microphone/system-audio recording (M3).
+    Record,
+    /// Model manager: manifest table + download/delete/set-default (M3).
+    Models,
+    /// Settings: engine/model/language/keep_audio/audio source/polish (M3).
+    Settings,
+}
+
+/// How many meter samples the rolling waveform painter keeps (oldest first).
+pub const RECORD_WAVEFORM_BARS: usize = 96;
+
+/// Recording state machine (M3) — **pure**; the runtime owns the cpal session.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecordState {
+    Idle,
+    Recording(Recording),
+    Failed { message: String },
+}
+
+/// A live recording session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Recording {
+    /// Auto title: `Recording <date>` (also the wav file's stem).
+    pub title: String,
+    pub started_at: Instant,
+    /// Elapsed time, refreshed by [`AppState::tick`].
+    pub elapsed: Duration,
+    /// Live rolling RMS (0..=1) from the capture layer.
+    pub rms: f32,
+    /// Rolling waveform bars (oldest first), at most [`RECORD_WAVEFORM_BARS`].
+    pub waveform: Vec<f32>,
+    /// Input device name, reported by the runtime once capture starts.
+    pub device: Option<String>,
+    /// Set while the runtime is finalising the wav (Stop pressed once).
+    pub stopping: bool,
+}
+
+/// Filesystem-safe file stem for a recording title:
+/// `Recording 2026-10-13 14:05:33` → `Recording 2026-10-13 14-05-33`.
+pub fn recording_file_stem(title: &str) -> String {
+    title
+        .chars()
+        .map(|c| match c {
+            ':' | '/' | '\\' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
+            other => other,
+        })
+        .collect()
+}
+
+/// `mm:ss.t` elapsed clock for the record view (`00:07.3`; hours fold into mm).
+pub fn format_elapsed(elapsed: Duration) -> String {
+    let total_secs = elapsed.as_secs();
+    let tenths = elapsed.subsec_millis() / 100;
+    let minutes = total_secs / 60;
+    let seconds = total_secs % 60;
+    format!("{minutes:02}:{seconds:02}.{tenths}")
 }
 
 /// Lifecycle of the in-app transcription job.
@@ -280,6 +345,22 @@ pub struct AppState {
     pub last_engine: Option<EngineId>,
     /// Set when the most recent finished job was written to the library.
     pub last_insert: Option<SaveOutcome>,
+    /// Microphone/system-audio recording state (M3).
+    pub record: RecordState,
+    /// Model-manager state (M3): rows, download progress, last action.
+    pub model_manager: ModelManager,
+    /// Settings-form state (M3).
+    pub settings_form: SettingsForm,
+    /// Enumerated input device names (for the Audio source dropdown).
+    pub audio_devices: Vec<String>,
+    /// Enumeration problem (no capture compiled / no host support), shown as a note.
+    pub audio_devices_error: Option<String>,
+    /// A temp recording to delete once its transcript is saved (`keep_audio` off).
+    pub pending_recording_cleanup: Option<PathBuf>,
+    /// Whether this build has capture compiled in — the record control's enable
+    /// (set from [`capture::CAPTURE_COMPILED`] at startup; a field so the state
+    /// machine is testable headless on Linux builds).
+    pub capture_available: bool,
 }
 
 /// Side effects the runtime executes after a frame (or an event).
@@ -301,6 +382,25 @@ pub enum Effect {
         format: ExportFormat,
         dest: PathBuf,
     },
+    /// Open the microphone / system-audio tap (runtime owns the cpal session).
+    StartCapture,
+    /// Close the session, write the recording wav (`keep_audio` decides where) and
+    /// continue into the job flow.
+    StopCapture { title: String },
+    /// Delete a temp recording after its transcript was saved.
+    DiscardRecording { path: PathBuf },
+    /// Refresh the model-manager table from the manifest + filesystem.
+    RefreshModels,
+    /// Download a model in the background (progress polled by the runtime).
+    DownloadModel { id: String },
+    /// Delete a model (decoder + unshared encoder, M1.5 rule).
+    DeleteModel { id: String },
+    /// Write `settings.model_id = id`.
+    SetDefaultModel { id: String },
+    /// Enumerate input devices for the Audio source dropdown.
+    RefreshAudioDevices,
+    /// Persist the settings form (toml; keychain on macOS/Windows).
+    SaveSettings { form: Box<SettingsForm> },
 }
 
 impl Default for AppState {
@@ -321,6 +421,13 @@ impl AppState {
             status: None,
             last_engine: None,
             last_insert: None,
+            record: RecordState::Idle,
+            model_manager: ModelManager::default(),
+            settings_form: SettingsForm::from_settings(&suramak_core::settings::Settings::default()),
+            audio_devices: Vec::new(),
+            audio_devices_error: None,
+            pending_recording_cleanup: None,
+            capture_available: capture::CAPTURE_COMPILED,
         }
     }
 
@@ -329,9 +436,11 @@ impl AppState {
         vec![Effect::RefreshLibrary]
     }
 
-    /// Whether the UI wants the periodic tick (job running / dirty edits).
+    /// Whether the UI wants the periodic tick (job running / dirty edits / recording).
     pub fn busy(&self) -> bool {
-        matches!(self.job, Job::Running(_)) || self.editor.as_ref().is_some_and(|e| e.dirty)
+        matches!(self.job, Job::Running(_))
+            || self.editor.as_ref().is_some_and(|e| e.dirty)
+            || matches!(self.record, RecordState::Recording(_))
     }
 
     pub fn set_status(&mut self, text: impl Into<String>, error: bool) {
@@ -345,9 +454,213 @@ impl AppState {
         self.home.drop_hover = hover;
     }
 
+    // ---- recording (M3) -----------------------------------------------------
+
+    /// Whether the chrome-strip record dot can start a session: capture compiled in,
+    /// no job running, not already recording.
+    pub fn can_record(&self) -> bool {
+        self.capture_available
+            && !matches!(self.job, Job::Running(_))
+            && !matches!(self.record, RecordState::Recording(_))
+    }
+
+    /// Record dot pressed: opens the recording view and asks the runtime to start.
+    pub fn start_recording(&mut self, now: Instant, date: &str) -> Vec<Effect> {
+        if !self.can_record() {
+            return Vec::new();
+        }
+        self.status = None;
+        self.home.error = None;
+        self.last_insert = None;
+        self.record = RecordState::Recording(Recording {
+            title: format!("Recording {date}"),
+            started_at: now,
+            elapsed: Duration::ZERO,
+            rms: 0.0,
+            waveform: Vec::new(),
+            device: None,
+            stopping: false,
+        });
+        self.route = Route::Record;
+        vec![Effect::StartCapture]
+    }
+
+    /// Runtime: capture is live on this device.
+    pub fn record_device(&mut self, device: String) {
+        if let RecordState::Recording(recording) = &mut self.record {
+            recording.device = Some(device);
+        }
+    }
+
+    /// Meter sample (one per tick while recording).
+    pub fn record_sample(&mut self, rms: f32) {
+        if let RecordState::Recording(recording) = &mut self.record {
+            let level = rms.clamp(0.0, 1.0);
+            recording.rms = level;
+            recording.waveform.push(level);
+            let overflow = recording
+                .waveform
+                .len()
+                .saturating_sub(RECORD_WAVEFORM_BARS);
+            if overflow > 0 {
+                recording.waveform.drain(..overflow);
+            }
+        }
+    }
+
+    /// Stop pressed in the record view (idempotent until the runtime answers).
+    pub fn stop_recording(&mut self) -> Vec<Effect> {
+        match &mut self.record {
+            RecordState::Recording(recording) if !recording.stopping => {
+                recording.stopping = true;
+                vec![Effect::StopCapture {
+                    title: recording.title.clone(),
+                }]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Runtime: the recording wav is written; continue into the existing job flow.
+    ///
+    /// `keep == false` → the temp file is remembered and deleted once the transcript
+    /// was saved (see [`AppState::on_transcript_saved`]); on a failed save it stays
+    /// for a retry.
+    pub fn on_recording_stopped(&mut self, wav: PathBuf, keep: bool) -> Vec<Effect> {
+        self.record = RecordState::Idle;
+        if !wav.is_file() {
+            self.record_failed(format!("recording file missing: {}", wav.display()));
+            return Vec::new();
+        }
+        self.pending_recording_cleanup = if keep { None } else { Some(wav.clone()) };
+        self.begin_import(wav)
+    }
+
+    /// Capture could not start (or the wav could not be written): show the runtime's
+    /// message in the record view.
+    pub fn record_failed(&mut self, message: String) {
+        self.record = RecordState::Failed {
+            message: message.clone(),
+        };
+        self.set_status(message, true);
+        self.route = Route::Record;
+    }
+
+    /// Back from the failed record view.
+    pub fn leave_record(&mut self) -> Vec<Effect> {
+        self.record = RecordState::Idle;
+        self.route = Route::Home;
+        Vec::new()
+    }
+
+    // ---- model manager (M3) -------------------------------------------------
+
+    /// Home → Models (the runtime rebuilds the table).
+    pub fn open_models(&mut self) -> Vec<Effect> {
+        self.route = Route::Models;
+        vec![Effect::RefreshModels]
+    }
+
+    /// Runtime: fresh table rows.
+    pub fn on_models_loaded(&mut self, rows: Vec<ModelRow>) {
+        self.model_manager.rows = rows;
+    }
+
+    /// Download pressed for `id`.
+    pub fn start_model_download(&mut self, id: &str) -> Vec<Effect> {
+        if !self.model_manager.begin_download(id) {
+            return Vec::new();
+        }
+        vec![Effect::DownloadModel { id: id.to_string() }]
+    }
+
+    /// Download progress polled by the runtime.
+    pub fn on_download_progress(&mut self, bytes_done: u64, bytes_total: u64) {
+        self.model_manager.on_progress(bytes_done, bytes_total);
+    }
+
+    /// Download finished (Ok/Err) → refresh the table (the row's state changed).
+    pub fn on_download_done(&mut self, id: &str, result: Result<(), String>) -> Vec<Effect> {
+        self.model_manager.on_download_done(id, result);
+        vec![Effect::RefreshModels]
+    }
+
+    /// Delete pressed for `id`.
+    pub fn delete_model(&mut self, id: &str) -> Vec<Effect> {
+        vec![Effect::DeleteModel { id: id.to_string() }]
+    }
+
+    /// Delete executed → status + refresh.
+    pub fn on_model_deleted(
+        &mut self,
+        id: &str,
+        result: Result<Vec<String>, String>,
+    ) -> Vec<Effect> {
+        self.model_manager.status = Some(match result {
+            Ok(removed) if removed.is_empty() => {
+                Ok(format!("{id} is not installed — nothing to remove"))
+            }
+            Ok(removed) => Ok(format!("{id}: removed {} file(s)", removed.len())),
+            Err(err) => Err(err),
+        });
+        vec![Effect::RefreshModels]
+    }
+
+    /// Set-default pressed for `id`.
+    pub fn set_default_model(&mut self, id: &str) -> Vec<Effect> {
+        vec![Effect::SetDefaultModel { id: id.to_string() }]
+    }
+
+    /// Set-default executed → status + refresh (the default marker follows).
+    pub fn on_default_set(&mut self, id: &str, result: Result<(), String>) -> Vec<Effect> {
+        self.model_manager.status = Some(match result {
+            Ok(()) => Ok(format!("{id} is now the default model")),
+            Err(err) => Err(err),
+        });
+        vec![Effect::RefreshModels]
+    }
+
+    // ---- settings (M3) ------------------------------------------------------
+
+    /// Home → Settings (also re-enumerates the audio devices for the dropdown).
+    pub fn open_settings(&mut self) -> Vec<Effect> {
+        self.route = Route::Settings;
+        vec![Effect::RefreshAudioDevices]
+    }
+
+    /// Runtime: enumerated input devices for the Audio source dropdown.
+    pub fn on_audio_devices(&mut self, devices: Vec<String>, error: Option<String>) {
+        self.audio_devices = devices;
+        self.audio_devices_error = error;
+    }
+
+    /// Save pressed: the runtime applies the form (toml write + keychain).
+    pub fn save_settings(&mut self) -> Vec<Effect> {
+        vec![Effect::SaveSettings {
+            form: Box::new(self.settings_form.clone()),
+        }]
+    }
+
+    /// Save result from the runtime.
+    pub fn on_settings_saved(&mut self, result: Result<String, String>) {
+        self.settings_form.dirty = result.is_err();
+        self.settings_form.status = Some(result);
+    }
+
+    /// Reset-to-defaults (form-only until Save).
+    pub fn reset_settings_form(&mut self) {
+        self.settings_form.reset();
+    }
+
+    // ---- import (M2) --------------------------------------------------------
+
     /// Import request from a drop, the dialog or the path field. Validates the
     /// path, switches to the transcribe route and asks the runtime to submit.
     pub fn begin_import(&mut self, input: PathBuf) -> Vec<Effect> {
+        // A live recording owns the audio session: imports are ignored until it stops.
+        if matches!(self.record, RecordState::Recording(_)) {
+            return Vec::new();
+        }
         if !input.is_file() {
             self.home.error = Some(format!("file not found: {}", input.display()));
             return Vec::new();
@@ -466,10 +779,19 @@ impl AppState {
                 };
                 self.set_status(text, false);
                 self.last_insert = Some(SaveOutcome {
-                    transcript,
+                    transcript: transcript.clone(),
                     error: None,
                 });
-                vec![Effect::RefreshLibrary]
+                let mut effects = vec![Effect::RefreshLibrary];
+                // keep_audio off: the temp recording goes now that its transcript
+                // is safely in the library (a failed save keeps it for a retry).
+                if let Some(path) = self.pending_recording_cleanup.clone() {
+                    if transcript.audio_path.as_deref() == Some(path.as_path()) {
+                        self.pending_recording_cleanup = None;
+                        effects.push(Effect::DiscardRecording { path });
+                    }
+                }
+                effects
             }
             Err(err) => {
                 self.set_status(format!("could not save to library: {err}"), true);
@@ -502,6 +824,10 @@ impl AppState {
     /// Library row clicked: load into the editor (or return to it when it is
     /// already open, keeping the edit buffers).
     pub fn select_library(&mut self, index: usize) -> Vec<Effect> {
+        // A live recording owns the route (its Stop button is the only exit).
+        if matches!(self.record, RecordState::Recording(_)) {
+            return Vec::new();
+        }
         let Some(item) = self.library.items.get(index).cloned() else {
             return Vec::new();
         };
@@ -531,8 +857,11 @@ impl AppState {
         self.flush_edits()
     }
 
-    /// The periodic tick: autosave debounce (and nothing else, for now).
+    /// The periodic tick: recording clock + autosave debounce.
     pub fn tick(&mut self, now: Instant) -> Vec<Effect> {
+        if let RecordState::Recording(recording) = &mut self.record {
+            recording.elapsed = now.saturating_duration_since(recording.started_at);
+        }
         let Some(editor) = &mut self.editor else {
             return Vec::new();
         };
@@ -667,7 +996,7 @@ pub fn resolve_model_path(settings_model_id: &str, models_dir: &Path) -> Result<
         }
     }
     let installed = |id: &str| {
-        models::find_model(id)
+        core_models::find_model(id)
             .map(|info| models_dir.join(info.hf_file))
             .filter(|path| path.is_file())
     };
@@ -1162,5 +1491,320 @@ mod tests {
         let err = resolve_model_path("turbo-q5-0", &dir).unwrap_err();
         assert!(err.contains("no model installed"), "unexpected: {err}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- M3: recording state machine ----------------------------------------
+
+    /// An AppState with capture "compiled in" (the Linux default build has it off;
+    /// the state machine is exercised here regardless — that is the point).
+    fn recording_state() -> AppState {
+        let mut state = AppState::new();
+        state.capture_available = true;
+        state
+    }
+
+    fn transcript_with_audio(title: &str, path: &Path) -> Transcript {
+        let mut t = transcript(title);
+        t.audio_path = Some(path.to_path_buf());
+        t
+    }
+
+    #[test]
+    fn recording_start_stop_runs_the_existing_job_flow() {
+        let mut state = recording_state();
+        let t0 = Instant::now();
+        let effects = state.start_recording(t0, "2026-10-13 14:05:33");
+        assert!(matches!(effects.as_slice(), [Effect::StartCapture]));
+        assert_eq!(state.route, Route::Record);
+        assert!(state.busy(), "recording keeps the tick alive");
+        match &state.record {
+            RecordState::Recording(rec) => {
+                assert_eq!(rec.title, "Recording 2026-10-13 14:05:33");
+                assert_eq!(rec.elapsed, Duration::ZERO);
+                assert!(rec.device.is_none());
+                assert!(!rec.stopping);
+            }
+            other => panic!("expected a recording, got {other:?}"),
+        }
+
+        // Meter samples + the timer.
+        state.record_device("MacBook Microphone".to_string());
+        state.record_sample(0.4);
+        state.record_sample(0.6);
+        state.tick(t0 + Duration::from_millis(7_300));
+        match &state.record {
+            RecordState::Recording(rec) => {
+                assert_eq!(rec.device.as_deref(), Some("MacBook Microphone"));
+                assert_eq!(rec.waveform, vec![0.4, 0.6]);
+                assert!((rec.rms - 0.6).abs() < 1e-6);
+                assert_eq!(rec.elapsed, Duration::from_millis(7_300));
+                assert_eq!(format_elapsed(rec.elapsed), "00:07.3");
+            }
+            other => panic!("expected a recording, got {other:?}"),
+        }
+
+        // Stop is idempotent until the runtime answers.
+        let effects = state.stop_recording();
+        let title = match effects.as_slice() {
+            [Effect::StopCapture { title }] => title.clone(),
+            other => panic!("expected a stop effect, got {other:?}"),
+        };
+        assert_eq!(title, "Recording 2026-10-13 14:05:33");
+        assert!(state.stop_recording().is_empty(), "no double stop");
+        assert!(matches!(state.record, RecordState::Recording(_)));
+
+        // The runtime wrote the wav (temp dir, keep_audio off) → job flow.
+        let wav = temp_wav("recorded");
+        let effects = state.on_recording_stopped(wav.clone(), false);
+        assert!(matches!(effects.as_slice(), [Effect::SubmitJob { .. }]));
+        assert_eq!(state.route, Route::Transcribe);
+        assert!(matches!(state.job, Job::Running(_)));
+        assert_eq!(
+            state.pending_recording_cleanup.as_deref(),
+            Some(wav.as_path())
+        );
+        assert!(matches!(state.record, RecordState::Idle));
+        // The file stem is the title (the transcript title comes from it).
+        assert_eq!(
+            recording_file_stem("Recording 2026-10-13 14:05:33"),
+            "Recording 2026-10-13 14-05-33"
+        );
+        assert_eq!(format_elapsed(Duration::from_millis(62_040)), "01:02.0");
+    }
+
+    #[test]
+    fn recording_failure_is_shown_and_recoverable() {
+        let mut state = recording_state();
+        state.start_recording(Instant::now(), "2026-10-13 14:05:33");
+        state.record_failed("no default input device".to_string());
+        match &state.record {
+            RecordState::Failed { message } => assert_eq!(message, "no default input device"),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        assert_eq!(state.route, Route::Record, "the error stays visible");
+        assert!(state.status.as_ref().unwrap().error);
+        assert!(!state.busy(), "a failed recording releases the tick");
+
+        let effects = state.leave_record();
+        assert!(effects.is_empty());
+        assert!(matches!(state.record, RecordState::Idle));
+        assert_eq!(state.route, Route::Home);
+    }
+
+    #[test]
+    fn recording_is_disabled_while_a_job_runs_and_without_capture() {
+        let mut state = recording_state();
+        state.begin_import(temp_wav("busy"));
+        assert!(!state.can_record(), "a running job locks the record dot");
+        assert!(state.start_recording(Instant::now(), "d").is_empty());
+
+        // Without capture compiled the dot is dead too (the Linux default build).
+        let mut plain = AppState::new();
+        assert_eq!(plain.capture_available, capture::CAPTURE_COMPILED);
+        assert_eq!(
+            plain.can_record(),
+            capture::CAPTURE_COMPILED,
+            "the probe is the build's capture feature"
+        );
+        plain.capture_available = false;
+        assert!(!plain.can_record());
+        assert!(plain.start_recording(Instant::now(), "d").is_empty());
+        assert!(matches!(plain.record, RecordState::Idle));
+    }
+
+    #[test]
+    fn a_recording_owns_the_audio_session() {
+        let mut state = recording_state();
+        state.on_library_loaded(vec![transcript("open.wav")], None);
+        state.start_recording(Instant::now(), "2026-10-13 14:05:33");
+
+        // Imports and library clicks are ignored while recording.
+        assert!(state.begin_import(temp_wav("import")).is_empty());
+        assert!(state.select_library(0).is_empty());
+        assert_eq!(state.route, Route::Record);
+
+        // The waveform is a rolling window of RECORD_WAVEFORM_BARS samples.
+        for i in 0..(RECORD_WAVEFORM_BARS + 10) {
+            state.record_sample(i as f32 / 200.0);
+        }
+        match &state.record {
+            RecordState::Recording(rec) => {
+                assert_eq!(rec.waveform.len(), RECORD_WAVEFORM_BARS);
+                assert!((rec.rms - (RECORD_WAVEFORM_BARS as f32 + 9.0) / 200.0).abs() < 1e-6);
+                assert_eq!(rec.waveform[0], 10.0 / 200.0, "oldest samples dropped");
+            }
+            other => panic!("expected a recording, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn temp_recordings_are_discarded_only_after_a_successful_save() {
+        let wav = temp_wav("temp-record");
+        let mut state = recording_state();
+        state.start_recording(Instant::now(), "2026-10-13 14:05:33");
+        state.stop_recording();
+        state.on_recording_stopped(wav.clone(), false);
+
+        // Job completes; the library save FAILS → the temp file stays for a retry.
+        state.on_worker_event(finished_event(transcript_with_audio(
+            "Recording x.wav",
+            &wav,
+        )));
+        let effects = state.on_transcript_saved(
+            transcript_with_audio("Recording x.wav", &wav),
+            Err("database is locked".to_string()),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(
+            state.pending_recording_cleanup.as_deref(),
+            Some(wav.as_path())
+        );
+
+        // A successful save discards it.
+        let effects =
+            state.on_transcript_saved(transcript_with_audio("Recording x.wav", &wav), Ok(()));
+        assert!(matches!(effects[0], Effect::RefreshLibrary));
+        match &effects[1] {
+            Effect::DiscardRecording { path } => assert_eq!(path, &wav),
+            other => panic!("expected a discard effect, got {other:?}"),
+        }
+        assert!(state.pending_recording_cleanup.is_none());
+
+        // keep_audio on → nothing is discarded.
+        let kept = temp_wav("kept-record");
+        let mut state = recording_state();
+        state.start_recording(Instant::now(), "2026-10-13 14:05:33");
+        state.stop_recording();
+        state.on_recording_stopped(kept.clone(), true);
+        assert!(state.pending_recording_cleanup.is_none());
+        let effects =
+            state.on_transcript_saved(transcript_with_audio("Recording y.wav", &kept), Ok(()));
+        assert_eq!(effects.len(), 1, "only the library refresh");
+    }
+
+    // ---- M3: model manager ---------------------------------------------------
+
+    #[test]
+    fn model_manager_actions_flow_through_effects() {
+        let mut state = AppState::new();
+        let effects = state.open_models();
+        assert!(matches!(effects.as_slice(), [Effect::RefreshModels]));
+        assert_eq!(state.route, Route::Models);
+
+        state.on_models_loaded(vec![ModelRow {
+            id: "tiny",
+            hf_file: "ggml-tiny.bin",
+            size_bytes: 77_691_713,
+            role: "CI + tests",
+            install: model_manager::InstallState::Missing,
+            encoder: model_manager::EncoderState::Missing,
+            is_default: false,
+        }]);
+        assert_eq!(state.model_manager.rows.len(), 1);
+
+        // Download start → effect + running state; a second start is ignored.
+        let effects = state.start_model_download("tiny");
+        assert!(matches!(effects.as_slice(), [Effect::DownloadModel { .. }]));
+        assert!(state.start_model_download("base").is_empty());
+        state.on_download_progress(38_845_856, 77_691_713);
+        assert_eq!(state.model_manager.download.percent(), Some(49));
+        let effects = state.on_download_done("tiny", Ok(()));
+        assert!(matches!(effects.as_slice(), [Effect::RefreshModels]));
+        assert!(state.model_manager.status.as_ref().unwrap().is_ok());
+
+        // Delete → effect; the result line follows the runtime's answer.
+        let effects = state.delete_model("small");
+        assert!(matches!(effects.as_slice(), [Effect::DeleteModel { .. }]));
+        let effects = state.on_model_deleted("small", Ok(vec!["/m/ggml-small.bin".to_string()]));
+        assert!(matches!(effects.as_slice(), [Effect::RefreshModels]));
+        assert!(state
+            .model_manager
+            .status
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .contains("1 file(s)"));
+
+        // Set default → effect; the marker refresh follows.
+        let effects = state.set_default_model("tiny");
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::SetDefaultModel { .. }]
+        ));
+        let effects = state.on_default_set("tiny", Ok(()));
+        assert!(matches!(effects.as_slice(), [Effect::RefreshModels]));
+        assert!(state
+            .model_manager
+            .status
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .contains("default"));
+    }
+
+    // ---- M3: settings --------------------------------------------------------
+
+    #[test]
+    fn settings_save_and_reset_flow() {
+        let mut state = AppState::new();
+        let effects = state.open_settings();
+        assert!(matches!(effects.as_slice(), [Effect::RefreshAudioDevices]));
+        assert_eq!(state.route, Route::Settings);
+
+        state.on_audio_devices(
+            vec![
+                "MacBook Microphone".to_string(),
+                "BlackHole 2ch".to_string(),
+            ],
+            None,
+        );
+        assert_eq!(state.audio_devices.len(), 2);
+
+        // Save carries the current form values.
+        state.settings_form.keep_audio = true;
+        state.settings_form.engine = EngineSetting::Cpu;
+        state.settings_form.dirty = true;
+        let effects = state.save_settings();
+        match effects.as_slice() {
+            [Effect::SaveSettings { form }] => {
+                assert!(form.keep_audio);
+                assert_eq!(form.engine, EngineSetting::Cpu);
+            }
+            other => panic!("expected a save effect, got {other:?}"),
+        }
+
+        state.on_settings_saved(Ok("settings saved".to_string()));
+        assert!(!state.settings_form.dirty);
+        assert!(state.settings_form.status.as_ref().unwrap().is_ok());
+
+        // A failed save keeps the dirty marker for a retry.
+        state.on_settings_saved(Err("disk full".to_string()));
+        assert!(state.settings_form.dirty);
+        assert!(state.settings_form.status.as_ref().unwrap().is_err());
+
+        // Reset is form-only: defaults appear, nothing is persisted here.
+        state.reset_settings_form();
+        assert_eq!(state.settings_form.model_id, "turbo-q5-0");
+        assert!(!state.settings_form.keep_audio);
+        assert!(state.settings_form.dirty);
+    }
+
+    #[test]
+    fn home_error_note_when_capture_is_unavailable() {
+        // The home view reads `capture_available` to show the disabled-dot note;
+        // the probe is the asr crate's compile-time flag (`capture` feature).
+        let state = AppState::new();
+        assert_eq!(state.capture_available, capture::CAPTURE_COMPILED);
+
+        // On a build without capture the dot is dead by default; with the flag
+        // cleared it is dead even on a capture-capable build.
+        let mut plain = AppState::new();
+        if !capture::CAPTURE_COMPILED {
+            assert!(!plain.can_record());
+        }
+        plain.capture_available = false;
+        assert!(!plain.can_record());
     }
 }

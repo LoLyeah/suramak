@@ -17,7 +17,11 @@ serde_json = { workspace = true }
 
 [features]
 # Microphone capture (cpal). OFF by default so Linux builds never need ALSA headers.
-capture = ["dep:cpal"]
+# `suramak-taps` (macOS system audio, Addendum A) rides along with it.
+capture = ["dep:cpal", "dep:suramak-taps"]
+# Device-enumeration smoke test (open no stream; CI runners have no microphone).
+# Implies `capture`. Used by the macOS CI job; compiles everywhere.
+capture-test = ["capture"]
 # Core ML (ANE) encoder support. Pure passthrough to whisper-rs; enabled for macOS
 # targets below (see `[target.'cfg(target_os = "macos")'.dependencies]`), and available
 # on every target so the CI cross-check can compile it explicitly.
@@ -25,6 +29,11 @@ coreml = ["whisper-rs/coreml"]
 
 [dependencies.cpal]
 version = "0.15.3"
+optional = true
+
+[dependencies.suramak-taps]
+# macOS system-audio taps; no-op stubs elsewhere (pure Rust).
+path = "../suramak-taps"
 optional = true
 
 [target.'cfg(target_os = "macos")'.dependencies]

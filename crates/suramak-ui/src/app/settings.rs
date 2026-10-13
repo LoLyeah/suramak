@@ -1,0 +1,416 @@
+//! Settings route (M3): engine, default model/language, keep_audio + Audio source,
+//! the recordings folder, and the polish section (base URL / model / keychain key).
+//!
+//! All form rules live in `app::settings_form` (egui-free, unit-tested); this view
+//! edits that form and asks the runtime to persist it (`Effect::SaveSettings`).
+
+use egui::{pos2, vec2, Align2, FontFamily, FontId, Rect};
+
+use suramak_core::models as core_models;
+use suramak_core::settings::{AudioSource, EngineSetting};
+
+use crate::theme::Palette;
+
+use super::settings_form::{self, SettingsForm, LANGUAGES};
+use super::views::{pane_caption, pane_title, PANE_PAD_X};
+use super::{AppState, Effect};
+
+/// System-audio entries exist on macOS builds only (hidden elsewhere; Addendum A).
+const SYSTEM_AUDIO_OFFERED: bool = cfg!(target_os = "macos");
+
+const ROW_H: f32 = 26.0;
+const LABEL_W: f32 = 150.0;
+
+pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &mut Vec<Effect>) {
+    let rect = ui.max_rect();
+    let left = rect.left() + PANE_PAD_X;
+    let right = rect.right() - PANE_PAD_X;
+
+    ui.horizontal(|ui| {
+        ui.add_space(PANE_PAD_X - 8.0);
+        ui.vertical(|ui| {
+            pane_title(ui, "Settings", palette);
+            pane_caption(
+                ui,
+                "Everything is stored locally (settings.toml); nothing here leaves this machine except model downloads and polish calls",
+                palette,
+                false,
+            );
+        });
+    });
+
+    // The form sections borrow only `state.settings_form`; device snapshots are
+    // copied out first so the borrows stay disjoint.
+    let devices = state.audio_devices.clone();
+    let device_error = state.audio_devices_error.clone();
+    let mut y = rect.top() + 96.0;
+
+    let mut dirty = false;
+    {
+        let form = &mut state.settings_form;
+        dirty |= transcription_section(ui, palette, form, left, right, &mut y);
+        dirty |= audio_source_section(
+            ui,
+            palette,
+            form,
+            &devices,
+            device_error.as_deref(),
+            left,
+            right,
+            &mut y,
+        );
+        dirty |= polish_section(ui, palette, form, left, right, &mut y);
+    }
+
+    // ---- actions ------------------------------------------------------------
+    let actions = Rect::from_min_size(pos2(left, y + 8.0), vec2(right - left, 62.0));
+    ui.scope_builder(egui::UiBuilder::new().max_rect(actions), |ui| {
+        ui.horizontal(|ui| {
+            if ui.button("Back").clicked() {
+                effects.extend(state.back_home());
+            }
+            ui.add_space(6.0);
+            if ui.button("Save").clicked() {
+                effects.extend(state.save_settings());
+            }
+            if ui.button("Reset to defaults").clicked() {
+                state.reset_settings_form();
+            }
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if let Some(status) = &state.settings_form.status {
+                match status {
+                    Ok(note) => pane_caption(ui, note, palette, false),
+                    Err(err) => pane_caption(ui, err, palette, true),
+                }
+            } else if dirty {
+                pane_caption(ui, "unsaved changes — press Save", palette, false);
+            }
+        });
+    });
+}
+
+/// Engine / default model / default language / keep_audio / recordings folder.
+/// Returns whether the user changed something.
+fn transcription_section(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    form: &mut SettingsForm,
+    left: f32,
+    right: f32,
+    y: &mut f32,
+) -> bool {
+    let mut dirty = false;
+    section(ui, palette, left, y, "Transcription");
+
+    // Engine.
+    label(ui, palette, left, *y, "Engine");
+    inside(ui, left, right, *y, |ui| {
+        for (setting, name) in [
+            (EngineSetting::Auto, "auto"),
+            (EngineSetting::CoreML, "coreml"),
+            (EngineSetting::Metal, "metal"),
+            (EngineSetting::Cpu, "cpu"),
+        ] {
+            if ui
+                .selectable_value(&mut form.engine, setting, name)
+                .changed()
+            {
+                dirty = true;
+            }
+        }
+    });
+    *y += ROW_H;
+
+    // Default model.
+    label(ui, palette, left, *y, "Default model");
+    let current = form.model_id.clone();
+    let mut chosen = current.clone();
+    inside(ui, left, right, *y, |ui| {
+        egui::ComboBox::from_id_salt("suramak-default-model")
+            .selected_text(chosen.clone())
+            .show_ui(ui, |ui| {
+                for option in model_options(&current) {
+                    ui.selectable_value(&mut chosen, option.clone(), option);
+                }
+            });
+        if !core_models::MODELS.iter().any(|m| m.id == current) && current != "auto" {
+            pane_caption(
+                ui,
+                "not a manifest id — treated as a file path at transcribe time",
+                palette,
+                false,
+            );
+        }
+    });
+    if chosen != current {
+        form.model_id = chosen;
+        dirty = true;
+    }
+    *y += ROW_H;
+
+    // Default language.
+    label(ui, palette, left, *y, "Default language");
+    inside(ui, left, right, *y, |ui| {
+        for value in LANGUAGES {
+            if ui
+                .selectable_value(&mut form.language, value.to_string(), value)
+                .changed()
+            {
+                dirty = true;
+            }
+        }
+        if !LANGUAGES.contains(&form.language.as_str()) {
+            pane_caption(
+                ui,
+                &format!("custom: {} — not offered here", form.language),
+                palette,
+                false,
+            );
+        }
+    });
+    *y += ROW_H;
+
+    // keep_audio.
+    label(ui, palette, left, *y, "Keep recordings");
+    inside(ui, left, right, *y, |ui| {
+        if ui
+            .checkbox(&mut form.keep_audio, "keep audio after transcription")
+            .changed()
+        {
+            dirty = true;
+        }
+    });
+    *y += ROW_H;
+
+    // Recordings folder display.
+    label(ui, palette, left, *y, "Recordings folder");
+    let recordings = suramak_core::paths::recordings_dir()
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_else(|_| "unavailable".to_string());
+    inside(ui, left, right, *y, |ui| {
+        let text = if form.keep_audio {
+            recordings
+        } else {
+            "off — recordings go to the temp dir and are deleted after the transcript is saved"
+                .to_string()
+        };
+        ui.label(
+            egui::RichText::new(text)
+                .family(FontFamily::Monospace)
+                .size(11.5)
+                .color(palette.text_dim),
+        );
+    });
+    *y += ROW_H + 8.0;
+    dirty
+}
+
+/// Audio source dropdown (Addendum A) + enumeration notes.
+#[allow(clippy::too_many_arguments)]
+fn audio_source_section(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    form: &mut SettingsForm,
+    devices: &[String],
+    device_error: Option<&str>,
+    left: f32,
+    right: f32,
+    y: &mut f32,
+) -> bool {
+    let mut dirty = false;
+    section(ui, palette, left, y, "Audio source");
+
+    label(ui, palette, left, *y, "Input");
+    let current = settings_form::audio_source_key(&form.audio_source);
+    let mut chosen = current.clone();
+    inside(ui, left, right, *y, |ui| {
+        egui::ComboBox::from_id_salt("suramak-audio-source")
+            .selected_text(audio_source_label(&form.audio_source))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut chosen, "default".to_string(), "Default microphone");
+                for name in devices {
+                    ui.selectable_value(&mut chosen, format!("device:{name}"), name);
+                }
+                if SYSTEM_AUDIO_OFFERED {
+                    ui.selectable_value(
+                        &mut chosen,
+                        "system".to_string(),
+                        "System audio (all processes except Suramak)",
+                    );
+                }
+            });
+    });
+    if chosen != current {
+        form.audio_source = settings_form::audio_source_from_key(&chosen);
+        dirty = true;
+    }
+    *y += ROW_H;
+
+    ui.scope_builder(
+        egui::UiBuilder::new().max_rect(Rect::from_min_size(
+            pos2(left, *y),
+            vec2(right - left, 44.0),
+        )),
+        |ui| {
+            ui.horizontal(|ui| {
+                if let Some(error) = device_error {
+                    pane_caption(ui, &format!("input devices: {error}"), palette, true);
+                } else if devices.is_empty() {
+                    pane_caption(
+                        ui,
+                        "no input devices enumerated — the default entry still opens the system default input",
+                        palette,
+                        false,
+                    );
+                } else {
+                    pane_caption(
+                        ui,
+                        &format!(
+                            "{} input device(s) enumerated (virtual loopback devices like BlackHole appear here)",
+                            devices.len()
+                        ),
+                        palette,
+                        false,
+                    );
+                }
+            });
+            if matches!(form.audio_source, AudioSource::SystemAudio) && !SYSTEM_AUDIO_OFFERED {
+                ui.horizontal(|ui| {
+                    pane_caption(
+                        ui,
+                        "system audio capture needs a macOS build (CoreAudio process taps, macOS 14.2+) — \
+                         recording fails with that message here",
+                        palette,
+                        true,
+                    );
+                });
+            }
+        },
+    );
+    *y += 46.0;
+    dirty
+}
+
+/// Polish section: base URL / model / keychain key (macOS/Windows only).
+fn polish_section(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    form: &mut SettingsForm,
+    left: f32,
+    right: f32,
+    y: &mut f32,
+) -> bool {
+    let mut dirty = false;
+    section(ui, palette, left, y, "Polish (LLM tidy-up)");
+
+    label(ui, palette, left, *y, "Base URL");
+    inside(ui, left, right, *y, |ui| {
+        let response = ui.add_sized(
+            [360.0, 22.0],
+            egui::TextEdit::singleline(&mut form.polish_base_url)
+                .hint_text(settings_form::DEFAULT_POLISH_BASE_URL),
+        );
+        if response.changed() {
+            dirty = true;
+        }
+    });
+    *y += ROW_H;
+
+    label(ui, palette, left, *y, "Model");
+    inside(ui, left, right, *y, |ui| {
+        let response = ui.add_sized(
+            [360.0, 22.0],
+            egui::TextEdit::singleline(&mut form.polish_model).hint_text("e.g. gpt-4o-mini"),
+        );
+        if response.changed() {
+            dirty = true;
+        }
+    });
+    *y += ROW_H;
+
+    label(ui, palette, left, *y, "API key");
+    inside(ui, left, right, *y, |ui| {
+        if settings_form::api_key_supported() {
+            let response = ui.add_sized(
+                [360.0, 22.0],
+                egui::TextEdit::singleline(&mut form.api_key)
+                    .password(true)
+                    .hint_text("stored in the OS keychain — never in settings.toml"),
+            );
+            if response.changed() {
+                dirty = true;
+            }
+        } else {
+            pane_caption(
+                ui,
+                "hidden on this platform — the key lives in the OS keychain on macOS/Windows; \
+                 here set SURAMAK_OPENAI_API_KEY in the environment",
+                palette,
+                false,
+            );
+        }
+    });
+    *y += ROW_H + 12.0;
+    dirty
+}
+
+/// The dropdown label for the current audio source.
+fn audio_source_label(source: &AudioSource) -> String {
+    match source {
+        AudioSource::Default => "Default microphone".to_string(),
+        AudioSource::Device { name } => name.clone(),
+        AudioSource::SystemAudio => "System audio (all processes except Suramak)".to_string(),
+    }
+}
+
+/// Model dropdown options: `auto` + every manifest id (+ a custom value if the
+/// settings carry one).
+fn model_options(current: &str) -> Vec<String> {
+    let mut options = vec!["auto".to_string()];
+    options.extend(core_models::MODELS.iter().map(|m| m.id.to_string()));
+    if !options.iter().any(|option| option == current) {
+        options.insert(1, current.to_string());
+    }
+    options
+}
+
+/// Section heading; advances `y` past it.
+fn section(ui: &mut egui::Ui, palette: &Palette, left: f32, y: &mut f32, title: &str) {
+    ui.scope_builder(
+        egui::UiBuilder::new().max_rect(Rect::from_min_size(pos2(left, *y), vec2(400.0, 26.0))),
+        |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(title)
+                        .font(FontId::new(17.0, crate::theme::serif_family()))
+                        .color(palette.text),
+                );
+            });
+        },
+    );
+    *y += 30.0;
+}
+
+/// Left-hand row label painted at `y`.
+fn label(ui: &mut egui::Ui, palette: &Palette, left: f32, y: f32, text: &str) {
+    ui.painter().text(
+        pos2(left + 2.0, y + 4.0),
+        Align2::LEFT_TOP,
+        text,
+        FontId::new(12.0, FontFamily::Proportional),
+        palette.text_dim,
+    );
+}
+
+/// Runs `body` in the field column of row `y`.
+fn inside(ui: &mut egui::Ui, left: f32, right: f32, y: f32, body: impl FnOnce(&mut egui::Ui)) {
+    let rect = Rect::from_min_size(
+        pos2(left + LABEL_W, y),
+        vec2((right - left - LABEL_W).max(120.0), ROW_H),
+    );
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+        ui.horizontal(body);
+    });
+}

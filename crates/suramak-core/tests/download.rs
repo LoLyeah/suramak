@@ -139,6 +139,47 @@ fn download_skips_if_dest_exists() {
 }
 
 #[test]
+fn download_with_progress_reports_monotonic_bytes() {
+    use suramak_core::download::download_with_progress;
+
+    let body: Vec<u8> = (0u8..=255).collect();
+    let expected_hash = sha256_of(&body);
+    let addr = spawn_file_server(body.clone());
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("progress.bin");
+    let url = format!("http://{addr}/progress.bin");
+
+    let mut samples: Vec<u64> = Vec::new();
+    download_with_progress(&url, &dest, &expected_hash, |bytes| samples.push(bytes)).unwrap();
+
+    assert_eq!(std::fs::read(&dest).unwrap(), body);
+    assert!(!samples.is_empty(), "progress must fire at least once");
+    assert!(
+        samples.windows(2).all(|w| w[0] <= w[1]),
+        "progress must be monotonic: {samples:?}"
+    );
+    // The final report is the full size (fires per 64 KiB chunk → once here).
+    assert_eq!(*samples.last().unwrap(), body.len() as u64);
+
+    // A resumed download reports its starting offset first.
+    let dir2 = tempfile::tempdir().unwrap();
+    let dest2 = dir2.path().join("resume.bin");
+    let addr2 = spawn_file_server(body.clone());
+    std::fs::write(dir2.path().join("resume.bin.part"), &body[..100]).unwrap();
+    let mut resumed: Vec<u64> = Vec::new();
+    download_with_progress(
+        &format!("http://{addr2}/resume.bin"),
+        &dest2,
+        &expected_hash,
+        |bytes| resumed.push(bytes),
+    )
+    .unwrap();
+    assert_eq!(resumed[0], 100, "first report is the pre-existing offset");
+    assert_eq!(*resumed.last().unwrap(), body.len() as u64);
+}
+
+#[test]
 fn verify_sha256_ok_and_fail() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("f.bin");

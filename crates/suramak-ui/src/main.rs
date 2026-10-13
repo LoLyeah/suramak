@@ -25,7 +25,7 @@ mod theme;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use app::{Effect, Job};
+use app::{Effect, Job, RecordState};
 use runtime::Runtime;
 use shell::Shell;
 use suramak_core::paths;
@@ -133,18 +133,61 @@ impl App {
         }
     }
 
-    /// Drains worker events (queued by the bridge thread) and runs the debounce tick.
+    /// Drains worker events (queued by the bridge thread), polls the model
+    /// download and the capture meter, and runs the debounce tick.
     fn pump(&mut self) {
-        let Some(runtime) = self.runtime.as_ref() else {
+        if self.runtime.is_none() {
             return;
-        };
-        for event in runtime.drain_worker() {
+        }
+        let events = self
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.drain_worker())
+            .unwrap_or_default();
+        for event in events {
             let effects = match self.shell.as_mut() {
                 Some(shell) => shell.app.on_worker_event(event),
                 None => return,
             };
             self.apply(effects);
         }
+
+        // Model-download progress (the download itself runs on its own thread).
+        let download = self
+            .runtime
+            .as_mut()
+            .and_then(|runtime| runtime.download_status());
+        if let Some(status) = download {
+            let effects = match (status.finished, self.shell.as_mut()) {
+                (None, Some(shell)) => {
+                    shell
+                        .app
+                        .on_download_progress(status.bytes_done, status.bytes_total);
+                    Vec::new()
+                }
+                (Some(result), Some(shell)) => shell.app.on_download_done(&status.id, result),
+                _ => Vec::new(),
+            };
+            self.apply(effects);
+        }
+
+        // Capture meter sample (only while a session is live).
+        let recording = self
+            .shell
+            .as_ref()
+            .is_some_and(|shell| matches!(shell.app.record, RecordState::Recording(_)));
+        if recording {
+            if let Some(rms) = self
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.capture_rms())
+            {
+                if let Some(shell) = self.shell.as_mut() {
+                    shell.app.record_sample(rms);
+                }
+            }
+        }
+
         let effects = match self.shell.as_mut() {
             Some(shell) => shell.app.tick(Instant::now()),
             None => return,
@@ -319,6 +362,8 @@ impl ApplicationHandler for App {
                         .app
                         .set_status(format!("library unavailable: {err}"), true);
                 }
+                // The settings screen opens on the persisted values (M3).
+                shell.app.settings_form = runtime.settings_form();
                 let initial = shell.app.initial_effects();
                 runtime.apply(initial, &mut shell.app);
 

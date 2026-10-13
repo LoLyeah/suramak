@@ -3881,6 +3881,7 @@ dependencies = [
  "serde",
  "serde_json",
  "suramak-core",
+ "suramak-taps",
  "thiserror 2.0.21",
  "tracing",
  "whisper-rs",
@@ -3935,9 +3936,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "suramak-taps"
+version = "0.1.0"
+dependencies = [
+ "core-foundation 0.10.1",
+ "libc",
+ "objc2 0.6.5",
+ "objc2-foundation 0.3.2",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "suramak-ui"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "egui",
  "egui-wgpu",
  "egui-winit",

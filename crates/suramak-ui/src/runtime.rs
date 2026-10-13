@@ -1,10 +1,15 @@
 //! Runtime: executes [`Effect`]s on the UI thread (worker submit, store reads
-//! and writes, export writes) and owns the background worker bridge.
+//! and writes, export writes, microphone capture, model downloads) and owns the
+//! background worker bridge.
 //!
 //! The worker itself lives on a dedicated bridge thread (the `suramak-asr`
 //! `Worker` handle is not shareable); the bridge moves events into a mutex
 //! queue and calls `egui::Context::request_repaint()` — `Context` is Send+Sync —
 //! so progress reaches the UI even when it is otherwise idle.
+//!
+//! M3: the cpal capture session ([`suramak_asr::capture::Recorder`] is `!Send`)
+//! lives here on the UI thread; model downloads run on a detached thread whose
+//! byte counter the UI polls each tick.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -13,13 +18,20 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
+use suramak_asr::capture;
 use suramak_asr::worker::{Job, Worker, WorkerEvent};
+use suramak_core::models as core_models;
 use suramak_core::paths;
+use suramak_core::resample;
 use suramak_core::settings::{LangMode, Settings};
 use suramak_core::store::Store;
 use suramak_core::transcript::Transcript;
 
-use crate::app::{self, AppState, Effect, ExportFormat};
+use crate::app::{self, model_manager, settings_form, AppState, Effect, ExportFormat};
+
+/// Subdirectory of the system temp dir used for transient recordings
+/// (`keep_audio` off — deleted once the transcript is saved).
+const RECORDINGS_TEMP_DIR: &str = "suramak-recordings";
 
 /// Owns the store, the settings snapshot and the worker bridge; executes effects.
 pub struct Runtime {
@@ -30,6 +42,26 @@ pub struct Runtime {
     next_job_id: u64,
     /// Store/settings problems found at startup (shown as a status line).
     pub startup_error: Option<String>,
+    /// Live capture session (`!Send` — stays on the UI thread).
+    recorder: Option<capture::Recorder>,
+    /// Background model download (one at a time).
+    download: Option<DownloadJob>,
+}
+
+/// A model download running on a detached thread; the UI polls it.
+struct DownloadJob {
+    id: String,
+    bytes: Arc<Mutex<u64>>,
+    result: Arc<Mutex<Option<Result<(), String>>>>,
+}
+
+/// One poll of the model download (see [`Runtime::download_status`]).
+pub struct DownloadStatus {
+    pub id: String,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    /// `Some` exactly once, when the download finished.
+    pub finished: Option<Result<(), String>>,
 }
 
 impl Runtime {
@@ -50,12 +82,53 @@ impl Runtime {
             bridge: Bridge::spawn(ctx),
             next_job_id: 0,
             startup_error,
+            recorder: None,
+            download: None,
         }
     }
 
     /// Drains worker events queued by the bridge thread (non-blocking).
     pub fn drain_worker(&self) -> Vec<WorkerEvent> {
         self.bridge.drain()
+    }
+
+    /// A settings form seeded from the persisted settings (startup sync).
+    pub fn settings_form(&self) -> settings_form::SettingsForm {
+        settings_form::SettingsForm::from_settings(&self.settings)
+    }
+
+    /// Live rolling RMS of the capture session (`None` when not recording).
+    pub fn capture_rms(&self) -> Option<f32> {
+        self.recorder.as_ref().map(|recorder| recorder.rms())
+    }
+
+    /// Progress of the model download, if one is running.
+    ///
+    /// A finished download is reported **once** (the job is cleared), so callers
+    /// must treat `finished: Some(..)` as terminal.
+    pub fn download_status(&mut self) -> Option<DownloadStatus> {
+        let job = self.download.as_ref()?;
+        let bytes_done = job.bytes.lock().map(|guard| *guard).unwrap_or(0);
+        let bytes_total = core_models::find_model(&job.id)
+            .map(|info| info.size_bytes)
+            .unwrap_or(0);
+        let finished = job.result.lock().ok().and_then(|guard| guard.clone());
+        if finished.is_some() {
+            let id = job.id.clone();
+            self.download = None;
+            return Some(DownloadStatus {
+                id,
+                bytes_done,
+                bytes_total,
+                finished,
+            });
+        }
+        Some(DownloadStatus {
+            id: job.id.clone(),
+            bytes_done,
+            bytes_total,
+            finished: None,
+        })
     }
 
     /// Executes effects (and any effects they produce) in order.
@@ -88,8 +161,197 @@ impl Runtime {
                     let result = write_export(&transcript, format, &dest);
                     state.on_export_done(&dest, result);
                 }
+                Effect::StartCapture => self.start_capture(state),
+                Effect::StopCapture { title } => {
+                    let follow_ups = self.stop_capture(&title, state);
+                    queue.extend(follow_ups);
+                }
+                Effect::DiscardRecording { path } => {
+                    if let Err(err) = std::fs::remove_file(&path) {
+                        tracing::warn!("could not remove {}: {err}", path.display());
+                    } else {
+                        tracing::info!("removed temp recording {}", path.display());
+                    }
+                }
+                Effect::RefreshModels => {
+                    let rows = model_manager::rows(&self.models_dir, &self.settings.asr.model_id);
+                    state.on_models_loaded(rows);
+                }
+                Effect::DownloadModel { id } => self.start_download(&id, state),
+                Effect::DeleteModel { id } => {
+                    let result = model_manager::delete_plan(&self.models_dir, &id)
+                        .and_then(|plan| model_manager::apply_delete(&plan))
+                        .map(|removed| {
+                            removed
+                                .iter()
+                                .map(|path| path.display().to_string())
+                                .collect::<Vec<_>>()
+                        });
+                    queue.extend(state.on_model_deleted(&id, result));
+                }
+                Effect::SetDefaultModel { id } => {
+                    let result = self.set_default(&id);
+                    queue.extend(state.on_default_set(&id, result));
+                }
+                Effect::RefreshAudioDevices => {
+                    let (devices, error) = match capture::list_input_devices() {
+                        Ok(devices) => (devices, None),
+                        Err(suramak_asr::AsrError::CaptureUnsupported) => (
+                            Vec::new(),
+                            Some("not compiled into this build (feature `capture`)".to_string()),
+                        ),
+                        Err(err) => (Vec::new(), Some(err.to_string())),
+                    };
+                    state.on_audio_devices(devices, error);
+                }
+                Effect::SaveSettings { form } => {
+                    form.apply(&mut self.settings);
+                    let result = self.persist_settings(&form);
+                    state.on_settings_saved(result);
+                }
             }
         }
+    }
+
+    /// Opens the microphone / system-audio tap on this thread (cpal streams are
+    /// `!Send`), reporting the device + any resolution warning.
+    fn start_capture(&mut self, state: &mut AppState) {
+        match capture::start_recording_with(&self.settings.recording.audio_source) {
+            Ok(recorder) => {
+                state.record_device(recorder.device_name().to_string());
+                if let Some(warning) = recorder.warning() {
+                    state.set_status(warning.to_string(), false);
+                }
+                self.recorder = Some(recorder);
+            }
+            Err(err) => state.record_failed(err.to_string()),
+        }
+    }
+
+    /// Stops the session, resamples to 16 kHz and writes the recording wav —
+    /// to `<data>/recordings/` when `keep_audio` is on, else to a temp dir
+    /// (deleted once the transcript is saved; see `AppState::on_transcript_saved`).
+    fn stop_capture(&mut self, title: &str, state: &mut AppState) -> Vec<Effect> {
+        let Some(recorder) = self.recorder.take() else {
+            state.record_failed("no recording in progress".to_string());
+            return Vec::new();
+        };
+        let buffer = recorder.stop();
+        let samples = match capture::resample_16k(&buffer.samples, buffer.rate) {
+            Ok(samples) => samples,
+            Err(err) => {
+                state.record_failed(format!("could not resample the recording: {err}"));
+                return Vec::new();
+            }
+        };
+        let keep = self.settings.storage.keep_audio;
+        let dir = if keep {
+            match paths::recordings_dir() {
+                Ok(dir) => dir,
+                Err(err) => {
+                    state.record_failed(err.to_string());
+                    return Vec::new();
+                }
+            }
+        } else {
+            std::env::temp_dir().join(RECORDINGS_TEMP_DIR)
+        };
+        let stem = app::recording_file_stem(title);
+        let path = dir.join(format!("{stem}.wav"));
+        match capture::write_recording_wav(&path, &samples, resample::TARGET_RATE) {
+            Ok(()) => state.on_recording_stopped(path, keep),
+            Err(err) => {
+                state.record_failed(format!("could not write the recording: {err}"));
+                Vec::new()
+            }
+        }
+    }
+
+    /// Starts the background download for `id` (one at a time).
+    fn start_download(&mut self, id: &str, state: &mut AppState) {
+        if self.download.is_some() {
+            state.on_download_done(id, Err("a download is already running".to_string()));
+            return;
+        }
+        let Some(info) = core_models::find_model(id) else {
+            state.on_download_done(id, Err(format!("unknown model '{id}'")));
+            return;
+        };
+        let dir = self.models_dir.clone();
+        let dest = dir.join(info.hf_file);
+        let url = core_models::model_url(info);
+        let sha256 = info.sha256.to_string();
+        let bytes = Arc::new(Mutex::new(0u64));
+        let result: Arc<Mutex<Option<Result<(), String>>>> = Arc::new(Mutex::new(None));
+        let progress = Arc::clone(&bytes);
+        let outcome = Arc::clone(&result);
+
+        let spawned = thread::Builder::new()
+            .name("suramak-model-download".to_string())
+            .spawn(move || {
+                let run = (|| -> Result<(), String> {
+                    std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+                    suramak_core::download::download_with_progress(
+                        &url,
+                        &dest,
+                        &sha256,
+                        |written| {
+                            if let Ok(mut guard) = progress.lock() {
+                                *guard = written;
+                            }
+                        },
+                    )
+                    .map_err(|err| err.to_string())
+                })();
+                if let Ok(mut guard) = outcome.lock() {
+                    *guard = Some(run);
+                }
+            });
+        match spawned {
+            Ok(_handle) => {
+                self.download = Some(DownloadJob {
+                    id: id.to_string(),
+                    bytes,
+                    result,
+                });
+            }
+            Err(err) => {
+                state.on_download_done(id, Err(format!("cannot start the download thread: {err}")));
+            }
+        }
+    }
+
+    /// Writes `settings.model_id = id` and persists settings.toml.
+    fn set_default(&mut self, id: &str) -> Result<(), String> {
+        model_manager::apply_default(&mut self.settings, id)?;
+        let path = paths::settings_path().map_err(|err| err.to_string())?;
+        self.settings
+            .save(&path)
+            .map_err(|err| format!("could not write {}: {err}", path.display()))
+    }
+
+    /// Persists the settings form (toml) and, on macOS/Windows, the keychain key.
+    fn persist_settings(&mut self, form: &settings_form::SettingsForm) -> Result<String, String> {
+        let path = paths::settings_path().map_err(|err| err.to_string())?;
+        self.settings
+            .save(&path)
+            .map_err(|err| format!("could not write {}: {err}", path.display()))?;
+        let mut note = format!("settings saved to {}", path.display());
+        let key = form.api_key.trim();
+        if !key.is_empty() {
+            if settings_form::api_key_supported() {
+                suramak_core::keychain::set_api_key(key).map_err(|err| {
+                    format!("settings saved, but the keychain refused the key: {err}")
+                })?;
+                note.push_str(" — API key stored in the OS keychain");
+            } else {
+                note.push_str(
+                    " — API key ignored (the keychain is macOS/Windows only; \
+                     set SURAMAK_OPENAI_API_KEY here)",
+                );
+            }
+        }
+        Ok(note)
     }
 
     /// Resolves model + engine plan, then hands the job to the bridge thread.

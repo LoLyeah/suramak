@@ -47,6 +47,14 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
                 palette,
                 false,
             );
+            if !state.capture_available {
+                pane_caption(
+                    ui,
+                    "Recording is not compiled into this build (feature `capture`) — import or drop audio files instead.",
+                    palette,
+                    false,
+                );
+            }
         });
     });
 
@@ -119,8 +127,42 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
         });
     }
 
+    // ---- navigation (M3: models + settings live here) -----------------------
+    let nav_top = row_top + 34.0;
+    ui.scope_builder(
+        egui::UiBuilder::new().max_rect(Rect::from_min_size(
+            pos2(left, nav_top),
+            vec2(right - left, 26.0),
+        )),
+        |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Models").clicked() {
+                    effects.extend(state.open_models());
+                }
+                if ui.button("Settings").clicked() {
+                    effects.extend(state.open_settings());
+                }
+            });
+        },
+    );
+
+    // Cross-view status line (e.g. the record-dot note on builds without capture).
+    if let Some(status) = &state.status {
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(Rect::from_min_size(
+                pos2(left, nav_top + 30.0),
+                vec2(right - left, 20.0),
+            )),
+            |ui| {
+                ui.horizontal(|ui| {
+                    pane_caption(ui, &status.text, palette, status.error);
+                });
+            },
+        );
+    }
+
     // ---- recent recordings --------------------------------------------------
-    let list_top = row_top + 46.0;
+    let list_top = row_top + 82.0;
     ui.scope_builder(
         egui::UiBuilder::new().max_rect(Rect::from_min_size(
             pos2(left, list_top),

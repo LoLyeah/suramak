@@ -17,10 +17,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system dependencies (cmake for whisper.cpp; xvfb + software GL/Vulkan for the UI smoke)
+      - name: Install system dependencies (cmake for whisper.cpp; libasound2 for the capture feature; xvfb + software GL/Vulkan for the UI smoke)
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake xvfb libgl1-mesa-dri mesa-vulkan-drivers
+          sudo apt-get install -y cmake libasound2-dev xvfb libgl1-mesa-dri mesa-vulkan-drivers
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -37,11 +37,25 @@ jobs:
       - name: Tests (debug profile)
         run: cargo test --workspace
 
+      # M3: the capture feature must compile on Linux (libasound2-dev installed
+      # above) and its pure helpers run headless. `capture` stays OFF in every
+      # default build, so nothing below changes what ships.
+      - name: Capture feature — check + unit tests (ALSA)
+        run: |
+          cargo check -p suramak-asr --features capture
+          cargo test -p suramak-asr --features capture
+
       - name: Cross-check suramak-glass (aarch64-apple-darwin)
         run: cargo check -p suramak-glass --target aarch64-apple-darwin
 
       - name: Cross-check suramak-glass (x86_64-pc-windows-msvc)
         run: cargo check -p suramak-glass --target x86_64-pc-windows-msvc
+
+      # M3 (Addendum A): the CoreAudio-tap crate is pure Rust (objc2 + extern "C",
+      # system-framework linkage only) — the darwin check runs from Linux, same
+      # story as the glass cross-checks. Runtime behavior is macOS CI/user smoke.
+      - name: Cross-check suramak-taps (aarch64-apple-darwin)
+        run: cargo check -p suramak-taps --target aarch64-apple-darwin
 
       # `cargo check --target aarch64-apple-darwin` is only meaningful for pure-Rust
       # crates: `suramak-asr` pulls C dependencies (ring via rustls, whisper-rs-sys) that
@@ -133,6 +147,12 @@ jobs:
           SURAMAK_REQUIRE_MODEL: "1"
           SURAMAK_REQUIRE_COREML: "1"
         run: cargo test --workspace --release -- --ignored
+
+      # M3: device enumeration only — CI runners have no microphone, so the test
+      # asserts a list (possibly empty) and opens no stream. `capture-test`
+      # implies `capture`; the real recording E2E is the user smoke on the Mac.
+      - name: Capture device enumeration (capture-test, no stream)
+        run: cargo test -p suramak-asr --features capture,capture-test
 
       - name: Build UI (release)
         run: cargo build --release -p suramak-ui

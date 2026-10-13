@@ -30,6 +30,8 @@
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Suramak uses the microphone to record audio for on-device transcription.</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Suramak can capture system audio (the sound other apps are playing) through CoreAudio process taps to transcribe it on this Mac. Audio never leaves the machine.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 </dict>

@@ -1,0 +1,19 @@
+[package]
+name = "suramak-taps"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "macOS system-audio capture via CoreAudio process taps (14.2+); no-op stubs elsewhere"
+
+[dependencies]
+thiserror = { workspace = true }
+
+# System-framework linkage only (no C build deps): the CoreAudio tap API is called
+# through objc2 message sends + extern "C" declarations, and the framework itself is
+# resolved at runtime (see `src/macos.rs`). Everything here is pure Rust, so
+# `cargo check -p suramak-taps --target aarch64-apple-darwin` works from Linux.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.2"
+objc2-foundation = { version = "0.3.1", features = ["NSArray", "NSObject", "NSString", "NSUUID", "NSValue"] }
+core-foundation = "0.10"
+libc = "0.2"

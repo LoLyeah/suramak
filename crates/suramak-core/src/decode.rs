@@ -221,3 +221,36 @@ pub fn write_wav(
         .map_err(|e| SuramakError::Io(std::io::Error::other(e.to_string())))?;
     Ok(())
 }
+
+/// Writes f32 samples to a WAV file as **16-bit signed PCM** (additive sibling of
+/// [`write_wav`], which stays 32-bit float for its existing callers).
+///
+/// M3 recordings use this: 16 kHz mono i16 is both the smallest sane intermediate
+/// (~115 MB/hour vs ~230 MB/h f32) and the sample depth whisper's decode step
+/// yields anyway. Samples are clamped to `i16` range and rounded to nearest.
+pub fn write_wav_i16(
+    path: &std::path::Path,
+    samples: &[f32],
+    rate: u32,
+    channels: u16,
+) -> Result<(), SuramakError> {
+    let spec = hound::WavSpec {
+        channels,
+        sample_rate: rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)
+        .map_err(|e| SuramakError::Io(std::io::Error::other(e.to_string())))?;
+    for &s in samples {
+        let scaled = (s * f32::from(i16::MAX)).round();
+        let value = scaled.clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16;
+        writer
+            .write_sample(value)
+            .map_err(|e| SuramakError::Io(std::io::Error::other(e.to_string())))?;
+    }
+    writer
+        .finalize()
+        .map_err(|e| SuramakError::Io(std::io::Error::other(e.to_string())))?;
+    Ok(())
+}

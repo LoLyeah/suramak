@@ -22,6 +22,15 @@ pub fn audio_dir() -> Result<PathBuf, SuramakError> {
     Ok(data_dir()?.join("audio"))
 }
 
+/// Returns the microphone-recordings directory (`data_dir/recordings/`).
+///
+/// This is where kept recordings land when `settings.storage.keep_audio` is on
+/// (M3); with `keep_audio` off they go to the system temp dir and are deleted
+/// after the transcript is saved.
+pub fn recordings_dir() -> Result<PathBuf, SuramakError> {
+    Ok(data_dir()?.join("recordings"))
+}
+
 /// Returns the path to the SQLite database file.
 pub fn db_path() -> Result<PathBuf, SuramakError> {
     Ok(data_dir()?.join("suramak.db"))

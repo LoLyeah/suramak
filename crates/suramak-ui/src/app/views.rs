@@ -2,6 +2,11 @@
 //! old static `view.rs` placeholder. Every frame draws the titlebar, the sidebar
 //! (library) and the route's main pane; the returned [`Effect`]s are executed by
 //! `crate::runtime` after the frame.
+//!
+//! M3: the record dot is live — it starts a session when capture is compiled in
+//! (and the palette/glyph stay the M1 ones; only the unavailable state dims it).
+
+use std::time::Instant;
 
 use egui::{
     pos2, vec2, Align2, CornerRadius, FontFamily, FontId, Painter, Pos2, Rect, Stroke, StrokeKind,
@@ -32,7 +37,7 @@ pub fn draw(ctx: &egui::Context, state: &mut AppState) -> Vec<Effect> {
     egui::TopBottomPanel::top("suramak-titlebar")
         .exact_height(TITLEBAR_HEIGHT)
         .frame(egui::Frame::NONE.fill(palette.chrome))
-        .show(ctx, |ui| titlebar(ui, &palette));
+        .show(ctx, |ui| titlebar(ui, &palette, state, &mut effects));
 
     egui::SidePanel::left("suramak-sidebar")
         .exact_width(sidebar_width)
@@ -47,14 +52,17 @@ pub fn draw(ctx: &egui::Context, state: &mut AppState) -> Vec<Effect> {
             Route::Home => home::ui(ui, &palette, state, &mut effects),
             Route::Transcribe => super::transcribe::ui(ui, &palette, state, &mut effects),
             Route::Editor => super::editor::ui(ui, &palette, state, &mut effects),
+            Route::Record => super::record::ui(ui, &palette, state, &mut effects),
+            Route::Models => super::models::ui(ui, &palette, state, &mut effects),
+            Route::Settings => super::settings::ui(ui, &palette, state, &mut effects),
         });
 
     effects
 }
 
 /// Window chrome: drag surface, centred title, integrated record/play/export.
-/// (M1 composition, unchanged — the glyphs are still painted, not interactive.)
-fn titlebar(ui: &mut egui::Ui, palette: &Palette) {
+/// (M1 composition and glyphs; the record dot is now interactive.)
+fn titlebar(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &mut Vec<Effect>) {
     let rect = ui.max_rect();
 
     // Drag anywhere in the chrome except the traffic-light inset and the controls.
@@ -71,7 +79,7 @@ fn titlebar(ui: &mut egui::Ui, palette: &Palette) {
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
     }
 
-    let painter = ui.painter();
+    let painter = ui.painter().clone();
     painter.text(
         rect.center(),
         Align2::CENTER_CENTER,
@@ -82,11 +90,39 @@ fn titlebar(ui: &mut egui::Ui, palette: &Palette) {
 
     let center_y = rect.center().y;
     let mut x = rect.right() - 30.0;
-    export_glyph(painter, pos2(x, center_y), palette);
+    export_glyph(&painter, pos2(x, center_y), palette);
     x -= 42.0;
-    play_glyph(painter, pos2(x, center_y), palette);
+    play_glyph(&painter, pos2(x, center_y), palette);
     x -= 42.0;
-    record_glyph(painter, pos2(x, center_y), palette);
+    let record_center = pos2(x, center_y);
+
+    // The record control: M1 red dot, live when capture is compiled in.
+    let recording = matches!(state.record, super::RecordState::Recording(_));
+    let enabled = state.can_record();
+    let record_response = ui.interact(
+        Rect::from_center_size(record_center, vec2(28.0, 28.0)),
+        egui::Id::new("suramak-record-dot"),
+        egui::Sense::click(),
+    );
+    record_glyph(&painter, record_center, palette, enabled || recording);
+    if record_response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if record_response.clicked() {
+        if enabled {
+            let date = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            effects.extend(state.start_recording(Instant::now(), &date));
+        } else if recording {
+            // Already recording: the Stop button in the record view ends it.
+        } else if matches!(state.job, super::Job::Running(_)) {
+            state.set_status("recording is disabled while a job is running", false);
+        } else {
+            state.set_status(
+                "recording is not compiled into this build (feature `capture`)",
+                true,
+            );
+        }
+    }
 
     painter.hline(
         rect.x_range(),
@@ -95,9 +131,14 @@ fn titlebar(ui: &mut egui::Ui, palette: &Palette) {
     );
 }
 
-/// Red filled circle — the record control (M1 glyph).
-fn record_glyph(painter: &Painter, center: Pos2, palette: &Palette) {
-    painter.circle_filled(center, 6.0, palette.record_red);
+/// Red filled circle — the record control (M1 glyph; dimmed when unavailable).
+fn record_glyph(painter: &Painter, center: Pos2, palette: &Palette, enabled: bool) {
+    let color = if enabled {
+        palette.record_red
+    } else {
+        palette.record_red.gamma_multiply(0.35)
+    };
+    painter.circle_filled(center, 6.0, color);
 }
 
 /// Play triangle (M1 glyph).

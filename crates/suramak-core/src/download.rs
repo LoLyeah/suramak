@@ -11,6 +11,19 @@ use crate::SuramakError;
 /// After the download completes, verifies sha256 against `expected_sha256` and renames
 /// the `.part` file to `dest`.
 pub fn download(url: &str, dest: &Path, expected_sha256: &str) -> Result<(), SuramakError> {
+    download_with_progress(url, dest, expected_sha256, |_| {})
+}
+
+/// [`download`] with a byte-progress callback (M3: the in-app model manager shows a
+/// progress bar). `on_progress` receives the number of bytes on disk so far —
+/// `existing .part` size + bytes written this run — and fires once per read chunk
+/// plus once up front (so a resumed download reports its starting offset).
+pub fn download_with_progress(
+    url: &str,
+    dest: &Path,
+    expected_sha256: &str,
+    mut on_progress: impl FnMut(u64),
+) -> Result<(), SuramakError> {
     let part_path = part_path(dest);
 
     if dest.exists() {
@@ -24,6 +37,7 @@ pub fn download(url: &str, dest: &Path, expected_sha256: &str) -> Result<(), Sur
     } else {
         0
     };
+    on_progress(existing_bytes);
 
     let client = reqwest::blocking::Client::builder()
         .https_only(false)
@@ -50,6 +64,7 @@ pub fn download(url: &str, dest: &Path, expected_sha256: &str) -> Result<(), Sur
         .append(true)
         .open(&part_path)?;
 
+    let mut written = 0u64;
     let mut buf = [0u8; 65536];
     loop {
         let n = resp.read(&mut buf)?;
@@ -57,6 +72,8 @@ pub fn download(url: &str, dest: &Path, expected_sha256: &str) -> Result<(), Sur
             break;
         }
         file.write_all(&buf[..n])?;
+        written += n as u64;
+        on_progress(existing_bytes + written);
     }
     drop(file);
 
