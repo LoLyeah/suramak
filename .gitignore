@@ -9,6 +9,11 @@
 *.bin
 /models/
 
+# Build/run artifacts
+build/
+dist/
+.agy-logs/
+
 # OS / editor
 .DS_Store
 .idea/
