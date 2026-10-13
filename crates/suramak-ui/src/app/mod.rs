@@ -19,6 +19,7 @@ use suramak_core::settings::EngineSetting;
 use suramak_core::transcript::Transcript;
 
 use self::model_manager::{ModelManager, ModelRow};
+use self::polish::{PolishState, PolishUndo};
 use self::settings_form::SettingsForm;
 
 pub mod editor;
@@ -27,6 +28,7 @@ pub mod home;
 pub mod library;
 pub mod model_manager;
 pub mod models;
+pub mod polish;
 pub mod record;
 pub mod settings;
 pub mod settings_form;
@@ -361,6 +363,15 @@ pub struct AppState {
     /// (set from [`capture::CAPTURE_COMPILED`] at startup; a field so the state
     /// machine is testable headless on Linux builds).
     pub capture_available: bool,
+    /// In-app polish lifecycle (M4) — see `app::polish`.
+    pub polish: PolishState,
+    /// One-step undo of an accepted polish (cleared when consumed / on a
+    /// transcript switch).
+    pub polish_undo: Option<PolishUndo>,
+    /// Whether polish is configured (base URL + API key present, per M4) — the
+    /// Polish action's enable. Seeded by the runtime at startup and refreshed
+    /// after a settings save; a field so the state machine is testable headless.
+    pub polish_configured: bool,
 }
 
 /// Side effects the runtime executes after a frame (or an event).
@@ -401,6 +412,9 @@ pub enum Effect {
     RefreshAudioDevices,
     /// Persist the settings form (toml; keychain on macOS/Windows).
     SaveSettings { form: Box<SettingsForm> },
+    /// Run the polish call for this transcript on a background thread
+    /// (core's client is blocking HTTP; never the ASR worker). M4.
+    PolishTranscript { transcript: Box<Transcript> },
 }
 
 impl Default for AppState {
@@ -428,6 +442,11 @@ impl AppState {
             audio_devices_error: None,
             pending_recording_cleanup: None,
             capture_available: capture::CAPTURE_COMPILED,
+            polish: PolishState::Idle,
+            polish_undo: None,
+            // Seeded by the runtime at startup (`Runtime::polish_configured`);
+            // false until then so the action can never fire half-configured.
+            polish_configured: false,
         }
     }
 
@@ -436,11 +455,13 @@ impl AppState {
         vec![Effect::RefreshLibrary]
     }
 
-    /// Whether the UI wants the periodic tick (job running / dirty edits / recording).
+    /// Whether the UI wants the periodic tick (job running / dirty edits /
+    /// recording / a polish run polling for its result).
     pub fn busy(&self) -> bool {
         matches!(self.job, Job::Running(_))
             || self.editor.as_ref().is_some_and(|e| e.dirty)
             || matches!(self.record, RecordState::Recording(_))
+            || self.polish.is_running()
     }
 
     pub fn set_status(&mut self, text: impl Into<String>, error: bool) {
@@ -978,6 +999,11 @@ impl AppState {
         self.export.result = None;
         self.library.selected = self.library.items.iter().position(|t| t.id == id);
         self.editor = Some(Editor::open(transcript));
+        // A pending polish review (or one-step undo) belongs to the transcript
+        // that was open — it applies by segment index, so a different
+        // transcript must never inherit it (M4).
+        self.polish = PolishState::Idle;
+        self.polish_undo = None;
         self.route = Route::Editor;
     }
 }

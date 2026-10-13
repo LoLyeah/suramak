@@ -1,21 +1,43 @@
-//! Windows: DWM system-backdrop stub — compile-checked only (never exercised in M1).
+//! Windows: the real DWM system-backdrop wiring — **compile-checked only** (M4).
 //!
-//! The call shape is fixed now so the `windows` dependency and the HWND
-//! extraction path are verified by the cross-target `cargo check`; the real
-//! implementation (and any Mica/Acrylic policy) lands in M4 per PLAN §6.
+//! Same contract as the macOS path: `apply(window, config)` runs once, on the
+//! main thread, after winit created the window and before the first frame. All
+//! calls below are DWM (`dwmapi.dll`); the winit/wgpu half of transparency (a
+//! `transparent` window attribute plus a premultiplied-alpha swapchain — PLAN §1
+//! steps 7–8) lives in `suramak-ui`, exactly like the macOS split.
+//!
+//! ## What is set, with exact DW values (WORKORDER-M4 §2)
+//!
+//! | call | attribute | value |
+//! |---|---|---|
+//! | `DwmSetWindowAttribute` | `DWMWA_USE_IMMERSIVE_DARK_MODE` (**20**) | `TRUE` (`BOOL` = 1) — dark titlebar/frame chrome |
+//! | `DwmSetWindowAttribute` | `DWMWA_SYSTEMBACKDROP_TYPE` (**38**) | `DWMSBT_MAINWINDOW` (**2**, Mica) for [`GlassMode::Auto`], `DWMSBT_TRANSIENTWINDOW` (**3**, Acrylic) for [`GlassMode::Always`] |
+//! | `DwmExtendFrameIntoClientArea` | — | margins `-1` on all four sides ("sheet of glass": extend the frame over the whole client area) |
+//!
+//! The backdrop attribute needs Windows 11 22H2+; older builds reject it with
+//! `E_INVALIDARG`, which surfaces as [`GlassError::BackdropFailed`] — the caller
+//! (`suramak-ui`) keeps running with the opaque shell, same as the macOS
+//! `NSVisualEffectView` fallback story. Dark mode and the frame extension are
+//! best-effort (documented, never fatal).
+//!
+//! No runtime claims: no Windows machine has executed this path. It is verified
+//! by `cargo check -p suramak-glass --target x86_64-pc-windows-msvc` from Linux
+//! and by review of the call shapes above (see `docs/reports/M4.md`).
 
 use core::ffi::c_void;
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, TRUE};
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
+    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMSBT_MAINWINDOW, DWMSBT_TRANSIENTWINDOW,
+    DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
 };
+use windows::Win32::UI::Controls::MARGINS;
 use winit::window::Window;
 
-use crate::{GlassConfig, GlassError, GlassMode};
+use crate::{GlassConfig, GlassError, GlassMode, WindowsBackdrop};
 
-/// Requests the DWM transient (acrylic-style) backdrop for `window`.
+/// Applies the DWM backdrop, immersive dark mode and frame extension to `window`.
 pub fn apply(window: &Window, config: GlassConfig) -> Result<(), GlassError> {
     if config.mode == GlassMode::Never {
         return Ok(());
@@ -26,8 +48,26 @@ pub fn apply(window: &Window, config: GlassConfig) -> Result<(), GlassError> {
     };
     let hwnd = HWND(win32.hwnd.get() as *mut c_void);
 
-    // DWMWA_SYSTEMBACKDROP_TYPE (38) = DWMSBT_TRANSIENTWINDOW (3) — Windows 11 22H2+.
-    let backdrop = DWMSBT_TRANSIENTWINDOW.0;
+    // Immersive dark mode (DWMWA_USE_IMMERSIVE_DARK_MODE = 20, payload BOOL = 1):
+    // the system titlebar and frame chrome follow the shell's dark palette.
+    // Best-effort: builds older than 20H1 reject the attribute and the window
+    // simply keeps its light chrome — not worth failing the whole apply.
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            core::ptr::from_ref(&TRUE).cast::<c_void>(),
+            size_of_val(&TRUE) as u32,
+        );
+    }
+
+    // System backdrop (DWMWA_SYSTEMBACKDROP_TYPE = 38, payload i32):
+    // Mica (DWMSBT_MAINWINDOW = 2) for Auto, Acrylic (DWMSBT_TRANSIENTWINDOW = 3)
+    // for Always — the policy lives in `WindowsBackdrop::for_mode`.
+    let backdrop = match WindowsBackdrop::for_mode(config.mode) {
+        WindowsBackdrop::Mica => DWMSBT_MAINWINDOW.0,
+        WindowsBackdrop::Acrylic => DWMSBT_TRANSIENTWINDOW.0,
+    };
     unsafe {
         DwmSetWindowAttribute(
             hwnd,
@@ -36,5 +76,20 @@ pub fn apply(window: &Window, config: GlassConfig) -> Result<(), GlassError> {
             size_of_val(&backdrop) as u32,
         )
     }
-    .map_err(|err| GlassError::BackdropFailed(err.code().0))
+    .map_err(|err| GlassError::BackdropFailed(err.code().0))?;
+
+    // Sheet of glass: -1 on every side is the documented "extend to the whole
+    // client area" value. The DWM frame (including the band the egui chrome
+    // strip draws over) is composited with the backdrop, so the material shows
+    // behind the transparent render surface across the full window.
+    let margins = MARGINS {
+        cxLeftWidth: -1,
+        cxRightWidth: -1,
+        cyTopHeight: -1,
+        cyBottomHeight: -1,
+    };
+    unsafe { DwmExtendFrameIntoClientArea(hwnd, &margins) }
+        .map_err(|err| GlassError::BackdropFailed(err.code().0))?;
+
+    Ok(())
 }

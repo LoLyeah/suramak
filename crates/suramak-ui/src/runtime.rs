@@ -10,6 +10,10 @@
 //! M3: the cpal capture session ([`suramak_asr::capture::Recorder`] is `!Send`)
 //! lives here on the UI thread; model downloads run on a detached thread whose
 //! byte counter the UI polls each tick.
+//!
+//! M4: the polish call (core's client is blocking HTTP) runs on its own
+//! detached `suramak-polish` thread — never the ASR worker, never the UI
+//! thread — and reports through the same poll-and-repaint pattern.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -22,12 +26,13 @@ use suramak_asr::capture;
 use suramak_asr::worker::{Job, Worker, WorkerEvent};
 use suramak_core::models as core_models;
 use suramak_core::paths;
+use suramak_core::polish::{OpenAiCompat, PolishBackend};
 use suramak_core::resample;
-use suramak_core::settings::{LangMode, Settings};
+use suramak_core::settings::{LangMode, PolishSettings, Settings};
 use suramak_core::store::Store;
-use suramak_core::transcript::Transcript;
+use suramak_core::transcript::{Segment, Transcript};
 
-use crate::app::{self, model_manager, settings_form, AppState, Effect, ExportFormat};
+use crate::app::{self, model_manager, polish, settings_form, AppState, Effect, ExportFormat};
 
 /// Subdirectory of the system temp dir used for transient recordings
 /// (`keep_audio` off — deleted once the transcript is saved).
@@ -39,6 +44,8 @@ pub struct Runtime {
     settings: Settings,
     models_dir: PathBuf,
     bridge: Bridge,
+    /// Kept for the polish thread's `request_repaint` wake-up (M4).
+    ctx: egui::Context,
     next_job_id: u64,
     /// Store/settings problems found at startup (shown as a status line).
     pub startup_error: Option<String>,
@@ -46,6 +53,8 @@ pub struct Runtime {
     recorder: Option<capture::Recorder>,
     /// Background model download (one at a time).
     download: Option<DownloadJob>,
+    /// Background polish run (one at a time, M4).
+    polish: Option<PolishJob>,
 }
 
 /// A model download running on a detached thread; the UI polls it.
@@ -54,6 +63,18 @@ struct DownloadJob {
     bytes: Arc<Mutex<u64>>,
     result: Arc<Mutex<Option<Result<(), String>>>>,
 }
+
+/// A polish run on a detached thread (`suramak-polish`); the UI polls it.
+/// Core's client is blocking HTTP, so it must never run on the UI thread or the
+/// ASR worker (WORKORDER-M4 §1).
+struct PolishJob {
+    result: PolishSlot,
+}
+
+/// Shared slot for a background polish outcome: `None` while running, `Some`
+/// exactly once when the call finished (Ok = validated segments, Err = the raw
+/// backend/reply error shown to the user).
+type PolishSlot = Arc<Mutex<Option<Result<Vec<Segment>, String>>>>;
 
 /// One poll of the model download (see [`Runtime::download_status`]).
 pub struct DownloadStatus {
@@ -79,12 +100,31 @@ impl Runtime {
             store,
             settings,
             models_dir,
-            bridge: Bridge::spawn(ctx),
+            bridge: Bridge::spawn(ctx.clone()),
+            ctx,
             next_job_id: 0,
             startup_error,
             recorder: None,
             download: None,
+            polish: None,
         }
+    }
+
+    /// Whether the Polish action may run: a configured base URL and an API key
+    /// (keychain on macOS/Windows, `SURAMAK_OPENAI_API_KEY` on Linux).
+    pub fn polish_configured(&self) -> bool {
+        polish::polish_config(&self.settings, key_present()).is_ok()
+    }
+
+    /// Outcome of the background polish run, if one finished since the last
+    /// poll. Terminal-once, like [`Runtime::download_status`].
+    pub fn polish_status(&mut self) -> Option<Result<Vec<Segment>, String>> {
+        let job = self.polish.as_ref()?;
+        let result = job.result.lock().ok().and_then(|guard| guard.clone());
+        if result.is_some() {
+            self.polish = None;
+        }
+        result
     }
 
     /// Drains worker events queued by the bridge thread (non-blocking).
@@ -207,9 +247,70 @@ impl Runtime {
                 Effect::SaveSettings { form } => {
                     form.apply(&mut self.settings);
                     let result = self.persist_settings(&form);
+                    // The form may have changed the polish base URL/key note —
+                    // refresh the action's enable from the new snapshot.
+                    state.polish_configured = self.polish_configured();
                     state.on_settings_saved(result);
                 }
+                Effect::PolishTranscript { transcript } => {
+                    if let Err(err) = self.start_polish(*transcript) {
+                        queue.extend(state.on_polish_done(Err(err)));
+                    }
+                }
             }
+        }
+    }
+
+    /// Runs the polish call for `transcript` on a detached `suramak-polish`
+    /// thread: core's client is blocking HTTP (never the ASR worker, never the
+    /// UI thread). The result lands in a mutex slot that [`Runtime::polish_status`]
+    /// polls; the thread also requests a repaint when it finishes, like the
+    /// bridge does for worker events.
+    fn start_polish(&mut self, transcript: Transcript) -> Result<(), String> {
+        if self.polish.is_some() {
+            return Err("a polish run is already in progress".to_string());
+        }
+        let config = polish::polish_config(&self.settings, key_present())?;
+        let segments = transcript.segments;
+        let result: PolishSlot = Arc::new(Mutex::new(None));
+        let outcome = Arc::clone(&result);
+        let ctx = self.ctx.clone();
+        tracing::info!(
+            endpoint = %config.base_url,
+            model = %config.model,
+            segments = segments.len(),
+            "polish: starting the background run"
+        );
+        let spawned = thread::Builder::new()
+            .name("suramak-polish".to_string())
+            .spawn(move || {
+                let run = (|| -> Result<Vec<Segment>, String> {
+                    let backend = OpenAiCompat::new().map_err(|err| err.to_string())?;
+                    let cfg = PolishSettings {
+                        base_url: config.base_url,
+                        model: config.model,
+                    };
+                    backend
+                        .polish(&segments, &cfg)
+                        .map_err(|err| error_chain(&err))
+                })();
+                match &run {
+                    Ok(segments) => {
+                        tracing::info!(segments = segments.len(), "polish: reply validated")
+                    }
+                    Err(err) => tracing::warn!(error = %err, "polish: run failed"),
+                }
+                if let Ok(mut guard) = outcome.lock() {
+                    *guard = Some(run);
+                }
+                ctx.request_repaint();
+            });
+        match spawned {
+            Ok(_handle) => {
+                self.polish = Some(PolishJob { result });
+                Ok(())
+            }
+            Err(err) => Err(format!("cannot start the polish thread: {err}")),
         }
     }
 
@@ -440,6 +541,29 @@ fn open_store() -> Result<Store, String> {
     paths::ensure_dirs().map_err(|err| err.to_string())?;
     let db = paths::db_path().map_err(|err| err.to_string())?;
     Store::open(&db).map_err(|err| err.to_string())
+}
+
+/// Whether an API key is available for polish: the OS keychain on
+/// macOS/Windows, `SURAMAK_OPENAI_API_KEY` on Linux (M3/M4 key policy).
+fn key_present() -> bool {
+    suramak_core::keychain::get_api_key().is_ok()
+}
+
+/// Formats an error together with its source chain.
+///
+/// `reqwest`'s own `Display` for a transport failure is only
+/// "error sending request for url (…)" — the actual cause (connection refused,
+/// connection closed before message completed, …) lives in `source()`. The
+/// polish flow surfaces this string to the user, so walk the chain.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut text = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        text.push_str(" — caused by: ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
 }
 
 fn write_export(transcript: &Transcript, format: ExportFormat, dest: &Path) -> Result<(), String> {

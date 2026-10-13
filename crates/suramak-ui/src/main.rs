@@ -56,8 +56,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn init_tracing() {
     // Our crate at info, everything else quiet unless RUST_LOG says otherwise.
+    // NOTE: the binary target is `suramak` (the package is suramak-ui), so the
+    // default filter must be `suramak=info` — `suramak_ui=info` matches no
+    // target and silently disabled every log line (found + fixed in M4).
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("suramak_ui=info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("suramak=info"));
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
@@ -167,6 +170,19 @@ impl App {
                 }
                 (Some(result), Some(shell)) => shell.app.on_download_done(&status.id, result),
                 _ => Vec::new(),
+            };
+            self.apply(effects);
+        }
+
+        // Polish result (the HTTP call runs on its own thread; M4).
+        let polish = self
+            .runtime
+            .as_mut()
+            .and_then(|runtime| runtime.polish_status());
+        if let Some(result) = polish {
+            let effects = match self.shell.as_mut() {
+                Some(shell) => shell.app.on_polish_done(result),
+                None => Vec::new(),
             };
             self.apply(effects);
         }
@@ -364,6 +380,8 @@ impl ApplicationHandler for App {
                 }
                 // The settings screen opens on the persisted values (M3).
                 shell.app.settings_form = runtime.settings_form();
+                // Polish availability is derived from the settings + key policy (M4).
+                shell.app.polish_configured = runtime.polish_configured();
                 let initial = shell.app.initial_effects();
                 runtime.apply(initial, &mut shell.app);
 

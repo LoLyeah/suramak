@@ -5,6 +5,10 @@
 //!
 //! Playback does not exist in the app yet, so selection-follows-playback is
 //! deliberately skipped (documented in the M2 report).
+//!
+//! M4 (additive): the polish bar (action + status, gated on configuration) and
+//! the polish panel that replaces the transcript rows while a run is in flight
+//! or a review is open — side-by-side original | tidied per segment.
 
 use std::time::Instant;
 
@@ -12,6 +16,7 @@ use egui::{pos2, vec2, Align2, CornerRadius, FontFamily, FontId, Rect, Stroke, S
 
 use crate::theme::Palette;
 
+use super::polish::{PolishState, POLISH_SETUP_NOTE};
 use super::views::{pane_caption, pane_title, PANE_PAD_X};
 use super::{export, AppState, Effect};
 
@@ -76,6 +81,9 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
         });
     });
 
+    // ---- polish bar (M4, additive) ------------------------------------------
+    polish_bar(ui, palette, state, effects);
+
     // ---- timeline strip (M1 scrubber composition, static) --------------------
     let (outer, _) = ui.allocate_exact_size(vec2(ui.available_width(), 66.0), egui::Sense::hover());
     let strip = Rect::from_min_max(
@@ -97,6 +105,14 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
         .show_inside(ui, |ui| export::ui(ui, palette, state, effects));
 
     // ---- transcript rows ----------------------------------------------------
+    // While a polish run is in flight (or its review is open) the rows are
+    // replaced by the polish panel: the review is modal for the editor, so a
+    // polished text can never land on a buffer that changed underneath it (M4).
+    if state.polish.is_running() || state.polish.is_reviewing() {
+        polish_panel(ui, palette, state);
+        return;
+    }
+
     let rows: Vec<(u32, i64)> = state
         .editor
         .as_ref()
@@ -157,6 +173,180 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
             }
             if let Some((idx, text)) = edited {
                 editor.edit(idx, text, Instant::now());
+            }
+        });
+}
+
+/// Polish action bar (M4, additive to the M1 composition): the gated action,
+/// the review actions and a status line. The button is enabled only when polish
+/// is configured (base URL + key) and an editor with segments is open; when it
+/// is not configured, the note explains where to set it up.
+fn polish_bar(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    state: &mut AppState,
+    effects: &mut Vec<Effect>,
+) {
+    // Copy what the bar draws first, so the match below can mutate `state`.
+    enum Bar {
+        Idle { can: bool, undo: bool },
+        Running { segments: usize },
+        Review { rows: usize },
+        Failed { can: bool, message: String },
+    }
+    let bar = match &state.polish {
+        PolishState::Idle => Bar::Idle {
+            can: state.can_polish(),
+            undo: state.polish_undo.is_some(),
+        },
+        PolishState::Running(run) => Bar::Running {
+            segments: run.originals.len(),
+        },
+        PolishState::Review(review) => Bar::Review {
+            rows: review.rows.len(),
+        },
+        PolishState::Failed { message } => Bar::Failed {
+            can: state.can_polish(),
+            message: message.clone(),
+        },
+    };
+
+    ui.horizontal(|ui| {
+        ui.add_space(PANE_PAD_X - 8.0);
+        match bar {
+            Bar::Idle { can, undo } => {
+                if ui.add_enabled(can, egui::Button::new("Polish")).clicked() {
+                    effects.extend(state.start_polish());
+                }
+                if undo && ui.button("Undo").clicked() {
+                    effects.extend(state.undo_polish());
+                }
+                if !state.polish_configured {
+                    pane_caption(ui, POLISH_SETUP_NOTE, palette, false);
+                }
+            }
+            Bar::Running { segments } => {
+                pane_caption(
+                    ui,
+                    &format!(
+                        "polishing {segments} segment(s) — the review opens here when the endpoint answers"
+                    ),
+                    palette,
+                    false,
+                );
+            }
+            Bar::Review { rows } => {
+                if ui.button("Accept").clicked() {
+                    effects.extend(state.accept_polish());
+                }
+                if ui.button("Discard").clicked() {
+                    state.discard_polish();
+                }
+                pane_caption(
+                    ui,
+                    &format!(
+                        "reviewing {rows} segment(s) — original | tidied; Accept replaces the transcript text"
+                    ),
+                    palette,
+                    false,
+                );
+            }
+            Bar::Failed { can, message } => {
+                if ui.add_enabled(can, egui::Button::new("Polish")).clicked() {
+                    effects.extend(state.start_polish());
+                }
+                if ui.button("Dismiss").clicked() {
+                    state.discard_polish();
+                }
+                pane_caption(ui, &message, palette, true);
+            }
+        }
+    });
+}
+
+/// The polish panel replacing the transcript rows while a run is in flight or a
+/// review is open (M4): a calm placeholder for the former, the side-by-side
+/// original | tidied review for the latter (batch only — no streaming).
+fn polish_panel(ui: &mut egui::Ui, palette: &Palette, state: &AppState) {
+    let PolishState::Review(review) = &state.polish else {
+        if let PolishState::Running(run) = &state.polish {
+            ui.add_space(22.0);
+            ui.horizontal(|ui| {
+                ui.add_space(PANE_PAD_X - 8.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "polishing {} segment(s) with the configured endpoint…",
+                        run.originals.len()
+                    ))
+                    .size(13.0)
+                    .color(palette.text_dim),
+                );
+            });
+        }
+        return;
+    };
+
+    ui.add_space(8.0);
+    // Column captions over the two text columns (timestamp column left blank).
+    ui.horizontal(|ui| {
+        ui.add_space(PANE_PAD_X - 8.0);
+        ui.add_sized([86.0, 16.0], egui::Label::new(""));
+        ui.columns(2, |columns| {
+            columns[0].label(
+                egui::RichText::new("original")
+                    .size(11.0)
+                    .color(palette.text_dim),
+            );
+            columns[1].label(
+                egui::RichText::new("tidied")
+                    .size(11.0)
+                    .color(palette.text_dim),
+            );
+        });
+    });
+
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for row in &review.rows {
+                let start_ms = state
+                    .editor
+                    .as_ref()
+                    .and_then(|editor| {
+                        editor
+                            .transcript
+                            .segments
+                            .iter()
+                            .find(|segment| segment.idx == row.idx)
+                    })
+                    .map(|segment| segment.start_ms)
+                    .unwrap_or(0);
+                ui.horizontal_top(|ui| {
+                    ui.add_space(PANE_PAD_X - 8.0);
+                    ui.add_sized(
+                        [86.0, 18.0],
+                        egui::Label::new(
+                            egui::RichText::new(suramak_core::time::fmt_ms(start_ms))
+                                .monospace()
+                                .size(11.0)
+                                .color(palette.text_dim),
+                        ),
+                    );
+                    ui.columns(2, |columns| {
+                        columns[0].label(
+                            egui::RichText::new(&row.original)
+                                .size(12.5)
+                                .color(palette.text_dim),
+                        );
+                        columns[1].label(
+                            egui::RichText::new(&row.polished)
+                                .size(14.0)
+                                .family(crate::theme::serif_family())
+                                .color(palette.text),
+                        );
+                    });
+                });
+                ui.add_space(6.0);
             }
         });
 }

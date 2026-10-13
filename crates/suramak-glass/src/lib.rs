@@ -3,7 +3,7 @@
 //! | target | behaviour |
 //! |---|---|
 //! | macOS | real AppKit materials only: `NSGlassEffectView` (macOS 26+, runtime class check) with an `NSVisualEffectView` fallback, plus the window-chrome surgery of PLAN §1 steps 1–6 |
-//! | Windows | DWM system-backdrop stub — compile-checked only (real wiring lands in M4) |
+//! | Windows | real DWM system backdrop: `DWMWA_SYSTEMBACKDROP_TYPE` (Mica/Acrylic per [`WindowsBackdrop`]) + `DWMWA_USE_IMMERSIVE_DARK_MODE` + the sheet-of-glass frame extension — **compile-checked only** (M4; no runtime claims, see `docs/reports/M4.md`) |
 //! | Linux | no-op: the UI paints an opaque dark window; transparency is not validated here |
 //!
 //! The crate is pure Rust with zero C-compiling dependencies, so it cross-checks
@@ -46,6 +46,31 @@ impl GlassConfig {
     /// Shorthand for `GlassConfig { mode }`.
     pub const fn new(mode: GlassMode) -> Self {
         Self { mode }
+    }
+}
+
+/// The Windows system-backdrop flavour the M4 policy selects from a [`GlassMode`].
+///
+/// Kept platform-independent (and unit-tested on every platform) so the
+/// Mica/Acrylic policy is reviewable where the Windows runtime cannot run —
+/// `windows.rs` maps each variant to its `DWM_SYSTEMBACKDROP_TYPE` value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowsBackdrop {
+    /// `DWMSBT_MAINWINDOW` (2) — the standard window material (Windows 11 "Mica").
+    Mica,
+    /// `DWMSBT_TRANSIENTWINDOW` (3) — the stronger transient material (Acrylic).
+    Acrylic,
+}
+
+impl WindowsBackdrop {
+    /// Policy (M4): `Auto` → Mica, the system's calm default main-window
+    /// material; `Always` → Acrylic, the stronger explicitly-requested effect.
+    /// (`Never` never reaches the backdrop call — `apply` returns first.)
+    pub const fn for_mode(mode: GlassMode) -> Self {
+        match mode {
+            GlassMode::Always => Self::Acrylic,
+            GlassMode::Auto | GlassMode::Never => Self::Mica,
+        }
     }
 }
 
@@ -109,5 +134,33 @@ pub fn apply(window: &Window, config: GlassConfig) -> Result<(), GlassError> {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         stub::apply(window, config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_backdrop_policy_maps_auto_to_mica_and_always_to_acrylic() {
+        assert_eq!(
+            WindowsBackdrop::for_mode(GlassMode::Auto),
+            WindowsBackdrop::Mica
+        );
+        assert_eq!(
+            WindowsBackdrop::for_mode(GlassMode::Always),
+            WindowsBackdrop::Acrylic
+        );
+        // `Never` returns before any backdrop call; the policy value is unused.
+        assert_eq!(
+            WindowsBackdrop::for_mode(GlassMode::Never),
+            WindowsBackdrop::Mica
+        );
+    }
+
+    #[test]
+    fn glass_config_new_carries_the_mode() {
+        assert_eq!(GlassConfig::new(GlassMode::Never).mode, GlassMode::Never);
+        assert_eq!(GlassConfig::default().mode, GlassMode::Auto);
     }
 }
