@@ -178,7 +178,11 @@ jobs:
       - name: UI scripted smoke job (in-app pipeline → sqlite library)
         run: |
           rm -f build/smoke_job_ok.txt
-          SURAMAK_SMOKE_SECS=120 SURAMAK_SMOKE_JOB=fixtures/audio/en.wav ./dist/Suramak.app/Contents/MacOS/suramak
+          SURAMAK_SMOKE_SECS=120 SURAMAK_SMOKE_JOB=fixtures/audio/en.wav ./dist/Suramak.app/Contents/MacOS/suramak &
+          PID=$!
+          for i in $(seq 1 30); do kill -0 $PID 2>/dev/null || break; sleep 5; done
+          kill -9 $PID 2>/dev/null || true
+          wait $PID 2>/dev/null; echo "smoke job app exit=$?"
           test -f build/smoke_job_ok.txt && echo SMOKE-JOB-OK
           ./target/release/suramak-cli library list | grep -q "en.wav" && echo LIBRARY-OK
 
