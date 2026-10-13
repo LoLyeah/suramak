@@ -31,6 +31,7 @@ use suramak_core::resample;
 use suramak_core::settings::{LangMode, PolishSettings, Settings};
 use suramak_core::store::Store;
 use suramak_core::transcript::{Segment, Transcript};
+use uuid::Uuid;
 
 use crate::app::{self, model_manager, polish, settings_form, AppState, Effect, ExportFormat};
 
@@ -228,6 +229,10 @@ impl Runtime {
                                 .collect::<Vec<_>>()
                         });
                     queue.extend(state.on_model_deleted(&id, result));
+                }
+                Effect::DeleteTranscript { id } => {
+                    let result = self.delete_transcript(id);
+                    queue.extend(state.on_transcript_deleted(id, result));
                 }
                 Effect::SetDefaultModel { id } => {
                     let result = self.set_default(&id);
@@ -498,6 +503,15 @@ impl Runtime {
             .as_ref()
             .ok_or_else(|| "library database unavailable".to_string())?
             .insert_transcript(transcript)
+            .map_err(|err| err.to_string())
+    }
+
+    /// Deletes a transcript from the store (its segments cascade).
+    fn delete_transcript(&self, id: Uuid) -> Result<(), String> {
+        self.store
+            .as_ref()
+            .ok_or_else(|| "library database unavailable".to_string())?
+            .delete_transcript(id)
             .map_err(|err| err.to_string())
     }
 

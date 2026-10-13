@@ -7,6 +7,8 @@ Local-first transcription app. Fully native, written in Rust. **macOS first; Win
 - On-device transcription (whisper.cpp via whisper-rs) — English + Indonesian first.
 - Fast path on Apple Silicon: the Whisper encoder runs on the Neural Engine via the official Core ML encoder package (`--engine coreml`; `auto` picks it when installed).
 - Import files + microphone recording, timestamped segments, editable transcript.
+- Any whisper language code: `auto` / `en` / `id` presets plus a free-text **Custom…** entry in Settings (loose validation, keeps the last good value).
+- Delete a transcript from the library: a trash button in the editor header with an inline confirm (segments go with it).
 - Export Markdown / TXT / JSON (+ SRT / VTT) — take it to any LLM you like.
 - Optional in-app "polish" via your own OpenAI-compatible endpoint — review side-by-side, accept/undo/discard; the app works fully without it.
 - No telemetry. Network only for model downloads and opt-in polish.

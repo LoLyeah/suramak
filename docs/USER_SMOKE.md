@@ -87,6 +87,20 @@ Data lives in `~/Library/Application Support/dev.suramak.Suramak/` (db, settings
 - Keep recordings ✗ → Save. Record 5 s, Stop, wait for the transcript.
   Expected: no new file in `recordings/`; the temp copy is deleted once the transcript is saved.
 
+## 12. Custom language code
+
+- Settings → Default language → **Custom…** → type `es` → Save. Quit, reopen the app.
+  Expected: Custom… still selected with `es` in the field; transcripts made with it carry `es` in the editor meta line; `grep language` in `settings.toml` shows `es`.
+- Type something invalid (e.g. `e!`) and press Save without fixing it.
+  Expected: a red inline hint under the field, and the language keeps its previous value (nothing invalid is written).
+
+## 13. Delete a transcript
+
+- Open any transcript (sidebar row) → click the small trash glyph in the editor header (left of `Home`) → confirm with **✔** (the ✖ cancels).
+  Expected: you land back on Home with `deleted <title>` in the status line; the sidebar row is gone.
+- Quit and relaunch the app.
+  Expected: the row is still gone and its segments with it (the delete is permanent).
+
 ## Report
 
 Anything that deviates from an expected result, with: what you did, what happened, what you expected.

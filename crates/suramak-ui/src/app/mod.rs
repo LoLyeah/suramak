@@ -17,6 +17,7 @@ use suramak_core::export as core_export;
 use suramak_core::models as core_models;
 use suramak_core::settings::EngineSetting;
 use suramak_core::transcript::Transcript;
+use uuid::Uuid;
 
 use self::model_manager::{ModelManager, ModelRow};
 use self::polish::{PolishState, PolishUndo};
@@ -167,6 +168,9 @@ pub struct Editor {
     pub last_saved: Option<Instant>,
     /// Last autosave failure (the buffer stays dirty and retries).
     pub save_error: Option<String>,
+    /// Trash affordance armed in the editor header (M4.5): the next frame draws
+    /// the in-place confirm step; cleared on cancel, on delete and on open.
+    pub confirm_delete: bool,
 }
 
 impl Editor {
@@ -180,6 +184,7 @@ impl Editor {
             last_edit: None,
             last_saved: None,
             save_error: None,
+            confirm_delete: false,
         }
     }
 
@@ -406,6 +411,8 @@ pub enum Effect {
     DownloadModel { id: String },
     /// Delete a model (decoder + unshared encoder, M1.5 rule).
     DeleteModel { id: String },
+    /// Delete a transcript from the library (its segments cascade in the store).
+    DeleteTranscript { id: Uuid },
     /// Write `settings.model_id = id`.
     SetDefaultModel { id: String },
     /// Enumerate input devices for the Audio source dropdown.
@@ -794,9 +801,15 @@ impl AppState {
                     .as_ref()
                     .filter(|status| !status.error && status.text.starts_with("engine:"))
                     .map(|status| status.text.clone());
+                let title = transcript.title.trim();
+                let saved_line = if title.is_empty() {
+                    "saved to library".to_string()
+                } else {
+                    format!("saved to library: {title}")
+                };
                 let text = match engine_line {
-                    Some(line) => format!("{line} — saved to library: {}", transcript.id),
-                    None => format!("saved to library: {}", transcript.id),
+                    Some(line) => format!("{line} — {saved_line}"),
+                    None => saved_line,
                 };
                 self.set_status(text, false);
                 self.last_insert = Some(SaveOutcome {
@@ -870,6 +883,59 @@ impl AppState {
     pub fn on_transcript_loaded(&mut self, transcript: Transcript) -> Vec<Effect> {
         self.open_editor(transcript);
         Vec::new()
+    }
+
+    /// Trash confirmed in the editor header (M4.5): delete the open transcript.
+    pub fn delete_open_transcript(&mut self) -> Vec<Effect> {
+        let Some(editor) = &self.editor else {
+            return Vec::new();
+        };
+        vec![Effect::DeleteTranscript {
+            id: editor.transcript.id,
+        }]
+    }
+
+    /// Delete executed → status + library refresh; the editor closes and the
+    /// route goes Home when the transcript it was showing is the one that was
+    /// deleted. Errors surface through the status line and change nothing.
+    pub fn on_transcript_deleted(&mut self, id: Uuid, result: Result<(), String>) -> Vec<Effect> {
+        // The title for the status line: the open editor first, else the
+        // library row (both are read before any state changes).
+        let title = self
+            .editor
+            .as_ref()
+            .filter(|editor| editor.transcript.id == id)
+            .map(|editor| editor.transcript.title.clone())
+            .or_else(|| {
+                self.library
+                    .items
+                    .iter()
+                    .find(|item| item.id == id)
+                    .map(|item| item.title.clone())
+            })
+            .unwrap_or_else(|| id.to_string());
+        match result {
+            Ok(()) => {
+                if self
+                    .editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.transcript.id == id)
+                {
+                    self.editor = None;
+                    // A pending polish review / undo belongs to the transcript
+                    // that just went away (same rule as `open_editor`).
+                    self.polish = PolishState::Idle;
+                    self.polish_undo = None;
+                    self.route = Route::Home;
+                }
+                self.set_status(format!("deleted {title}"), false);
+                vec![Effect::RefreshLibrary]
+            }
+            Err(err) => {
+                self.set_status(format!("could not delete {title}: {err}"), true);
+                Vec::new()
+            }
+        }
     }
 
     /// Back to the home route (pending edits are flushed first).
@@ -1154,6 +1220,11 @@ mod tests {
         assert!(
             status.text.starts_with("engine: cpu — saved to library:"),
             "unexpected status: {}",
+            status.text
+        );
+        assert!(
+            status.text.contains("happy.wav") && !status.text.contains(&id.to_string()),
+            "the saved title, not the raw id: {}",
             status.text
         );
 
@@ -1768,6 +1839,84 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains("default"));
+    }
+
+    // ---- M4.5: transcript delete --------------------------------------------
+
+    #[test]
+    fn transcript_delete_flows_through_effects_and_closes_the_editor() {
+        let mut state = AppState::new();
+        let open = transcript("trash.wav");
+        let id = open.id;
+        state.on_transcript_loaded(open.clone());
+        state.on_library_loaded(vec![open], None);
+        assert_eq!(state.route, Route::Editor);
+        assert!(
+            !state.editor.as_ref().unwrap().confirm_delete,
+            "a freshly opened editor is not armed"
+        );
+
+        // Trash confirmed → the delete effect carries the open transcript's id.
+        let effects = state.delete_open_transcript();
+        match effects.as_slice() {
+            [Effect::DeleteTranscript { id: effect_id }] => assert_eq!(*effect_id, id),
+            other => panic!("expected a delete effect, got {other:?}"),
+        }
+
+        // The runtime answers Ok: Home + status + a library refresh.
+        let effects = state.on_transcript_deleted(id, Ok(()));
+        assert!(matches!(effects.as_slice(), [Effect::RefreshLibrary]));
+        assert!(state.editor.is_none());
+        assert_eq!(state.route, Route::Home);
+        let status = state.status.as_ref().unwrap();
+        assert!(!status.error);
+        assert_eq!(status.text, "deleted trash.wav");
+
+        // The refreshed list no longer holds the row (the sidebar row is gone).
+        state.on_library_loaded(Vec::new(), None);
+        assert!(state.library.items.is_empty());
+        assert_eq!(state.library.selected, None);
+    }
+
+    #[test]
+    fn deleting_another_transcript_keeps_the_open_editor() {
+        let mut state = AppState::new();
+        let open = transcript("open.wav");
+        let other = transcript("other.wav");
+        state.on_transcript_loaded(open.clone());
+        state.on_library_loaded(vec![open.clone(), other.clone()], None);
+
+        let effects = state.on_transcript_deleted(other.id, Ok(()));
+        assert!(matches!(effects.as_slice(), [Effect::RefreshLibrary]));
+        assert_eq!(state.route, Route::Editor, "the open transcript stays open");
+        assert_eq!(state.editor.as_ref().unwrap().transcript.id, open.id);
+        assert_eq!(state.status.as_ref().unwrap().text, "deleted other.wav");
+    }
+
+    #[test]
+    fn transcript_delete_failure_surfaces_and_changes_nothing() {
+        let mut state = AppState::new();
+        let open = transcript("locked.wav");
+        state.on_transcript_loaded(open.clone());
+
+        let effects = state.on_transcript_deleted(open.id, Err("database is locked".to_string()));
+        assert!(effects.is_empty());
+        assert_eq!(state.route, Route::Editor, "no navigation on failure");
+        assert!(state.editor.is_some());
+        let status = state.status.as_ref().unwrap();
+        assert!(status.error);
+        assert!(status.text.contains("could not delete"), "{}", status.text);
+        assert!(
+            status.text.contains("database is locked"),
+            "{}",
+            status.text
+        );
+    }
+
+    #[test]
+    fn delete_without_an_open_transcript_emits_nothing() {
+        let mut state = AppState::new();
+        assert!(state.delete_open_transcript().is_empty());
     }
 
     // ---- M3: settings --------------------------------------------------------

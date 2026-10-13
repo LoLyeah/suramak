@@ -13,6 +13,7 @@ path = "src/main.rs"
 suramak-core = { path = "../suramak-core" }
 suramak-asr = { path = "../suramak-asr" }        # default features; `capture` OFF on Linux
 suramak-glass = { path = "../suramak-glass" }
+uuid = { workspace = true }                      # transcript ids in Effect::DeleteTranscript (M4.5)
 egui = { workspace = true }
 egui-winit = { workspace = true }
 egui-wgpu = { workspace = true }         # wgpu consumed via egui_wgpu::wgpu re-export only

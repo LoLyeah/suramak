@@ -310,3 +310,79 @@ impl Store {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transcript::Source;
+
+    fn sample(title: &str) -> Transcript {
+        Transcript::new(
+            title.to_string(),
+            Source::File {
+                name: title.to_string(),
+            },
+            "tiny".to_string(),
+            Some("en".to_string()),
+            None,
+            vec![
+                Segment {
+                    idx: 0,
+                    start_ms: 0,
+                    end_ms: 900,
+                    text: "first".to_string(),
+                },
+                Segment {
+                    idx: 1,
+                    start_ms: 900,
+                    end_ms: 1_800,
+                    text: "second".to_string(),
+                },
+            ],
+        )
+    }
+
+    /// Direct segment-row count (the cascade is only observable inside the crate).
+    fn segment_rows(store: &Store, id: Uuid) -> i64 {
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM segments WHERE transcript_id = ?1",
+                params![id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("count segments")
+    }
+
+    #[test]
+    fn delete_transcript_removes_its_segments_and_spares_the_others() {
+        let store = Store::open_in_memory().expect("store");
+        let doomed = sample("doomed.wav");
+        let survivor = sample("survivor.wav");
+        store.insert_transcript(&doomed).unwrap();
+        store.insert_transcript(&survivor).unwrap();
+        assert_eq!(segment_rows(&store, doomed.id), 2);
+
+        store.delete_transcript(doomed.id).unwrap();
+
+        // The header row is gone…
+        assert!(store.get_transcript(doomed.id).is_err());
+        // …and so are its segments (the schema's ON DELETE CASCADE, enforced).
+        assert_eq!(
+            segment_rows(&store, doomed.id),
+            0,
+            "deleting a transcript must cascade to its segments"
+        );
+
+        // A random other transcript survives intact, header + segments.
+        let kept = store
+            .get_transcript(survivor.id)
+            .expect("survivor readable");
+        assert_eq!(kept.segments.len(), 2);
+        assert_eq!(segment_rows(&store, survivor.id), 2);
+        assert_eq!(store.list_transcripts().unwrap().len(), 1);
+
+        // Deleting again reports not-found instead of silently succeeding.
+        assert!(store.delete_transcript(doomed.id).is_err());
+    }
+}

@@ -150,27 +150,56 @@ fn transcription_section(
     }
     *y += ROW_H;
 
-    // Default language.
+    // Default language: the presets plus a free-text "Custom…" entry (M4.5).
+    // The value that persists is whatever `settings_form` validates; an invalid
+    // draft is refused there and only the inline hint shows it here.
     label(ui, palette, left, *y, "Default language");
+    let mut custom_clicked = false;
     inside(ui, left, right, *y, |ui| {
         for value in LANGUAGES {
-            if ui
-                .selectable_value(&mut form.language, value.to_string(), value)
-                .changed()
-            {
+            let selected = !form.language_custom && form.language == value;
+            let clicked = ui.selectable_label(selected, value).clicked();
+            if clicked && !selected {
+                form.language = value.to_string();
+                form.language_custom = false;
                 dirty = true;
             }
         }
-        if !LANGUAGES.contains(&form.language.as_str()) {
-            pane_caption(
-                ui,
-                &format!("custom: {} — not offered here", form.language),
-                palette,
-                false,
+        if ui
+            .selectable_label(form.language_custom, settings_form::CUSTOM_LANGUAGE_LABEL)
+            .clicked()
+        {
+            custom_clicked = true;
+        }
+        if form.language_custom {
+            let response = ui.add_sized(
+                [110.0, 22.0],
+                egui::TextEdit::singleline(&mut form.language_draft).hint_text("es, jv…"),
             );
+            if response.changed() {
+                dirty = true;
+            }
         }
     });
+    if custom_clicked {
+        // Seed the field from the last non-preset code, so switching to
+        // Custom… never starts blank when there is something to edit.
+        if form.language_draft.trim().is_empty() && !LANGUAGES.contains(&form.language.as_str()) {
+            form.language_draft = form.language.clone();
+        }
+        if !form.language_custom {
+            dirty = true;
+        }
+        form.language_custom = true;
+    }
     *y += ROW_H;
+    if form.language_custom {
+        inside(ui, left, right, *y, |ui| {
+            let (hint, error) = form.language_hint();
+            pane_caption(ui, &hint, palette, error);
+        });
+        *y += 22.0;
+    }
 
     // keep_audio.
     label(ui, palette, left, *y, "Keep recordings");

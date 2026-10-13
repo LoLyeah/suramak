@@ -78,6 +78,10 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
             if response.clicked() {
                 effects.extend(state.back_home());
             }
+            // M4.5: delete the open transcript — a discreet trash affordance
+            // with an in-place confirm step, left of Home.
+            ui.add_space(16.0);
+            delete_control(ui, palette, state, effects);
         });
     });
 
@@ -175,6 +179,63 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
                 editor.edit(idx, text, Instant::now());
             }
         });
+}
+
+/// The editor header's trash affordance (M4.5): a discreet wastebasket that
+/// turns into an in-place confirm step (`Delete? ✔ ✖`) — acting where the user
+/// clicked, no OS dialog. Confirming emits [`Effect::DeleteTranscript`] for the
+/// open transcript; cancelling only disarms.
+///
+/// Glyphs come from egui's bundled emoji fonts (🗑 U+1F5D1, ✔ U+2714,
+/// ✖ U+2716 — the plain ✓/✕ variants are not in the default font set).
+fn delete_control(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    state: &mut AppState,
+    effects: &mut Vec<Effect>,
+) {
+    let confirming = state
+        .editor
+        .as_ref()
+        .is_some_and(|editor| editor.confirm_delete);
+    if confirming {
+        // Right-to-left layout: the first added sits rightmost, so this reads
+        // "Delete? ✔ ✖" from left to right.
+        let cancel = clickable_glyph(ui, "✖", palette.text_dim);
+        let confirm = clickable_glyph(ui, "✔", palette.record_red);
+        ui.add(egui::Label::new(
+            egui::RichText::new("Delete?")
+                .size(12.0)
+                .color(palette.text_dim),
+        ));
+        if cancel {
+            if let Some(editor) = state.editor.as_mut() {
+                editor.confirm_delete = false;
+            }
+        }
+        if confirm {
+            if let Some(editor) = state.editor.as_mut() {
+                editor.confirm_delete = false;
+            }
+            effects.extend(state.delete_open_transcript());
+        }
+    } else if clickable_glyph(ui, "🗑", palette.text_dim) {
+        if let Some(editor) = state.editor.as_mut() {
+            editor.confirm_delete = true;
+        }
+    }
+}
+
+/// A small clickable header glyph in `color`; returns true when clicked.
+fn clickable_glyph(ui: &mut egui::Ui, glyph: &str, color: egui::Color32) -> bool {
+    let response = ui.add(
+        egui::Label::new(egui::RichText::new(glyph).size(13.0).color(color))
+            .sense(egui::Sense::click()),
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response.clicked()
 }
 
 /// Polish action bar (M4, additive to the M1 composition): the gated action,

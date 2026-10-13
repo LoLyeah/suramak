@@ -3961,6 +3961,7 @@ dependencies = [
  "suramak-glass",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "winit",
 ]
 

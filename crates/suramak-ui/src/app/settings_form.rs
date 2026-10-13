@@ -11,6 +11,28 @@ use suramak_core::settings::{AudioSource, EngineSetting, LangMode, PolishSetting
 /// forced language; auto-detect translated it to English).
 pub const LANGUAGES: [&str; 3] = ["auto", "en", "id"];
 
+/// Label of the free-text entry in the language selector row (M4.5).
+pub const CUSTOM_LANGUAGE_LABEL: &str = "Custom…";
+
+/// Loose validation of a custom whisper language code (M4.5): trimmed; 2–8
+/// chars of ASCII letters/digits/`-` (whisper codes are lowercase
+/// ISO-639-1-ish — deliberately not stricter); returned lowercased. `Err`
+/// carries the inline hint shown under the field.
+pub fn normalize_language_code(raw: &str) -> Result<String, String> {
+    let code = raw.trim();
+    if code.is_empty() {
+        return Err("enter a language code (2–8 letters, digits or '-')".to_string());
+    }
+    let acceptable = (2..=8).contains(&code.len())
+        && code.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if !acceptable {
+        return Err(format!(
+            "'{code}' is not a usable language code — use 2–8 letters, digits or '-' (e.g. es, jv)"
+        ));
+    }
+    Ok(code.to_ascii_lowercase())
+}
+
 /// Placeholder base URL shown (not persisted until typed).
 pub const DEFAULT_POLISH_BASE_URL: &str = "https://api.openai.com/v1";
 
@@ -70,6 +92,11 @@ pub struct SettingsForm {
     pub model_id: String,
     /// Language selector (`auto`/`en`/`id`, or a custom code from an older file).
     pub language: String,
+    /// True while the "Custom…" entry is selected (reveals the free-text field,
+    /// M4.5; UI-only — the persisted value stays in [`SettingsForm::language`]).
+    pub language_custom: bool,
+    /// Free-text draft for the custom language code; validated on save.
+    pub language_draft: String,
     pub keep_audio: bool,
     pub audio_source: AudioSource,
     pub polish_base_url: String,
@@ -86,10 +113,22 @@ pub struct SettingsForm {
 impl SettingsForm {
     /// Builds the form from the persisted settings.
     pub fn from_settings(settings: &Settings) -> Self {
+        let language = lang_selector(&settings.asr.language);
+        // A code that is not one of the offered presets came from an older
+        // file (or an earlier Custom… entry): show Custom… with the code in
+        // the field so it is editable in place (M4.5).
+        let language_custom = !LANGUAGES.contains(&language.as_str());
+        let language_draft = if language_custom {
+            language.clone()
+        } else {
+            String::new()
+        };
         Self {
             engine: settings.asr.engine,
             model_id: settings.asr.model_id.clone(),
-            language: lang_selector(&settings.asr.language),
+            language,
+            language_custom,
+            language_draft,
             keep_audio: settings.storage.keep_audio,
             audio_source: settings.recording.audio_source.clone(),
             polish_base_url: settings
@@ -108,11 +147,47 @@ impl SettingsForm {
         }
     }
 
+    /// The language selector value [`SettingsForm::apply`] will persist: the
+    /// chosen preset as-is, or the validated (trimmed, lowercased) custom code.
+    /// `Err` carries the inline hint shown under the field (M4.5).
+    pub fn validated_language(&self) -> Result<String, String> {
+        if !self.language_custom {
+            return Ok(self.language.trim().to_string());
+        }
+        normalize_language_code(&self.language_draft)
+    }
+
+    /// The caption shown under the Custom… field: the friendly "your own risk"
+    /// note when the draft is usable, or the inline validation hint (error)
+    /// when it is not. Returns `(text, error)` (M4.5).
+    pub fn language_hint(&self) -> (String, bool) {
+        match self.validated_language() {
+            Ok(code) => (
+                format!(
+                    "custom: {code} — not officially supported; the model may produce poor results"
+                ),
+                false,
+            ),
+            Err(_) if self.language_draft.trim().is_empty() => (
+                "type a code — 2–8 letters, digits or '-' (e.g. es, jv); not officially \
+                 supported — the model may produce poor results"
+                    .to_string(),
+                false,
+            ),
+            Err(hint) => (hint, true),
+        }
+    }
+
     /// Writes the form's values into `settings` (non-UI fields are left alone).
+    ///
+    /// An invalid custom language draft refuses to persist: the previous
+    /// `settings.asr.language` stays (the view shows the inline hint).
     pub fn apply(&self, settings: &mut Settings) {
         settings.asr.engine = self.engine;
         settings.asr.model_id = self.model_id.trim().to_string();
-        settings.asr.language = lang_mode(&self.language);
+        if let Ok(code) = self.validated_language() {
+            settings.asr.language = lang_mode(&code);
+        }
         settings.storage.keep_audio = self.keep_audio;
         settings.recording.audio_source = self.audio_source.clone();
         let base = self.polish_base_url.trim();
@@ -289,7 +364,8 @@ mod tests {
         assert_eq!(lang_selector(&LangMode::Auto), "auto");
         assert_eq!(lang_selector(&LangMode::Fixed("id".to_string())), "id");
         // A custom code from an older settings file round-trips even when it is
-        // not one of the offered options.
+        // not one of the offered options — and shows as Custom… with the code
+        // in the field (M4.5).
         let form = SettingsForm::from_settings(&Settings {
             asr: suramak_core::settings::AsrSettings {
                 language: LangMode::Fixed("fr".to_string()),
@@ -298,7 +374,115 @@ mod tests {
             ..Settings::default()
         });
         assert_eq!(form.language, "fr");
+        assert!(form.language_custom, "a non-preset code shows as Custom…");
+        assert_eq!(form.language_draft, "fr");
         assert_eq!(LANGUAGES, ["auto", "en", "id"]);
+        assert_eq!(CUSTOM_LANGUAGE_LABEL, "Custom…");
+    }
+
+    // ---- M4.5: custom language codes ----------------------------------------
+
+    #[test]
+    fn custom_language_code_is_accepted_lowered_and_persisted() {
+        let mut settings = Settings::default();
+        let mut form = SettingsForm::from_settings(&settings);
+        form.language_custom = true;
+        form.language_draft = "  ES  ".to_string();
+        assert_eq!(form.validated_language().unwrap(), "es");
+        form.apply(&mut settings);
+        assert_eq!(settings.asr.language, LangMode::Fixed("es".to_string()));
+
+        // Dashes and mixed case are fine (trimmed, lowered) — whisper codes
+        // are ISO-639-1-ish and the validation is deliberately loose.
+        form.language_draft = "PT-br".to_string();
+        form.apply(&mut settings);
+        assert_eq!(settings.asr.language, LangMode::Fixed("pt-br".to_string()));
+
+        // The stored value survives a settings.toml round-trip (acceptance §5).
+        let path = temp_path("custom-lang");
+        settings.save(&path).expect("save");
+        let reloaded = Settings::load(&path).expect("reload");
+        assert_eq!(reloaded.asr.language, LangMode::Fixed("pt-br".to_string()));
+        let form = SettingsForm::from_settings(&reloaded);
+        assert_eq!(form.language, "pt-br");
+        assert!(form.language_custom);
+        assert_eq!(form.language_draft, "pt-br");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn custom_code_validation_is_loose_but_bounded() {
+        assert_eq!(normalize_language_code(" es ").unwrap(), "es");
+        assert_eq!(normalize_language_code("AB").unwrap(), "ab");
+        assert_eq!(normalize_language_code("jv").unwrap(), "jv");
+        assert_eq!(normalize_language_code("pt-BR").unwrap(), "pt-br");
+        assert_eq!(normalize_language_code("zh-8").unwrap(), "zh-8");
+        assert_eq!(normalize_language_code("abcdefgh").unwrap(), "abcdefgh");
+        // Too short / too long / empty / not letters-digits-dash → refused.
+        for bad in ["", "a", "abcdefghi", "e!", "es es", "é", "e_s"] {
+            assert!(
+                normalize_language_code(bad).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_custom_language_is_refused_and_keeps_the_previous_value() {
+        let mut settings = Settings::default();
+        settings.asr.language = LangMode::Fixed("en".to_string());
+        let mut form = SettingsForm::from_settings(&settings);
+        form.language_custom = true;
+
+        for bad in ["e", "abcdefghi", "e!", "es es", "é", "e_s"] {
+            form.language_draft = bad.to_string();
+            assert!(
+                form.validated_language().is_err(),
+                "{bad:?} must be refused"
+            );
+            assert!(form.language_hint().1, "{bad:?} must show an error hint");
+            form.apply(&mut settings);
+            assert_eq!(
+                settings.asr.language,
+                LangMode::Fixed("en".to_string()),
+                "the previous value must be kept for {bad:?}"
+            );
+        }
+
+        // An empty draft is a neutral prompt (not an error) but still refuses.
+        form.language_draft = String::new();
+        assert!(!form.language_hint().1);
+        form.apply(&mut settings);
+        assert_eq!(settings.asr.language, LangMode::Fixed("en".to_string()));
+
+        // Fixing the code persists it on the next apply.
+        form.language_draft = "jv".to_string();
+        assert_eq!(
+            form.language_hint().0,
+            "custom: jv — not officially supported; the model may produce poor results"
+        );
+        form.apply(&mut settings);
+        assert_eq!(settings.asr.language, LangMode::Fixed("jv".to_string()));
+    }
+
+    #[test]
+    fn language_presets_still_work_and_win_over_a_stale_draft() {
+        let mut settings = Settings::default();
+        let mut form = SettingsForm::from_settings(&settings);
+        // The user typed a custom draft, then went back to a preset.
+        form.language_draft = "es".to_string();
+        for preset in LANGUAGES {
+            form.language = preset.to_string();
+            form.language_custom = false;
+            assert_eq!(form.validated_language().unwrap(), preset);
+            form.apply(&mut settings);
+            assert_eq!(lang_selector(&settings.asr.language), preset);
+        }
+        assert_eq!(
+            settings.asr.language,
+            LangMode::Fixed("id".to_string()),
+            "the last preset wins"
+        );
     }
 
     #[test]
