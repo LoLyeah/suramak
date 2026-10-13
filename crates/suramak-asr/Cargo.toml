@@ -1,0 +1,27 @@
+[package]
+name = "suramak-asr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Suramak ASR: whisper-rs pipeline, worker thread and microphone capture"
+
+[dependencies]
+suramak-core = { path = "../suramak-core" }
+# `raw-api` re-exports whisper-rs-sys so the progress trampoline can name the C context
+# types for `FullParams::set_progress_callback` + user-data pointer (PLAN §2).
+whisper-rs = { workspace = true, features = ["raw-api"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+# Microphone capture (cpal). OFF by default so Linux builds never need ALSA headers.
+capture = ["dep:cpal"]
+
+[dependencies.cpal]
+version = "0.15.3"
+optional = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { workspace = true, features = ["metal"] }

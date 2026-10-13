@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: linux (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies (cmake for whisper.cpp)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests (debug profile)
+        run: cargo test --workspace
+
+      - name: Build release CLI
+        run: cargo build --release -p suramak-cli
+
+      - name: Restore tiny model cache
+        uses: actions/cache@v4
+        with:
+          # `directories` lowercases the app name on Linux → ~/.local/share/suramak
+          path: ~/.local/share/suramak/models
+          key: suramak-linux-models-tiny-be07e048e1e5
+
+      - name: Download tiny model (sha256 verified)
+        run: ./target/release/suramak-cli models download tiny
+
+      - name: CLI e2e — English fixture
+        run: |
+          ./target/release/suramak-cli transcribe fixtures/audio/en.wav --model tiny --lang en --formats json,md --out-dir build/out
+          python3 -c "import json;d=json.load(open('build/out/en.json'));assert len(d['segments'])>=1;print('en segments',len(d['segments']))"
+          grep -qi fox build/out/en.json && echo EN-OK
+
+      - name: CLI e2e — Indonesian fixture
+        run: |
+          ./target/release/suramak-cli transcribe fixtures/audio/id.wav --model tiny --lang id --formats json --out-dir build/out
+          python3 -c "import json;d=json.load(open('build/out/id.json'));assert len(d['segments'])>=1 and d['segments'][0]['text'].strip();print('id segments',len(d['segments']))"
+
+      - name: whisper e2e tests (release, ignored)
+        env:
+          SURAMAK_REQUIRE_MODEL: "1"
+        run: cargo test --workspace --release -- --ignored
+
+  macos:
+    name: macos (macos-26-arm64)
+    runs-on: macos-26-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build workspace (release, Metal)
+        run: cargo build --release --workspace
+
+      - name: Restore tiny model cache
+        uses: actions/cache@v4
+        with:
+          # macOS ProjectDirs project path is the reverse-DNS bundle id
+          path: ~/Library/Application Support/dev.suramak.Suramak/models
+          key: suramak-macos-models-tiny-be07e048e1e5
+
+      - name: Download tiny model (sha256 verified)
+        run: ./target/release/suramak-cli models download tiny
+
+      - name: whisper e2e tests (release, ignored)
+        env:
+          SURAMAK_REQUIRE_MODEL: "1"
+        run: cargo test --workspace --release -- --ignored
