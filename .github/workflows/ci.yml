@@ -23,10 +23,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system dependencies (cmake for whisper.cpp; libasound2 for the capture feature; xvfb + software GL/Vulkan for the UI smoke)
+      - name: Install system dependencies (cmake for whisper.cpp; libasound2 for the capture feature; xvfb + software GL/Vulkan + libxkbcommon-x11 for the UI smoke)
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libasound2-dev xvfb libgl1-mesa-dri mesa-vulkan-drivers
+          sudo apt-get install -y cmake libasound2-dev xvfb libgl1-mesa-dri mesa-vulkan-drivers libxkbcommon-x11-0
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
