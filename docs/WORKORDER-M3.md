@@ -50,3 +50,15 @@ rm -f build/smoke_job_ok.txt && SURAMAK_SMOKE_SECS=120 SURAMAK_SMOKE_JOB=fixture
 ```
 
 Constraints: only files inside this repo; no sudo; **no git commit/push**. A truthful blocker beats a false green.
+
+---
+
+## Addendum A — audio source selection (user request, during build)
+
+Settings gain **audio source selection**; recording uses it.
+
+1. **Settings**: `Audio source` dropdown with entries: `Default microphone` (default), **each enumerated input device** (cpal; on macOS this includes virtual loopback devices like BlackHole — "other audio sources"), and `System audio` (macOS builds only; hidden elsewhere). Persist the choice; resolve at record time: default → system default input; named device → match enumerated devices by display name (case-insensitive; fall back to default with a visible warning); system audio → the tap path below. Unit-test the resolution logic (all branches, fallback, Linux error path for `SystemAudio`).
+2. **System audio via CoreAudio process taps** (macOS 14.2+; macOS 26 fully supports; NO kernel drivers involved): new crate **`crates/suramak-taps`** — pure Rust (objc2 / CoreAudio externs; system-framework linkage only, NO new C build deps), mac-only code behind `cfg`, no-op stubs elsewhere so **`cargo check -p suramak-taps --target aarch64-apple-darwin` passes from Linux** (same checkability story as `suramak-glass`). API: create a system-audio tap (all processes except Suramak itself) + private aggregate device; return the CoreAudio device UID; `stop()`/Drop tears down aggregate-then-tap exactly once (idempotent). `suramak-asr` capture (feature `capture`) uses it when source = SystemAudio: open the tapped device through cpal by UID. Investigate `objc2-core-audio`-class bindings first; raw `objc2::msg_send`/`extern "C"` is acceptable. Document the exact API calls used with their availability annotations.
+3. **Permissions/plist**: add the audio-capture usage description (`NSAudioCaptureUsageDescription`) to `packaging/Info.plist`; document the expected TCC prompt in the report (cannot be verified here — user smoke on the Mac; if the tap fails, the recording view must show a clear, actionable error, unit-tested on the Linux error path).
+4. **Acceptance additions**: `cargo check -p suramak-taps --target aarch64-apple-darwin` (from Linux, must pass); `cargo check --workspace`; the source-resolution unit tests; CI linux job gains the taps darwin check step (pure Rust, like the glass one). Existing acceptance block unchanged.
+5. **Do NOT** attempt ScreenCaptureKit in this milestone (process taps are the chosen route; SCK stays a documented fallback). Per-app capture ("only this Zoom call") is explicitly a future milestone — but design the tap API so a process-list variant can slot in later (one parameter, not a reshape).
