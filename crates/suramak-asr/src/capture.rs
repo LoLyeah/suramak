@@ -484,22 +484,33 @@ mod imp {
     /// cpal 0.15.3's coreaudio backend exposes **no UID/AudioDeviceID lookup**
     /// (verified against its source: `Device { audio_device_id, is_default }` is
     /// opaque and only `name()` is public), so the private aggregate device is
-    /// matched by the distinctive name `suramak-taps` gave it. The UID stays the
-    /// authoritative handle (tap teardown, diagnostics; `suramak-taps` resolves it
-    /// through `kAudioHardwarePropertyTranslateUIDToDevice`), and a future cpal
-    /// that exposes UID lookup makes this a one-line change.
+    /// matched by the distinctive name `suramak-taps` gave it. The HAL registers
+    /// newly created aggregate devices asynchronously, so this retries briefly
+    /// before giving up; the tap UID in the error is the authoritative handle.
+    ///
+    /// Deliberately does NOT call `SystemTap::device_id()`: translating the UID
+    /// while the HAL device list was still settling crashed inside the HAL
+    /// (`HALDeviceList::CopyDeviceByUID` → `CFStringCompare`, SIGSEGV on
+    /// macOS 27, 2026-10-13 — probed live on the owner's Mac).
     fn device_for_tap(
         host: &cpal::Host,
         tap: &suramak_taps::SystemTap,
     ) -> Result<cpal::Device, AsrError> {
-        device_by_name(host, tap.device_name()).map_err(|_| {
-            AsrError::Capture(format!(
-                "the system-audio tap (uid '{}', device id {:?}) is not visible to the audio layer yet — \
-                 grant the audio-capture permission and retry",
-                tap.device_uid(),
-                tap.device_id()
-            ))
-        })
+        const ATTEMPTS: u32 = 6;
+        const DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+        for attempt in 0..ATTEMPTS {
+            if let Ok(device) = device_by_name(host, tap.device_name()) {
+                return Ok(device);
+            }
+            if attempt + 1 < ATTEMPTS {
+                std::thread::sleep(DELAY);
+            }
+        }
+        Err(AsrError::Capture(format!(
+            "the system-audio tap (uid '{}') is not visible to the audio layer yet — \
+             grant the audio-capture permission and retry",
+            tap.device_uid()
+        )))
     }
 
     /// Mono-mixes one interleaved block into `samples` and updates the rolling RMS.

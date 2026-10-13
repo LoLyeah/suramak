@@ -411,6 +411,12 @@ impl TapInner {
     /// (`kAudioHardwarePropertyTranslateUIDToDevice`, queried lazily; `None` when
     /// the system has not registered the device yet). This is the id a
     /// future/UID-aware cpal API would open the tap with.
+    ///
+    /// Do NOT call right after [`SystemTap::start`]: translating the UID while
+    /// the HAL device list was still settling after aggregate creation crashed
+    /// inside `HALDeviceList::CopyDeviceByUID` (SIGSEGV, macOS 27, 2026-10-13 —
+    /// probed live on the owner's Mac; the record path uses device enumeration
+    /// instead). Diagnostics only, once the device has been up for a while.
     pub fn device_id(&self) -> Option<AudioObjectId> {
         device_id_for_uid(&self.uid)
     }
