@@ -12,7 +12,7 @@
 //! | `AudioObjectGetPropertyData` | macOS 10.0+ | `CoreAudio/AudioHardware.h` |
 //! | `kAudioTapPropertyUID` (`'tuid'`) | macOS 14.2+ | tap object property, `AudioHardwareTapping.h` |
 //! | `kAudioDevicePropertyDeviceUID` (`'uid '`) / `kAudioDevicePropertyDeviceNameCFString` (`'lnam'`) | macOS 10.0+ | device properties, `AudioHardware.h` |
-//! | `kAudioAggregateDeviceNameKey` / `…UIDKey` / `…IsPrivateKey` / `…TapListKey`, `kAudioSubTapUIDKey` | macOS 10.9+/14.2 | aggregate-device description keys, `AudioHardware.h` |
+//! | `kAudioAggregateDeviceNameKey` / `…UIDKey` / `…IsPrivateKey` / `…TapListKey`, `kAudioSubTapUIDKey` | macOS 10.9+/14.2 | aggregate-device description keys — **string-literal macros** on the macOS 27 SDK (`"uid"` / `"name"` / `"private"` / `"taps"` / `"uid"`); see the note below |
 //!
 //! The two **14.2+ functions are resolved with `dlsym(RTLD_DEFAULT, …)` at call
 //! time**, not linked directly: Rust cannot mark a symbol `weak_import`, and a
@@ -20,6 +20,15 @@
 //! < 14.2. The `CATapDescription` class presence check via
 //! `AnyClass::get("CATapDescription")` is the availability gate — on older macOS
 //! `start()` returns [`TapError::OsTooOld`] before any symbol is called.
+//!
+//! The five aggregate-device description keys are **string-literal macros** in
+//! the macOS 27 SDK and the macOS 27 runtime exports *no symbols* for them —
+//! linking the old `extern` statics against CoreAudio is a hard link error on
+//! macOS 27 SDKs (verified on a real SDK: `#define kAudioAggregateDeviceUIDKey "uid"`
+//! etc. in `CoreAudio/AudioHardware.h`, and `dlsym` finds nothing in CoreAudio
+//! or AudioToolbox). We therefore build the keys as plain CFStrings from those
+//! literal values (see `KEY_*` below): the HAL matches aggregate-device
+//! dictionary keys by string content, so this is exact on every macOS version.
 //!
 //! ## Teardown
 //!
@@ -60,6 +69,18 @@ const K_AUDIO_DEVICE_PROPERTY_DEVICE_UID: u32 = fourcc(*b"uid ");
 /// `kAudioHardwarePropertyTranslateUIDToDevice` (`'uidd'`, macOS 10.5+): UID → device id.
 const K_AUDIO_HARDWARE_PROPERTY_TRANSLATE_UID_TO_DEVICE: u32 = fourcc(*b"uidd");
 
+/// Aggregate-device description keys — string-literal macros in the macOS 27 SDK
+/// (`CoreAudio/AudioHardware.h`): `#define kAudioAggregateDeviceUIDKey "uid"`,
+/// `…NameKey "name"`, `…IsPrivateKey "private"`, `…TapListKey "taps"`.
+/// Values taken verbatim from Apple's macOS 27 SDK header.
+const KEY_UID: &str = "uid";
+const KEY_NAME: &str = "name";
+const KEY_PRIVATE: &str = "private";
+const KEY_TAPS: &str = "taps";
+/// `kAudioSubTapUIDKey` — same literal as `kAudioAggregateDeviceUIDKey`; the
+/// sub-tap entry is its own dictionary level, so the key repeats there.
+const KEY_SUBTAP_UID: &str = "uid";
+
 /// Four-Charpack → `AudioObjectPropertySelector` (C multi-char constants are
 /// big-endian packed; `'tuid'` → `0x74756964`).
 const fn fourcc(bytes: [u8; 4]) -> u32 {
@@ -81,13 +102,6 @@ type DestroyProcessTapFn = unsafe extern "C" fn(AudioObjectId) -> OsStatus;
 
 #[link(name = "CoreAudio", kind = "framework")]
 extern "C" {
-    // Aggregate-device description keys (extern CFStringRef, CoreAudio/AudioHardware.h).
-    static kAudioAggregateDeviceNameKey: CFStringRef;
-    static kAudioAggregateDeviceUIDKey: CFStringRef;
-    static kAudioAggregateDeviceIsPrivateKey: CFStringRef;
-    static kAudioAggregateDeviceTapListKey: CFStringRef;
-    static kAudioSubTapUIDKey: CFStringRef;
-
     /// CoreAudio/AudioHardware.h, macOS 10.9+.
     fn AudioHardwareCreateAggregateDevice(
         description: CFDictionaryRef,
@@ -201,7 +215,7 @@ fn string_property(object: AudioObjectId, selector: u32) -> Result<String, TapEr
 fn create_aggregate_device(name: &str, tap_uid: &str) -> Result<AudioObjectId, TapError> {
     // One sub-tap entry: the tap's UID.
     let sub_tap = {
-        let key = unsafe { CFString::wrap_under_get_rule(kAudioSubTapUIDKey) };
+        let key = CFString::new(KEY_SUBTAP_UID);
         let value = CFString::new(tap_uid);
         CFDictionary::from_CFType_pairs(&[(key, value)]).to_untyped()
     };
@@ -209,12 +223,10 @@ fn create_aggregate_device(name: &str, tap_uid: &str) -> Result<AudioObjectId, T
     let device_uid = NSUUID::new().UUIDString().to_string();
 
     let dictionary = {
-        let name_key = unsafe { CFString::wrap_under_get_rule(kAudioAggregateDeviceNameKey) };
-        let uid_key = unsafe { CFString::wrap_under_get_rule(kAudioAggregateDeviceUIDKey) };
-        let private_key =
-            unsafe { CFString::wrap_under_get_rule(kAudioAggregateDeviceIsPrivateKey) };
-        let tap_list_key =
-            unsafe { CFString::wrap_under_get_rule(kAudioAggregateDeviceTapListKey) };
+        let name_key = CFString::new(KEY_NAME);
+        let uid_key = CFString::new(KEY_UID);
+        let private_key = CFString::new(KEY_PRIVATE);
+        let tap_list_key = CFString::new(KEY_TAPS);
         CFDictionary::from_CFType_pairs(&[
             (name_key, CFString::new(name).as_CFType()),
             (uid_key, CFString::new(&device_uid).as_CFType()),
