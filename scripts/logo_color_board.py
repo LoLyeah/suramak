@@ -105,7 +105,7 @@ def main():
         im = Image.alpha_composite(white, im).convert("RGB")
         tx = (cw - 16 - 256) // 2
         cell.paste(im, (tx, 14))
-        cd.rectangle([tx - 2, 12, tx + 257, 14 + 257], outline="#B0B0B6", width=2)
+        cd.rectangle([tx - 2, 12, tx + 257, 14 + 257], outline="#8E8E93", width=3)
         ok = "OK" if cr >= 3.0 else "below 3:1"
         cd.text((16, 290), name, font=fname, fill="#111111")
         cd.text((16, 316), f"tile {tc}  ·  glyph {gc}", font=fsm, fill="#3A3A3C")
