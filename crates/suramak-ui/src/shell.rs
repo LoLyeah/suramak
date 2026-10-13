@@ -192,8 +192,24 @@ impl Shell {
         // Viewport commands first (they borrow `full_output`), then the moved
         // platform output.
         handle_viewport_commands(&self.window, &full_output);
+        // macOS 27 + winit 0.30.13: the IME enable→disable round-trip crashes
+        // inside `WinitView::set_ime_allowed` (SIGSEGV releasing the marked-text
+        // cell, object literal `0x3`, crash 48A5EFA3 on the owner's Mac,
+        // 2026-10-13 — see docs/PLAN-NOTES.md). Until winit is fixed, the app
+        // never asks for IME: with `ime = None` every frame and the debounce
+        // state left at its `false` default, egui-winit issues no
+        // `set_ime_allowed` calls at all. en/id typing needs no IME (text
+        // arrives as regular key events). Re-enable when upstream handles it.
+        #[cfg(target_os = "macos")]
+        let platform_output = {
+            let mut output = full_output.platform_output;
+            output.ime = None;
+            output
+        };
+        #[cfg(not(target_os = "macos"))]
+        let platform_output = full_output.platform_output;
         self.egui_state
-            .handle_platform_output(&self.window, full_output.platform_output);
+            .handle_platform_output(&self.window, platform_output);
         let pixels_per_point = full_output.pixels_per_point;
         let paint_jobs = egui_ctx.tessellate(full_output.shapes, pixels_per_point);
 
