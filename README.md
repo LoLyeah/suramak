@@ -1,8 +1,11 @@
 # Suramak
 
+<img src="assets/logo/icons/readme-logo.png" alt="Suramak" width="360">
+
 Local-first transcription app. Fully native, written in Rust. **macOS first; Windows and Linux ports to follow.**
 
 - On-device transcription (whisper.cpp via whisper-rs) — English + Indonesian first.
+- Fast path on Apple Silicon: the Whisper encoder runs on the Neural Engine via the official Core ML encoder package (`--engine coreml`; `auto` picks it when installed).
 - Import files + microphone recording, timestamped segments, editable transcript.
 - Export Markdown / TXT / JSON (+ SRT / VTT) — take it to any LLM you like.
 - Optional in-app "polish" via your own OpenAI-compatible endpoint — the app works fully without it.
@@ -14,6 +17,7 @@ Local-first transcription app. Fully native, written in Rust. **macOS first; Win
 - ✅ `suramak-core` — types, storage (sqlite), export, model download w/ sha256, decode, resample, polish client — fully tested
 - ✅ `suramak-asr` — whisper-rs pipeline + worker thread (record-then-transcribe), verified end-to-end
 - ✅ `suramak-cli` — `models` / `transcribe` / `export` / `library` / `polish` / `doctor`
+- ✅ engine tiers — CPU / Metal / Core ML-ANE (`--engine`, `doctor` reports the stack; M1.5)
 - 🚧 `suramak-ui` + `suramak-glass` — the native window & Liquid Glass shell (in progress)
 
 ## Layout
