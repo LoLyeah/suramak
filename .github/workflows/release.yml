@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos-app:
+    name: macOS app bundle
+    runs-on: macos-26-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release -p suramak-ui -p suramak-cli
+
+      - name: Bundle + ad-hoc sign (includes the generated app icon)
+        run: ./scripts/make-app.sh
+
+      - name: Package
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          ditto -c -k --keepParent dist/Suramak.app "Suramak-${TAG}-macos-arm64.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-app
+          path: Suramak-*.zip
+
+  linux-cli:
+    name: Linux CLI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System dependencies (cmake for whisper.cpp)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libasound2-dev
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release -p suramak-cli
+
+      - name: Package
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p pkg
+          cp target/release/suramak-cli pkg/
+          cp README.md LICENSE pkg/
+          tar -czf "suramak-cli-${TAG}-linux-x86_64.tar.gz" -C pkg .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-cli
+          path: suramak-cli-*.tar.gz
+
+  release:
+    name: Publish GitHub Release
+    needs: [macos-app, linux-cli]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          awk -v ver="$TAG" 'BEGIN{f=0} $0 ~ "^## \\[" ver "\\]" {f=1; next} /^## \[/ {if (f) exit} f {print}' CHANGELOG.md > RELEASE-NOTES.md
+          if [ ! -s RELEASE-NOTES.md ]; then echo "See CHANGELOG.md." > RELEASE-NOTES.md; fi
+          {
+            echo
+            echo "---"
+            echo "Ad-hoc signed build: on first launch macOS may ask you to right-click → Open (Gatekeeper)."
+            echo "Models are not bundled — they download on first use (sha256-pinned)."
+            echo "Owner checklist for this machine: docs/USER_SMOKE.md"
+          } >> RELEASE-NOTES.md
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Suramak-*.zip
+            suramak-cli-*.tar.gz
+          body_path: RELEASE-NOTES.md

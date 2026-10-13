@@ -14,6 +14,11 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/suramak"
 cp "packaging/Info.plist" "$APP/Contents/Info.plist"
 
+# Stamp the monotonic build number (git commit count) onto the bundle. The
+# marketing version comes from the repo plist, kept in sync by scripts/bump_version.py.
+BUILD="$(git rev-list --count HEAD 2>/dev/null || echo 0)"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD" "$APP/Contents/Info.plist"
+
 # App icon: build AppIcon.icns from the generated iconset (iconutil, macOS) and bundle it.
 ICONSET="assets/logo/icons/macos/AppIcon.iconset"
 if [[ -d "$ICONSET" ]] && command -v iconutil >/dev/null; then
