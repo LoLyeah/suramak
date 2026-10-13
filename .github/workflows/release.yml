@@ -33,13 +33,13 @@ jobs:
           name: macos-app
           path: Suramak-*.zip
 
-  linux-cli:
-    name: Linux CLI
+  linux-app:
+    name: Linux app (tar.gz)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: System dependencies (cmake for whisper.cpp)
+      - name: System dependencies (cmake for whisper.cpp; libasound2-dev kept for the future Linux capture feature)
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake libasound2-dev
@@ -47,25 +47,37 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Build
-        run: cargo build --release -p suramak-cli
+      - name: Build (app + CLI)
+        run: cargo build --release -p suramak-ui -p suramak-cli
 
-      - name: Package
+      - name: Package (app binary + CLI + .desktop + icon)
         run: |
           TAG="${GITHUB_REF_NAME}"
-          mkdir -p pkg
-          cp target/release/suramak-cli pkg/
-          cp README.md LICENSE pkg/
-          tar -czf "suramak-cli-${TAG}-linux-x86_64.tar.gz" -C pkg .
+          DIR="suramak-${TAG}-linux-x86_64"
+          mkdir -p "pkg/${DIR}"
+          cp target/release/suramak target/release/suramak-cli "pkg/${DIR}/"
+          cp assets/logo/icons/linux/suramak-256.png "pkg/${DIR}/suramak.png"
+          cp README.md LICENSE "pkg/${DIR}/"
+          printf '%s\n' \
+            '[Desktop Entry]' \
+            'Name=Suramak' \
+            'Comment=Private, on-device transcription' \
+            'Exec=suramak' \
+            'Icon=suramak' \
+            'Terminal=false' \
+            'Type=Application' \
+            'Categories=AudioVideo;Audio;Utility;' \
+            > "pkg/${DIR}/suramak.desktop"
+          tar -czf "${DIR}.tar.gz" -C pkg "${DIR}"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: linux-cli
-          path: suramak-cli-*.tar.gz
+          name: linux-app
+          path: suramak-*-linux-x86_64.tar.gz
 
   release:
     name: Publish GitHub Release
-    needs: [macos-app, linux-cli]
+    needs: [macos-app, linux-app]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -82,6 +94,7 @@ jobs:
             echo "---"
             echo "Ad-hoc signed build: on first launch macOS may ask you to right-click → Open (Gatekeeper)."
             echo "Models are not bundled — they download on first use (sha256-pinned)."
+            echo "Linux: extract the tarball and run ./suramak — needs a Vulkan or OpenGL capable desktop; suramak.desktop + icon are included for your app menu."
             echo "Owner checklist for this machine: docs/USER_SMOKE.md"
           } >> RELEASE-NOTES.md
 
@@ -93,5 +106,5 @@ jobs:
         with:
           files: |
             Suramak-*.zip
-            suramak-cli-*.tar.gz
+            suramak-*-linux-x86_64.tar.gz
           body_path: RELEASE-NOTES.md
