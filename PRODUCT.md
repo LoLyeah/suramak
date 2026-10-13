@@ -32,11 +32,11 @@ Daily capture/import of en+id speech on macOS; transcripts exported to md/txt/js
 
 ## Capabilities and Constraints
 
-Capabilities (MVP scope): file import (wav/mp3/flac/ogg/m4a), microphone recording (record-then-transcribe), on-device transcription with explicit language selection (Auto / English / Indonesian) and a default prompt that teaches the brand word, editable timestamped segments, transcript library (sqlite), exports md/txt/json/srt/vtt, model manager (download with checksum + resume).
+Capabilities (MVP scope): file import (wav/mp3/flac/ogg/m4a), microphone recording (record-then-transcribe), on-device transcription with explicit language selection (Auto / English / Indonesian, plus any custom whisper language code the user types — offered, not officially supported) and a default prompt that teaches the brand word, editable timestamped segments, transcript library (sqlite, with delete), exports md/txt/json/srt/vtt, model manager (download with checksum + resume).
 
 Constraints: Rust, native rendering, macOS Liquid Glass as a hard requirement; no telemetry; network only for model downloads and opt-in polish. Polish API keys live in the OS keychain (env-var fallback on Linux dev).
 
-Undecided (do not invent): distribution model (private / open source / paid), UI localization beyond English, live/streaming transcription.
+Undecided (do not invent): distribution model (private / open source / paid), UI localization beyond English.
 
 ## Brand Commitments
 
@@ -61,5 +61,6 @@ No testimonials, benchmarks, or screenshots. Measured, verifiable facts exist in
 - **File associations** — declare supported audio+video document types (CFBundleDocumentTypes) so double-click / "Open With…" opens Suramak; Open Recent; macOS Services later.
 - **Recordings** — optional "save compressed (FLAC)" toggle (symphonia already decodes FLAC); kept audio stays 16 kHz mono 16-bit WAV, transient temp file by default.
 - **Capture 2.0 — multi-source + per-app (M6)** — source selection moves from a single-source dropdown to a **checkbox list** so sources combine: N concurrent inputs (e.g. two mics; **mic + system audio** — the meeting-transcription combo) mixed into the single 16 kHz mono pipeline with proper clock-drift handling and per-source levels. **Per-app capture** ("transcribe only this Zoom call") rides the same milestone: it is one parameter away in `suramak-taps` (`ProcessSelection::Only(processes)`), plus a picker of running audio processes. Virtual loopback devices (BlackHole etc.) already work today via the input-device picker. Rule: the checkbox UI ships together with the mixing engine — never a single-choice checkbox list.
+- **Live transcription (M7)** — partial transcripts *while recording* (user-requested 2026-10-13; today the pipeline is record-then-transcribe, so results appear only after Stop). Shape: chunked partial decodes during capture (VAD-gated windows through the same whisper path, transcript view growing live), clearly labeled as provisional; a final full-file pass on Stop keeps quality. Gating questions: engine cost during capture (CPU/GPU contention with the audio path) and graceful degradation on slower Macs. Until then, record-then-transcribe remains the product.
 - **Icons / brand** — macOS 26 layered/tinted icon variants via Icon Composer; optional wordmark optical pass.
 - **Windows / Linux** — bring-up per the platform roadmap (the DWM frosted-glass stub is already compile-checked).
