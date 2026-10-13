@@ -6,7 +6,7 @@
 
 adaptive
 
-Desktop-first in practice: macOS 26 (Apple Silicon) is the primary target; Windows follows. One product, OS-native design language: Apple Liquid Glass on macOS, frosted glass (DWM backdrop) on Windows. Mobile references are intentionally not applicable.
+Desktop-first in practice: macOS 26 (Apple Silicon) is the primary target and stays first priority; Windows and Linux ports follow (Linux doubles as the dev-preview surface today and becomes a release target later). One product, OS-native design language: Apple Liquid Glass on macOS; frosted glass (DWM backdrop) on Windows; on Linux, a calm native look without OS glass until a real system material exists to adopt. Mobile references are intentionally not applicable.
 
 ## Stack
 
