@@ -37,3 +37,7 @@ cargo build --release -p suramak-ui    # the app
 ```
 
 Models are downloaded on demand (`suramak-cli models download <id>`, sha256-pinned).
+
+## License
+
+GPL-3.0-or-later — see [LICENSE](LICENSE).
