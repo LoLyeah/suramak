@@ -4,6 +4,8 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-13
+
 ### Added
 - On-device transcription (whisper.cpp; CPU / Metal / **Core ML-ANE** tiers with automatic fallback + honest reporting) — English + Indonesian
 - Import audio files (wav/mp3/m4a/flac/ogg) via drag-and-drop, file picker, or path
@@ -12,6 +14,15 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 - In-app model manager (download with progress, delete, set default) and full settings screen
 - Optional LLM “polish” via your own OpenAI-compatible endpoint (key stored in the OS keychain)
 - macOS 26 **Liquid Glass** shell (fallback material on older macOS)
+- Custom language codes in Settings — presets plus any whisper code you type (unofficial codes are best-effort)
+- Delete transcripts from the library (trash affordance with an in-place confirm)
+
+### Fixed
+- macOS 27 hardening (all found through owner smoke testing): the Liquid Glass re-parenting could abort when a modal panel (open/save dialog) ran; two winit IME crashes around text-field focus (nil input context; `set_ime_allowed` release) — fixed via a pinned winit fork plus keeping the app IME-free on macOS; system-audio taps now translate pids to process objects and never probe the HAL immediately after aggregate creation
+
+### Changed
+- Linux is a shipping target from this release — the release page gains a Linux app tarball next to the macOS build
+- A second app instance exits with a clear message instead of fighting over the library (single-instance guard)
 
 ### License
 - GPL-3.0-or-later
