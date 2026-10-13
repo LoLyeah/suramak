@@ -1,0 +1,16 @@
+# M5 video fixtures — one file per container, each carrying 9.0 s of real speech
+# (the TTS sample build/share/suramak-sample-en.mp3, 16 kHz mono) plus a testsrc
+# video stream, so container+video coexistence is real. Commands are runnable
+# from the repo root with ffmpeg n9.0.1; regeneration matches in content, not
+# bytes (mp4/mov embed creation timestamps, matroska a random SegmentUID).
+#
+# Source speech: "The quick brown fox jumps over the lazy dog. Suramak keeps
+# every recording on this machine and never sends audio to the cloud."
+#
+# file	container/streams	role	ffmpeg command
+sample-en.mp4	mp4 (h264 + aac)	supported	ffmpeg -y -f lavfi -i testsrc=size=160x120:rate=5 -i build/share/suramak-sample-en.mp3 -map 0:v -map 1:a -c:v libx264 -preset veryslow -crf 51 -c:a aac -b:a 64k -movflags +faststart -shortest -f mp4 fixtures/video/sample-en.mp4
+sample-en.mov	mov (h264 + aac)	supported	ffmpeg -y -f lavfi -i testsrc=size=160x120:rate=5 -i build/share/suramak-sample-en.mp3 -map 0:v -map 1:a -c:v libx264 -preset veryslow -crf 51 -c:a aac -b:a 64k -movflags +faststart -shortest -f mov fixtures/video/sample-en.mov
+sample-en.m4v	m4v (mp4 container; h264 + aac)	supported	ffmpeg -y -f lavfi -i testsrc=size=160x120:rate=5 -i build/share/suramak-sample-en.mp3 -map 0:v -map 1:a -c:v libx264 -preset veryslow -crf 51 -c:a aac -b:a 64k -movflags +faststart -shortest -f mp4 fixtures/video/sample-en.m4v
+sample-en.mkv	mkv (h264 + aac)	supported	ffmpeg -y -f lavfi -i testsrc=size=160x120:rate=5 -i build/share/suramak-sample-en.mp3 -map 0:v -map 1:a -c:v libx264 -preset veryslow -crf 51 -c:a aac -b:a 64k -shortest -f matroska fixtures/video/sample-en.mkv
+sample-en-opus.mkv	mkv (h264 + opus)	unsupported (error path)	ffmpeg -y -f lavfi -i testsrc=size=160x120:rate=5 -i build/share/suramak-sample-en.mp3 -map 0:v -map 1:a -c:v libx264 -preset veryslow -crf 51 -c:a libopus -b:a 24k -shortest -f matroska fixtures/video/sample-en-opus.mkv
+sample-en-opus.webm	webm (vp9 + opus)	unsupported (error path)	ffmpeg -y -f lavfi -i testsrc=size=160x120:rate=5 -i build/share/suramak-sample-en.mp3 -map 0:v -map 1:a -c:v libvpx-vp9 -deadline best -cpu-used 2 -crf 50 -b:v 0 -c:a libopus -b:a 24k -shortest -f webm fixtures/video/sample-en-opus.webm

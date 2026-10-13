@@ -72,6 +72,41 @@ What to expect:
 - Then benchmark the tiers on the same file — `--engine coreml` vs `--engine metal` vs `--engine cpu` (`time …`) — and check `engine:` on stderr; Activity Monitor's GPU History / `powermetrics` show the ANE/GPU activity.
 - If a macOS/chip combination regresses on ANE init (the whisper.cpp #3702 class), the run still succeeds: the CLI prints `engine: metal`/`cpu` plus a warning — no hard failure.
 
+## Container support — the decode path (M5)
+
+Status: 2026-10-14, test-verified on Linux from the committed fixtures in
+`fixtures/video/` (real ffmpeg files built from the TTS speech sample; exact
+commands in `fixtures/video/manifest.tsv`). Import decodes the **first audio
+track** of a file and ignores video streams; every container below rides the
+identical pipeline (decode → resample → whisper) as audio imports.
+
+| container | audio codec | supported | fallback hint (the import error) |
+|---|---|---|---|
+| wav / mp3 / flac / ogg (vorbis) / m4a | pcm / mp3 / flac / vorbis / aac | ✅ (pre-M5) | — |
+| mp4 | aac | ✅ (M5) | — |
+| mov | aac | ✅ (M5) | — |
+| m4v | aac | ✅ (M5) | — |
+| mkv | aac | ✅ (M5) | — |
+| mkv | opus | ❌ | `cannot decode clip.mkv: the audio codec (Opus) is not supported — convert it first, for example: ffmpeg -i "clip.mkv" "clip.mp4"` |
+| webm (not an offered import extension) | opus | ❌ | same message with the file's own name |
+| anything else (wma, aiff, …) | — | ❌ (no reader in this build) | `cannot decode clip.wma: this file's format is not supported — convert it first, for example: ffmpeg -i "clip.wma" "clip.mp4"` |
+
+Notes:
+
+- Decoding is pure-Rust **symphonia** — no ffmpeg dependency and nothing
+  bundled. The `ffmpeg` line in the errors is a user-facing conversion recipe.
+- Readers enabled: `isomp4` (mp4/m4a/mov/m4v), `mkv` (matroska/webm), `wav`,
+  `ogg`, plus the existing audio codecs; `mkv` was already active through
+  symphonia's default features and is now pinned explicitly in the workspace
+  manifest (no new crates).
+- `aiff` is listed in the file picker but has no reader enabled in this build
+  (pre-existing); such files now fail with the actionable conversion error
+  instead of a raw decoder message.
+- The **ffmpeg-sidecar** integration (decode anything by shelling out to a
+  bundled ffmpeg) remains the documented future escape hatch — see
+  `docs/PLAN-NOTES.md`; it is deliberately not implemented and nothing is ever
+  bundled.
+
 ## Multi-engine strategy (agreed direction, 2026-10-13)
 
 Verdict: **different engines per language is the right end state** — it is where the mature apps converge (MacWhisper ships Whisper and Parakeet side by side). Phase it:

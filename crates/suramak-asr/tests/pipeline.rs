@@ -11,6 +11,13 @@
 //! (`~/.local/share/suramak/models/ggml-tiny.bin`). A missing model skips the test with
 //! a message unless `SURAMAK_REQUIRE_MODEL=1` is set, in which case it fails.
 //!
+//! `e2e_video_fixture_matches_the_source_mp3_words` compares the video fixture against
+//! the committed `fixtures/audio/en.wav` (same sentences; always present) and — when the
+//! gitignored TTS sample `build/share/suramak-sample-en.mp3` is present — against that
+//! source mp3 too (the file the video fixtures were built from). A missing sample skips
+//! the second comparison with a message; `SURAMAK_REQUIRE_SAMPLE=1` turns that skip into
+//! a failure (used for the M5 acceptance run).
+//!
 //! `e2e_coreml_encoder_engaged_macos` additionally needs macOS + the tiny Core ML
 //! encoder package; `SURAMAK_REQUIRE_COREML=1` turns its skips into failures (used by
 //! the macOS CI job).
@@ -28,6 +35,48 @@ fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/audio")
         .join(name)
+}
+
+/// Serializes the whisper e2e tests in this file.
+///
+/// Each e2e test runs a full whisper session (all cores); running two sessions
+/// concurrently on a small machine corrupts the process heap — observed as
+/// glibc's `malloc(): unaligned tcache chunk detected` aborting ~1 in 4 runs of
+/// this file on the 2-core dev VPS, on the pre-M5 test set as well. Serializing
+/// makes the suite deterministic (and faster there: ~11 s vs ~22 s). Poisoning
+/// is ignored so one failing test never cascades into the others.
+static E2E_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn e2e_serial() -> std::sync::MutexGuard<'static, ()> {
+    E2E_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// An M5 video fixture (`fixtures/video/`): real speech + a testsrc video stream.
+fn video_fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/video")
+        .join(name)
+}
+
+/// The gitignored TTS sample the video fixtures were built from
+/// (`build/share/suramak-sample-en.mp3`) — the mp3 baseline for the video e2e.
+fn source_sample_mp3() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build/share/suramak-sample-en.mp3")
+}
+
+/// The words of a transcript, normalized for comparison: lowercased, single spaces.
+fn words(transcript: &suramak_core::transcript::Transcript) -> String {
+    transcript
+        .segments
+        .iter()
+        .map(|segment| segment.text.to_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Resolves the tiny model from the standard data dir; `None` (skip) when absent,
@@ -168,6 +217,7 @@ fn worker_reports_missing_model_as_error_event() {
 #[test]
 #[ignore = "release-only e2e: debug whisper is ~50x too slow (run with --release -- --ignored)"]
 fn e2e_en_fixture_contains_fox() {
+    let _serial = e2e_serial();
     let Some(model_path) = tiny_model_or_skip() else {
         return;
     };
@@ -214,6 +264,7 @@ fn e2e_en_fixture_contains_fox() {
 #[test]
 #[ignore = "release-only e2e: debug whisper is ~50x too slow (run with --release -- --ignored)"]
 fn e2e_id_fixture_has_non_empty_segment() {
+    let _serial = e2e_serial();
     let Some(model_path) = tiny_model_or_skip() else {
         return;
     };
@@ -250,6 +301,91 @@ fn e2e_id_fixture_has_non_empty_segment() {
     );
 }
 
+/// M5 end-to-end: the mp4 fixture (speech + a testsrc video stream) must
+/// transcribe to the same words as the source speech — the video rides the
+/// identical pipeline (decode the first audio track → resample → whisper).
+///
+/// Baselines: the committed `fixtures/audio/en.wav` (same sentences, always
+/// present — this is what runs in CI) and, when it exists, the gitignored TTS
+/// sample `build/share/suramak-sample-en.mp3` the video fixtures were built
+/// from. A missing sample skips the second comparison with a message;
+/// `SURAMAK_REQUIRE_SAMPLE=1` turns that skip into a failure (M5 acceptance).
+#[test]
+#[ignore = "release-only e2e: debug whisper is ~50x too slow (run with --release -- --ignored)"]
+fn e2e_video_fixture_matches_the_source_mp3_words() {
+    let _serial = e2e_serial();
+    let Some(model_path) = tiny_model_or_skip() else {
+        return;
+    };
+
+    let plan = resolve_for(&model_path, EngineSetting::Auto, Some("en"));
+    let mut cache = ContextCache::new();
+    let ctx = cache
+        .get_or_load(&model_path, plan.engine.use_gpu())
+        .expect("load tiny model");
+
+    let run = |path: &Path| {
+        transcribe_file(
+            ctx,
+            path,
+            &model_path,
+            &LangMode::Fixed("en".to_string()),
+            None,
+            whisper::default_threads(),
+            &plan,
+            |_| {},
+        )
+        .unwrap_or_else(|err| panic!("transcribe {}: {err}", path.display()))
+    };
+
+    let video = run(&video_fixture("sample-en.mp4"));
+    eprintln!("video (sample-en.mp4): {}", words(&video.transcript));
+    assert!(
+        !video.transcript.segments.is_empty(),
+        "expected at least one segment from the video"
+    );
+
+    // The committed fixture carries the same sentences; it is always available.
+    let committed = run(&fixture("en.wav"));
+    eprintln!("committed en.wav: {}", words(&committed.transcript));
+    assert_eq!(
+        words(&video.transcript),
+        words(&committed.transcript),
+        "the video's audio track must transcribe to the same words as the committed en.wav"
+    );
+
+    // The workorder's baseline: the source mp3 the fixtures were built from.
+    let source = source_sample_mp3();
+    if !source.is_file() {
+        if std::env::var("SURAMAK_REQUIRE_SAMPLE").as_deref() == Ok("1") {
+            panic!(
+                "SURAMAK_REQUIRE_SAMPLE=1 but the source sample is missing at {} \
+                 (build/share is gitignored)",
+                source.display()
+            );
+        }
+        eprintln!(
+            "skipping the source-mp3 comparison: sample not found at {} \
+             (set SURAMAK_REQUIRE_SAMPLE=1 to make this a hard failure)",
+            source.display()
+        );
+        return;
+    }
+    let baseline = run(&source);
+    eprintln!(
+        "source mp3 (suramak-sample-en.mp3): {}",
+        words(&baseline.transcript)
+    );
+    assert_eq!(
+        words(&video.transcript),
+        words(&baseline.transcript),
+        "the video's audio track must transcribe to the same words as the source mp3"
+    );
+    if !cfg!(target_os = "macos") {
+        assert_eq!(video.engine_used, EngineId::Cpu);
+    }
+}
+
 /// macOS-only e2e: with `--engine coreml` the Core ML encoder must be the engine that
 /// actually ran (whisper.cpp loaded the `.mlmodelc` package next to the model file).
 ///
@@ -258,6 +394,7 @@ fn e2e_id_fixture_has_non_empty_segment() {
 #[test]
 #[ignore = "macOS-only: needs Core ML + the tiny encoder package (run with --release -- --ignored on a Mac)"]
 fn e2e_coreml_encoder_engaged_macos() {
+    let _serial = e2e_serial();
     let require = std::env::var("SURAMAK_REQUIRE_COREML").as_deref() == Ok("1");
     if !cfg!(target_os = "macos") {
         if require {

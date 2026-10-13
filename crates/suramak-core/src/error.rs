@@ -48,6 +48,22 @@ pub enum SuramakError {
     #[error("No audio data in file")]
     NoAudioData,
 
+    /// A file the decode path cannot handle — an unsupported container or an
+    /// audio codec without a decoder (e.g. Opus in WebM/MKV). The message is
+    /// user-facing and actionable: it names a working alternative.
+    #[error(
+        "cannot decode {name}: {detail} — convert it first, \
+         for example: ffmpeg -i \"{name}\" \"{suggested}\""
+    )]
+    UnsupportedFormat {
+        /// File name (not the full path) as shown to the user.
+        name: String,
+        /// What exactly is unsupported: the container or the audio codec.
+        detail: String,
+        /// Suggested conversion target (same stem, `.mp4`).
+        suggested: String,
+    },
+
     #[error("Keychain error: {0}")]
     Keychain(String),
 

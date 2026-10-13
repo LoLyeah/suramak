@@ -125,6 +125,17 @@ Data lives in `~/Library/Application Support/dev.suramak.Suramak/` (db, settings
 - **While a transcription job is running** (or on a build without capture compiled in), the control is dimmed. Expected: clicking it does not start anything; a status line explains why (`recording is disabled while a job is running` / `recording is not compiled into this build (feature \`capture\`)`).
 - **The old titlebar red dot is gone** — the floating control is the record entry point. Expected: no red dot in the title bar; the titlebar keeps only the (decorative) play/export glyphs.
 
+## 16. Import a video (M5)
+
+- Drag a real screen recording (`.mov` or `.mp4`) onto the window (or Home → `Choose file…` — the picker now says `Audio or video`).
+  Expected: exactly the audio-import flow — transcribe view with progress, then the editor with timestamped segments and the file name in the sidebar; the audio track is transcribed and the video stream is ignored.
+- Repeat with an `.mkv` (AAC audio).
+  Expected: identical behavior.
+- Drag a WebM (Opus audio — e.g. a screen recording made on a Linux box) onto the window.
+  Expected: the transcribe view fails with a red, actionable line naming a working alternative, e.g. `cannot decode clip.webm: the audio codec (Opus) is not supported — convert it first, for example: ffmpeg -i "clip.webm" "clip.mp4"` — no crash, no dead end; **Back** returns home.
+- Export the video transcript as `SRT`/`VTT`.
+  Expected: valid subtitle files with the same timestamps as the audio (the editor and exports are unchanged — a video import is unremarkable).
+
 ## Report
 
 Anything that deviates from an expected result, with: what you did, what happened, what you expected.

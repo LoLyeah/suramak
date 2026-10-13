@@ -17,15 +17,20 @@ use super::{AppState, Effect};
 /// macOS/Windows: native open dialog (rfd). Linux: `None` — the path field is
 /// the affordance there (avoids the zbus/portal dependency chain).
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-fn pick_audio_file() -> Option<PathBuf> {
+fn pick_media_file() -> Option<PathBuf> {
     rfd::FileDialog::new()
-        .set_title("Import audio")
-        .add_filter("Audio", &["wav", "mp3", "m4a", "flac", "ogg", "aiff"])
+        .set_title("Import audio or video")
+        .add_filter(
+            "Audio or video",
+            &[
+                "wav", "mp3", "m4a", "flac", "ogg", "aiff", "mp4", "mov", "m4v", "mkv",
+            ],
+        )
         .pick_file()
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn pick_audio_file() -> Option<PathBuf> {
+fn pick_media_file() -> Option<PathBuf> {
     None
 }
 
@@ -43,14 +48,14 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
             pane_title(ui, "New transcription", palette);
             pane_caption(
                 ui,
-                "Drop an audio file anywhere in this window, or import one below.",
+                "Drop an audio or video file anywhere in this window, or import one below.",
                 palette,
                 false,
             );
             if !state.capture_available {
                 pane_caption(
                     ui,
-                    "Recording is not compiled into this build (feature `capture`) — import or drop audio files instead.",
+                    "Recording is not compiled into this build (feature `capture`) — import or drop audio or video files instead.",
                     palette,
                     false,
                 );
@@ -83,7 +88,7 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
     painter.text(
         pos2(zone.center().x, zone.center().y + 20.0),
         Align2::CENTER_CENTER,
-        "wav · mp3 · m4a · flac · ogg — transcribed on this machine, never uploaded",
+        "wav · mp3 · m4a · flac · ogg · mp4 · mov · m4v · mkv — transcribed on this machine, never uploaded",
         FontId::new(12.0, FontFamily::Proportional),
         palette.text_dim,
     );
@@ -98,7 +103,7 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
         |ui| {
             ui.horizontal(|ui| {
                 if HAS_NATIVE_DIALOG && ui.button("Choose file…").clicked() {
-                    if let Some(path) = pick_audio_file() {
+                    if let Some(path) = pick_media_file() {
                         effects.extend(state.begin_import(path));
                     }
                 }
@@ -107,7 +112,7 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
                 let response = ui.add_sized(
                     [field_width.max(120.0), 24.0],
                     egui::TextEdit::singleline(&mut state.home.path_field)
-                        .hint_text("path to an audio file — press Enter to import"),
+                        .hint_text("path to an audio or video file — press Enter to import"),
                 );
                 let submitted =
                     response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));

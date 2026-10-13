@@ -9,8 +9,8 @@ use std::process::ExitCode;
 #[command(
     name = "suramak-cli",
     version,
-    about = "Suramak — fully-local audio transcription (CLI)",
-    long_about = "Suramak CLI: transcribe audio files locally with whisper.cpp.\n\
+    about = "Suramak — fully-local audio & video transcription (CLI)",
+    long_about = "Suramak CLI: transcribe audio and video files locally with whisper.cpp.\n\
                   Audio never leaves the machine; saving transcripts to the library is \
                   OFF by default and enabled per-run with --db."
 )]
@@ -24,7 +24,7 @@ enum Command {
     /// Manage whisper models: list, download (sha256-verified), remove
     #[command(subcommand)]
     Models(cmd::models::ModelsCmd),
-    /// Transcribe an audio file and write export files
+    /// Transcribe an audio or video file and write export files
     Transcribe(cmd::transcribe::TranscribeArgs),
     /// Library operations
     #[command(subcommand)]

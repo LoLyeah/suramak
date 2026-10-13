@@ -7,6 +7,7 @@ Local-first transcription app. Fully native, written in Rust. **macOS first; Win
 - On-device transcription (whisper.cpp via whisper-rs) — English + Indonesian first.
 - Fast path on Apple Silicon: the Whisper encoder runs on the Neural Engine via the official Core ML encoder package (`--engine coreml`; `auto` picks it when installed).
 - Import files + microphone recording, timestamped segments, editable transcript.
+- Import **video** (`.mp4` / `.mov` / `.m4v` / `.mkv`): the first audio track is transcribed through the identical pipeline — library row → transcribe → editor → exports (SRT/VTT become video subtitles). Unsupported audio (e.g. WebM/Opus) fails with an actionable conversion hint (`ffmpeg -i in.webm out.mp4`), never a raw decoder error (M5).
 - In-app playback with segment follow: play/pause on the waveform strip, click-to-seek, and the active segment highlighted and kept in view while playing; a clean “no audio / no output device” state when either is missing.
 - Floating record control: a bottom-center Liquid Glass pill on macOS 26+ (a real `NSGlassEffectView` behind the egui-drawn glyph and live `mm:ss` clock), an honest painted pill on Linux/Windows/older macOS; it is the record entry point — click to start, click to stop — and stays bottom-centered on resize (M8.5).
 - Any whisper language code: `auto` / `en` / `id` presets plus a free-text **Custom…** entry in Settings (loose validation, keeps the last good value).

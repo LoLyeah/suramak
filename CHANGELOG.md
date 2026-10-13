@@ -5,6 +5,7 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 ## [Unreleased]
 
 ### Added
+- Import video files (`.mp4` / `.mov` / `.m4v` / `.mkv`): the first audio track is transcribed through the identical pipeline as audio imports (library row → transcribe → editor → exports; SRT/VTT become video subtitles), with a test-verified container matrix from real ffmpeg fixtures. Unsupported audio (WebM/Opus, or any container this build has no reader for) fails with an actionable conversion hint — `cannot decode clip.webm: the audio codec (Opus) is not supported — convert it first, for example: ffmpeg -i "clip.webm" "clip.mp4"` — instead of a raw decoder error (M5)
 - In-app playback with segment follow: play/pause + moving playhead on the waveform strip, click-to-seek (the strip and any segment's timestamp), a `mm:ss / mm:ss` readout, and the active segment highlighted and scrolled into view while playing. Missing audio and a missing output device are explicit states, never a dead control (M8)
 
 ### Changed

@@ -32,6 +32,12 @@ Empirically verified on the dev VPS, 2026-10-13. **Where these notes conflict wi
 9. Copy detail: `NSMicrophoneUsageDescription` string (PLAN §7) — keep as planned.
 10. **mojibake guard**: whisper output for non-ASCII may include replacement chars — `to_str()` is fine for en/id; use `to_str_lossy()` only if a test shows an issue.
 
+## Decode path — container support & the ffmpeg-sidecar escape hatch (M5, verified)
+
+- Container support is pure-Rust **symphonia**: `isomp4` (mp4/m4a/mov/m4v) and `mkv` (matroska/webm, already active via symphonia's default features — now pinned explicitly) plus the pre-existing readers/codecs. A video file's **first audio track** is decoded; video streams demux as `CODEC_TYPE_NULL` and are skipped. Opus demuxes (mkv/webm) but symphonia 0.5.5 ships **no Opus decoder** — it fails with the actionable `UnsupportedFormat` message (`… convert it first, for example: ffmpeg -i "clip.webm" "clip.mp4"`).
+- **`ffmpeg` sidecar is the known escape hatch for anything symphonia cannot decode** (Opus, WMA, …) — deliberately **not** implemented in M5 and nothing is ever bundled: the import error hands the user a copy-paste conversion command instead. If a later milestone adds it, it must be an explicit opt-in layered on this same error path (and must not become a runtime dependency of the default build).
+- Container matrix + fixtures: `docs/ENGINES.md` §Container support; exact ffmpeg provenance in `fixtures/video/manifest.tsv`.
+
 ## AppKit window material — the float-glass layering rule (verified, M8.5)
 
 Where these conflict with a tempting "simplification", this wins; the arrangement survived two crashes.

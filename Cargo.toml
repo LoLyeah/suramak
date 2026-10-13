@@ -24,7 +24,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 sha2 = "0.10"
-symphonia = { version = "0.5.4", features = ["aac", "flac", "isomp4", "mp3", "vorbis", "wav"] }
+# M5: `isomp4` decodes mp4/mov/m4v; `mkv` decodes matroska/webm containers (AAC
+# inside mkv). `mkv` was already pulled in by symphonia's default features; it is
+# listed explicitly so the intended reader set is pinned, not implied.
+symphonia = { version = "0.5.4", features = ["aac", "flac", "isomp4", "mkv", "mp3", "vorbis", "wav"] }
 rubato = { version = "0.16", features = ["fft_resampler"] }
 hound = "3.5"
 clap = { version = "4", features = ["derive"] }
