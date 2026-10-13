@@ -1,0 +1,37 @@
+[workspace]
+members = ["crates/suramak-core"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+version = "0.1.0"
+
+[profile.release]
+lto = false
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+directories = "5"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+sha2 = "0.10"
+symphonia = { version = "0.5.4", features = ["aac", "flac", "isomp4", "mp3", "vorbis", "wav"] }
+rubato = { version = "0.16", features = ["fft_resampler"] }
+hound = "3.5"
+clap = { version = "4", features = ["derive"] }
+pollster = "0.4"
+egui = "0.33"
+egui-winit = "0.33"
+egui-wgpu = "0.33"
+winit = { version = "0.30", features = ["rwh_06"] }
+raw-window-handle = "0.6"
+whisper-rs = "0.16"
