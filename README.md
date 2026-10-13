@@ -8,6 +8,7 @@ Local-first transcription app. Fully native, written in Rust. **macOS first; Win
 - Fast path on Apple Silicon: the Whisper encoder runs on the Neural Engine via the official Core ML encoder package (`--engine coreml`; `auto` picks it when installed).
 - Import files + microphone recording, timestamped segments, editable transcript.
 - In-app playback with segment follow: play/pause on the waveform strip, click-to-seek, and the active segment highlighted and kept in view while playing; a clean “no audio / no output device” state when either is missing.
+- Floating record control: a bottom-center Liquid Glass pill on macOS 26+ (a real `NSGlassEffectView` behind the egui-drawn glyph and live `mm:ss` clock), an honest painted pill on Linux/Windows/older macOS; it is the record entry point — click to start, click to stop — and stays bottom-centered on resize (M8.5).
 - Any whisper language code: `auto` / `en` / `id` presets plus a free-text **Custom…** entry in Settings (loose validation, keeps the last good value).
 - Delete a transcript from the library: a trash button in the editor header with an inline confirm (segments go with it).
 - Export Markdown / TXT / JSON (+ SRT / VTT) — take it to any LLM you like.
@@ -30,7 +31,7 @@ Local-first transcription app. Fully native, written in Rust. **macOS first; Win
 ```
 crates/suramak-core   portable domain logic (no UI, no whisper)
 crates/suramak-asr    whisper-rs pipeline + worker (feature-gated mic capture)
-crates/suramak-glass  AppKit glass integration (objc2) + DWM backdrop (Windows) + Linux no-op
+crates/suramak-glass  AppKit glass integration (objc2; incl. the M8.5 floating record-control surface) + DWM backdrop (Windows) + Linux no-op
 crates/suramak-ui     the app window (winit + egui, no webview)
 crates/suramak-playback  in-app playback engine (cpal output + transport state; M8)
 crates/suramak-cli    headless CLI (also powers CI end-to-end tests)

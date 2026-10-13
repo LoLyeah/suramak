@@ -386,6 +386,12 @@ pub struct AppState {
     /// the state the strip draws from and the machine that decides what the
     /// engine is told.
     pub playback: Playback,
+    /// Whether the floating record control has a real system material behind it
+    /// (macOS 26+: the `NSGlassEffectView` subview via `suramak-glass`, M8.5).
+    /// The painter then draws the glyph/label/time only; `false` paints the
+    /// fallback pill. Seeded by the shell at startup; a field so the state is
+    /// testable headless.
+    pub float_glass: bool,
 }
 
 /// Side effects the runtime executes after a frame (or an event).
@@ -471,6 +477,9 @@ impl AppState {
             // false until then so the action can never fire half-configured.
             polish_configured: false,
             playback: Playback::none(),
+            // Seeded by the shell at startup (`GlassHandle::float_glass_available`);
+            // false until then — headless/non-macOS builds paint the pill.
+            float_glass: false,
         }
     }
 
@@ -502,15 +511,46 @@ impl AppState {
 
     // ---- recording (M3) -----------------------------------------------------
 
-    /// Whether the chrome-strip record dot can start a session: capture compiled in,
-    /// no job running, not already recording.
+    /// Whether the floating record control can start a session: capture compiled
+    /// in, no job running, not already recording (M8.5: the floating control is
+    /// the record entry point).
     pub fn can_record(&self) -> bool {
         self.capture_available
             && !matches!(self.job, Job::Running(_))
             && !matches!(self.record, RecordState::Recording(_))
     }
 
-    /// Record dot pressed: opens the recording view and asks the runtime to start.
+    /// The floating record control pressed (M8.5) — the single record entry
+    /// point. Idle → start (the effect the titlebar dot used to emit);
+    /// recording → stop (the same `StopCapture` effect the record view's Stop
+    /// button emits, final pass → transcript); unavailable → the same status
+    /// lines the old titlebar dot produced.
+    pub fn toggle_record(&mut self, now: Instant, date: &str) -> Vec<Effect> {
+        let recording = matches!(self.record, RecordState::Recording(_));
+        if recording {
+            let stopping =
+                matches!(&self.record, RecordState::Recording(recording) if recording.stopping);
+            if stopping {
+                // The runtime is finalising; a second stop is a no-op.
+                return Vec::new();
+            }
+            return self.stop_recording();
+        }
+        if self.can_record() {
+            return self.start_recording(now, date);
+        }
+        if matches!(self.job, Job::Running(_)) {
+            self.set_status("recording is disabled while a job is running", false);
+        } else {
+            self.set_status(
+                "recording is not compiled into this build (feature `capture`)",
+                true,
+            );
+        }
+        Vec::new()
+    }
+
+    /// Record pressed: opens the recording view and asks the runtime to start.
     pub fn start_recording(&mut self, now: Instant, date: &str) -> Vec<Effect> {
         if !self.can_record() {
             return Vec::new();
@@ -1876,6 +1916,108 @@ mod tests {
         let effects =
             state.on_transcript_saved(transcript_with_audio("Recording y.wav", &kept), Ok(()));
         assert_eq!(effects.len(), 1, "only the library refresh");
+    }
+
+    // ---- M8.5: the floating record control -----------------------------------
+
+    #[test]
+    fn the_floating_control_toggles_record_and_stop_through_the_same_effects() {
+        let mut state = recording_state();
+        assert!(
+            !state.float_glass,
+            "headless builds paint the fallback pill"
+        );
+        let t0 = Instant::now();
+
+        // Idle → recording: the exact effect the titlebar dot used to emit.
+        let effects = state.toggle_record(t0, "2026-10-14 09:00:00");
+        assert!(matches!(effects.as_slice(), [Effect::StartCapture]));
+        assert_eq!(state.route, Route::Record);
+        match &state.record {
+            RecordState::Recording(recording) => {
+                assert_eq!(recording.title, "Recording 2026-10-14 09:00:00");
+                assert!(!recording.stopping);
+            }
+            other => panic!("expected a recording, got {other:?}"),
+        }
+
+        // The elapsed clock ticks on the app tick while recording.
+        state.tick(t0 + Duration::from_millis(7_300));
+        match &state.record {
+            RecordState::Recording(recording) => {
+                assert_eq!(
+                    suramak_playback::format_mmss(recording.elapsed.as_millis() as u32),
+                    "00:07",
+                    "the pill shows the live mm:ss clock"
+                );
+            }
+            other => panic!("expected a recording, got {other:?}"),
+        }
+
+        // Recording → stop: the same StopCapture the record view's button emits.
+        let effects = state.toggle_record(t0 + Duration::from_millis(8_000), "ignored");
+        match effects.as_slice() {
+            [Effect::StopCapture { title }] => {
+                assert_eq!(title, "Recording 2026-10-14 09:00:00");
+            }
+            other => panic!("expected a stop effect, got {other:?}"),
+        }
+        // A second press while the runtime finalises is a no-op.
+        assert!(state.toggle_record(t0, "ignored").is_empty());
+        assert!(
+            state.busy(),
+            "recording keeps the tick alive until it stops"
+        );
+
+        // The runtime wrote the wav → the existing job flow takes over.
+        let wav = temp_wav("float-record");
+        let effects = state.on_recording_stopped(wav, false);
+        assert!(matches!(effects.as_slice(), [Effect::SubmitJob { .. }]));
+        assert_eq!(state.route, Route::Transcribe);
+    }
+
+    #[test]
+    fn the_floating_control_explains_when_recording_is_unavailable() {
+        // A running job locks the control, with the old dot's status line.
+        let mut state = recording_state();
+        state.begin_import(temp_wav("float-busy"));
+        assert!(state.toggle_record(Instant::now(), "d").is_empty());
+        let status = state.status.as_ref().unwrap();
+        assert!(!status.error);
+        assert_eq!(status.text, "recording is disabled while a job is running");
+        assert!(matches!(state.record, RecordState::Idle));
+
+        // Without capture compiled in the control is dead too (Linux default).
+        let mut plain = AppState::new();
+        plain.capture_available = false;
+        assert!(plain.toggle_record(Instant::now(), "d").is_empty());
+        let status = plain.status.as_ref().unwrap();
+        assert!(status.error);
+        assert!(
+            status.text.contains("not compiled"),
+            "unexpected: {}",
+            status.text
+        );
+        assert!(matches!(plain.record, RecordState::Idle));
+    }
+
+    #[test]
+    fn the_recording_clock_keeps_the_event_loop_pumping() {
+        // The pill's mm:ss clock is driven by the frame tick, so the busy
+        // predicate must hold from the moment the control starts a session
+        // until the runtime has taken the recording over (the M8 playback rule).
+        let mut state = recording_state();
+        assert!(!state.busy(), "a parked app keeps no tick");
+        state.toggle_record(Instant::now(), "2026-10-14 09:00:00");
+        assert!(state.busy(), "recording must keep frames coming");
+
+        state.stop_recording();
+        assert!(
+            state.busy(),
+            "the finalising pass still counts as recording"
+        );
+        state.on_recording_stopped(temp_wav("float-clock"), false);
+        assert!(state.busy(), "…and the job it hands over to is running");
     }
 
     // ---- M3: model manager ---------------------------------------------------

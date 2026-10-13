@@ -27,8 +27,8 @@ Data lives in `~/Library/Application Support/dev.suramak.Suramak/` (db, settings
 
 ## 2. Record 5 s from the microphone
 
-- Click the red dot in the title bar. Expected: record view, `Recording <date>` title, running `mm:ss.t` clock, live waveform/RMS bars.
-- Speak ~5 s, press **Stop**. Expected: `transcribing on this machine…` progress, then the editor with your words; sidebar shows the new `Recording <date>` row.
+- Click the floating **Record** control (bottom center of the window; real glass pill on macOS 26+). Expected: record view, `Recording <date>` title, running `mm:ss.t` clock, live waveform/RMS bars; the floating control itself now shows the stop glyph + a live `mm:ss`.
+- Speak ~5 s, press **Stop** (in the record view) — or click the floating control (its stop affordance) — the result is identical. Expected: `transcribing on this machine…` progress, then the editor with your words; sidebar shows the new `Recording <date>` row.
 
 ## 3. System audio source (tap + permission prompt)
 
@@ -115,6 +115,15 @@ Data lives in `~/Library/Application Support/dev.suramak.Suramak/` (db, settings
   Expected: playback stops and the playhead resets; opening that transcript again starts from the beginning.
 - **Missing audio**: open a transcript recorded with `Keep recordings` **off** (item 11 ✗). Expected: the strip shows the reason (`keep audio was off — the recording's file is gone …`) instead of the playhead and the play control is dimmed — pressing it does nothing (there is no file to play).
 - **No output device**: press play with no output device available (unplug headphones/speakers, or a VM without audio). Expected: the strip shows `no audio output device on this machine`; the app keeps working and the rest of the editor is unaffected. Connect a device and press play again to retry.
+
+## 15. Floating record control (M8.5)
+
+- On the Home view, look at the bottom center of the window. Expected: a floating pill-shaped control — on macOS 26+ **real Liquid Glass** (it blurs/refracts the desktop behind it; resize the window over a wallpaper to see the material move); on older macOS the same pill is egui-painted (translucent fill, hairline, subtle shadow) — with a red dot and the label `Record`.
+- Click it. Expected: the record view opens and the recording starts, **and the floating control switches to the stop glyph + a live `mm:ss` clock ticking every frame** (it stays visible on every screen while recording).
+- Click the floating control again (or the record view's Stop). Expected: recording stops and finalizes exactly like before — `transcribing on this machine…`, then the editor with your words and the new `Recording <date>` sidebar row. No double-finalize if you click twice.
+- **Resize the window** (any size, any screen scale). Expected: the control stays bottom-centered, ~24 pt above the bottom edge, horizontally centered on the window — never stretched, never off the bottom; its glass material follows exactly the painted pill.
+- **While a transcription job is running** (or on a build without capture compiled in), the control is dimmed. Expected: clicking it does not start anything; a status line explains why (`recording is disabled while a job is running` / `recording is not compiled into this build (feature \`capture\`)`).
+- **The old titlebar red dot is gone** — the floating control is the record entry point. Expected: no red dot in the title bar; the titlebar keeps only the (decorative) play/export glyphs.
 
 ## Report
 

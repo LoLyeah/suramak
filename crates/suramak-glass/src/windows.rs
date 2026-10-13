@@ -23,6 +23,9 @@
 //! No runtime claims: no Windows machine has executed this path. It is verified
 //! by `cargo check -p suramak-glass --target x86_64-pc-windows-msvc` from Linux
 //! and by review of the call shapes above (see `docs/reports/M4.md`).
+//!
+//! M8.5: the floating record control gets no DWM material — the UI paints its
+//! fallback pill on Windows ([`Handle::float_glass_available`] is `false`).
 
 use core::ffi::c_void;
 
@@ -35,12 +38,26 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::UI::Controls::MARGINS;
 use winit::window::Window;
 
-use crate::{GlassConfig, GlassError, GlassMode, WindowsBackdrop};
+use crate::{FloatRect, GlassConfig, GlassError, GlassMode, WindowsBackdrop};
+
+/// The Windows handle: DWM materials only; no floating glass (the UI's painted
+/// pill is the fallback — M8.5).
+pub struct Handle;
+
+impl Handle {
+    /// No-op: the UI's painted pill is the fallback material (M8.5).
+    pub fn set_float_rect(&mut self, _rect: Option<FloatRect>) {}
+
+    /// Always `false` — no per-control material on this platform.
+    pub fn float_glass_available(&self) -> bool {
+        false
+    }
+}
 
 /// Applies the DWM backdrop, immersive dark mode and frame extension to `window`.
-pub fn apply(window: &Window, config: GlassConfig) -> Result<(), GlassError> {
+pub fn apply(window: &Window, config: GlassConfig) -> Result<Handle, GlassError> {
     if config.mode == GlassMode::Never {
-        return Ok(());
+        return Ok(Handle);
     }
     let handle = window.window_handle().map_err(GlassError::NoWindowHandle)?;
     let RawWindowHandle::Win32(win32) = handle.as_raw() else {
@@ -91,5 +108,5 @@ pub fn apply(window: &Window, config: GlassConfig) -> Result<(), GlassError> {
     unsafe { DwmExtendFrameIntoClientArea(hwnd, &margins) }
         .map_err(|err| GlassError::BackdropFailed(err.code().0))?;
 
-    Ok(())
+    Ok(Handle)
 }

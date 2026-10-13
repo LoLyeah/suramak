@@ -1,4 +1,8 @@
 //! Window + wgpu surface + manual egui wiring for the Suramak shell.
+//!
+//! M8.5: the shell also owns the window-material handle and keeps the floating
+//! record control's glass glued to the shared `suramak_glass::float_rect`
+//! (applied on creation, on every resize and after any geometry change).
 
 use std::sync::Arc;
 
@@ -25,6 +29,15 @@ pub struct Shell {
     pub config: wgpu::SurfaceConfiguration,
     /// App state (routes, job, editor, library) drawn every frame.
     pub app: AppState,
+    /// The window-material handle (M8.5): drives the floating record control's
+    /// glass. `None` on platforms without the macOS material (see
+    /// [`apply_glass`]) — the UI then paints its fallback pill.
+    glass: Option<suramak_glass::GlassHandle>,
+    /// The window geometry the float rect was last applied for (physical
+    /// width, height, scale-factor bits). The per-frame sync re-applies the
+    /// rect whenever this changes — a scale-factor change can arrive without a
+    /// `Resized` event.
+    float_applied: Option<(u32, u32, u32)>,
     egui_ctx: egui::Context,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -115,10 +128,9 @@ impl Shell {
             });
         }
 
-        #[cfg(target_os = "macos")]
-        apply_glass(&window);
+        let glass = apply_glass(&window);
 
-        Ok(Self {
+        let mut shell = Self {
             window,
             egui_state,
             frames: 0,
@@ -129,15 +141,27 @@ impl Shell {
             backend: init.backend,
             config,
             app: AppState::new(),
+            glass,
+            float_applied: None,
             egui_ctx: egui_ctx.clone(),
             surface: init.surface,
             device,
             queue,
             renderer,
-        })
+        };
+        // M8.5: tell the painter whether a real material stands behind the
+        // floating record control, then place that material at the shared
+        // float rect (creates it on macOS 26+; no-op elsewhere).
+        shell.app.float_glass = shell
+            .glass
+            .as_ref()
+            .is_some_and(|glass| glass.float_glass_available());
+        shell.sync_float_rect();
+        Ok(shell)
     }
 
-    /// Reconfigures the surface after a resize.
+    /// Reconfigures the surface after a resize; the floating record control's
+    /// glass follows (M8.5) — bottom-centered, re-applied on every resize.
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
         if size.width == 0 || size.height == 0 {
             return;
@@ -145,11 +169,49 @@ impl Shell {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
+        // Applied immediately; the next frame's sync re-applies it with settled
+        // AppKit bounds in case the views had not caught up with the resize yet.
+        self.apply_float_rect();
+    }
+
+    /// Re-applies the floating control's rect whenever the window's logical
+    /// geometry changed (M8.5). Runs on every frame — the work is skipped while
+    /// nothing changed, so this also catches scale-factor moves that arrive
+    /// without a `Resized` event.
+    fn sync_float_rect(&mut self) {
+        let size = self.window.inner_size();
+        let ppp = self.window.scale_factor() as f32;
+        let key = (size.width, size.height, ppp.to_bits());
+        if self.float_applied == Some(key) {
+            return;
+        }
+        self.apply_float_rect();
+        self.float_applied = Some(key);
+    }
+
+    /// Hands the shared float geometry to the glass handle (no-op without a
+    /// material). `suramak_glass::float_rect` is the one definition both the
+    /// egui painter and the macOS glass use, so the material sits behind
+    /// exactly the painted pixels.
+    fn apply_float_rect(&mut self) {
+        let Some(glass) = self.glass.as_mut() else {
+            return;
+        };
+        let size = self.window.inner_size();
+        let ppp = self.window.scale_factor() as f32;
+        let ppp = if ppp > 0.0 { ppp } else { 1.0 };
+        glass.set_float_rect(Some(suramak_glass::float_rect(
+            (size.width as f32 / ppp, size.height as f32 / ppp),
+            ppp,
+        )));
     }
 
     /// Renders one frame; recoverable surface errors reconfigure and skip.
     /// Returns the effects the frame requested (empty when the frame was skipped).
     pub fn redraw_or_log(&mut self) -> Vec<app::Effect> {
+        // Keep the floating control's material glued to the painted rect
+        // (M8.5): cheap no-op unless the window geometry changed.
+        self.sync_float_rect();
         match self.render() {
             Ok(effects) => effects,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
@@ -397,10 +459,26 @@ fn pick_alpha_mode(modes: &[wgpu::CompositeAlphaMode]) -> wgpu::CompositeAlphaMo
     .unwrap_or(Mode::Opaque)
 }
 
+/// Applies the window material and hands back the handle that drives the
+/// floating record control's glass (M8.5).
 #[cfg(target_os = "macos")]
-fn apply_glass(window: &Window) {
+fn apply_glass(window: &Window) -> Option<suramak_glass::GlassHandle> {
     match suramak_glass::apply(window, suramak_glass::GlassConfig::default()) {
-        Ok(()) => tracing::info!("AppKit window material applied"),
-        Err(err) => tracing::warn!("window material not applied: {err}"),
+        Ok(handle) => {
+            tracing::info!("AppKit window material applied");
+            Some(handle)
+        }
+        Err(err) => {
+            tracing::warn!("window material not applied: {err}");
+            None
+        }
     }
+}
+
+/// Non-macOS: no window material, so no float-glass handle — the UI paints its
+/// fallback pill. (Linux is a deliberate no-op per PLAN §1; the Windows DWM
+/// path stays compile-checked-only per M4, so `apply` is not called there.)
+#[cfg(not(target_os = "macos"))]
+fn apply_glass(_window: &Window) -> Option<suramak_glass::GlassHandle> {
+    None
 }

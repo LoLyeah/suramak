@@ -32,6 +32,15 @@ Empirically verified on the dev VPS, 2026-10-13. **Where these notes conflict wi
 9. Copy detail: `NSMicrophoneUsageDescription` string (PLAN §7) — keep as planned.
 10. **mojibake guard**: whisper output for non-ASCII may include replacement chars — `to_str()` is fine for en/id; use `to_str_lossy()` only if a test shows an issue.
 
+## AppKit window material — the float-glass layering rule (verified, M8.5)
+
+Where these conflict with a tempting "simplification", this wins; the arrangement survived two crashes.
+
+- **The window's `contentView` stays the base material's container.** On macOS 26+ the base `NSGlassEffectView` is the content view and the render surface lives inside its `contentView` property (in M8.5 that property is a plain `NSView` container); pre-26 the `NSVisualEffectView` is the content view with winit's view as a subview. Content placed as an arbitrary sibling above the glass is not supported and aborted with `AppKit/NSGlassEffectView.swift:736: Fatal error` once the window ran modal machinery (the import open panel, macOS 27, 2026-10-13 — commit `ed1fee1`). `NSGlassEffectView.h` only guarantees z-order for the `contentView` property.
+- **The floating record control's glass (M8.5) is an ordered subview between the base material and the winit view** — inside the plain container that is the base glass's `contentView`, ordered directly below the render surface (`addSubview:positioned:relativeTo:`). It is **never** made a `contentView`, and it is never added as an arbitrary subview of a glass view.
+- The float glass is created lazily (first `set_float_rect(Some(..))`), hidden on `None`, and re-positioned on every resize; its frame is set in the host's coordinate space (flipped-aware), so the same top-left-origin `suramak_glass::float_rect` drives both the egui painter and AppKit.
+- On machines without the `NSGlassEffectView` class (macOS < 26) there is no float glass — `set_float_rect` is a clean no-op and the UI paints its fallback pill (same rect, same behavior).
+
 ## Known non-issues (verified — do not chase)
 
 - **macOS 27 + winit 0.30.13 IME** — two latent crashes, both first-hit on the owner's Mac (2026-10-13): (1) `-[NSView inputContext]` is nil on macOS 27, so the first text-field focus panicked (`set_ime_cursor_area` → `.expect("input context")`, view.rs:901) — fixed by the `LoLyeah/winit@63f21f8` fork pin (nil-tolerant guards; drop the pin when upstream handles nil). (2) `set_ime_allowed(false)` (text field loses focus) SIGSEGVs in `objc_release` releasing the marked-text cell — released object is the literal `0x3` (crash `48A5EFA3-…`); root cause not yet pinned. Workaround shipped: on macOS the shell forces `platform_output.ime = None` every frame (`shell.rs`), so egui-winit never calls `set_ime_allowed` at all; en/id typing is unaffected (no IME needed). Revisit the winit 0.31 IME rework before re-enabling IME.

@@ -1,15 +1,24 @@
 //! Frame dispatcher + the M1 chrome strip (visuals unchanged), split out of the
 //! old static `view.rs` placeholder. Every frame draws the titlebar, the sidebar
-//! (library) and the route's main pane; the returned [`Effect`]s are executed by
-//! `crate::runtime` after the frame.
+//! (library), the route's main pane and the floating record control; the
+//! returned [`Effect`]s are executed by `crate::runtime` after the frame.
 //!
-//! M3: the record dot is live — it starts a session when capture is compiled in
-//! (and the palette/glyph stay the M1 ones; only the unavailable state dims it).
+//! M3: the record control is live — it starts a session when capture is compiled
+//! in (and the palette/glyph stay the M1 ones; only the unavailable state dims).
+//!
+//! M8.5: the record affordance left the titlebar. The floating bottom-center
+//! control below is THE record entry point — idle shows the red dot + "Record",
+//! a live session shows the stop glyph + the ticking `mm:ss` clock. On macOS
+//! 26+ a real `NSGlassEffectView` sits behind exactly these pixels (same rect,
+//! via `suramak-glass`); everywhere else the painter draws the honest fallback
+//! pill (translucent fill, hairline, subtle shadow — the M9 material ladder,
+//! never a fake of Liquid Glass).
 
 use std::time::Instant;
 
 use egui::{
-    pos2, vec2, Align2, CornerRadius, FontFamily, FontId, Painter, Pos2, Rect, Stroke, StrokeKind,
+    pos2, vec2, Align2, Color32, CornerRadius, FontFamily, FontId, Painter, Pos2, Rect, Stroke,
+    StrokeKind,
 };
 
 use crate::theme::{self, Palette};
@@ -22,8 +31,10 @@ pub const TITLEBAR_HEIGHT: f32 = 46.0;
 pub const SIDEBAR_FRACTION: f32 = 0.23;
 /// Left inset reserved for the native traffic lights — M1 value.
 pub const TRAFFIC_LIGHT_INSET: f32 = 78.0;
-/// Right edge reserved for the integrated toolbar controls — M1 value.
-pub const TOOLBAR_RESERVED: f32 = 158.0;
+/// Right edge reserved for the integrated toolbar glyphs (play + export; the
+/// record control moved to the floating pill in M8.5, so this is smaller than
+/// the M1 three-glyph value).
+pub const TOOLBAR_RESERVED: f32 = 96.0;
 /// Inner padding of the main pane (comp: content starts at 25% of window width).
 pub const PANE_PAD_X: f32 = 26.0;
 
@@ -37,7 +48,7 @@ pub fn draw(ctx: &egui::Context, state: &mut AppState) -> Vec<Effect> {
     egui::TopBottomPanel::top("suramak-titlebar")
         .exact_height(TITLEBAR_HEIGHT)
         .frame(egui::Frame::NONE.fill(palette.chrome))
-        .show(ctx, |ui| titlebar(ui, &palette, state, &mut effects));
+        .show(ctx, |ui| titlebar(ui, &palette));
 
     egui::SidePanel::left("suramak-sidebar")
         .exact_width(sidebar_width)
@@ -57,15 +68,18 @@ pub fn draw(ctx: &egui::Context, state: &mut AppState) -> Vec<Effect> {
             Route::Settings => super::settings::ui(ui, &palette, state, &mut effects),
         });
 
+    // The floating record control rides above every panel (M8.5).
+    float_control(ctx, &palette, state, &mut effects);
+
     effects
 }
 
-/// Window chrome: drag surface, centred title, integrated record/play/export.
-/// (M1 composition and glyphs; the record dot is now interactive.)
-fn titlebar(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &mut Vec<Effect>) {
+/// Window chrome: drag surface, centred title, integrated play/export glyphs.
+/// (M1 composition and glyphs; the record dot moved to the floating control.)
+fn titlebar(ui: &mut egui::Ui, palette: &Palette) {
     let rect = ui.max_rect();
 
-    // Drag anywhere in the chrome except the traffic-light inset and the controls.
+    // Drag anywhere in the chrome except the traffic-light inset and the glyphs.
     let drag_rect = Rect::from_min_max(
         pos2(rect.left() + TRAFFIC_LIGHT_INSET, rect.top()),
         pos2(rect.right() - TOOLBAR_RESERVED, rect.bottom()),
@@ -93,36 +107,6 @@ fn titlebar(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects:
     export_glyph(&painter, pos2(x, center_y), palette);
     x -= 42.0;
     play_glyph(&painter, pos2(x, center_y), palette);
-    x -= 42.0;
-    let record_center = pos2(x, center_y);
-
-    // The record control: M1 red dot, live when capture is compiled in.
-    let recording = matches!(state.record, super::RecordState::Recording(_));
-    let enabled = state.can_record();
-    let record_response = ui.interact(
-        Rect::from_center_size(record_center, vec2(28.0, 28.0)),
-        egui::Id::new("suramak-record-dot"),
-        egui::Sense::click(),
-    );
-    record_glyph(&painter, record_center, palette, enabled || recording);
-    if record_response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    if record_response.clicked() {
-        if enabled {
-            let date = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-            effects.extend(state.start_recording(Instant::now(), &date));
-        } else if recording {
-            // Already recording: the Stop button in the record view ends it.
-        } else if matches!(state.job, super::Job::Running(_)) {
-            state.set_status("recording is disabled while a job is running", false);
-        } else {
-            state.set_status(
-                "recording is not compiled into this build (feature `capture`)",
-                true,
-            );
-        }
-    }
 
     painter.hline(
         rect.x_range(),
@@ -131,14 +115,144 @@ fn titlebar(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects:
     );
 }
 
-/// Red filled circle — the record control (M1 glyph; dimmed when unavailable).
-fn record_glyph(painter: &Painter, center: Pos2, palette: &Palette, enabled: bool) {
-    let color = if enabled {
-        palette.record_red
-    } else {
-        palette.record_red.gamma_multiply(0.35)
-    };
-    painter.circle_filled(center, 6.0, color);
+/// The floating record control (M8.5): bottom-center of the window content,
+/// above every route — THE record entry point.
+///
+/// One rect, two consumers: the painter below draws the crisp glyph/label/live
+/// clock (and owns all input — no hit-test juggling), while `suramak-ui` hands
+/// the same rect to `suramak-glass` so on macOS 26+ a real `NSGlassEffectView`
+/// provides the material behind exactly these pixels. Everywhere else — and
+/// until that glass exists — the painter draws the fallback pill.
+fn float_control(
+    ctx: &egui::Context,
+    palette: &Palette,
+    state: &mut AppState,
+    effects: &mut Vec<Effect>,
+) {
+    let viewport = ctx.viewport_rect();
+    let float = suramak_glass::float_rect(
+        (viewport.width(), viewport.height()),
+        ctx.pixels_per_point(),
+    );
+    let rect = Rect::from_min_size(
+        viewport.min + vec2(float.x, float.y),
+        vec2(float.width, float.height),
+    );
+    if rect.width() < 1.0 || rect.height() < 1.0 {
+        return; // degenerate window: nothing sensible to draw
+    }
+
+    let recording = matches!(state.record, super::RecordState::Recording(_));
+    let stopping = matches!(&state.record, super::RecordState::Recording(rec) if rec.stopping);
+    let enabled = state.can_record() || recording;
+
+    egui::Area::new(egui::Id::new("suramak-record-float"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(rect.min)
+        .movable(false)
+        .constrain(false)
+        .fade_in(false)
+        .show(ctx, |ui| {
+            let (rect, response) = ui.allocate_exact_size(rect.size(), egui::Sense::click());
+            let painter = ui.painter();
+            let radius = CornerRadius::same((rect.height() * 0.5).round().clamp(0.0, 255.0) as u8);
+
+            if !state.float_glass {
+                // The fallback material: a frosted pill — translucent fill,
+                // hairline, subtle shadow. Not a Liquid Glass imitation.
+                painter.add(
+                    egui::epaint::Shadow {
+                        offset: [0, 6],
+                        blur: 18,
+                        spread: 0,
+                        color: Color32::from_black_alpha(96),
+                    }
+                    .as_shape(rect, radius),
+                );
+                painter.rect_filled(rect, radius, palette.float_fill);
+                painter.rect_stroke(
+                    rect,
+                    radius,
+                    Stroke::new(1.0_f32, palette.hairline),
+                    StrokeKind::Inside,
+                );
+            }
+
+            let center_y = rect.center().y;
+            if recording {
+                // Stop affordance + the live clock (mm:ss).
+                let elapsed = match &state.record {
+                    super::RecordState::Recording(rec) => rec.elapsed,
+                    _ => std::time::Duration::ZERO,
+                };
+                let clock = suramak_playback::format_mmss(elapsed.as_millis() as u32);
+                let galley = painter.layout_no_wrap(
+                    clock,
+                    FontId::new(19.0, FontFamily::Monospace),
+                    palette.text,
+                );
+                let glyph_size = 16.0;
+                let gap = 12.0;
+                let total = glyph_size + gap + galley.size().x;
+                let left = rect.center().x - total / 2.0;
+                let glyph_color = if stopping || !enabled {
+                    palette.record_red.gamma_multiply(0.4)
+                } else {
+                    palette.record_red
+                };
+                painter.rect_filled(
+                    Rect::from_center_size(
+                        pos2(left + glyph_size / 2.0, center_y),
+                        vec2(glyph_size, glyph_size),
+                    ),
+                    CornerRadius::same(3),
+                    glyph_color,
+                );
+                painter.galley(
+                    pos2(left + glyph_size + gap, center_y - galley.size().y / 2.0),
+                    galley,
+                    palette.text,
+                );
+            } else {
+                // Red dot + "Record" label.
+                let label_color = if enabled {
+                    palette.text
+                } else {
+                    palette.text_dim
+                };
+                let galley = painter.layout_no_wrap(
+                    "Record".to_owned(),
+                    FontId::new(15.0, FontFamily::Proportional),
+                    label_color,
+                );
+                let dot_radius = 6.5;
+                let gap = 10.0;
+                let total = dot_radius * 2.0 + gap + galley.size().x;
+                let left = rect.center().x - total / 2.0;
+                let dot_color = if enabled {
+                    palette.record_red
+                } else {
+                    palette.record_red.gamma_multiply(0.35)
+                };
+                painter.circle_filled(pos2(left + dot_radius, center_y), dot_radius, dot_color);
+                painter.galley(
+                    pos2(
+                        left + dot_radius * 2.0 + gap,
+                        center_y - galley.size().y / 2.0,
+                    ),
+                    galley,
+                    label_color,
+                );
+            }
+
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if response.clicked() {
+                let date = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                effects.extend(state.toggle_record(Instant::now(), &date));
+            }
+        });
 }
 
 /// Play triangle (M1 glyph).

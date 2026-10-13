@@ -60,7 +60,7 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
             pane_title(ui, "Not recording", palette);
             pane_caption(
                 ui,
-                "Press the red dot in the title bar to record.",
+                "Press the floating Record control (bottom center) to record.",
                 palette,
                 false,
             );

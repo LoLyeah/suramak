@@ -7,6 +7,9 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 ### Added
 - In-app playback with segment follow: play/pause + moving playhead on the waveform strip, click-to-seek (the strip and any segment's timestamp), a `mm:ss / mm:ss` readout, and the active segment highlighted and scrolled into view while playing. Missing audio and a missing output device are explicit states, never a dead control (M8)
 
+### Changed
+- The floating record control replaces the titlebar red dot: bottom-center, a real Liquid Glass pill on macOS 26+ (`NSGlassEffectView`, egui-painted glyph/label/live `mm:ss` on top) and an honest painted pill on Linux/Windows/older macOS; click starts, click stops (the same finalize flow as the record view's Stop), and it stays bottom-centered on resize (M8.5)
+
 ## [0.1.0] - 2026-10-13
 
 ### Added

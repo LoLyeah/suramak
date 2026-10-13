@@ -48,6 +48,10 @@ pub struct Palette {
     pub row_selected: Color32,
     /// Record control (system red).
     pub record_red: Color32,
+    /// Floating record control's fallback pill fill (M8.5): a translucent wash
+    /// that lifts the control off the pane where no real system material
+    /// exists (Linux/Windows/older macOS; on macOS 26+ the glass is real).
+    pub float_fill: Color32,
 }
 
 /// The palette for this platform.
@@ -69,6 +73,7 @@ pub fn palette() -> Palette {
             hairline: Color32::from_white_alpha(26),
             row_selected: Color32::from_rgba_unmultiplied(0x6e, 0xa8, 0xff, 42),
             record_red: Color32::from_rgb(0xff, 0x45, 0x3a),
+            float_fill: Color32::from_white_alpha(22),
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -87,6 +92,7 @@ pub fn palette() -> Palette {
             hairline: Color32::from_rgba_unmultiplied(0xea, 0xea, 0xf2, 26),
             row_selected: Color32::from_rgba_unmultiplied(0x6e, 0xa8, 0xff, 42),
             record_red: Color32::from_rgb(0xff, 0x45, 0x3a),
+            float_fill: Color32::from_rgba_unmultiplied(0x1e, 0x2a, 0x54, 0xd9),
         }
     }
 }
