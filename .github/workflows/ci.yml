@@ -43,6 +43,17 @@ jobs:
       - name: Cross-check suramak-glass (x86_64-pc-windows-msvc)
         run: cargo check -p suramak-glass --target x86_64-pc-windows-msvc
 
+      # `cargo check --target aarch64-apple-darwin` is only meaningful for pure-Rust
+      # crates: `suramak-asr` pulls C dependencies (ring via rustls, whisper-rs-sys) that
+      # need an Apple C toolchain (no osxcross on this runner). The darwin *build* of the
+      # asr crate — including the Core ML feature — is verified by the macos job below;
+      # here we verify the feature wiring itself, which needs no toolchain.
+      - name: Verify Core ML feature wiring (aarch64-apple-darwin feature resolution)
+        run: |
+          cargo tree -e features -p suramak-asr --target aarch64-apple-darwin | grep -q 'whisper-rs feature "coreml"' && echo "coreml wired for macOS target"
+          cargo tree -e features -p suramak-asr --target aarch64-apple-darwin | grep -q 'whisper-rs feature "metal"' && echo "metal wired for macOS target"
+          cargo tree -e features -p suramak-asr --features coreml --target aarch64-apple-darwin | grep -q 'whisper-rs-sys feature "coreml"' && echo "coreml passthrough -> whisper-rs-sys"
+
       - name: UI smoke (xvfb, software Vulkan → GL)
         run: |
           SURAMAK_SMOKE_SECS=3 xvfb-run -a cargo run -p suramak-ui
@@ -99,9 +110,16 @@ jobs:
       - name: Download tiny model (sha256 verified)
         run: ./target/release/suramak-cli models download tiny
 
-      - name: whisper e2e tests (release, ignored)
+      - name: Download tiny Core ML encoder package (sha256 verified, extracted)
+        run: ./target/release/suramak-cli models download tiny --encoder
+
+      - name: doctor (engine stack + encoder pairing)
+        run: ./target/release/suramak-cli doctor
+
+      - name: whisper e2e tests (release, ignored) — incl. Core ML/ANE engagement
         env:
           SURAMAK_REQUIRE_MODEL: "1"
+          SURAMAK_REQUIRE_COREML: "1"
         run: cargo test --workspace --release -- --ignored
 
       - name: Build UI (release)

@@ -30,6 +30,9 @@ pub enum SuramakError {
     #[error("Checksum mismatch — expected {expected}, got {actual}")]
     ChecksumMismatch { expected: String, actual: String },
 
+    #[error("zip error: {0}")]
+    Zip(String),
+
     #[error("Model not found: {0}")]
     ModelNotFound(String),
 

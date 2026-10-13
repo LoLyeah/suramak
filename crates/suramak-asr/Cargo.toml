@@ -18,10 +18,17 @@ serde_json = { workspace = true }
 [features]
 # Microphone capture (cpal). OFF by default so Linux builds never need ALSA headers.
 capture = ["dep:cpal"]
+# Core ML (ANE) encoder support. Pure passthrough to whisper-rs; enabled for macOS
+# targets below (see `[target.'cfg(target_os = "macos")'.dependencies]`), and available
+# on every target so the CI cross-check can compile it explicitly.
+coreml = ["whisper-rs/coreml"]
 
 [dependencies.cpal]
 version = "0.15.3"
 optional = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
-whisper-rs = { workspace = true, features = ["metal"] }
+# macOS builds get the GPU tier (Metal) and the ANE tier (Core ML) — the Core ML encoder
+# package is what makes whisper.cpp fast on Apple Silicon. `WHISPER_COREML_ALLOW_FALLBACK`
+# is set by whisper-rs-sys, so a broken/missing encoder never breaks a run.
+whisper-rs = { workspace = true, features = ["metal", "coreml"] }

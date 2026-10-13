@@ -1,13 +1,14 @@
-//! `transcribe <input> [--model id|path] [--lang auto|en|id] [--initial-prompt S]
-//! [--formats md,txt,json,srt,vtt] [--out-dir D] [--db]`
+//! `transcribe <input> [--model id|path] [--lang auto|en|id] [--engine auto|coreml|metal|cpu]
+//! [--initial-prompt S] [--formats md,txt,json,srt,vtt] [--out-dir D] [--db]`
 
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, ValueEnum};
+use suramak_asr::engine::resolve_for;
 use suramak_asr::worker::{Job, Worker, WorkerEvent};
 use suramak_core::paths;
-use suramak_core::settings::LangMode;
+use suramak_core::settings::{EngineSetting, LangMode, Settings};
 use suramak_core::store::Store;
 
 use crate::cmd::{parse_formats, resolve_model};
@@ -22,6 +23,30 @@ pub enum LangArg {
     Id,
 }
 
+/// `--engine` values (identical to `EngineSetting`, spelled for the CLI).
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum EngineArg {
+    /// Pick the best available engine (macOS: coreml → metal → cpu; elsewhere: cpu)
+    Auto,
+    /// Core ML encoder package on the ANE (macOS + `models download <id> --encoder`)
+    Coreml,
+    /// Metal GPU backend (macOS)
+    Metal,
+    /// CPU only
+    Cpu,
+}
+
+impl From<EngineArg> for EngineSetting {
+    fn from(arg: EngineArg) -> Self {
+        match arg {
+            EngineArg::Auto => EngineSetting::Auto,
+            EngineArg::Coreml => EngineSetting::CoreML,
+            EngineArg::Metal => EngineSetting::Metal,
+            EngineArg::Cpu => EngineSetting::Cpu,
+        }
+    }
+}
+
 #[derive(Args)]
 pub struct TranscribeArgs {
     /// Input audio file (wav, mp3, flac, ogg/vorbis, m4a)
@@ -34,6 +59,11 @@ pub struct TranscribeArgs {
     /// Source language (forcing `en`/`id` is recommended over auto-detect)
     #[arg(long, value_enum, default_value_t = LangArg::Auto)]
     pub lang: LangArg,
+
+    /// Engine: auto (settings.toml default), coreml (ANE), metal, cpu.
+    /// Defaults to `settings.asr.engine` (auto when unset).
+    #[arg(long, value_enum)]
+    pub engine: Option<EngineArg>,
 
     /// Initial prompt forwarded to whisper (helps brand words and names)
     #[arg(long)]
@@ -64,8 +94,30 @@ pub fn run(args: TranscribeArgs) -> Result<()> {
         LangArg::En => LangMode::Fixed("en".to_string()),
         LangArg::Id => LangMode::Fixed("id".to_string()),
     };
+    // Flags beat settings.toml, which beats the built-in default (`auto`).
+    let settings = Settings::load(&paths::settings_path()?)?;
+    let engine = args
+        .engine
+        .map(EngineSetting::from)
+        .unwrap_or(settings.asr.engine);
     std::fs::create_dir_all(&args.out_dir)
         .with_context(|| format!("cannot create output dir {}", args.out_dir.display()))?;
+
+    // Resolve the engine up front so a downgraded request is reported before decoding
+    // (the worker re-resolves from the same pure function and reports what actually ran).
+    let language = match &lang {
+        LangMode::Auto => None,
+        LangMode::Fixed(code) => Some(code.as_str()),
+    };
+    let plan = resolve_for(&model_path, engine, language);
+    if let Some(warning) = &plan.warning {
+        eprintln!("warning: {warning}");
+    }
+    eprintln!(
+        "engine: requested {} → planned {}",
+        engine.as_str(),
+        plan.engine.as_str()
+    );
 
     let worker = Worker::spawn();
     worker.submit(Job {
@@ -74,10 +126,11 @@ pub fn run(args: TranscribeArgs) -> Result<()> {
         model_path,
         lang,
         initial_prompt: args.initial_prompt,
+        engine,
     })?;
 
     let mut next_pct = 0u8;
-    let transcript = loop {
+    let (transcript, engine_used, warnings) = loop {
         match worker.recv() {
             Some(WorkerEvent::Progress { pct, .. }) => {
                 if pct >= next_pct {
@@ -87,7 +140,12 @@ pub fn run(args: TranscribeArgs) -> Result<()> {
             }
             // Emitted just before Finished; the CLI writes files from the transcript.
             Some(WorkerEvent::Segments { .. }) => {}
-            Some(WorkerEvent::Finished { transcript, .. }) => break transcript,
+            Some(WorkerEvent::Finished {
+                transcript,
+                engine_used,
+                warnings,
+                ..
+            }) => break (transcript, engine_used, warnings),
             Some(WorkerEvent::Error { message, .. }) => {
                 eprintln!();
                 bail!("transcription failed: {message}");
@@ -96,6 +154,12 @@ pub fn run(args: TranscribeArgs) -> Result<()> {
         }
     };
     eprintln!("\rtranscribing… done  ");
+
+    for warning in &warnings {
+        eprintln!("warning: {warning}");
+    }
+    // The engaged engine, always on stderr (stdout stays parseable for scripts).
+    eprintln!("engine: {}", engine_used.as_str());
 
     if transcript.segments.is_empty() {
         eprintln!("warning: no speech segments were detected");

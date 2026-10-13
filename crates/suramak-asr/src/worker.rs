@@ -8,9 +8,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
 use serde::{Deserialize, Serialize};
-use suramak_core::settings::LangMode;
+use suramak_core::settings::{EngineSetting, LangMode};
 use suramak_core::transcript::{Segment, Transcript};
 
+use crate::engine::{self, EngineId};
 use crate::pipeline;
 use crate::whisper::{self, AsrError, ContextCache};
 
@@ -25,6 +26,9 @@ pub struct Job {
     pub model_path: PathBuf,
     pub lang: LangMode,
     pub initial_prompt: Option<String>,
+    /// Requested engine; absent in older callers → `Auto`.
+    #[serde(default)]
+    pub engine: EngineSetting,
 }
 
 /// Events emitted by the worker.
@@ -34,8 +38,14 @@ pub enum WorkerEvent {
     Progress { job_id: u64, pct: u8 },
     /// The final segment list for the job (emitted once, just before `Finished`).
     Segments { job_id: u64, segments: Vec<Segment> },
-    /// The completed transcript.
-    Finished { job_id: u64, transcript: Transcript },
+    /// The completed transcript plus the engine that actually ran.
+    Finished {
+        job_id: u64,
+        transcript: Transcript,
+        engine_used: EngineId,
+        /// Non-fatal engine notes (downgrades, Core ML fallback).
+        warnings: Vec<String>,
+    },
     /// The job failed; `message` is human-readable.
     Error { job_id: u64, message: String },
 }
@@ -102,7 +112,8 @@ impl Drop for Worker {
 fn run_worker(jobs: Receiver<Job>, events: Sender<WorkerEvent>) {
     // Route whisper.cpp/GGML C-level logs into whisper-rs's hooks. With neither the
     // `log_backend` nor `tracing_backend` feature enabled this silences the C-level
-    // model-load chatter; the CLI/UI owns all user-facing output.
+    // model-load chatter; the CLI/UI owns all user-facing output. `suramak-asr` then
+    // layers its Core ML engagement probe on top (see `whisper::install_log_hooks`).
     whisper_rs::install_logging_hooks();
 
     let mut cache = ContextCache::new();
@@ -110,7 +121,14 @@ fn run_worker(jobs: Receiver<Job>, events: Sender<WorkerEvent>) {
         let job_id = job.id;
         let _ = events.send(WorkerEvent::Progress { job_id, pct: 0 });
 
-        let ctx = match cache.get_or_load(&job.model_path) {
+        // Engine selection is a pure function of (setting, language, availability).
+        let language = match &job.lang {
+            LangMode::Auto => None,
+            LangMode::Fixed(code) => Some(code.as_str()),
+        };
+        let plan = engine::resolve_for(&job.model_path, job.engine, language);
+
+        let ctx = match cache.get_or_load(&job.model_path, plan.engine.use_gpu()) {
             Ok(ctx) => ctx,
             Err(err) => {
                 let _ = events.send(WorkerEvent::Error {
@@ -129,18 +147,24 @@ fn run_worker(jobs: Receiver<Job>, events: Sender<WorkerEvent>) {
             &job.lang,
             job.initial_prompt.as_deref(),
             whisper::default_threads(),
+            &plan,
             move |pct| {
                 let _ = progress_events.send(WorkerEvent::Progress { job_id, pct });
             },
         );
 
         match result {
-            Ok(transcript) => {
+            Ok(outcome) => {
                 let _ = events.send(WorkerEvent::Segments {
                     job_id,
-                    segments: transcript.segments.clone(),
+                    segments: outcome.transcript.segments.clone(),
                 });
-                let _ = events.send(WorkerEvent::Finished { job_id, transcript });
+                let _ = events.send(WorkerEvent::Finished {
+                    job_id,
+                    transcript: outcome.transcript,
+                    engine_used: outcome.engine_used,
+                    warnings: outcome.warnings,
+                });
             }
             Err(err) => {
                 let _ = events.send(WorkerEvent::Error {

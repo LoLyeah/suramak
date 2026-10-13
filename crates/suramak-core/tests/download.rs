@@ -154,3 +154,204 @@ fn verify_sha256_ok_and_fail() {
     );
     assert!(bad.is_err());
 }
+
+// ---------------------------------------------------------------------------
+// `.zip` artifacts (Core ML encoder packages)
+// ---------------------------------------------------------------------------
+
+/// Builds an in-memory zip with the given entries (name, bytes). Names ending in `/`
+/// become directory entries.
+fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let mut buf = Vec::new();
+    {
+        let mut writer = ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        for (name, data) in entries {
+            if name.ends_with('/') {
+                writer.add_directory(*name, options).unwrap();
+            } else {
+                writer.start_file(*name, options).unwrap();
+                writer.write_all(data).unwrap();
+            }
+        }
+        writer.finish().unwrap();
+    }
+    buf
+}
+
+/// A synthetic encoder package shaped like the real ones: everything under one
+/// top-level directory, plus a macOS `__MACOSX/` junk entry.
+fn synthetic_encoder_zip() -> Vec<u8> {
+    build_zip(&[
+        ("ggml-tiny-encoder.mlmodelc/", b""),
+        ("ggml-tiny-encoder.mlmodelc/coremldata.bin", b"coreml"),
+        ("ggml-tiny-encoder.mlmodelc/metadata.json", b"{}"),
+        ("ggml-tiny-encoder.mlmodelc/model.mil", b"mil"),
+        ("ggml-tiny-encoder.mlmodelc/weights/", b""),
+        ("ggml-tiny-encoder.mlmodelc/weights/weight.bin", b"weights"),
+        (
+            "__MACOSX/ggml-tiny-encoder.mlmodelc/._coremldata.bin",
+            b"junk",
+        ),
+    ])
+}
+
+const REQUIRED: &[&str] = &[
+    "coremldata.bin",
+    "metadata.json",
+    "model.mil",
+    "weights/weight.bin",
+];
+
+#[test]
+fn extract_zip_flattens_top_level_and_skips_junk() {
+    let dir = tempfile::tempdir().unwrap();
+    let zip_path = dir.path().join("pkg.zip");
+    std::fs::write(&zip_path, synthetic_encoder_zip()).unwrap();
+
+    let dest = dir.path().join("ggml-tiny-encoder.mlmodelc");
+    suramak_core::download::extract_zip(&zip_path, &dest).unwrap();
+
+    assert!(suramak_core::download::dir_ready(&dest, REQUIRED));
+    assert_eq!(
+        std::fs::read(dest.join("weights/weight.bin")).unwrap(),
+        b"weights"
+    );
+    // The archive's own top-level directory must not be nested inside `dest`.
+    assert!(!dest.join("ggml-tiny-encoder.mlmodelc").exists());
+    // `__MACOSX/` junk is skipped, not written next to the package.
+    assert!(!dir.path().join("__MACOSX").exists());
+    assert!(!dest.join("._coremldata.bin").exists());
+    // No temp directory is left behind.
+    assert!(!dir
+        .path()
+        .join(format!(
+            "ggml-tiny-encoder.mlmodelc.{}.tmp",
+            std::process::id()
+        ))
+        .exists());
+}
+
+#[test]
+fn extract_zip_replaces_an_existing_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let zip_path = dir.path().join("pkg.zip");
+    std::fs::write(&zip_path, synthetic_encoder_zip()).unwrap();
+
+    let dest = dir.path().join("ggml-tiny-encoder.mlmodelc");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("stale.bin"), b"stale").unwrap();
+
+    suramak_core::download::extract_zip(&zip_path, &dest).unwrap();
+    assert!(suramak_core::download::dir_ready(&dest, REQUIRED));
+    assert!(!dest.join("stale.bin").exists(), "stale files must be gone");
+}
+
+#[test]
+fn extract_zip_rejects_path_traversal() {
+    let dir = tempfile::tempdir().unwrap();
+    let zip_path = dir.path().join("evil.zip");
+    std::fs::write(
+        &zip_path,
+        build_zip(&[
+            ("pkg/", b""),
+            ("pkg/../escape.txt", b"escaped"),
+            ("pkg/ok.txt", b"ok"),
+        ]),
+    )
+    .unwrap();
+
+    let dest = dir.path().join("pkg");
+    let result = suramak_core::download::extract_zip(&zip_path, &dest);
+    assert!(result.is_err(), "traversal entry must be rejected");
+    assert!(!dest.exists(), "nothing may be extracted on rejection");
+    assert!(!dir.path().join("escape.txt").exists());
+}
+
+#[test]
+fn download_zip_mock_server_verifies_and_extracts() {
+    let zip_bytes = synthetic_encoder_zip();
+    let expected_hash = sha256_of(&zip_bytes);
+    let addr = spawn_file_server(zip_bytes.clone());
+
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("http://{addr}/ggml-tiny-encoder.mlmodelc.zip");
+
+    let dest = suramak_core::download::download_zip(
+        &url,
+        dir.path(),
+        "ggml-tiny-encoder.mlmodelc.zip",
+        "ggml-tiny-encoder.mlmodelc",
+        &expected_hash,
+        REQUIRED,
+    )
+    .unwrap();
+
+    assert_eq!(dest, dir.path().join("ggml-tiny-encoder.mlmodelc"));
+    assert!(suramak_core::download::dir_ready(&dest, REQUIRED));
+    // The archive is removed after a successful extraction.
+    assert!(!dir.path().join("ggml-tiny-encoder.mlmodelc.zip").exists());
+
+    // Idempotent: a second call short-circuits without contacting the server.
+    let again = suramak_core::download::download_zip(
+        "http://127.0.0.1:1/unreachable.zip",
+        dir.path(),
+        "ggml-tiny-encoder.mlmodelc.zip",
+        "ggml-tiny-encoder.mlmodelc",
+        &expected_hash,
+        REQUIRED,
+    )
+    .unwrap();
+    assert_eq!(again, dest);
+}
+
+#[test]
+fn download_zip_checksum_mismatch_leaves_no_directory() {
+    let zip_bytes = synthetic_encoder_zip();
+    let addr = spawn_file_server(zip_bytes);
+
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("http://{addr}/ggml-tiny-encoder.mlmodelc.zip");
+
+    let result = suramak_core::download::download_zip(
+        &url,
+        dir.path(),
+        "ggml-tiny-encoder.mlmodelc.zip",
+        "ggml-tiny-encoder.mlmodelc",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        REQUIRED,
+    );
+    assert!(result.is_err());
+    assert!(!dir.path().join("ggml-tiny-encoder.mlmodelc").exists());
+}
+
+#[test]
+fn download_zip_requires_the_pinned_files() {
+    // A zip that extracts fine but misses a required file must be rejected.
+    let zip_bytes = build_zip(&[
+        ("ggml-tiny-encoder.mlmodelc/", b""),
+        ("ggml-tiny-encoder.mlmodelc/coremldata.bin", b"coreml"),
+    ]);
+    let expected_hash = sha256_of(&zip_bytes);
+    let addr = spawn_file_server(zip_bytes);
+
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("http://{addr}/ggml-tiny-encoder.mlmodelc.zip");
+
+    let result = suramak_core::download::download_zip(
+        &url,
+        dir.path(),
+        "ggml-tiny-encoder.mlmodelc.zip",
+        "ggml-tiny-encoder.mlmodelc",
+        &expected_hash,
+        REQUIRED,
+    );
+    let err = result.expect_err("incomplete package must fail");
+    assert!(
+        err.to_string().contains("required files are missing"),
+        "unexpected error: {err}"
+    );
+}
