@@ -128,7 +128,7 @@ fn print_engines(models_dir: &std::path::Path) {
     println!(
         "  auto order:  {}",
         if macos {
-            "coreml (encoder installed) → metal → cpu"
+            "coreml (when the model's encoder package is installed) → metal → cpu"
         } else {
             "cpu"
         }
