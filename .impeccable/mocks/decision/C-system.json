@@ -1,0 +1,11 @@
+{
+  "card": "C — Impeccable's Pick (system-zenith OS citizen)",
+  "direction": "Control-Center-grade OS citizen: macOS system materials at Apple's own scale; native = local = trust.",
+  "prompt_file": "C-system.prompt.txt",
+  "model": "google/gemini-3-pro-image (via OpenRouter, scripts/gen_comp.py)",
+  "comp": "C-system.png",
+  "approved": true,
+  "approved_at": "2026-10-13 (user chose Option C)",
+  "seed_key": "b7306df5",
+  "notes": "Chosen by the user in the Telegram design round. The comp is the north star for the built UI; real Liquid Glass comes from AppKit at build time, so material fidelity will exceed the render. Build must respect macOS Tahoe conventions (unified window chrome, native sidebar, integrated toolbar)."
+}
