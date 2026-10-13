@@ -31,3 +31,9 @@ Empirically verified on the dev VPS, 2026-10-13. **Where these notes conflict wi
 8. **M0 is split for execution**: M0a = workspace + `suramak-core` (+ its tests). M0b = `suramak-asr` + `suramak-cli` + CI + end-to-end acceptance. Workorders `docs/WORKORDER-M0a.md` / `docs/WORKORDER-M0b.md` are authoritative for scope and acceptance.
 9. Copy detail: `NSMicrophoneUsageDescription` string (PLAN §7) — keep as planned.
 10. **mojibake guard**: whisper output for non-ASCII may include replacement chars — `to_str()` is fine for en/id; use `to_str_lossy()` only if a test shows an issue.
+
+## Known non-issues (verified — do not chase)
+
+- Build-end warning *"block v0.1.6 … code that will be rejected by a future version of Rust"*: the frozen `block 0.1.6` comes from the **`metal` crate inside wgpu/wgpu-hal** (our renderer), not from the audio stack; the flagged construct is `static _NSConcreteStackBlock: Class;` (uninhabited static, rust-lang/rust#74840). Harmless today; disappears when wgpu/metal migrate to `block2`/objc2 upstream. Do not vendor or patch it pre-1.0.
+- **macOS 27 SDK**: the CoreAudio aggregate-device description keys (`kAudioAggregateDeviceUIDKey`, `…NameKey`, `…IsPrivateKey`, `…TapListKey`, `kAudioSubTapUIDKey`) are **string-literal macros** with no linkable symbols and no `dlsym` hits; `suramak-taps` builds the dictionary keys as CFStrings from the literal values (`"uid"`, `"name"`, `"private"`, `"taps"`, `"uid"` — from the SDK header). Keep the literal-CFString approach if a future SDK shifts again: the HAL matches dictionary keys by string content.
+- On macOS 27 machines `ld` prints *"object file … was built for newer 'macOS' version (27.0) than being linked (11.0)"* for C deps: benign deployment-target noise (rustc's default `-mmacosx-version-min=11.0` vs SDK-built objects); the app's real minimum is `LSMinimumSystemVersion` in `Info.plist`.
