@@ -15,9 +15,14 @@
 //!    macOS 26+ → `AnyClass::get("NSGlassEffectView")` present → typed wrapper;
 //!    otherwise `NSVisualEffectView` (`BehindWindow`, `UnderWindowBackground`,
 //!    `Active`).
-//! 6. Re-parent so the material sits BEHIND the render surface: subviews
-//!    composite above their parent, so the winit view becomes a child of the
-//!    material view, which becomes the window's content view.
+//! 6. The material wraps the render surface: the material is the window's
+//!    content view and winit's view goes inside the material's `contentView`
+//!    property — the only arrangement `NSGlassEffectView.h` documents as having
+//!    a z-order guarantee; content as a plain sibling above the glass does not
+//!    (and aborted with `AppKit/NSGlassEffectView.swift:736: Fatal error` once
+//!    the window ran modal machinery — the import open panel — on macOS 27,
+//!    2026-10-13). The pre-26 `NSVisualEffectView` fallback uses the classic
+//!    parent-with-child-view arrangement.
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyClass;
@@ -64,34 +69,54 @@ pub fn apply(window: &Window, config: GlassConfig) -> Result<(), GlassError> {
         ns_window.setAppearance(Some(&dark));
     }
 
-    // Step 5: material view sized to the content view.
+    // Steps 5–6: the material wraps the render surface.
+    //
+    // `NSGlassEffectView.contentView` is the *only* documented way to place
+    // content on the material (NSGlassEffectView.h: "only guarantees the
+    // contentView will be placed inside the glass effect; arbitrary subviews
+    // aren't guaranteed specific behavior with regard to z-order"). A plain
+    // sibling above the glass is not supported — that arrangement aborted with
+    // `AppKit/NSGlassEffectView.swift:736: Fatal error` as soon as the window
+    // ran modal machinery (the import open panel) on macOS 27, 2026-10-13.
     let bounds = winit_view.bounds();
-    let material = make_material_view(mtm, bounds);
-
-    // Step 6: swap the content view so the material sits BEHIND winit's view.
-    material.setAutoresizingMask(resize_both());
-    ns_window.setContentView(Some(&material));
-    material.addSubview(&winit_view);
-    winit_view.setAutoresizingMask(resize_both());
+    winit_view.setFrame(bounds);
+    match make_material_view(mtm, bounds) {
+        Material::Glass(glass) => {
+            glass.setAutoresizingMask(resize_both());
+            glass.setContentView(Some(&winit_view));
+            ns_window.setContentView(Some(&glass));
+        }
+        Material::Visual(effect) => {
+            effect.setAutoresizingMask(resize_both());
+            effect.addSubview(&winit_view);
+            winit_view.setAutoresizingMask(resize_both());
+            ns_window.setContentView(Some(&effect));
+        }
+    }
 
     Ok(())
 }
 
 /// macOS 26+ (`NSGlassEffectView` present at runtime): the typed wrapper from
 /// objc2-app-kit 0.3.2; otherwise the `NSVisualEffectView` fallback of PLAN §1.
-fn make_material_view(mtm: MainThreadMarker, bounds: NSRect) -> Retained<NSView> {
+enum Material {
+    Glass(Retained<NSGlassEffectView>),
+    Visual(Retained<NSVisualEffectView>),
+}
+
+fn make_material_view(mtm: MainThreadMarker, bounds: NSRect) -> Material {
     if AnyClass::get(c"NSGlassEffectView").is_some() {
         let glass = NSGlassEffectView::new(mtm);
         glass.setStyle(NSGlassEffectViewStyle::Regular);
         glass.setFrame(bounds);
-        glass.into_super()
+        Material::Glass(glass)
     } else {
         let effect = NSVisualEffectView::new(mtm);
         effect.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
         effect.setMaterial(NSVisualEffectMaterial::UnderWindowBackground);
         effect.setState(NSVisualEffectState::Active);
         effect.setFrame(bounds);
-        effect.into_super()
+        Material::Visual(effect)
     }
 }
 
