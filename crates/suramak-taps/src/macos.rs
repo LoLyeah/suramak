@@ -12,6 +12,7 @@
 //! | `AudioObjectGetPropertyData` | macOS 10.0+ | `CoreAudio/AudioHardware.h` |
 //! | `kAudioTapPropertyUID` (`'tuid'`) | macOS 14.2+ | tap object property, `AudioHardwareTapping.h` |
 //! | `kAudioDevicePropertyDeviceUID` (`'uid '`) / `kAudioDevicePropertyDeviceNameCFString` (`'lnam'`) | macOS 10.0+ | device properties, `AudioHardware.h` |
+//! | `kAudioHardwarePropertyTranslatePIDToProcessObject` (selector `0x69643270`) | macOS 14.2+ | pid → process audio-object id; the tap exclusion array wants **process objects**, not pids |
 //! | `kAudioAggregateDeviceNameKey` / `…UIDKey` / `…IsPrivateKey` / `…TapListKey`, `kAudioSubTapUIDKey` | macOS 10.9+/14.2 | aggregate-device description keys — **string-literal macros** on the macOS 27 SDK (`"uid"` / `"name"` / `"private"` / `"taps"` / `"uid"`); see the note below |
 //!
 //! The two **14.2+ functions are resolved with `dlsym(RTLD_DEFAULT, …)` at call
@@ -68,6 +69,11 @@ const K_AUDIO_TAP_PROPERTY_UID: u32 = fourcc(*b"tuid");
 const K_AUDIO_DEVICE_PROPERTY_DEVICE_UID: u32 = fourcc(*b"uid ");
 /// `kAudioHardwarePropertyTranslateUIDToDevice` (`'uidd'`, macOS 10.5+): UID → device id.
 const K_AUDIO_HARDWARE_PROPERTY_TRANSLATE_UID_TO_DEVICE: u32 = fourcc(*b"uidd");
+/// `kAudioHardwarePropertyTranslatePIDToProcessObject` (macOS 14.2+): pid (as the
+/// call qualifier) → that process's HAL **audio object** id; `0` when the process
+/// has no audio object. Value `0x69643270`, verbatim from the SDK-generated
+/// `objc2-core-audio` bindings (same value in the `core-audio` crate).
+const K_AUDIO_HARDWARE_PROPERTY_TRANSLATE_PID_TO_PROCESS_OBJECT: u32 = 0x6964_3270;
 
 /// Aggregate-device description keys — string-literal macros in the macOS 27 SDK
 /// (`CoreAudio/AudioHardware.h`): `#define kAudioAggregateDeviceUIDKey "uid"`,
@@ -155,7 +161,19 @@ fn tap_description(config: &TapConfig) -> Result<Retained<AnyObject>, TapError> 
         return Err(TapError::OsTooOld);
     };
     let ProcessSelection::AllExcept(pids) = &config.processes;
-    let numbers: Vec<Retained<NSNumber>> = pids.iter().map(|pid| NSNumber::new_u32(*pid)).collect();
+    // Apple: this array holds *audio process object* ids, **not** pids. Passing a
+    // raw pid made tap creation fail with `kAudioHardwareBadObjectError` (`'!obj'`,
+    // OSStatus 560947818) on the first real macOS run (2026-10-13). Translate
+    // first; a pid with no audio object yet is not in the HAL's process list
+    // (not an error — the same nil contract Apple's samples use) and is skipped.
+    let objects: Vec<AudioObjectId> = pids
+        .iter()
+        .filter_map(|pid| process_object_for_pid(*pid))
+        .collect();
+    let numbers: Vec<Retained<NSNumber>> = objects
+        .iter()
+        .map(|object| NSNumber::new_u32(*object))
+        .collect();
     let excluded = NSArray::from_retained_slice(&numbers);
     let name = NSString::from_str(&config.name);
     let uuid = NSUUID::new();
@@ -278,6 +296,36 @@ fn device_id_for_uid(uid: &str) -> Option<AudioObjectId> {
         )
     };
     (status == 0 && device != 0).then_some(device)
+}
+
+/// Translates a BSD pid to its HAL **audio process object** id
+/// (`kAudioHardwarePropertyTranslatePIDToProcessObject`, macOS 14.2+).
+///
+/// `None` when the process has no audio object yet — a process that has never
+/// done audio I/O is simply not in the HAL's process list, which is not an
+/// error (the same "translate or nil" contract Apple's sample code uses).
+fn process_object_for_pid(pid: u32) -> Option<AudioObjectId> {
+    let address = AudioObjectPropertyAddress {
+        m_selector: K_AUDIO_HARDWARE_PROPERTY_TRANSLATE_PID_TO_PROCESS_OBJECT,
+        m_scope: SCOPE_GLOBAL,
+        m_element: ELEMENT_MAIN,
+    };
+    let mut object: AudioObjectId = 0;
+    let mut size = std::mem::size_of::<AudioObjectId>() as u32;
+    let mut qualifier: u32 = pid;
+    // SAFETY: the qualifier is a live u32 holding the pid and `object` is a
+    // matching out slot; the address is a live stack value for the call.
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            AUDIO_OBJECT_SYSTEM_OBJECT,
+            &address,
+            std::mem::size_of::<u32>() as u32,
+            &mut qualifier as *mut u32 as *const c_void,
+            &mut size,
+            &mut object as *mut AudioObjectId as *mut c_void,
+        )
+    };
+    (status == 0 && object != 0).then_some(object)
 }
 
 /// macOS tap state.
