@@ -35,3 +35,13 @@ egui-wgpu = "0.33"
 winit = { version = "0.30", features = ["rwh_06"] }
 raw-window-handle = "0.6"
 whisper-rs = "0.16"
+
+# macOS 27: `-[NSView inputContext]` returns nil and winit 0.30.13 panics on the
+# first text-field focus (`set_ime_cursor_area` → `.expect("input context")`).
+# Upstream has no fix in the 0.30 line, so we pin our backport fork:
+# github.com/LoLyeah/winit branch `suramak/macos27-ime-guard` — the IME extras
+# degrade to no-ops and IME key interpretation is skipped when the context is
+# nil (typing still works). Drop the pin when upstream handles the nil case.
+# See docs/PLAN-NOTES.md.
+[patch.crates-io]
+winit = { git = "https://github.com/LoLyeah/winit", rev = "63f21f8e189d32852f0c0629f866e3292631371a" }
