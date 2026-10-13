@@ -1,0 +1,16 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# Models / audio artifacts (never committed; live in app data dir)
+*.ggml
+*.gguf
+*.bin
+/models/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
