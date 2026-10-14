@@ -77,6 +77,24 @@ fn sidebar_row(
     let width = ui.available_width() - 16.0;
     let (rect, response) = ui.allocate_exact_size(vec2(width, 40.0), egui::Sense::click());
     let rect = Rect::from_min_size(pos2(rect.left() + 8.0, rect.top()), vec2(width, 40.0));
+    // M9b a11y: the painted row is a labeled button; the selected state rides
+    // along, and focus draws the one ring.
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            true,
+            selected,
+            format!("Open {title}"),
+        )
+    });
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect,
+            CornerRadius::same(tokens.radius.row),
+            egui::Stroke::new(tokens.stroke.focus, tokens.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
     let hover = motion.factor(
         ui.ctx(),
         egui::Id::new(("suramak-sidebar-hover", index)),

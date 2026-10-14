@@ -18,7 +18,7 @@ use suramak_core::models as core_models;
 use suramak_core::settings::{Appearance, EngineSetting, RecordSource};
 use suramak_core::transcript::{Segment, Transcript};
 use suramak_playback::{
-    resolve_playback_source, transcript_duration_ms, Command as PlaybackCommand, Playback,
+    resolve_playback_source, transcript_duration_ms, Command as PlaybackCommand, Peaks, Playback,
     Status as PlaybackStatus,
 };
 use uuid::Uuid;
@@ -33,6 +33,7 @@ pub mod controls;
 pub mod editor;
 pub mod export;
 pub mod home;
+pub mod keymap;
 pub mod library;
 pub mod model_manager;
 pub mod models;
@@ -399,6 +400,24 @@ pub struct Status {
     pub error: bool,
 }
 
+/// The open transcript's waveform envelope (M9b).
+///
+/// Peaks are computed once per source load on a background thread (the runtime's
+/// peaks job) and land here by transcript id. `transcript` names the editor the
+/// envelope belongs to — a late result for a transcript that was left (or
+/// switched away from) is discarded, never drawn over another one. While
+/// `peaks` is `None` the strip draws the honest flat baseline (no audio, or the
+/// decode still in flight) — never fake data.
+#[derive(Debug, Clone, Default)]
+pub struct EditorPeaks {
+    /// The transcript the envelope belongs to (`None` until a job is started).
+    pub transcript: Option<Uuid>,
+    /// The decoded envelope, once the background job answered.
+    pub peaks: Option<Peaks>,
+    /// Why the envelope is missing (a decode failure) — logged, not shown.
+    pub error: Option<String>,
+}
+
 /// Outcome of the most recent library insert (drives the status line and the
 /// scripted smoke job).
 #[derive(Debug, Clone)]
@@ -472,6 +491,8 @@ pub struct AppState {
     /// by the shell at startup and whenever settings apply; every motion
     /// helper reads it through [`crate::motion::Motion`].
     pub reduce_motion: bool,
+    /// M9b: the open transcript's waveform envelope (background decode).
+    pub peaks: EditorPeaks,
 }
 
 /// Side effects the runtime executes after a frame (or an event).
@@ -526,6 +547,11 @@ pub enum Effect {
         source: Option<PathBuf>,
         command: PlaybackCommand,
     },
+    /// Compute the open transcript's waveform envelope off the UI thread
+    /// (M9b): the runtime decodes `path` once and answers through
+    /// [`Runtime::peaks_status`]; the result lands on [`AppState::on_peaks_loaded`]
+    /// tagged with `transcript`, so a stale decode is discarded.
+    LoadPeaks { transcript: Uuid, path: PathBuf },
 }
 
 impl Default for AppState {
@@ -570,6 +596,7 @@ impl AppState {
             theme: AppTheme::Dark,
             appearance: Appearance::System,
             reduce_motion: false,
+            peaks: EditorPeaks::default(),
         }
     }
 
@@ -940,6 +967,37 @@ impl AppState {
         };
     }
 
+    // ---- waveform peaks (M9b) ----------------------------------------------
+
+    /// The envelope the deck strip must draw for the open transcript, when it
+    /// exists. `None` → the honest flat baseline (no audio, or still decoding).
+    pub fn strip_peaks(&self) -> Option<&Peaks> {
+        let editor = self.editor.as_ref()?;
+        if self.peaks.transcript != Some(editor.transcript.id) {
+            return None;
+        }
+        self.peaks.peaks.as_ref()
+    }
+
+    /// The runtime's answer to [`Effect::LoadPeaks`]: stored only for the
+    /// transcript it was requested for — a late decode for another (or a
+    /// closed) editor is discarded, never drawn over the wrong strip.
+    pub fn on_peaks_loaded(&mut self, transcript: Uuid, result: Result<Peaks, String>) {
+        if self.peaks.transcript != Some(transcript) {
+            return;
+        }
+        match result {
+            Ok(peaks) => {
+                self.peaks.peaks = Some(peaks);
+                self.peaks.error = None;
+            }
+            Err(err) => {
+                tracing::warn!(transcript = %transcript, error = %err, "peaks: decode failed");
+                self.peaks.error = Some(err);
+            }
+        }
+    }
+
     // ---- model manager (M3) -------------------------------------------------
 
     /// Home → Models (the runtime rebuilds the table).
@@ -1149,8 +1207,9 @@ impl AppState {
                     status.push_str(&format!(" — {}", warnings.join("; ")));
                 }
                 self.set_status(status, false);
-                self.open_editor(transcript.clone());
-                vec![Effect::SaveTranscript(Box::new(transcript))]
+                let mut effects = self.open_editor(transcript.clone());
+                effects.push(Effect::SaveTranscript(Box::new(transcript)));
+                effects
             }
             WorkerEvent::Error { message, .. } => {
                 self.job_failed(message);
@@ -1256,8 +1315,7 @@ impl AppState {
 
     /// Transcript loaded from the store.
     pub fn on_transcript_loaded(&mut self, transcript: Transcript) -> Vec<Effect> {
-        self.open_editor(transcript);
-        Vec::new()
+        self.open_editor(transcript)
     }
 
     /// Trash confirmed in the editor header (M4.5): delete the open transcript.
@@ -1447,8 +1505,9 @@ impl AppState {
         vec![Effect::SaveEdits { updates }]
     }
 
-    /// Opens a transcript in the editor and switches the route.
-    fn open_editor(&mut self, transcript: Transcript) {
+    /// Opens a transcript in the editor and switches the route. Returns the
+    /// effects the open produced (M9b: the waveform peaks job).
+    fn open_editor(&mut self, transcript: Transcript) -> Vec<Effect> {
         let id = transcript.id;
         self.export.dest = default_dest(&transcript.title, self.export.format);
         self.export.follows_default = true;
@@ -1465,6 +1524,19 @@ impl AppState {
         // M8: the transport is rebuilt for this transcript's source (a previous
         // transcript's playback never leaks across).
         self.reset_playback();
+        // M9b: the strip's envelope is decoded once per source load, off the UI
+        // thread. A source with no audio starts no job — the strip draws the
+        // flat baseline instead (never fake data).
+        self.peaks = EditorPeaks::default();
+        let mut effects = Vec::new();
+        if let Some(path) = self.playback.ready_path().map(Path::to_path_buf) {
+            self.peaks.transcript = Some(id);
+            effects.push(Effect::LoadPeaks {
+                transcript: id,
+                path,
+            });
+        }
+        effects
     }
 }
 
@@ -3031,6 +3103,87 @@ mod tests {
         assert_eq!(suramak_playback::segment_index_at(segments, 900), None);
         assert_eq!(suramak_playback::segment_index_at(segments, 1_000), Some(1));
         assert_eq!(suramak_playback::segment_index_at(segments, 5_000), None);
+    }
+
+    // ---- M9b: waveform peaks -------------------------------------------------
+
+    #[test]
+    fn opening_a_transcript_with_audio_requests_its_envelope() {
+        let wav = temp_wav("peaks-open");
+        let mut state = AppState::new();
+        let effects = state.on_transcript_loaded(transcript_with_audio("open.wav", &wav));
+        match effects.as_slice() {
+            [Effect::LoadPeaks { transcript, path }] => {
+                assert_eq!(*transcript, state.editor.as_ref().unwrap().transcript.id);
+                assert_eq!(path, &wav);
+            }
+            other => panic!("expected a peaks load, got {other:?}"),
+        }
+        // Until the job answers, the strip draws the baseline — no fake data.
+        assert!(state.strip_peaks().is_none());
+        // The answer lands on the strip.
+        let peaks = Peaks::from_samples(&[0.5, -0.5, 0.25, -0.25], 2);
+        state.on_peaks_loaded(
+            state.editor.as_ref().unwrap().transcript.id,
+            Ok(peaks.clone()),
+        );
+        assert_eq!(state.strip_peaks(), Some(&peaks));
+    }
+
+    #[test]
+    fn a_source_without_audio_draws_the_baseline_and_never_starts_a_job() {
+        // keep_audio off: the recording's file is gone (the M8 unavailable path).
+        let mut state = AppState::new();
+        let mut recorded = transcript("Recording x.wav");
+        recorded.source = Source::Recording {
+            started_at: chrono::Utc::now(),
+            duration_ms: 1_900,
+        };
+        let effects = state.on_transcript_loaded(recorded);
+        assert!(
+            effects.is_empty(),
+            "no decode job for a source with no audio"
+        );
+        assert!(
+            state.strip_peaks().is_none(),
+            "the strip draws the flat baseline"
+        );
+        assert!(state.peaks.transcript.is_none());
+    }
+
+    #[test]
+    fn a_stale_peaks_answer_is_discarded() {
+        let first = temp_wav("peaks-stale-first");
+        let second = temp_wav("peaks-stale-second");
+        let mut state = AppState::new();
+        state.on_transcript_loaded(transcript_with_audio("first.wav", &first));
+        let first_id = state.editor.as_ref().unwrap().transcript.id;
+        state.on_transcript_loaded(transcript_with_audio("second.wav", &second));
+        let second_id = state.editor.as_ref().unwrap().transcript.id;
+        assert_ne!(first_id, second_id);
+        let peaks = Peaks::from_samples(&[1.0], 1);
+        state.on_peaks_loaded(first_id, Ok(peaks.clone()));
+        assert!(
+            state.strip_peaks().is_none(),
+            "the stale envelope never lands"
+        );
+        assert!(state.peaks.peaks.is_none());
+        state.on_peaks_loaded(second_id, Ok(peaks.clone()));
+        assert_eq!(state.strip_peaks(), Some(&peaks));
+    }
+
+    #[test]
+    fn a_failed_decode_leaves_the_baseline_and_records_the_reason() {
+        let wav = temp_wav("peaks-failed");
+        let mut state = AppState::new();
+        state.on_transcript_loaded(transcript_with_audio("bad.wav", &wav));
+        let id = state.editor.as_ref().unwrap().transcript.id;
+        state.on_peaks_loaded(id, Err("could not read the audio".to_string()));
+        assert!(state.strip_peaks().is_none());
+        assert_eq!(
+            state.peaks.error.as_deref(),
+            Some("could not read the audio")
+        );
     }
 
     // ---- M9a: deck readout / export sheet / arrival tracking -----------------

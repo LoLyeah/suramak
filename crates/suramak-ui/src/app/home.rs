@@ -287,6 +287,19 @@ pub fn recording_row(
 ) -> bool {
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), 40.0), egui::Sense::click());
+    // M9b a11y: the painted row is a labeled button; it carries the one focus
+    // ring when tabbed to.
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Open {title}"))
+    });
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect,
+            CornerRadius::same(tokens.radius.row),
+            egui::Stroke::new(tokens.stroke.focus, tokens.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
     let hover = motion.factor(
         ui.ctx(),
         egui::Id::new(("suramak-home-row-hover", index)),

@@ -39,7 +39,9 @@ use suramak_core::resample;
 use suramak_core::settings::{LangMode, PolishSettings, RecordSource, Settings};
 use suramak_core::store::Store;
 use suramak_core::transcript::{Segment, Transcript};
-use suramak_playback::{Command as PlaybackCommand, Engine, Status as PlaybackStatus};
+use suramak_playback::{
+    peaks, Command as PlaybackCommand, Engine, Peaks, Status as PlaybackStatus,
+};
 use uuid::Uuid;
 
 use crate::app::{
@@ -79,6 +81,15 @@ pub struct Runtime {
     /// A playback session that could not even be started (thread spawn);
     /// reported to the UI once through [`Runtime::playback_status`].
     playback_error: Option<String>,
+    /// The waveform-peaks decode for the open transcript (M9b): one background
+    /// job at a time, polled through [`Runtime::peaks_status`].
+    peaks: Option<PeaksJob>,
+}
+
+/// A waveform-peaks decode running on a detached thread; the UI polls it.
+struct PeaksJob {
+    transcript: Uuid,
+    result: Arc<Mutex<Option<Result<Peaks, String>>>>,
 }
 
 /// A model download running on a detached thread; the UI polls it.
@@ -141,6 +152,7 @@ impl Runtime {
             polish: None,
             playback: None,
             playback_error: None,
+            peaks: None,
         }
     }
 
@@ -191,6 +203,59 @@ impl Runtime {
         }
         let session = self.playback.as_ref()?;
         Some(session.engine.poll())
+    }
+
+    /// The waveform-peaks decode's answer, if one finished since the last poll
+    /// (M9b). Terminal-once: the job is cleared, so the caller must treat a
+    /// `Some` as final. The transcript id tags the result for `AppState`.
+    pub fn peaks_status(&mut self) -> Option<(Uuid, Result<Peaks, String>)> {
+        let job = self.peaks.as_ref()?;
+        let result = job.result.lock().ok().and_then(|guard| guard.clone())?;
+        let transcript = job.transcript;
+        self.peaks = None;
+        Some((transcript, result))
+    }
+
+    /// Starts the background envelope decode for `path` (one at a time). The
+    /// thread decodes the source **once** (M9b: peaks are computed at source
+    /// load) and requests a repaint when it lands — the event-driven idle loop
+    /// then wakes to draw them.
+    fn start_peaks(&mut self, transcript: Uuid, path: PathBuf) {
+        let result: Arc<Mutex<Option<Result<Peaks, String>>>> = Arc::new(Mutex::new(None));
+        let outcome = Arc::clone(&result);
+        let ctx = self.ctx.clone();
+        let spawned = thread::Builder::new()
+            .name("suramak-peaks".to_string())
+            .spawn(move || {
+                let peaks = peaks::Peaks::from_file(&path, peaks::DEFAULT_BUCKETS);
+                match &peaks {
+                    Ok(peaks) => tracing::info!(
+                        path = %path.display(),
+                        buckets = peaks.buckets().len(),
+                        peak = peaks.peak(),
+                        "peaks: envelope decoded"
+                    ),
+                    Err(err) => {
+                        tracing::warn!(path = %path.display(), error = %err, "peaks: decode failed")
+                    }
+                }
+                if let Ok(mut guard) = outcome.lock() {
+                    *guard = Some(peaks);
+                }
+                ctx.request_repaint();
+            });
+        match spawned {
+            Ok(_handle) => self.peaks = Some(PeaksJob { transcript, result }),
+            Err(err) => {
+                tracing::warn!("peaks: cannot start the decode thread: {err}");
+                self.peaks = Some(PeaksJob {
+                    transcript,
+                    result: Arc::new(Mutex::new(Some(Err(format!(
+                        "cannot start the peaks thread: {err}"
+                    ))))),
+                });
+            }
+        }
     }
 
     /// Executes a playback transport command (M8).
@@ -373,6 +438,7 @@ impl Runtime {
                     }
                 }
                 Effect::Playback { source, command } => self.playback_command(source, command),
+                Effect::LoadPeaks { transcript, path } => self.start_peaks(transcript, path),
             }
         }
     }
@@ -509,6 +575,7 @@ impl Runtime {
             pending: Vec::new(),
             published_revision: 0,
             published_skipped: 0,
+            published_this_step: false,
         });
     }
 
@@ -519,19 +586,28 @@ impl Runtime {
     /// Called from the frame pump while a recording runs; a no-op otherwise.
     /// Stop tears the machinery down here and in [`Runtime::stop_capture`] —
     /// provisional content never outlives the recording.
-    pub fn live_tick(&mut self, state: &mut AppState) {
+    ///
+    /// Returns whether a new provisional revision was **published** (M9b): a
+    /// line arrived, which is a discrete change the frame loop repaints for
+    /// even though the recording's own cadence is the throttled meter one.
+    pub fn live_tick(&mut self, state: &mut AppState) -> bool {
         let stopping = matches!(&state.record, RecordState::Recording(rec) if rec.stopping);
         if stopping || self.session.is_none() {
             self.live = None;
-            return;
+            return false;
         }
         let Some(mut live) = self.live.take() else {
-            return;
+            return false;
         };
         match self.live_step(&mut live, state) {
-            LiveStep::Keep => self.live = Some(live),
+            LiveStep::Keep => {
+                let published = live.published_this_step;
+                self.live = Some(live);
+                published
+            }
             LiveStep::Stop(reason) => {
                 tracing::warn!("live transcription stopped for this recording: {reason}");
+                false
             }
         }
     }
@@ -539,6 +615,7 @@ impl Runtime {
     /// The body of [`Runtime::live_tick`], factored out so the machinery can be
     /// taken out of `self` (and dropped on failure) without borrow conflicts.
     fn live_step(&mut self, live: &mut LiveCapture, state: &mut AppState) -> LiveStep {
+        live.published_this_step = false;
         // 1. Finished decodes → the provisional transcript.
         for result in live.decoder.take_results() {
             if let Some(error) = result.error {
@@ -581,6 +658,7 @@ impl Runtime {
         {
             live.published_revision = live.session.revision();
             live.published_skipped = live.session.skipped_windows();
+            live.published_this_step = true;
             state.record_provisional(
                 live.session.segments().to_vec(),
                 live.session.skipped_windows(),
@@ -890,9 +968,9 @@ impl Runtime {
     /// context cache as it exits).
     ///
     /// A job in flight is **not** interrupted — a full join would block the
-    /// quit; `shutdown::hard_exit` covers that case. Download/polish threads
-    /// own no whisper contexts and are left detached. Never panics; idempotent
-    /// (every step tolerates having nothing to stop).
+    /// quit; `shutdown::hard_exit` covers that case. Download/polish/peaks
+    /// threads own no whisper contexts and are left detached. Never panics;
+    /// idempotent (every step tolerates having nothing to stop).
     ///
     /// Returns whether every context-owning thread exited within the grace.
     pub fn shutdown(&mut self, grace: Duration) -> bool {
@@ -946,6 +1024,10 @@ struct LiveCapture {
     published_revision: u64,
     /// The skipped-window count the record view has already seen.
     published_skipped: u64,
+    /// M9b: set by [`Runtime::live_step`] when it published a new revision —
+    /// [`Runtime::live_tick`] returns it so the frame loop can repaint on the
+    /// arrival (a discrete change) without a periodic cadence.
+    published_this_step: bool,
 }
 
 /// One source's pending device-rate audio (M7).

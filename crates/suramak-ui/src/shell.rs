@@ -5,15 +5,18 @@
 //! (applied on creation, on every resize and after any geometry change).
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use egui_wgpu::wgpu;
 use suramak_core::settings::Appearance;
 use winit::dpi::{LogicalSize, PhysicalSize};
-use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::window::{Window, WindowAttributes};
 
 use crate::app::{self, AppState};
+use crate::framestats::FrameStats;
 use crate::theme::{self, AppTheme};
+use crate::AccessKitEnabler;
 
 const WINDOW_TITLE: &str = "Suramak";
 const INITIAL_SIZE: LogicalSize<f64> = LogicalSize::new(1280.0, 800.0);
@@ -25,6 +28,9 @@ pub struct Shell {
     pub window: Arc<Window>,
     pub egui_state: egui_winit::State,
     pub frames: u64,
+    /// M9b: the per-state frame tally printed at exit under `SURAMAK_FRAME_STATS`
+    /// (`FrameStats::summary`).
+    pub frame_stats: FrameStats,
     pub adapter_info: String,
     pub backend: &'static str,
     pub config: wgpu::SurfaceConfiguration,
@@ -49,12 +55,22 @@ pub struct Shell {
 impl Shell {
     /// Creates the window, picks a wgpu adapter (explicit backend chain), wires
     /// egui, and applies the macOS material.
-    pub fn new(event_loop: &ActiveEventLoop, egui_ctx: &egui::Context) -> Result<Self, String> {
+    ///
+    /// M9b: the window is created **invisible** and shown right after the
+    /// AccessKit adapter is created — `accesskit_winit` requires the adapter to
+    /// exist before the window is first shown (it panics otherwise), which is
+    /// also what makes the a11y tree live from the first frame.
+    pub fn new(
+        event_loop: &ActiveEventLoop,
+        egui_ctx: &egui::Context,
+        accesskit_proxy: Option<EventLoopProxy<AccessKitEnabler>>,
+    ) -> Result<Self, String> {
         let attributes: WindowAttributes = Window::default_attributes()
             .with_title(WINDOW_TITLE)
             .with_inner_size(INITIAL_SIZE)
             .with_min_inner_size(MIN_SIZE)
-            .with_transparent(true);
+            .with_transparent(true)
+            .with_visible(false);
         let window = Arc::new(
             event_loop
                 .create_window(attributes)
@@ -108,7 +124,7 @@ impl Shell {
 
         let renderer =
             egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
-        let egui_state = egui_winit::State::new(
+        let mut egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
             window.as_ref(),
@@ -116,6 +132,18 @@ impl Shell {
             None,
             None,
         );
+
+        // M9b: AccessKit — the platform adapter starts here, before the window
+        // is shown (its constructor requires that). VoiceOver / AT-SPI then see
+        // the egui tree from the first frame; the adapter's action requests
+        // arrive through the winit user event (`App::user_event`) and the tree
+        // updates ride `handle_platform_output` below. On Linux the same wiring
+        // is active (AT-SPI); it degrades silently on a headless machine.
+        if let Some(proxy) = accesskit_proxy {
+            egui_state.init_accesskit::<AccessKitEnabler>(event_loop, window.as_ref(), proxy);
+            tracing::info!("accesskit adapter initialised");
+        }
+        window.set_visible(true);
 
         theme::install_fonts(egui_ctx);
         // A sane first ladder before `sync_appearance` runs (it resolves the
@@ -126,7 +154,10 @@ impl Shell {
         // arrive on the bridge thread and call `Context::request_repaint`).
         {
             let window = window.clone();
-            egui_ctx.set_request_repaint_callback(move |_info| {
+            egui_ctx.set_request_repaint_callback(move |info| {
+                // `debug`: every egui-side repaint request with its delay — the
+                // frame-stats seam's companion when tracing why a frame came.
+                tracing::debug!(delay = ?info.delay, "egui repaint requested");
                 window.request_redraw();
             });
         }
@@ -137,6 +168,7 @@ impl Shell {
             window,
             egui_state,
             frames: 0,
+            frame_stats: FrameStats::new(),
             adapter_info: format!(
                 "{} ({:?}, driver {})",
                 adapter_info.name, adapter_info.device_type, adapter_info.driver
@@ -287,15 +319,25 @@ impl Shell {
     }
 
     fn render(&mut self) -> Result<Vec<app::Effect>, wgpu::SurfaceError> {
-        let raw_input = self.egui_state.take_egui_input(&self.window);
+        let mut raw_input = self.egui_state.take_egui_input(&self.window);
+        // M9b keyboard map: dispatched on the raw input BEFORE egui sees it — a
+        // matched shortcut's key event is consumed here, so a focused widget,
+        // egui's own focus movement and the keymap can never both act on one
+        // press. The guard (a focused text edit) is read from the same focus
+        // state the pass would see.
+        let key_effects =
+            app::keymap::dispatch(&self.egui_ctx, &mut self.app, &mut raw_input.events);
         let egui_ctx = self.egui_ctx.clone();
         let app = &mut self.app;
         // egui may run the UI closure more than once per frame (passes); the
-        // last pass's effects win (assignment, not accumulation).
-        let mut effects = Vec::new();
+        // last pass's effects win (assignment, not accumulation). The keyboard
+        // effects were produced before the passes and are prepended after.
+        let mut frame_effects = Vec::new();
         let full_output = egui_ctx.run(raw_input, |ctx| {
-            effects = app::views::draw(ctx, app);
+            frame_effects = app::views::draw(ctx, app);
         });
+        let mut effects = key_effects;
+        effects.extend(frame_effects);
 
         // Viewport commands first (they borrow `full_output`), then the moved
         // platform output.
@@ -381,6 +423,9 @@ impl Shell {
             self.renderer.free_texture(id);
         }
         self.frames += 1;
+        // M9b: attribute this presented frame to the visible state it was drawn
+        // in (the `SURAMAK_FRAME_STATS` summary prints at exit).
+        self.frame_stats.on_frame(&self.app, Instant::now());
         Ok(effects)
     }
 }

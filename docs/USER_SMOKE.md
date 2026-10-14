@@ -189,6 +189,18 @@ The shell has been rebuilt (M9 slice 1). The editor now reads as **one** surface
 - Hover and press controls (buttons, glyphs, transport): subtle fast transitions everywhere; nothing animates forever.
 - With **Reduce Motion** enabled (System Settings → Accessibility → Display), the same actions snap instantly instead of animating.
 
+## 23. The waveform is real + the heat budget (M9b)
+
+- Open `en.wav` (or any imported file): the waveform strip should show a **real** envelope — tall where there's speech, flat through pauses, a flat tail at the end. Play it and compare the shape to what you hear.
+- Open the recording whose audio wasn't kept (keep-audio off): the strip shows a **flat line + a hint text** — no invented waveform, ever.
+- The heat budget: the app no longer redraws continuously. Sanity check in Activity Monitor (search "suramak"): idle ≈ 0% CPU; while recording, the meter/timer tick without the app chewing CPU; a long transcription runs far quieter than before. (Linux-measured: idle repaints −99%, recording ~10 fps instead of ~19, job ≈ 1.5 fps.)
+
+## 24. Keyboard + focus (M9b)
+
+- In the editor: **Space** play/pause · **⌘E** export sheet · **⌘R** start/stop recording (from anywhere) · **↑/↓** jump between segments · **⌘⌫** arm the delete confirm · **Esc** closes the sheet / leaves the editor.
+- All of those must stay silent while you're typing inside a transcript row (Esc excepted).
+- Press **Tab** repeatedly: every control gets a visible blue focus ring (sidebar rows → transport → waveform strip → Export… → trash…).
+
 ## Report
 
 Anything that deviates from an expected result, with: what you did, what happened, what you expected.

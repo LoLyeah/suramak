@@ -16,7 +16,7 @@
 
 use egui::{
     pos2, vec2, Color32, CornerRadius, FontFamily, FontId, Rect, Response, Sense, Stroke,
-    StrokeKind, Ui,
+    StrokeKind, Ui, WidgetInfo, WidgetType,
 };
 
 use crate::motion::{self, Motion};
@@ -391,6 +391,11 @@ pub fn button_sized(
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     let id = ui.id().with(id_salt);
     let painted = painted_body(ui, tokens, motion, id, rect, tier, enabled);
+    // M9b a11y: the painted button carries its semantic label (screen reader +
+    // tooltip from the same string).
+    painted
+        .response
+        .widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, label));
     let galley =
         ui.painter()
             .layout_no_wrap(label.to_owned(), label_font(tier), painted.colors.text);
@@ -419,6 +424,11 @@ pub fn glyph_button(
     let id = ui.id().with(id_salt);
     let painted = painted_body(ui, tokens, motion, id, rect, tier, enabled);
     paint_glyph(ui.painter(), rect, glyph, painted.colors.text);
+    // M9b a11y: the glyph's meaning is the tooltip string — label and tooltip
+    // come from the same text.
+    painted
+        .response
+        .widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, tooltip));
     painted.response.on_hover_text(tooltip)
 }
 
@@ -469,6 +479,9 @@ pub fn glyph_label_button(
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     let id = ui.id().with(id_salt);
     let painted = painted_body(ui, tokens, motion, id, rect, Tier::Tertiary, enabled);
+    painted
+        .response
+        .widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, label));
     let glyph_rect = Rect::from_center_size(
         pos2(
             rect.left() + tokens.space.m + glyph_w / 2.0,
@@ -538,6 +551,10 @@ pub fn segmented<T: PartialEq + Clone>(
             let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
             let id = ui.id().with(&id_salt).with(index);
             let response = ui.interact(rect, id, Sense::click());
+            // M9b a11y: every segment is a labeled radio node with its state.
+            response.widget_info(|| {
+                WidgetInfo::selected(WidgetType::RadioButton, true, selected, label)
+            });
             let hover = motion.factor(ui.ctx(), id.with("hover"), response.hovered(), motion::FAST);
             // The selected segment carries the accent tint; the rest are quiet.
             let fill = if selected {
@@ -656,6 +673,17 @@ pub fn transport(
         if playing { Glyph::Pause } else { Glyph::Play },
         toggle.colors.text,
     );
+    // M9b a11y: both capsule halves are labeled buttons; the toggle's label
+    // follows its state (Play ↔ Pause).
+    skip.response
+        .widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, "Skip to start"));
+    toggle.response.widget_info(|| {
+        WidgetInfo::labeled(
+            WidgetType::Button,
+            enabled,
+            if playing { "Pause" } else { "Play" },
+        )
+    });
     Transport {
         skip_start: skip.response.on_hover_text("Skip to start"),
         toggle: toggle
@@ -730,6 +758,71 @@ mod tests {
             assert!(
                 sum(disabled.text) < sum(rest.text),
                 "{tier:?}: disabled text must be dimmer"
+            );
+        }
+    }
+
+    /// M9b a11y floor: every painted control type must land in the accesskit
+    /// tree with its semantic label (and be focusable, i.e. Tab-reachable).
+    #[test]
+    fn every_painted_control_exposes_its_label_to_accesskit() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let t = tokens(AppTheme::Light);
+        let motion = Motion::new(false);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 400.0))),
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = button(
+                    ui,
+                    &t,
+                    &motion,
+                    "a11y-secondary",
+                    "Export…",
+                    Tier::Secondary,
+                    true,
+                );
+                let _ = glyph_button(
+                    ui,
+                    &t,
+                    &motion,
+                    "a11y-trash",
+                    Glyph::Trash,
+                    Tier::Tertiary,
+                    true,
+                    "Delete this transcript",
+                );
+                let mut selection = 0u8;
+                let options = [(0u8, "Markdown"), (1u8, "Text")];
+                let _ = segmented(ui, &t, &motion, "a11y-segments", &mut selection, &options);
+                let _ = transport(ui, &t, &motion, "a11y-transport", false, true);
+                let _ = nav_home(ui, &t, &motion, "a11y-home");
+            });
+        });
+        let update = output
+            .platform_output
+            .accesskit_update
+            .expect("an accesskit tree update");
+        let labels: Vec<String> = update
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.label().map(str::to_string))
+            .collect();
+        for expected in [
+            "Export…",
+            "Delete this transcript",
+            "Markdown",
+            "Text",
+            "Skip to start",
+            "Play",
+            "Home",
+        ] {
+            assert!(
+                labels.iter().any(|label| label == expected),
+                "missing a11y label {expected:?}; got {labels:?}"
             );
         }
     }

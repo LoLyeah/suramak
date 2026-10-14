@@ -10,6 +10,12 @@ version = "0.1.0"
 [profile.release]
 lto = false
 
+# Dependencies are ~2/3 of target/debug's size on the dev VPS. Line tables keep
+# file:line in backtraces (drop variables/types); workspace crates keep full
+# debug info. Verified against cargo profile docs; advised by glm-5.3.
+[profile.dev.package."*"]
+debug = "line-tables-only"
+
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -32,8 +38,8 @@ rubato = { version = "0.16", features = ["fft_resampler"] }
 hound = "3.5"
 clap = { version = "4", features = ["derive"] }
 pollster = "0.4"
-egui = "0.33"
-egui-winit = "0.33"
+egui = { version = "0.33", features = ["accesskit"] }
+egui-winit = { version = "0.33", features = ["accesskit"] }
 egui-wgpu = "0.33"
 winit = { version = "0.30", features = ["rwh_06"] }
 raw-window-handle = "0.6"

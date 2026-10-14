@@ -26,6 +26,8 @@
 //! unchanged (0 / 1).
 
 mod app;
+mod cadence;
+mod framestats;
 mod instance;
 mod motion;
 mod runtime;
@@ -43,8 +45,22 @@ use suramak_core::paths;
 use suramak_core::store::Store;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::WindowId;
+
+/// The winit user-event payload the AccessKit platform adapter delivers through
+/// its `EventLoopProxy` (the `egui-winit` wiring pattern, named after the eframe
+/// convention for the same plumbing). [`App::user_event`] forwards the action
+/// requests into the egui state, so a screen reader's "press" lands on the same
+/// painted control a mouse would.
+#[derive(Debug)]
+pub struct AccessKitEnabler(egui_winit::accesskit_winit::Event);
+
+impl From<egui_winit::accesskit_winit::Event> for AccessKitEnabler {
+    fn from(event: egui_winit::accesskit_winit::Event) -> Self {
+        Self(event)
+    }
+}
 
 /// Written on a successful plain smoke run (repo-root relative, like the acceptance block).
 const SMOKE_FILE: &str = "build/smoke_ok.txt";
@@ -69,8 +85,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let smoke = Smoke::from_env();
     // One Suramak at a time (skipped in smoke modes — transient runs).
     acquire_instance_lock(smoke.is_none());
-    let event_loop = EventLoop::new()?;
-    let mut app = App::new(smoke);
+    // M9b: the user-event channel carries AccessKit's action requests back into
+    // the loop (the proxy is handed to the shell's adapter at startup).
+    let event_loop = EventLoop::<AccessKitEnabler>::with_user_event().build()?;
+    let mut app = App::new(smoke, Some(event_loop.create_proxy()));
     // Every quit flavor ends in `App::exiting` (winit dispatches `LoopExiting`
     // on the way out), which tears down and hard-exits — see `App::quit`. For
     // Cmd-Q that happens inside AppKit's `applicationWillTerminate:`, *before*
@@ -183,10 +201,20 @@ struct App {
     /// Set once the quit teardown ran — [`App::shutdown`] is idempotent, so the
     /// `exiting` hook and the post-loop belt-and-braces can both call it.
     shutdown_done: bool,
+    /// The AccessKit user-event proxy, handed to the shell when it starts
+    /// (M9b: `Shell::new` creates the platform adapter before the window shows).
+    accesskit_proxy: Option<EventLoopProxy<AccessKitEnabler>>,
+    /// The next scheduled cadence repaint (M9b). Set while the state asks for an
+    /// interval (recording / playing / download / autosave due), cleared when it
+    /// does not; a wake that finds the deadline passed repaints and re-arms.
+    repaint_due: Option<Instant>,
 }
 
 impl App {
-    fn new(smoke: Option<Smoke>) -> Self {
+    fn new(
+        smoke: Option<Smoke>,
+        accesskit_proxy: Option<EventLoopProxy<AccessKitEnabler>>,
+    ) -> Self {
         Self {
             egui_ctx: egui::Context::default(),
             shell: None,
@@ -194,6 +222,8 @@ impl App {
             smoke,
             failed: false,
             shutdown_done: false,
+            accesskit_proxy,
+            repaint_due: None,
         }
     }
 
@@ -210,6 +240,15 @@ impl App {
     /// The exit code is the app's usual one (1 after a failed start / job /
     /// smoke run, else 0), so the smoke modes keep their codes.
     fn quit(&mut self) -> ! {
+        // M9b: the frame-stats seam — with `SURAMAK_FRAME_STATS` set, the
+        // per-state frame summary prints on the way out (stdout + the log).
+        if framestats::enabled() {
+            if let Some(shell) = &self.shell {
+                let summary = shell.frame_stats.summary();
+                print!("{summary}");
+                tracing::info!(target: "suramak::frames", "\n{summary}");
+            }
+        }
         self.shutdown();
         shutdown::hard_exit(self.exit_code())
     }
@@ -248,20 +287,33 @@ impl App {
     }
 
     /// Drains worker events (queued by the bridge thread), polls the model
-    /// download and the capture meter, and runs the debounce tick.
-    fn pump(&mut self) {
+    /// download, the polish run, the playback engine, the capture meter and the
+    /// waveform-peaks job, and runs the debounce tick.
+    ///
+    /// Returns whether anything **discrete** changed (M9b): queued events were
+    /// drained, a background result landed, a terminal transport transition
+    /// happened, a live transcript line arrived, or a tick fired effects.
+    /// Continuously moving values (the playback position, the live meter) are
+    /// deliberately not reported here — their repaints come from the cadence
+    /// policy ([`cadence::repaint_interval`]), so a busy state cannot turn the
+    /// change flag into a busy loop.
+    fn pump(&mut self) -> bool {
+        let mut changed = false;
         if self.runtime.is_none() {
-            return;
+            return false;
         }
         let events = self
             .runtime
             .as_ref()
             .map(|runtime| runtime.drain_worker())
             .unwrap_or_default();
+        if !events.is_empty() {
+            changed = true;
+        }
         for event in events {
             let effects = match self.shell.as_mut() {
                 Some(shell) => shell.app.on_worker_event(event),
-                None => return,
+                None => return changed,
             };
             self.apply(effects);
         }
@@ -272,6 +324,7 @@ impl App {
             .as_mut()
             .and_then(|runtime| runtime.download_status());
         if let Some(status) = download {
+            changed = true;
             let effects = match (status.finished, self.shell.as_mut()) {
                 (None, Some(shell)) => {
                     shell
@@ -291,6 +344,7 @@ impl App {
             .as_mut()
             .and_then(|runtime| runtime.polish_status());
         if let Some(result) = polish {
+            changed = true;
             let effects = match self.shell.as_mut() {
                 Some(shell) => shell.app.on_polish_done(result),
                 None => Vec::new(),
@@ -298,13 +352,30 @@ impl App {
             self.apply(effects);
         }
 
+        // Waveform peaks (M9b: decoded once per source load, off this thread).
+        let peaks = self
+            .runtime
+            .as_mut()
+            .and_then(|runtime| runtime.peaks_status());
+        if let Some((transcript, result)) = peaks {
+            changed = true;
+            if let Some(shell) = self.shell.as_mut() {
+                shell.app.on_peaks_loaded(transcript, result);
+            }
+        }
+
         // Playback position (M8): polled per frame while an engine exists — the
-        // capture-RMS pattern, but for the moving playhead.
+        // capture-RMS pattern, but for the moving playhead. The position moves
+        // continuously (the cadence policy repaints for it); only the terminal
+        // transitions are discrete changes.
         let playback = self
             .runtime
             .as_mut()
             .and_then(|runtime| runtime.playback_status());
         if let Some(status) = playback {
+            if status.finished || status.error.is_some() {
+                changed = true;
+            }
             let effects = match self.shell.as_mut() {
                 Some(shell) => shell.app.on_playback_status(status),
                 None => Vec::new(),
@@ -331,16 +402,21 @@ impl App {
             // Live provisional transcript (M7): per-frame while recording —
             // feed new audio through the live scheduler and publish what the
             // decoder merged. Stop tears it down; the final pass is unaffected.
+            // A published line is a discrete change (repaint on arrival).
             if let (Some(shell), Some(runtime)) = (self.shell.as_mut(), self.runtime.as_mut()) {
-                runtime.live_tick(&mut shell.app);
+                changed |= runtime.live_tick(&mut shell.app);
             }
         }
 
         let effects = match self.shell.as_mut() {
             Some(shell) => shell.app.tick(Instant::now()),
-            None => return,
+            None => return changed,
         };
+        if !effects.is_empty() {
+            changed = true;
+        }
         self.apply(effects);
+        changed
     }
 
     /// Executes effects through the runtime, then re-syncs the appearance
@@ -454,7 +530,7 @@ impl App {
             .and_then(|smoke| smoke.job.clone())
             .unwrap_or_default();
         let content = format!(
-            "suramak ui smoke job ok\njob={}\ntranscript_id={}\nsegments={}\nmodel={}\nengine={}\nsecs={elapsed:.1}\n",
+            "suramak ui smoke job ok\njob={}\ntranscript_id={}\nsegments={}\nmodel={}\nengine={}\nframes={frames}\nsecs={elapsed:.1}\n",
             input.display(),
             outcome.transcript.id,
             segments,
@@ -466,7 +542,7 @@ impl App {
             return;
         }
         println!(
-            "suramak: SMOKE-JOB-OK — {} ({} segments, model {}) saved to the library",
+            "suramak: SMOKE-JOB-OK — {} ({} segments, model {}) saved to the library ({frames} frames)",
             outcome.transcript.title, segments, outcome.transcript.model
         );
         if let Some(smoke) = &mut self.smoke {
@@ -501,12 +577,12 @@ fn assert_stored(outcome: &app::SaveOutcome) -> Result<usize, String> {
     Ok(stored.segments.len())
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<AccessKitEnabler> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.shell.is_some() {
             return;
         }
-        match Shell::new(event_loop, &self.egui_ctx) {
+        match Shell::new(event_loop, &self.egui_ctx, self.accesskit_proxy.take()) {
             Ok(mut shell) => {
                 let mut runtime = Runtime::new(self.egui_ctx.clone());
                 if let Some(err) = runtime.startup_error.clone() {
@@ -572,7 +648,14 @@ impl ApplicationHandler for App {
             return;
         };
         let response = shell.egui_state.on_window_event(&shell.window, &event);
-        if response.repaint {
+        // egui-winit reports `repaint` for input-ish events — and also for
+        // `RedrawRequested` itself. Re-requesting a redraw from the redraw
+        // handler is a self-perpetuating full-window loop: the M9a build did
+        // exactly that, which is why an "idle" run measured ~29 fps on
+        // llvmpipe. Redraws are scheduled by the cadence policy in
+        // `about_to_wait`, by egui's own repaint callback and by the smoke
+        // harness; input events still repaint right here.
+        if response.repaint && !matches!(event, WindowEvent::RedrawRequested) {
             shell.window.request_redraw();
         }
         match event {
@@ -614,9 +697,34 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        self.pump();
+    /// M9b: AccessKit's platform adapter posts its events through the winit
+    /// user-event channel (the `AccessKitEnabler` proxy `Shell::new` handed to
+    /// it). Action requests — a screen reader "pressing" a node — go back into
+    /// the egui state, which turns them into `Event::AccessKitActionRequest`s
+    /// for the next pass; the initial-tree request just needs a frame.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AccessKitEnabler) {
+        let Some(shell) = self.shell.as_mut() else {
+            return;
+        };
+        if event.0.window_id != shell.window.id() {
+            return;
+        }
+        match event.0.window_event {
+            egui_winit::accesskit_winit::WindowEvent::ActionRequested(request) => {
+                shell.egui_state.on_accesskit_action_request(request);
+                shell.window.request_redraw();
+            }
+            egui_winit::accesskit_winit::WindowEvent::InitialTreeRequested => {
+                shell.window.request_redraw();
+            }
+            egui_winit::accesskit_winit::WindowEvent::AccessibilityDeactivated => {}
+        }
+    }
 
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let changed = self.pump();
+
+        let smoke_active = self.smoke.as_ref().is_some_and(|smoke| !smoke.finished);
         let snapshot = self
             .smoke
             .as_ref()
@@ -632,19 +740,51 @@ impl ApplicationHandler for App {
             }
         }
 
-        // Keep the loop awake while a job runs or edits are pending; otherwise
-        // sleep until an event (the bridge thread wakes us for worker events).
-        let busy = self.smoke.as_ref().is_some_and(|smoke| !smoke.finished)
-            || self.shell.as_ref().is_some_and(|shell| shell.app.busy());
-        if busy {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(50),
-            ));
+        // M9b cadence policy: idle waits for events; recording meters at ~10 fps;
+        // playback moves at ≤30 fps; a download wakes for its progress; unsaved
+        // edits wake at the autosave due time. A repaint happens when the
+        // policy's deadline is due or when the pump saw a discrete change —
+        // never on every wake (the M9a busy loop).
+        let now = Instant::now();
+        let cadence = self
+            .shell
+            .as_ref()
+            .map(|shell| cadence::repaint_interval(&shell.app, now))
+            .unwrap_or(cadence::Cadence::EventDriven);
+        let mut repaint = changed;
+        match cadence {
+            cadence::Cadence::Interval(interval) => {
+                let due = self.repaint_due.unwrap_or(now + interval);
+                if now >= due {
+                    repaint = true;
+                    self.repaint_due = Some(now + interval);
+                } else {
+                    self.repaint_due = Some(due);
+                }
+            }
+            cadence::Cadence::EventDriven => {
+                self.repaint_due = None;
+            }
+        }
+        if repaint {
             if let Some(shell) = &self.shell {
                 shell.window.request_redraw();
             }
+        }
+
+        // The wake schedule: the smoke watchdogs need 50 ms granularity (they
+        // check deadlines here, not in a frame); the app otherwise sleeps until
+        // its cadence deadline or the next event.
+        let wake = if smoke_active {
+            Some(Duration::from_millis(50))
         } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
+            cadence.interval()
+        };
+        match wake {
+            Some(interval) => {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(now + interval));
+            }
+            None => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
 
@@ -668,7 +808,7 @@ mod tests {
     /// post-loop belt-and-braces may both call it (WORKORDER-HOTFIX-QUIT).
     #[test]
     fn shutdown_without_a_shell_or_runtime_is_a_no_op_and_idempotent() {
-        let mut app = App::new(None);
+        let mut app = App::new(None, None);
         app.shutdown();
         app.shutdown();
         assert!(!app.failed, "teardown must not change the exit code");
@@ -679,7 +819,7 @@ mod tests {
     /// modes' existing codes), else 0.
     #[test]
     fn the_exit_code_follows_the_failure_flag() {
-        let mut app = App::new(None);
+        let mut app = App::new(None, None);
         assert_eq!(app.exit_code(), 0);
         app.failed = true;
         assert_eq!(app.exit_code(), 1);

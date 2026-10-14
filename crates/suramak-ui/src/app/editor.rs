@@ -23,6 +23,7 @@ use std::time::Instant;
 use egui::{pos2, vec2, Align2, CornerRadius, FontFamily, FontId, Rect, Stroke, StrokeKind, Vec2};
 
 use suramak_playback::segment_index_at;
+use suramak_playback::Peaks;
 
 use crate::app::controls::{self, Tier};
 use crate::motion::{self, Motion};
@@ -163,14 +164,51 @@ fn deck_band(
     let total_ms = state.playback.duration_ms();
     let position_ms = state.playback.position_ms();
     let hint = state.playback.hint().map(str::to_string);
+    let peaks = state.strip_peaks();
+    let transcript_id = state.editor.as_ref().map(|editor| editor.transcript.id);
     let mut seek_ms: Option<u32> = None;
     ui.scope_builder(egui::UiBuilder::new().max_rect(deck.waveform), |ui| {
         let (rect, response) = ui.allocate_exact_size(deck.waveform.size(), egui::Sense::click());
-        waveform_strip(ui, rect, tokens, total_ms, position_ms, hint.as_deref());
-        if response.hovered() && hint.is_none() && total_ms > 0 {
+        let can_seek = hint.is_none() && total_ms > 0;
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Other,
+                can_seek,
+                "Waveform — click to seek",
+            )
+        });
+        if response.has_focus() {
+            ui.painter().rect_stroke(
+                rect.expand(1.5),
+                CornerRadius::same(tokens.radius.control.saturating_add(2)),
+                Stroke::new(tokens.stroke.focus, tokens.accent),
+                StrokeKind::Outside,
+            );
+        }
+        // M9b motion: the real peaks fade in once, on their first paint (base
+        // token; a snap under Reduce Motion). No growth animation.
+        let peaks_fade = match (transcript_id, peaks) {
+            (Some(id), Some(_)) => motion.arrive(
+                ui.ctx(),
+                egui::Id::new(("suramak-peaks-fade", id)),
+                motion::BASE,
+            ),
+            _ => 1.0,
+        };
+        waveform_strip(
+            ui,
+            rect,
+            tokens,
+            total_ms,
+            position_ms,
+            hint.as_deref(),
+            peaks,
+            peaks_fade,
+        );
+        if response.hovered() && can_seek {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
-        if response.clicked() && hint.is_none() && total_ms > 0 {
+        if response.clicked() && can_seek {
             if let Some(pointer) = response.interact_pointer_pos() {
                 seek_ms = Some(waveform_ms_at(rect, pointer.x, total_ms));
             }
@@ -212,9 +250,11 @@ fn deck_band(
     });
 }
 
-/// The waveform strip: the M1 silhouette (deterministic bars — real peaks are
-/// slice 2; the geometry here is final), the moving accent playhead and
-/// click-to-seek. An unavailable source replaces the playhead with the reason.
+/// The waveform strip: the **real** min/max envelope (M9b) in the frozen M9a
+/// geometry — same band, same bar pitch, same playhead and click-to-seek. A
+/// source with no envelope (no audio, or the decode still in flight) draws a
+/// quiet flat baseline — never the old deterministic silhouette.
+#[allow(clippy::too_many_arguments)]
 fn waveform_strip(
     ui: &egui::Ui,
     strip: Rect,
@@ -222,35 +262,68 @@ fn waveform_strip(
     total_ms: u32,
     position_ms: u32,
     unavailable: Option<&str>,
+    peaks: Option<&Peaks>,
+    peaks_fade: f32,
 ) {
     let painter = ui.painter();
     let bars = strip.shrink2(vec2(2.0, 2.0));
     let center_y = bars.center().y;
-    painter.hline(
-        bars.x_range(),
-        center_y,
-        Stroke::new(tokens.stroke.hairline, tokens.hairline),
-    );
 
     let max_half = (bars.height() * 0.5 - 3.0).max(3.0);
     let bar_width = 2.0;
     let pitch = 5.0;
-    let mut x = bars.left();
-    let mut index = 0usize;
-    while x + bar_width <= bars.right() {
-        let half = 2.0 + bar_height(index) * max_half;
-        let bar = Rect::from_center_size(
-            pos2(x + bar_width * 0.5, center_y),
-            vec2(bar_width, half * 2.0),
-        );
-        let color = if index % 9 == 0 {
-            tokens.wave_dim
-        } else {
-            tokens.wave
-        };
-        painter.rect_filled(bar, CornerRadius::same(1), color);
-        x += pitch;
-        index += 1;
+
+    match peaks {
+        Some(peaks) => {
+            painter.hline(
+                bars.x_range(),
+                center_y,
+                Stroke::new(tokens.stroke.hairline, tokens.hairline),
+            );
+            let mut x = bars.left();
+            let mut index = 0usize;
+            while x + bar_width <= bars.right() {
+                // Each bar draws the envelope over the time span it covers (the
+                // normalized min/max of every bucket it touches).
+                let t0 = (x - bars.left()) / bars.width().max(1.0);
+                let t1 = (x + bar_width - bars.left()) / bars.width().max(1.0);
+                let (min, max) = peaks.range(t0, t1);
+                if min != 0.0 || max != 0.0 {
+                    let top = center_y - max.clamp(0.0, 1.0) * max_half;
+                    let bottom = center_y - min.clamp(-1.0, 0.0) * max_half;
+                    // A non-silent span never draws thinner than one pixel
+                    // (legibility, not invented data).
+                    let (top, bottom) = if bottom - top < 1.0 {
+                        let mid = (top + bottom) * 0.5;
+                        (mid - 0.5, mid + 0.5)
+                    } else {
+                        (top, bottom)
+                    };
+                    let bar = Rect::from_min_max(pos2(x, top), pos2(x + bar_width, bottom));
+                    let color = if index % 9 == 0 {
+                        tokens.wave_dim
+                    } else {
+                        tokens.wave
+                    };
+                    painter.rect_filled(
+                        bar,
+                        CornerRadius::same(1),
+                        color.gamma_multiply(peaks_fade),
+                    );
+                }
+                x += pitch;
+                index += 1;
+            }
+        }
+        None => {
+            // The honest flat baseline: a quiet line at zero amplitude. No
+            // silhouette, no stubs — a source without audio has no waveform.
+            painter.hline(
+                bars.x_range(),
+                center_y,
+                Stroke::new(1.5_f32, tokens.wave_dim.gamma_multiply(0.7)),
+            );
+        }
     }
 
     if let Some(hint) = unavailable {
@@ -291,18 +364,6 @@ fn waveform_ms_at(strip: Rect, x: f32, total_ms: u32) -> u32 {
     let bars = strip.shrink2(vec2(2.0, 2.0));
     let t = ((x - bars.left()) / bars.width().max(1.0)).clamp(0.0, 1.0);
     (t * total_ms as f32).round() as u32
-}
-
-/// Deterministic pseudo-random bar silhouette (no RNG dependency; M1 generator;
-/// slice 2 replaces this with real peaks).
-fn bar_height(index: usize) -> f32 {
-    let mut hash = (index as u32).wrapping_mul(2_654_435_761);
-    hash ^= hash >> 15;
-    hash = hash.wrapping_mul(0x2c1b_3c6d);
-    hash ^= hash >> 12;
-    let noise = (hash & 0xffff) as f32 / 65_535.0;
-    let swell = 0.45 + 0.55 * ((index as f32) * 0.045).sin().abs();
-    (swell * (0.25 + 0.75 * noise)).clamp(0.0, 1.0)
 }
 
 /// The title line: serif title at the left, `Polish` (quiet) at the far right,
@@ -662,6 +723,22 @@ fn transcript_rows(
                     let stamp_rect =
                         Rect::from_min_size(ui.cursor().min, vec2(gutter_w - 10.0, 20.0));
                     let stamp = ui.allocate_rect(stamp_rect, egui::Sense::click());
+                    // M9b a11y: the painted timestamp carries its semantic label.
+                    stamp.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::Button,
+                            true,
+                            format!("Seek to {}", suramak_core::time::fmt_plain(*start_ms)),
+                        )
+                    });
+                    if stamp.has_focus() {
+                        ui.painter().rect_stroke(
+                            stamp_rect.expand(1.0),
+                            CornerRadius::same(3),
+                            Stroke::new(tokens.stroke.focus, tokens.accent),
+                            StrokeKind::Outside,
+                        );
+                    }
                     let stamp_hover = motion.factor(
                         ui.ctx(),
                         egui::Id::new(("suramak-gutter-hover", *idx)),
@@ -926,5 +1003,75 @@ mod tests {
         // Clamped outside the axis.
         assert_eq!(waveform_ms_at(strip, bars.left() - 50.0, 18_000), 0);
         assert_eq!(waveform_ms_at(strip, bars.right() + 50.0, 18_000), 18_000);
+    }
+
+    /// M9b a11y floor: a full editor frame with accesskit enabled must expose
+    /// every painted control as a node carrying its semantic label — this is
+    /// the tree VoiceOver / AT-SPI reads.
+    #[test]
+    fn the_editor_exposes_labelled_accesskit_nodes() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        // The editor draws in the serif family (registered by `install_fonts`);
+        // a bare test context has no font families at all.
+        crate::theme::install_fonts(&ctx);
+        let tokens = crate::theme::tokens(crate::theme::AppTheme::Light);
+        let motion = crate::motion::Motion::new(false);
+
+        let dir = std::env::temp_dir().join(format!("suramak-a11y-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let wav = dir.join("a11y.wav");
+        std::fs::write(&wav, b"RIFF....").expect("temp wav");
+        let mut state = crate::app::AppState::new();
+        state.on_transcript_loaded(suramak_core::transcript::Transcript::new(
+            "a11y.wav".to_string(),
+            suramak_core::transcript::Source::File {
+                name: "a11y.wav".to_string(),
+            },
+            "tiny".to_string(),
+            Some("en".to_string()),
+            Some(wav),
+            vec![suramak_core::transcript::Segment {
+                idx: 0,
+                start_ms: 0,
+                end_ms: 1_900,
+                text: "hello".to_string(),
+            }],
+        ));
+
+        let mut effects = Vec::new();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0))),
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                super::ui(ui, &tokens, &motion, &mut state, &mut effects);
+            });
+        });
+
+        let update = output
+            .platform_output
+            .accesskit_update
+            .expect("an accesskit tree update");
+        let labels: Vec<String> = update
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.label().map(str::to_string))
+            .collect();
+        for expected in [
+            "Waveform — click to seek",
+            "Skip to start",
+            "Play",
+            "Export…",
+            "Polish",
+            "Delete this transcript",
+            "Seek to 00:00:00",
+        ] {
+            assert!(
+                labels.iter().any(|label| label == expected),
+                "the editor's a11y tree must carry {expected:?}; got {labels:?}"
+            );
+        }
     }
 }

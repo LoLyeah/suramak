@@ -205,6 +205,30 @@ fn float_control(
             let (rect, response) = ui.allocate_exact_size(rect.size(), egui::Sense::click());
             let painter = ui.painter();
             let radius = CornerRadius::same((rect.height() * 0.5).round().clamp(0.0, 255.0) as u8);
+            // M9b a11y: the pill is a labeled button (Record ↔ Stop recording)
+            // and carries the one focus ring when tabbed to.
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    enabled,
+                    if recording {
+                        "Stop recording"
+                    } else {
+                        "Record"
+                    },
+                )
+            });
+            if response.has_focus() {
+                let ring_radius = CornerRadius::same(
+                    ((rect.height() * 0.5) + 2.0).round().clamp(0.0, 255.0) as u8,
+                );
+                painter.rect_stroke(
+                    rect.expand(1.5),
+                    ring_radius,
+                    egui::Stroke::new(tokens.stroke.focus, tokens.accent),
+                    egui::StrokeKind::Outside,
+                );
+            }
 
             // The morph: 0 = idle (dot + "Record"), 1 = recording (stop + clock).
             let morph = motion.factor(

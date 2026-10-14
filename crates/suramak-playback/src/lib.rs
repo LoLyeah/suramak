@@ -7,8 +7,10 @@
 //!   off) — no DB field involved, the kept path *is* `transcript.audio_path`.
 //! * [`segments`] — the position → active-segment binary search and the `mm:ss`
 //!   readout format.
-//! * [`transport`] — the playback state machine (`Idle → Playing → Paused →
-//!   stop-on-leave`, plus the unavailable path) and the command protocol.
+//! * [`transport`] — the playback state machine (`Idle → Playing → Paused →`
+//!   `stop-on-leave`, plus the unavailable path) and the command protocol.
+//! * [`peaks`] — the min/max envelope of a decoded source (M9b): computed once
+//!   per source load, drawn by the editor's deck strip.
 //!
 //! [`engine`] is the cpal half: one `suramak-playback` thread owns the decoded
 //! audio and the output stream; the UI thread only sends [`Command`]s and polls
@@ -18,11 +20,13 @@
 //! no output device at all.
 
 pub mod engine;
+pub mod peaks;
 pub mod segments;
 pub mod source;
 pub mod transport;
 
 pub use engine::{pick_output_rate, Engine, EngineError, RateRange, Status};
+pub use peaks::{Peaks, DEFAULT_BUCKETS as PEAKS_BUCKETS};
 pub use segments::{format_mmss, segment_index_at};
 pub use source::{resolve_playback_source, transcript_duration_ms, PlaybackSource};
 pub use transport::{Command, Playback, PlaybackState};
