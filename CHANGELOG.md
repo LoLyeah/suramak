@@ -16,6 +16,10 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 - Settings → **Audio sources**: the single-source dropdown became the checkbox list (≥1 source required to save; capture-less builds show it read-only with the existing copy)
 - The floating record control replaces the titlebar red dot: bottom-center, a real Liquid Glass pill on macOS 26+ (`NSGlassEffectView`, egui-painted glyph/label/live `mm:ss` on top) and an honest painted pill on Linux/Windows/older macOS; click starts, click stops (the same finalize flow as the record view's Stop), and it stays bottom-centered on resize (M8.5)
 
+### Fixed
+- **Quitting is clean and silent in every path** — menu Quit, Cmd-Q and window close, after any amount of whisper / live-transcription / playback activity, including quitting **while recording** or **while a job runs**: every quit flavor now runs one explicit shutdown step (capture stopped through the existing stop path, the live decode thread and the worker bridge signalled and waited for at most ~250 ms, playback `Stop`ped — a job in flight is never interrupted) and then exits hard, so ggml's macOS Metal-device teardown assert (`GGML_ASSERT([rsets->data count] == 0)` in `ggml_metal_device_free`, the llama.cpp#17869/#19137 class) can never fire after a whisper session. No more `zsh: abort` or crash-report noise on quit; smoke exit codes are unchanged. (Owner-verified: docs/USER_SMOKE.md item 19; rationale in docs/PLAN-NOTES.md.)
+- The benign stop-time `audio capture error: The requested device is no longer available …` line no longer prints on every Stop (it is the teardown race of the stream being dropped); genuine mid-recording capture errors still print exactly as before, and the teardown-time variant is a debug-level line
+
 ## [0.1.0] - 2026-10-13
 
 ### Added

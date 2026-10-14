@@ -71,6 +71,10 @@ use crate::whisper::{self, AsrError, ContextCache};
 /// Name of the live decode thread (visible in debuggers/profilers).
 pub const LIVE_DECODE_THREAD_NAME: &str = "suramak-live-decode";
 
+/// Poll interval while [`LiveDecoder::shutdown_and_wait`] waits for the decode
+/// thread to exit (the quit path's teardown — WORKORDER-HOTFIX-QUIT).
+const SHUTDOWN_POLL: std::time::Duration = std::time::Duration::from_millis(2);
+
 /// Workorder bound of the window cadence (new audio per window).
 pub const STEP_MS_RANGE: std::ops::RangeInclusive<u32> = 4_000..=6_000;
 /// Workorder bound of the context overlap carried between windows.
@@ -641,6 +645,41 @@ impl LiveDecoder {
             .queue
             .len()
     }
+
+    /// Signals shutdown and waits at most `grace` for the decode thread — the
+    /// quit path's teardown (WORKORDER-HOTFIX-QUIT).
+    ///
+    /// The existing teardown (see [`Drop`]) signals and **detaches**: an
+    /// in-flight decode finishes on its own, so Stop never blocks the UI
+    /// thread. This bounded wait exists so the quit path can let an *idle*
+    /// thread exit right away — which drops its whisper context, and with it
+    /// the Metal residency sets whose survival aborts the process at exit on
+    /// macOS (ggml's `[rsets->data count] == 0` assert). Returns whether the
+    /// thread exited within `grace`; on timeout it is left detached exactly
+    /// like [`Drop`] leaves it. Idempotent.
+    pub fn shutdown_and_wait(&mut self, grace: std::time::Duration) -> bool {
+        {
+            let (lock, cvar) = &*self.shared;
+            if let Ok(mut state) = lock.lock() {
+                state.shutdown = true;
+            }
+            cvar.notify_all();
+        }
+        let deadline = std::time::Instant::now() + grace;
+        let mut finished = self.handle.as_ref().is_none_or(|h| h.is_finished());
+        while !finished && std::time::Instant::now() < deadline {
+            std::thread::sleep(SHUTDOWN_POLL);
+            finished = self.handle.as_ref().is_none_or(|h| h.is_finished());
+        }
+        if finished {
+            // Reap it: the join is instant (the thread already returned) and it
+            // proves the decode thread — and its context cache — is gone.
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+        finished
+    }
 }
 
 impl Drop for LiveDecoder {
@@ -1122,5 +1161,37 @@ mod tests {
         assert_eq!(decoder.queued_windows(), 0);
         assert_eq!(decoder.dropped_windows(), 0);
         drop(decoder); // signals shutdown; the thread exits on its own
+    }
+
+    /// The quit path's decode-thread teardown (WORKORDER-HOTFIX-QUIT): an idle
+    /// thread exits within the grace, the wait is idempotent, and a stopped
+    /// decoder takes no further work ("teardown is a no-op when nothing runs").
+    #[test]
+    fn the_live_decoder_shutdown_is_quick_idempotent_and_final() {
+        let settings = LiveDecodeSettings {
+            model_path: PathBuf::from("/nonexistent/suramak/ggml-tiny.bin"),
+            lang: LangMode::Fixed("en".to_string()),
+            initial_prompt: None,
+            plan: EngineDecision {
+                engine: EngineId::Cpu,
+                warning: None,
+            },
+            n_threads: 2,
+        };
+        let grace = std::time::Duration::from_millis(250);
+        let mut decoder = LiveDecoder::spawn(settings, 2);
+        assert!(
+            decoder.shutdown_and_wait(grace),
+            "an idle decode thread must exit within the grace"
+        );
+        assert!(
+            decoder.shutdown_and_wait(grace),
+            "a second shutdown is a no-op that still reports the exit"
+        );
+        // Shut down means shut down: further windows are refused outright
+        // (reported through `submit`'s drop answer, never decoded).
+        assert!(decoder.submit(window(0, 0, 0, 16_000)).is_some());
+        assert!(decoder.take_results().is_empty());
+        drop(decoder);
     }
 }

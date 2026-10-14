@@ -366,7 +366,7 @@ pub fn resolve_app_processes(
 
 #[cfg(feature = "capture")]
 mod imp {
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -395,6 +395,12 @@ mod imp {
         /// Keeps a system-audio tap (and its private aggregate device) alive for
         /// as long as the recording runs; `None` for microphone sessions.
         tap: Option<suramak_taps::SystemTap>,
+        /// Set the moment the session is being torn down (`stop`, and therefore
+        /// the quit path). A stream error arriving after this is the benign
+        /// stop-time race — the device going away while the stream is dropped —
+        /// and is logged quietly; before it, errors stay loud (see
+        /// [`stream_error`]). Shared with the stream's error callback.
+        teardown: Arc<AtomicBool>,
     }
 
     impl Recorder {
@@ -421,7 +427,12 @@ mod imp {
         /// Stops capture (stream first, then any system-audio tap) and returns the
         /// accumulated mono samples as an [`AudioBuffer`] (channels = 1) ready for
         /// 16 kHz resampling via [`super::resample_16k`].
+        ///
+        /// Marks the teardown before the stream is dropped: a stream error racing
+        /// this drop is the benign stop-time race (see [`stream_error`]) and is
+        /// logged quietly, while genuine mid-recording errors stay loud.
         pub fn stop(self) -> AudioBuffer {
+            self.teardown.store(true, Ordering::Relaxed);
             let Recorder {
                 stream,
                 samples,
@@ -430,6 +441,7 @@ mod imp {
                 rms_bits: _,
                 warning: _,
                 tap,
+                teardown: _,
             } = self;
             drop(stream); // stops the cpal stream
             drop(tap); // then tears down aggregate device + tap (macOS system audio)
@@ -583,10 +595,11 @@ mod imp {
 
         let samples: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
         let rms_bits = Arc::new(AtomicU32::new(0));
+        // Stop-time teardown marker (see `Recorder::teardown` / `stream_error`):
+        // set by `Recorder::stop` just before the stream is dropped.
+        let teardown = Arc::new(AtomicBool::new(false));
         let window =
             ((config.sample_rate.0 as u128 * RMS_WINDOW.as_millis()) / 1000).max(1) as usize;
-
-        let err_fn = |err: cpal::StreamError| eprintln!("audio capture error: {err}");
 
         let stream = match sample_format {
             cpal::SampleFormat::F32 => {
@@ -599,7 +612,7 @@ mod imp {
                         move |data: &[f32], _| {
                             accumulate(&samples, &rms_bits, &mut rolling, data, channels);
                         },
-                        err_fn,
+                        stream_error(Arc::clone(&teardown)),
                         None,
                     )
                     .map_err(|e| AsrError::Capture(e.to_string()))?
@@ -616,7 +629,7 @@ mod imp {
                                 data.iter().map(|s| *s as f32 / i16::MAX as f32).collect();
                             accumulate(&samples, &rms_bits, &mut rolling, &floats, channels);
                         },
-                        err_fn,
+                        stream_error(Arc::clone(&teardown)),
                         None,
                     )
                     .map_err(|e| AsrError::Capture(e.to_string()))?
@@ -635,7 +648,7 @@ mod imp {
                                 .collect();
                             accumulate(&samples, &rms_bits, &mut rolling, &floats, channels);
                         },
-                        err_fn,
+                        stream_error(Arc::clone(&teardown)),
                         None,
                     )
                     .map_err(|e| AsrError::Capture(e.to_string()))?
@@ -659,6 +672,7 @@ mod imp {
             sample_rate: config.sample_rate.0,
             warning,
             tap,
+            teardown,
         })
     }
 
@@ -824,6 +838,36 @@ mod imp {
             rolling.push(mono);
         }
         rms_bits.store(rolling.value().to_bits(), Ordering::Relaxed);
+    }
+
+    /// The line a cpal stream error logs, or `None` while the session is being
+    /// torn down — see [`stream_error`]. Pure; unit-tested.
+    pub(super) fn stream_error_line(teardown: bool, err: &cpal::StreamError) -> Option<String> {
+        if teardown {
+            None
+        } else {
+            Some(format!("audio capture error: {err}"))
+        }
+    }
+
+    /// The stream-error logger handed to every cpal input stream.
+    ///
+    /// A genuine capture failure prints exactly as it always has. The **benign
+    /// stop-time race** — the device going away while the stream is being
+    /// dropped (`The requested device is no longer available`, seen on every
+    /// Stop on macOS, run11) — is a debug line instead: `Recorder::stop` marks
+    /// the teardown before dropping the stream, so the noise disappears while
+    /// genuine mid-recording errors stay loud (WORKORDER-HOTFIX-QUIT).
+    fn stream_error(teardown: Arc<AtomicBool>) -> impl FnMut(cpal::StreamError) + Send + 'static {
+        move |err: cpal::StreamError| match stream_error_line(
+            teardown.load(Ordering::Relaxed),
+            &err,
+        ) {
+            Some(line) => eprintln!("{line}"),
+            None => {
+                tracing::debug!("audio capture error while stopping (benign teardown race): {err}")
+            }
+        }
     }
 }
 
@@ -1276,5 +1320,39 @@ mod tests {
             CaptureInput::AppAudio(pids) => assert_eq!(pids, vec![700]),
             other => panic!("expected app audio, got {other:?}"),
         }
+    }
+
+    /// Stop-time stream errors are quiet, live ones stay loud (HOTFIX-QUIT's
+    /// capture-noise item). The `capture` build's tests run in CI
+    /// (`cargo test -p suramak-asr --features capture`).
+    #[cfg(feature = "capture")]
+    #[test]
+    fn stop_time_stream_errors_are_quiet_but_live_ones_stay_loud() {
+        use super::imp::stream_error_line;
+
+        // The exact race the owner's run11 saw on every Stop (cpal's
+        // DeviceNotAvailable wording).
+        let gone = cpal::StreamError::DeviceNotAvailable;
+        let live = stream_error_line(false, &gone).expect("a live capture error must print");
+        assert!(live.starts_with("audio capture error: "));
+        assert!(
+            live.contains("The requested device is no longer available"),
+            "unexpected line: {live}"
+        );
+        assert_eq!(
+            stream_error_line(true, &gone),
+            None,
+            "the stop-time teardown race must be quiet"
+        );
+
+        // Any other stream error is downgraded only while the session is being
+        // torn down — never mid-recording.
+        let other = cpal::StreamError::BackendSpecific {
+            err: cpal::BackendSpecificError {
+                description: "backend said no".to_string(),
+            },
+        };
+        assert!(stream_error_line(false, &other).is_some());
+        assert!(stream_error_line(true, &other).is_none());
     }
 }

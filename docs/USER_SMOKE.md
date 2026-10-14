@@ -156,6 +156,16 @@ Data lives in `~/Library/Application Support/dev.suramak.Suramak/` (db, settings
 - On a slower machine, or with a big model (`turbo-q5-0`), a note like `N window(s) skipped to keep up — live updates may lag; the final pass is unaffected` may appear in the card and live words may fall behind the speech — **that is fine**: live updates degrade, the recording and the final transcript never do.
 - The live pass uses the same model / language / initial prompt as the final one and never uploads anything (like everything else in the app). The first live words appear after ~4 s of speech (the window cadence) plus the model load.
 
+## 19. Quit is clean — no ggml assert / `zsh: abort` (HOTFIX-QUIT)
+
+Quit behavior is **owner-verified on the Mac** — the ggml-metal teardown abort only exists there (Linux has no Metal). Launch the app from a terminal so its logs are visible: `./dist/Suramak.app/Contents/MacOS/suramak` (or `cargo run -p suramak-ui` for a dev build).
+
+- **Quit after a session**: record ~5 s, press **Stop**, wait for the editor/transcript, then quit with **Cmd-Q**. Expected: the app vanishes with **no** `zsh: abort`, **no** `GGML_ASSERT([rsets->data count] == 0)` and no `ggml_metal_device_free` line in the terminal, and **no new Suramak crash report** in Console.app.
+- **Menu Quit and window close**: repeat the same sequence using the **Suramak → Quit Suramak** menu item, and once more closing the window with the red button. Expected: identical — clean, silent exit every way.
+- **Quit while recording**: start a recording (floating Record control), speak a few seconds, then Cmd-Q **without** pressing Stop. Expected: same clean exit (no abort/assert); the recording is discarded — quitting is not Stop, nothing is saved.
+- **Quit while a job runs**: import a file and Cmd-Q during `transcribing on this machine…`. Expected: same clean exit (no abort/assert); the half-done job is not saved, the app is gone within a moment (the quit waits at most ~¼ s for workers, never for the whole job).
+- **Quit after live transcription**: record >5 s so the live transcript card fills in, Stop, wait for the final transcript, then Cmd-Q. Expected: same clean exit.
+
 ## Report
 
 Anything that deviates from an expected result, with: what you did, what happened, what you expected.

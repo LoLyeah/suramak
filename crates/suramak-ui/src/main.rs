@@ -16,11 +16,20 @@
 //!   prints `SMOKE-JOB-OK`, writes `build/smoke_job_ok.txt` and exits 0.
 //!   `SURAMAK_SMOKE_SECS` is the watchdog: exit 1 (no file) when the job has not
 //!   completed by then.
+//!
+//! Quit path (WORKORDER-HOTFIX-QUIT): every quit flavor — menu Quit, Cmd-Q, the
+//! window's close button, a smoke run's `event_loop.exit()` — dispatches winit's
+//! `LoopExiting`, which runs [`App::quit`]: best-effort teardown through the
+//! existing teardown paths, then a hard exit that cannot run ggml's static
+//! Metal-device destructor (`shutdown.rs` documents why that exit must be
+//! `_exit(2)` on macOS and not `std::process::exit`). Smoke exit codes are
+//! unchanged (0 / 1).
 
 mod app;
 mod instance;
 mod runtime;
 mod shell;
+mod shutdown;
 mod theme;
 
 use std::path::PathBuf;
@@ -61,11 +70,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     acquire_instance_lock(smoke.is_none());
     let event_loop = EventLoop::new()?;
     let mut app = App::new(smoke);
-    event_loop.run_app(&mut app)?;
-    if app.failed {
-        std::process::exit(1);
+    // Every quit flavor ends in `App::exiting` (winit dispatches `LoopExiting`
+    // on the way out), which tears down and hard-exits — see `App::quit`. For
+    // Cmd-Q that happens inside AppKit's `applicationWillTerminate:`, *before*
+    // AppKit's own `exit()`; so this function normally never returns. If the
+    // loop itself fails to run, the same shutdown still applies (exit 1).
+    if let Err(err) = event_loop.run_app(&mut app) {
+        eprintln!("suramak: event loop error: {err}");
+        app.failed = true;
     }
-    Ok(())
+    app.quit()
 }
 
 /// Exits with code 2 when another instance holds the data-directory lock; a
@@ -165,6 +179,9 @@ struct App {
     runtime: Option<Runtime>,
     smoke: Option<Smoke>,
     failed: bool,
+    /// Set once the quit teardown ran — [`App::shutdown`] is idempotent, so the
+    /// `exiting` hook and the post-loop belt-and-braces can both call it.
+    shutdown_done: bool,
 }
 
 impl App {
@@ -175,7 +192,58 @@ impl App {
             runtime: None,
             smoke,
             failed: false,
+            shutdown_done: false,
         }
+    }
+
+    /// The quit path (WORKORDER-HOTFIX-QUIT): tear down best-effort, then
+    /// hard-exit. Never returns.
+    ///
+    /// This is the one funnel for every quit flavor. Menu Quit / Cmd-Q reach it
+    /// through AppKit's `applicationWillTerminate:` — winit's delegate runs
+    /// `internal_exit()`, which dispatches `LoopExiting` — **before** AppKit's
+    /// own `exit()`, so the process is already gone when that (and with it
+    /// ggml's static Metal-device destructor) would run; a window close and a
+    /// smoke run's `event_loop.exit()` reach it through the same dispatch.
+    ///
+    /// The exit code is the app's usual one (1 after a failed start / job /
+    /// smoke run, else 0), so the smoke modes keep their codes.
+    fn quit(&mut self) -> ! {
+        self.shutdown();
+        shutdown::hard_exit(self.exit_code())
+    }
+
+    /// 1 after a failed start / job / smoke run, else 0.
+    fn exit_code(&self) -> i32 {
+        if self.failed {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Best-effort teardown of everything that owns a whisper context or a
+    /// device, through the existing teardown paths (WORKORDER-HOTFIX-QUIT).
+    ///
+    /// Idempotent, bounded (`shutdown::TEARDOWN_GRACE`), never panics: capture
+    /// is stopped (streams and taps down), the live decode thread and the
+    /// worker bridge are signalled and waited for at most the grace — an idle
+    /// thread exits and drops its whisper context (and the Metal residency sets
+    /// behind it) right away — and playback gets its `Stop`. A job in flight is
+    /// never interrupted; [`App::quit`]'s hard exit covers it. The
+    /// window/surface is left to process teardown (dropping it inside AppKit's
+    /// terminate notification would be a risk for no gain — the process ends
+    /// immediately after).
+    fn shutdown(&mut self) {
+        if self.shutdown_done {
+            return;
+        }
+        self.shutdown_done = true;
+        let Some(runtime) = self.runtime.as_mut() else {
+            return;
+        };
+        let workers_stopped = runtime.shutdown(shutdown::TEARDOWN_GRACE);
+        tracing::debug!(workers_stopped, "quit: teardown finished");
     }
 
     /// Drains worker events (queued by the bridge thread), polls the model
@@ -555,5 +623,42 @@ impl ApplicationHandler for App {
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
+    }
+
+    /// The one quit funnel (WORKORDER-HOTFIX-QUIT): winit dispatches
+    /// `LoopExiting` on every way out of the loop — AppKit's
+    /// `applicationWillTerminate:` (menu Quit / Cmd-Q) reaches it *before* the
+    /// AppKit-level `exit()`, and `event_loop.exit()` (window close, smoke)
+    /// reaches it on the way to `run_app` returning. Tear down and hard-exit;
+    /// see [`App::quit`] and `shutdown.rs`.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.quit()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The quit teardown is a no-op when nothing runs (no shell, no runtime)
+    /// and idempotent — it runs once per quit, but `exiting` and the
+    /// post-loop belt-and-braces may both call it (WORKORDER-HOTFIX-QUIT).
+    #[test]
+    fn shutdown_without_a_shell_or_runtime_is_a_no_op_and_idempotent() {
+        let mut app = App::new(None);
+        app.shutdown();
+        app.shutdown();
+        assert!(!app.failed, "teardown must not change the exit code");
+        assert_eq!(app.exit_code(), 0);
+    }
+
+    /// The quit exit code: 1 after a failed start / job / smoke run (the smoke
+    /// modes' existing codes), else 0.
+    #[test]
+    fn the_exit_code_follows_the_failure_flag() {
+        let mut app = App::new(None);
+        assert_eq!(app.exit_code(), 0);
+        app.failed = true;
+        assert_eq!(app.exit_code(), 1);
     }
 }

@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use suramak_asr::capture;
 use suramak_asr::live;
@@ -869,6 +869,54 @@ impl Runtime {
             None => (Vec::new(), Some("library database unavailable".to_string())),
         }
     }
+
+    /// Best-effort shutdown of everything that owns a whisper context or a
+    /// device — the quit path's teardown (WORKORDER-HOTFIX-QUIT).
+    ///
+    /// Reuses the existing teardown paths and stays bounded by `grace` in
+    /// total, never blocking longer: the live decode thread is signalled and
+    /// waited for (an idle thread exits and drops its whisper context — and
+    /// the Metal residency sets behind it — right away), the capture session is
+    /// stopped through [`capture::MultiRecorder::stop`] (streams first, then
+    /// any tap; the recorded buffers are discarded — the user quit, nothing is
+    /// saved), playback gets its existing `Stop`, and the worker bridge is
+    /// closed and waited for (the bridge thread joins the worker and drops its
+    /// context cache as it exits).
+    ///
+    /// A job in flight is **not** interrupted — a full join would block the
+    /// quit; `shutdown::hard_exit` covers that case. Download/polish threads
+    /// own no whisper contexts and are left detached. Never panics; idempotent
+    /// (every step tolerates having nothing to stop).
+    ///
+    /// Returns whether every context-owning thread exited within the grace.
+    pub fn shutdown(&mut self, grace: Duration) -> bool {
+        let deadline = Instant::now() + grace;
+
+        // 1. Live transcription (M7): signal the decode thread and give an idle
+        //    one the moment it needs to drop its context.
+        if let Some(mut live) = self.live.take() {
+            live.decoder.shutdown_and_wait(remaining(deadline));
+        }
+
+        // 2. Capture: the existing stop path (each stream, then its tap).
+        if let Some(session) = self.session.take() {
+            let _ = session.stop();
+        }
+
+        // 3. Playback: the existing transport teardown (`Stop` releases the
+        //    engine; it owns no whisper context).
+        self.playback_command(None, PlaybackCommand::Stop);
+
+        // 4. The worker bridge: close the job channel, then wait for the thread.
+        self.bridge.shutdown_and_wait(remaining(deadline))
+    }
+}
+
+/// Time left before `deadline` (zero once it passed) — the quit teardown's
+/// budget is shared across its steps, so the whole teardown stays within one
+/// grace.
+fn remaining(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
 }
 
 /// One live step's outcome (see [`Runtime::live_step`]).
@@ -1096,6 +1144,37 @@ impl Bridge {
             .expect("the bridge event queue was poisoned");
         std::mem::take(&mut *guard)
     }
+
+    /// Closes the job channel and waits at most `grace` for the bridge thread —
+    /// which joins the worker and drops its whisper context cache (and with it
+    /// the Metal residency sets) as it exits. The quit path's worker teardown
+    /// (WORKORDER-HOTFIX-QUIT).
+    ///
+    /// Reuses the existing teardown: dropping the sender ends the bridge's
+    /// `recv()` loop as soon as the current job — if any — is done; a job in
+    /// flight is never interrupted. Returns whether the thread exited in time;
+    /// on timeout it is left detached exactly like [`Drop`] leaves it.
+    /// Idempotent.
+    pub fn shutdown_and_wait(&mut self, grace: Duration) -> bool {
+        self.jobs.take();
+        let Some(_) = self.handle.as_ref() else {
+            return true; // already shut down
+        };
+        let deadline = Instant::now() + grace;
+        let mut finished = self.handle.as_ref().is_none_or(|h| h.is_finished());
+        while !finished && Instant::now() < deadline {
+            thread::sleep(crate::shutdown::TEARDOWN_POLL);
+            finished = self.handle.as_ref().is_none_or(|h| h.is_finished());
+        }
+        if finished {
+            // Reap it: the join is instant (the thread already returned) and it
+            // proves the worker — and the context cache it owns — is gone.
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+        finished
+    }
 }
 
 impl Drop for Bridge {
@@ -1154,5 +1233,58 @@ fn worker_gone(job_id: u64) -> WorkerEvent {
 fn push(queue: &Arc<Mutex<Vec<WorkerEvent>>>, event: WorkerEvent) {
     if let Ok(mut guard) = queue.lock() {
         guard.push(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use suramak_core::settings::{EngineSetting, LangMode};
+
+    fn job() -> Job {
+        Job {
+            id: 1,
+            input: PathBuf::from("/nonexistent/suramak/input.wav"),
+            model_path: PathBuf::from("/nonexistent/suramak/ggml-tiny.bin"),
+            lang: LangMode::Auto,
+            initial_prompt: None,
+            engine: EngineSetting::Auto,
+        }
+    }
+
+    /// The quit teardown's worker step (WORKORDER-HOTFIX-QUIT): an idle bridge
+    /// exits within the grace, a second shutdown is a no-op, and the closed
+    /// channel refuses further jobs — the teardown is idempotent and does not
+    /// leave the bridge usable.
+    #[test]
+    fn bridge_shutdown_is_quick_idempotent_and_closes_the_channel() {
+        let mut bridge = Bridge::spawn(egui::Context::default());
+        assert!(
+            bridge.shutdown_and_wait(crate::shutdown::TEARDOWN_GRACE),
+            "an idle bridge must exit within the grace"
+        );
+        assert!(
+            bridge.shutdown_and_wait(crate::shutdown::TEARDOWN_GRACE),
+            "a second shutdown is a no-op that still reports the exit"
+        );
+        assert!(
+            bridge.submit(job()).is_err(),
+            "a shut-down bridge refuses further jobs"
+        );
+    }
+
+    /// The teardown budget helper: steps share one grace, and an expired
+    /// deadline means "no more waiting" (never a negative duration).
+    #[test]
+    fn the_remaining_budget_shrinks_and_clamps_at_zero() {
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let left = remaining(deadline);
+        assert!(left > Duration::ZERO && left <= Duration::from_millis(50));
+        assert_eq!(remaining(Instant::now()), Duration::ZERO);
+        assert_eq!(
+            remaining(Instant::now() - Duration::from_secs(1)),
+            Duration::ZERO,
+            "an expired deadline never yields a negative wait"
+        );
     }
 }
