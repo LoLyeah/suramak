@@ -239,6 +239,23 @@ impl GlassHandle {
     pub fn set_appearance(&mut self, mode: ThemeMode) {
         self.imp.set_appearance(mode);
     }
+
+    /// Installs (`Some`) or clears (`None`) the **quit veto** (M9e, P1-1): a
+    /// callback AppKit consults inside `applicationShouldTerminate:` — return
+    /// `true` to cancel a termination (Cmd-Q / menu Quit) so the app can show
+    /// its in-app confirm first. The macOS implementation adds the method to
+    /// winit's application delegate (it does not implement it; see `macos.rs`);
+    /// everywhere else this is a clean no-op — there is no menu Quit to veto.
+    ///
+    /// The callback runs on the main thread, synchronously inside AppKit's
+    /// terminate sequence; it must be cheap and must not block. Keep it pure
+    /// state-reading: record a pending flag, wake the event loop, return.
+    pub fn set_terminate_veto(
+        &mut self,
+        veto: Option<Box<dyn Fn() -> bool + Send + Sync + 'static>>,
+    ) {
+        self.imp.set_terminate_veto(veto);
+    }
 }
 
 /// Whether the OS asks for reduced motion (macOS

@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use suramak_asr::cancel::CancelToken;
 use suramak_asr::capture;
 use suramak_asr::live;
 use suramak_asr::mix;
@@ -48,6 +49,7 @@ use crate::app::{
     self, model_manager, polish, record_source_label, settings_form, AppState, Effect,
     ExportFormat, RecordState,
 };
+use crate::pending_transcription::{self, PendingTranscription};
 
 /// Subdirectory of the system temp dir used for transient recordings
 /// (`keep_audio` off — deleted once the transcript is saved).
@@ -84,6 +86,11 @@ pub struct Runtime {
     /// The waveform-peaks decode for the open transcript (M9b): one background
     /// job at a time, polled through [`Runtime::peaks_status`].
     peaks: Option<PeaksJob>,
+    /// M9e (P2-2): the in-flight job's cooperative cancel token. A clone rides
+    /// the `Job` to the worker; [`Runtime::cancel_job`] sets this one. Cleared
+    /// when the job's terminal event is drained (the next job gets a fresh
+    /// token).
+    job_cancel: Option<CancelToken>,
 }
 
 /// A waveform-peaks decode running on a detached thread; the UI polls it.
@@ -127,6 +134,15 @@ pub struct DownloadStatus {
     pub finished: Option<Result<(), String>>,
 }
 
+/// M9e (P1-1): what the startup pending-transcription check found.
+pub enum PendingResume {
+    /// A saved recording to auto-run (its wav is on disk).
+    Resume(PendingTranscription),
+    /// An entry whose audio is missing — cleared; the caller shows the honest
+    /// status instead of fabricating a job.
+    MissingAudio { title: String },
+}
+
 impl Runtime {
     pub fn new(ctx: egui::Context) -> Self {
         let settings = paths::settings_path()
@@ -153,6 +169,7 @@ impl Runtime {
             playback: None,
             playback_error: None,
             peaks: None,
+            job_cancel: None,
         }
     }
 
@@ -180,8 +197,61 @@ impl Runtime {
     }
 
     /// Drains worker events queued by the bridge thread (non-blocking).
-    pub fn drain_worker(&self) -> Vec<WorkerEvent> {
-        self.bridge.drain()
+    ///
+    /// M9e (P2-2): a terminal event (Finished / Error / Cancelled) ends the
+    /// in-flight job — its cancel token is dropped here, so a stale token can
+    /// never be set against the next job.
+    pub fn drain_worker(&mut self) -> Vec<WorkerEvent> {
+        let events = self.bridge.drain();
+        if events.iter().any(|event| {
+            matches!(
+                event,
+                WorkerEvent::Finished { .. }
+                    | WorkerEvent::Error { .. }
+                    | WorkerEvent::Cancelled { .. }
+            )
+        }) {
+            self.job_cancel = None;
+        }
+        events
+    }
+
+    /// M9e (P2-2): sets the in-flight job's cancel token. The worker observes
+    /// it at its next stage boundary and answers with `WorkerEvent::Cancelled`.
+    /// A no-op when no job is in flight.
+    pub fn cancel_job(&mut self) {
+        match &self.job_cancel {
+            Some(token) => {
+                token.cancel();
+                tracing::info!(
+                    "job cancel requested — the worker stops at its next stage boundary"
+                );
+            }
+            None => tracing::debug!("job cancel requested with no job in flight — ignored"),
+        }
+    }
+
+    /// M9e (P1-1): the pending-transcription entry to auto-run at startup.
+    ///
+    /// `None` when none is stored. An entry whose wav is missing is cleared
+    /// here (logged) and reported as `MissingAudio` so the caller can show the
+    /// honest status — the resume never fabricates work for audio that is gone.
+    pub fn pending_transcription(&mut self) -> Option<PendingResume> {
+        let entry = pending_transcription::read()?;
+        if !entry.wav.is_file() {
+            tracing::warn!(
+                wav = %entry.wav.display(),
+                "pending transcription: the saved recording's audio is missing — clearing the entry"
+            );
+            pending_transcription::clear();
+            return Some(PendingResume::MissingAudio { title: entry.title });
+        }
+        tracing::info!(
+            wav = %entry.wav.display(),
+            title = %entry.title,
+            "pending transcription: resuming the recording saved at quit"
+        );
+        Some(PendingResume::Resume(entry))
     }
 
     /// A settings form seeded from the persisted settings (startup sync).
@@ -448,6 +518,16 @@ impl Runtime {
                 }
                 Effect::Playback { source, command } => self.playback_command(source, command),
                 Effect::LoadPeaks { transcript, path } => self.start_peaks(transcript, path),
+                // M9e (P2-2): set the in-flight job's cooperative cancel token.
+                Effect::CancelJob => self.cancel_job(),
+                // M9e (P1-1): the resumed pending transcription was saved —
+                // its entry is done.
+                Effect::ClearPendingTranscription => pending_transcription::clear(),
+                // Executed by the frame loop (only it can exit); reaching the
+                // runtime means a caller misrouted it — log, never crash.
+                Effect::Quit(outcome) => {
+                    tracing::warn!(?outcome, "quit outcome reached the runtime — ignored");
+                }
             }
         }
     }
@@ -690,9 +770,36 @@ impl Runtime {
         if self.live.take().is_some() {
             tracing::info!("live transcription: recording stopped — provisional content discarded");
         }
+        let keep = self.settings.storage.keep_audio;
+        match self.finalize_capture(title, keep, state) {
+            Ok(Some(path)) => state.on_recording_stopped(path, keep),
+            Ok(None) => {
+                state.record_failed("no recording in progress".to_string());
+                Vec::new()
+            }
+            Err(message) => {
+                state.record_failed(message);
+                Vec::new()
+            }
+        }
+    }
+
+    /// Stops the capture session (if one is live) and writes the mixed wav:
+    /// the one finalize path Stop and the quit path's Stop & Save share.
+    ///
+    /// `keep` forces the recordings dir (the quit path always preserves the
+    /// wav) or follows the setting (Stop). `Ok(None)` when no session was live
+    /// — the quit path tolerates that (a capture-free build, or a session that
+    /// already finalized); the mix and write failures carry the same messages
+    /// the Stop path reports.
+    fn finalize_capture(
+        &mut self,
+        title: &str,
+        keep: bool,
+        state: &mut AppState,
+    ) -> Result<Option<PathBuf>, String> {
         let Some(session) = self.session.take() else {
-            state.record_failed("no recording in progress".to_string());
-            return Vec::new();
+            return Ok(None);
         };
         let (buffers, duration) = session.stop();
         // The record view's per-source gain/mute (unity when it holds none or a
@@ -735,13 +842,8 @@ impl Runtime {
                 muted: *muted,
             })
             .collect();
-        let outcome = match mix::mix(&tracks, Some(duration)) {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                state.record_failed(format!("could not mix the recording: {err}"));
-                return Vec::new();
-            }
-        };
+        let outcome = mix::mix(&tracks, Some(duration))
+            .map_err(|err| format!("could not mix the recording: {err}"))?;
         // The mix's honesty line: per-source measured clocks + saturation.
         for report in &outcome.reports {
             tracing::info!(
@@ -763,27 +865,62 @@ impl Runtime {
                 "the mix exceeded full scale and saturated at the PCM boundary"
             );
         }
-        let keep = self.settings.storage.keep_audio;
         let dir = if keep {
-            match paths::recordings_dir() {
-                Ok(dir) => dir,
-                Err(err) => {
-                    state.record_failed(err.to_string());
-                    return Vec::new();
-                }
-            }
+            paths::recordings_dir().map_err(|err| err.to_string())?
         } else {
             std::env::temp_dir().join(RECORDINGS_TEMP_DIR)
         };
         let stem = app::recording_file_stem(title);
         let path = dir.join(format!("{stem}.wav"));
-        match capture::write_recording_wav(&path, &outcome.samples, resample::TARGET_RATE) {
-            Ok(()) => state.on_recording_stopped(path, keep),
-            Err(err) => {
-                state.record_failed(format!("could not write the recording: {err}"));
-                Vec::new()
-            }
+        capture::write_recording_wav(&path, &outcome.samples, resample::TARGET_RATE)
+            .map_err(|err| format!("could not write the recording: {err}"))?;
+        Ok(Some(path))
+    }
+
+    /// M9e (P1-1): **Stop & Save** at quit — the bounded save.
+    ///
+    /// Stops the session through the same finalize path Stop uses (forced
+    /// `keep`, so the wav lands in the recordings dir), then writes the
+    /// pending-transcription entry the next launch auto-runs. No transcription
+    /// runs here: the exit stays bounded by the mix + write (the smoke measures
+    /// it). With no session live (a capture-free build, or an already-taken
+    /// session) the wav cannot be produced — the entry is still written with
+    /// the expected path, and the resume treats missing audio as nothing to
+    /// transcribe (never fabricating work).
+    ///
+    /// Returns the wav path when one was written.
+    pub fn save_recording_for_quit(
+        &mut self,
+        state: &mut AppState,
+    ) -> Result<Option<PathBuf>, String> {
+        if self.live.take().is_some() {
+            tracing::info!("quit: live transcription machinery torn down for stop & save");
         }
+        let title = match &state.record {
+            RecordState::Recording(recording) => recording.title.clone(),
+            _ => "Recording".to_string(),
+        };
+        let wav = self.finalize_capture(&title, true, state)?;
+        let wav = match wav {
+            Some(path) => path,
+            None => {
+                tracing::warn!(
+                    "quit: stop & save with no live capture session — writing the \
+                     pending entry without audio"
+                );
+                let stem = app::recording_file_stem(&title);
+                paths::recordings_dir()
+                    .map(|dir| dir.join(format!("{stem}.wav")))
+                    .map_err(|err| err.to_string())?
+            }
+        };
+        let entry = PendingTranscription::new(title, wav.clone());
+        pending_transcription::write(&entry)?;
+        tracing::info!(
+            wav = %wav.display(),
+            "quit: stop & save — recording preserved, pending transcription written"
+        );
+        Ok(Some(wav))
     }
 
     /// Starts the background download for `id` (one at a time).
@@ -898,6 +1035,9 @@ impl Runtime {
         );
 
         self.next_job_id += 1;
+        // M9e (P2-2): one fresh cancel token per job; the runtime keeps the
+        // handle the Cancel control sets, the worker observes its clone.
+        let cancel = CancelToken::new();
         let job = Job {
             id: self.next_job_id,
             input,
@@ -905,9 +1045,12 @@ impl Runtime {
             lang,
             initial_prompt: self.settings.asr.initial_prompt.clone(),
             engine: self.settings.asr.engine,
+            cancel: cancel.clone(),
         };
         if let Err(err) = self.bridge.submit(job) {
             state.job_failed(err);
+        } else {
+            self.job_cancel = Some(cancel);
         }
     }
 
@@ -1346,6 +1489,7 @@ mod tests {
             lang: LangMode::Auto,
             initial_prompt: None,
             engine: EngineSetting::Auto,
+            cancel: CancelToken::new(),
         }
     }
 

@@ -33,8 +33,8 @@
 //! (the header only guarantees z-order for the `contentView` property).
 
 use objc2::rc::Retained;
-use objc2::runtime::AnyClass;
-use objc2::MainThreadMarker;
+use objc2::runtime::{AnyClass, AnyObject, Sel};
+use objc2::{ffi, sel, MainThreadMarker};
 use objc2_app_kit::{
     NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
     NSAutoresizingMaskOptions, NSColor, NSGlassEffectView, NSGlassEffectViewStyle, NSView,
@@ -43,6 +43,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use std::sync::Mutex;
 use winit::window::Window;
 
 use crate::{FloatRect, GlassConfig, GlassError, GlassMode, ThemeMode};
@@ -140,6 +141,108 @@ pub fn reduce_motion() -> bool {
     }
     let workspace = NSWorkspace::sharedWorkspace();
     workspace.accessibilityDisplayShouldReduceMotion()
+}
+
+// ---- the quit veto (M9e, P1-1) ---------------------------------------------
+
+/// The installed quit-veto callback (M9e): consulted inside AppKit's
+/// `applicationShouldTerminate:`. `true` cancels the termination.
+///
+/// Process-global because the AppKit delegate method has nowhere to carry user
+/// data — the delegate is winit's, and the method is added to its class (see
+/// [`set_terminate_veto`]). One app, one callback.
+static TERMINATE_VETO: Mutex<Option<Box<dyn Fn() -> bool + Send + Sync>>> = Mutex::new(None);
+
+/// `applicationShouldTerminate:` — added to winit's delegate class.
+///
+/// AppKit calls this before the termination sequence (`applicationWillTerminate:`
+/// → winit's `internal_exit` → `LoopExiting` → the app's hard exit). Returning
+/// `NSTerminateCancel` (0) aborts the termination completely — the run loop
+/// keeps going, which is what lets the app show its in-app confirm and answer
+/// "Keep Recording" without any state to unwind. `NSTerminateNow` (1) is
+/// AppKit's default when a delegate does not answer; the veto returning false
+/// must reproduce exactly that.
+///
+/// # Safety
+///
+/// The signature matches `NSApplicationDelegate`'s method: `(self, _cmd,
+/// sender)` returning `NSApplicationTerminateReply` (`NSUInteger`). The
+/// pointers are unused; the callback only reads state.
+unsafe extern "C-unwind" fn application_should_terminate(
+    _this: *mut AnyObject,
+    _cmd: Sel,
+    _sender: *mut AnyObject,
+) -> usize {
+    let veto = TERMINATE_VETO
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|callback| callback()));
+    match veto {
+        // NSTerminateCancel — the app keeps running and shows its confirm.
+        Some(true) => 0,
+        // NSTerminateNow — AppKit's default answer, byte-identical to the
+        // pre-M9e behaviour.
+        _ => 1,
+    }
+}
+
+/// Installs (`Some`) or clears (`None`) the quit veto and adds
+/// `applicationShouldTerminate:` to winit's application delegate class.
+///
+/// winit's `WinitApplicationDelegate` implements only `applicationDidFinishLaunching:`
+/// and `applicationWillTerminate:` (verified against the pinned fork), so the
+/// method is *added* with `class_addMethod`; if a future winit implements it,
+/// the implementation is replaced instead. The class is taken from the live
+/// delegate object (no hardcoded class name), so any winit version works.
+///
+/// Must run on the main thread (it is called from `Shell::new`). Silently does
+/// nothing when AppKit has no delegate yet — the veto is then simply never
+/// consulted (the pre-M9e behaviour).
+pub fn set_terminate_veto(callback: Option<Box<dyn Fn() -> bool + Send + Sync>>) {
+    match TERMINATE_VETO.lock() {
+        Ok(mut guard) => *guard = callback,
+        Err(_) => return, // poisoned: never install a half state
+    }
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+    let Some(delegate) = app.delegate() else {
+        return;
+    };
+    // SAFETY: any object pointer can be viewed as `AnyObject`; `class()` only
+    // reads the object's `isa`.
+    let object: &AnyObject = unsafe { &*(Retained::as_ptr(&delegate) as *const AnyObject) };
+    let class = object.class();
+    let selector = sel!(applicationShouldTerminate:);
+    let imp = application_should_terminate
+        as unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject) -> usize;
+    if let Some(method) = class.instance_method(selector) {
+        // A winit that already implements it: replace the implementation.
+        // SAFETY: the replacement has the method's exact signature and only
+        // reads shared state.
+        unsafe {
+            method.set_implementation(std::mem::transmute::<
+                unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject) -> usize,
+                objc2::runtime::Imp,
+            >(imp));
+        }
+    } else {
+        // The pinned winit does not implement it — add it. Types: return
+        // `Q` (NSUInteger), then `@` (self), `:` (_cmd), `@` (sender).
+        // SAFETY: the encoding matches the trampoline's signature exactly.
+        unsafe {
+            ffi::class_addMethod(
+                class as *const AnyClass as *mut AnyClass,
+                selector,
+                std::mem::transmute::<
+                    unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject) -> usize,
+                    objc2::runtime::Imp,
+                >(imp),
+                c"Q@:@".as_ptr(),
+            );
+        }
+    }
 }
 
 /// The handle `suramak-ui` drives the floating record control through (M8.5).
@@ -253,6 +356,15 @@ impl Handle {
     /// material was actually applied.
     pub fn float_glass_available(&self) -> bool {
         self.placement.is_some() && AnyClass::get(c"NSGlassEffectView").is_some()
+    }
+
+    /// Installs (`Some`) or clears (`None`) the quit veto (M9e, P1-1) — see
+    /// [`set_terminate_veto`], which owns the AppKit delegate-method surgery.
+    pub fn set_terminate_veto(
+        &mut self,
+        veto: Option<Box<dyn Fn() -> bool + Send + Sync + 'static>>,
+    ) {
+        set_terminate_veto(veto);
     }
 
     /// Creates the float glass view on first use, ordered directly below the

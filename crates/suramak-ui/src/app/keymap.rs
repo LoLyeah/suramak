@@ -64,6 +64,12 @@ pub struct KeyContext {
     pub can_play: bool,
     pub recording: bool,
     pub can_record: bool,
+    /// M9e (P1-1): the quit confirm is up — it is modal, and Esc answers it
+    /// (Keep Recording).
+    pub quit_prompt: bool,
+    /// M9e (P2-2): the transcribe screen has a job in flight — Esc cancels it
+    /// (the same path as the card's Cancel control).
+    pub job_cancellable: bool,
 }
 
 /// What a shortcut resolves to, given the context.
@@ -77,6 +83,10 @@ pub enum Action {
     SegmentPrev,
     SegmentNext,
     ArmDelete,
+    /// M9e: Esc on the quit confirm — Keep Recording (cancel the quit).
+    QuitKeep,
+    /// M9e: Esc on the transcribe screen — cancel the running job.
+    CancelJob,
 }
 
 /// The direction of a segment step.
@@ -88,6 +98,15 @@ pub enum Direction {
 
 /// The pure dispatch rule: which action (if any) a shortcut fires in `context`.
 pub fn resolve(shortcut: Shortcut, context: &KeyContext) -> Option<Action> {
+    // M9e (P1-1): the quit confirm is modal — nothing fires while it is up
+    // except Esc, which answers it (Keep Recording; cancel the quit).
+    if context.quit_prompt {
+        return if shortcut == Shortcut::Escape {
+            Some(Action::QuitKeep)
+        } else {
+            None
+        };
+    }
     let editor = context.route == Route::Editor && context.has_editor;
     match shortcut {
         // Space: the transport, but never while typing.
@@ -102,6 +121,9 @@ pub fn resolve(shortcut: Shortcut, context: &KeyContext) -> Option<Action> {
         // Esc is the guard's exception: the way out always works.
         Shortcut::Escape if context.export_open => Some(Action::CloseExport),
         Shortcut::Escape if editor => Some(Action::LeaveEditor),
+        // M9e (P2-2): Esc on the transcribe screen cancels the running job —
+        // the same path as the card's Cancel control.
+        Shortcut::Escape if context.job_cancellable => Some(Action::CancelJob),
         Shortcut::SegmentUp if !context.text_focused && editor && context.can_play => {
             Some(Action::SegmentPrev)
         }
@@ -193,6 +215,8 @@ pub fn dispatch(ctx: &egui::Context, state: &mut AppState, events: &mut Vec<Even
         can_play: state.playback.can_play(),
         recording: matches!(state.record, RecordState::Recording(_)),
         can_record: state.can_record(),
+        quit_prompt: state.quit_prompt.is_some(),
+        job_cancellable: state.job_cancellable(),
     };
     let mut effects = Vec::new();
     for binding in BINDINGS {
@@ -258,6 +282,14 @@ fn apply(action: Action, state: &mut AppState) -> Vec<Effect> {
             }
             Vec::new()
         }
+        // M9e: Esc answers the quit confirm — Keep Recording; the outcome
+        // (Stay) travels to the frame loop like a button's.
+        Action::QuitKeep => match state.answer_quit(super::QuitAnswer::Keep) {
+            Some(outcome) => vec![Effect::Quit(outcome)],
+            None => Vec::new(),
+        },
+        // M9e: Esc on the transcribe screen — the card's Cancel path.
+        Action::CancelJob => state.cancel_job(),
     }
 }
 
@@ -350,6 +382,8 @@ mod tests {
             can_play: state.playback.can_play(),
             recording: matches!(state.record, RecordState::Recording(_)),
             can_record: state.can_record(),
+            quit_prompt: state.quit_prompt.is_some(),
+            job_cancellable: state.job_cancellable(),
         }
     }
 
@@ -535,6 +569,74 @@ mod tests {
         let effects = apply(Action::ArmDelete, &mut state);
         assert!(effects.is_empty(), "arming emits no delete effect");
         assert!(state.editor.as_ref().unwrap().confirm_delete);
+    }
+
+    // ---- M9e: the quit confirm + the job cancel ------------------------------
+
+    /// The quit confirm is modal: nothing fires while it is up except Esc,
+    /// which answers it with Keep Recording (the quit is cancelled).
+    #[test]
+    fn the_quit_confirm_is_modal_and_escape_keeps_recording() {
+        let mut state = AppState::new();
+        state.capture_available = true;
+        state.start_recording(Instant::now(), "2026-10-14 09:00:00");
+        assert_eq!(
+            state.request_quit(crate::app::QuitSource::WindowClose),
+            crate::app::QuitAction::ShowConfirm
+        );
+        let ctx = context(&state, false);
+        assert!(ctx.quit_prompt);
+        for shortcut in [
+            Shortcut::PlayPause,
+            Shortcut::Record,
+            Shortcut::Export,
+            Shortcut::SegmentUp,
+            Shortcut::SegmentDown,
+            Shortcut::Delete,
+        ] {
+            assert_eq!(
+                resolve(shortcut, &ctx),
+                None,
+                "{shortcut:?} must not fire while the confirm is up"
+            );
+        }
+        // Esc answers it — and only Esc.
+        assert_eq!(resolve(Shortcut::Escape, &ctx), Some(Action::QuitKeep));
+        let effects = apply(Action::QuitKeep, &mut state);
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Quit(crate::app::QuitOutcome::Stay)]
+            ),
+            "Esc keeps recording: {effects:?}"
+        );
+        assert!(state.quit_prompt.is_none());
+        assert!(matches!(state.record, RecordState::Recording(_)));
+    }
+
+    /// Esc on the transcribe screen with a job in flight resolves to the same
+    /// cancel path the card's control uses; without a job it stays inert.
+    #[test]
+    fn escape_cancels_a_running_job_on_the_transcribe_screen() {
+        let mut state = AppState::new();
+        let input = std::env::temp_dir().join("suramak-keymap-cancel.wav");
+        std::fs::write(&input, b"RIFF....").expect("temp wav");
+        state.begin_import(input);
+        assert_eq!(state.route, Route::Transcribe);
+        let ctx = context(&state, false);
+        assert_eq!(resolve(Shortcut::Escape, &ctx), Some(Action::CancelJob));
+        let effects = apply(Action::CancelJob, &mut state);
+        assert!(
+            matches!(effects.as_slice(), [Effect::CancelJob]),
+            "Esc sets the cancel token: {effects:?}"
+        );
+        // Idempotent: a second Esc (or a second Cancel click) is a no-op.
+        assert!(apply(Action::CancelJob, &mut state).is_empty());
+
+        // The failure state has no job: Esc is inert there (unchanged).
+        state.job_failed("boom".to_string());
+        let ctx = context(&state, false);
+        assert_eq!(resolve(Shortcut::Escape, &ctx), None);
     }
 
     // ---- the dispatch seam ---------------------------------------------------

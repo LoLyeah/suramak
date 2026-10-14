@@ -12,6 +12,7 @@
 //! bounded queue + provisional merging on every platform; the decode thread
 //! rides the whisper machinery) — the final pass stays exactly the worker's.
 
+pub mod cancel;
 pub mod capture;
 pub mod engine;
 pub mod live;
@@ -20,6 +21,7 @@ pub mod pipeline;
 pub mod whisper;
 pub mod worker;
 
+pub use cancel::CancelToken;
 pub use engine::{resolve_engine, resolve_for, EngineAvailability, EngineDecision, EngineId};
 pub use live::{LiveConfig, LiveDecodeSettings, LiveDecoder, LiveResult, LiveSession, LiveWindow};
 pub use pipeline::{model_id_from_path, parse_lang, transcribe_file, PipelineOutcome};

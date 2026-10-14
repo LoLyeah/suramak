@@ -39,6 +39,7 @@ pub mod library;
 pub mod model_manager;
 pub mod models;
 pub mod polish;
+pub mod quit_confirm;
 pub mod record;
 pub mod settings;
 pub mod settings_form;
@@ -223,6 +224,59 @@ pub struct RunningJob {
     /// Engine the plan selected (the engaged engine is reported at `Finished`).
     pub planned_engine: Option<String>,
     pub warnings: Vec<String>,
+    /// M9e (P2-2): the Cancel control was pressed — the cancel token is set and
+    /// the card reads `cancelling…` until the worker's `Cancelled` event lands
+    /// (the job is not gone until the worker says so). One-shot.
+    pub cancelling: bool,
+}
+
+/// M9e (P1-1): which quit path asked for the confirm. Both paths answer
+/// identically; the source is kept for tests and the report (the AppKit veto
+/// needs no reply once cancelled — the app simply keeps running).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuitSource {
+    /// The window's close button (`WindowEvent::CloseRequested`).
+    WindowClose,
+    /// Cmd-Q / menu Quit, vetoed at the AppKit level.
+    AppTerminate,
+}
+
+/// M9e (P1-1): what a quit request resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuitAction {
+    /// Quit exactly as before this slice (no live recording session).
+    Proceed,
+    /// A live session is recording — show the in-app confirm instead.
+    ShowConfirm,
+}
+
+/// M9e (P1-1): the confirm's three actions (Esc = [`QuitAnswer::Keep`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuitAnswer {
+    /// Stop the session, keep the wav, persist the pending entry, then exit.
+    StopAndSave,
+    /// Today's behavior exactly: stop and discard, then exit.
+    Discard,
+    /// Cancel the quit — the recording continues.
+    Keep,
+}
+
+/// M9e (P1-1): what the frame loop does after the confirm is answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuitOutcome {
+    /// Keep Recording: nothing happens; the session continues.
+    Stay,
+    /// Discard Recording: exit now (teardown stops the session, nothing saved).
+    ExitNow,
+    /// Stop & Save: finalize + persist the pending entry, then exit.
+    SaveThenExit { title: String },
+}
+
+/// M9e (P1-1): the live quit confirm (the card is up; one answer only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuitPrompt {
+    /// The quit path that asked (informational).
+    pub source: QuitSource,
 }
 
 /// Home view state.
@@ -567,6 +621,13 @@ pub struct AppState {
     pub reduce_motion: bool,
     /// M9b: the open transcript's waveform envelope (background decode).
     pub peaks: EditorPeaks,
+    /// M9e (P1-1): the live quit-mid-recording confirm (`Some` while the card
+    /// is up). Both quit paths funnel through [`AppState::request_quit`].
+    pub quit_prompt: Option<QuitPrompt>,
+    /// M9e (P1-1): the wav of a pending transcription the app auto-resumed at
+    /// startup (quit-mid-recording Stop & Save). Cleared once its transcript is
+    /// saved — that save is what completes the pending entry.
+    pub resumed_pending: Option<PathBuf>,
 }
 
 /// Side effects the runtime executes after a frame (or an event).
@@ -626,6 +687,15 @@ pub enum Effect {
     /// [`Runtime::peaks_status`]; the result lands on [`AppState::on_peaks_loaded`]
     /// tagged with `transcript`, so a stale decode is discarded.
     LoadPeaks { transcript: Uuid, path: PathBuf },
+    /// M9e (P2-2): set the in-flight job's cooperative cancel token. The worker
+    /// answers with `WorkerEvent::Cancelled` once it reaches a stage boundary.
+    CancelJob,
+    /// M9e (P1-1): delete the pending-transcription entry (its resumed
+    /// transcript was saved).
+    ClearPendingTranscription,
+    /// M9e (P1-1): the quit confirm was answered — executed by the frame loop
+    /// (only it can exit the process), never by the runtime.
+    Quit(QuitOutcome),
 }
 
 impl Default for AppState {
@@ -671,6 +741,8 @@ impl AppState {
             appearance: Appearance::System,
             reduce_motion: false,
             peaks: EditorPeaks::default(),
+            quit_prompt: None,
+            resumed_pending: None,
         }
     }
 
@@ -907,6 +979,98 @@ impl AppState {
         self.record = RecordState::Idle;
         self.route = Route::Home;
         Vec::new()
+    }
+
+    // ---- quit confirm (M9e, P1-1) -------------------------------------------
+
+    /// A quit was requested — the window's close button
+    /// ([`QuitSource::WindowClose`]) or Cmd-Q / menu Quit through the AppKit
+    /// veto ([`QuitSource::AppTerminate`]).
+    ///
+    /// With a live capture session the request is turned into the in-app
+    /// confirm (nothing is discarded until the user answers); without one it
+    /// proceeds exactly as before this slice. Repeated requests while the
+    /// confirm is already up are absorbed (no second card, no lost answer).
+    pub fn request_quit(&mut self, source: QuitSource) -> QuitAction {
+        if matches!(self.record, RecordState::Recording(_)) {
+            if self.quit_prompt.is_none() {
+                self.quit_prompt = Some(QuitPrompt { source });
+            }
+            return QuitAction::ShowConfirm;
+        }
+        QuitAction::Proceed
+    }
+
+    /// The confirm was answered (the card's controls; Esc resolves to
+    /// [`QuitAnswer::Keep`]). One-shot: `None` when nothing is pending (a
+    /// second answer cannot fire twice).
+    ///
+    /// - `Keep` → the quit is aborted completely; the recording continues.
+    /// - `Discard` → today's behavior exactly (the teardown stops the session
+    ///   and discards the buffers).
+    /// - `StopAndSave` → the frame loop finalizes the wav + writes the pending
+    ///   entry, then exits.
+    pub fn answer_quit(&mut self, answer: QuitAnswer) -> Option<QuitOutcome> {
+        self.quit_prompt.take()?;
+        Some(match answer {
+            QuitAnswer::Keep => QuitOutcome::Stay,
+            QuitAnswer::Discard => QuitOutcome::ExitNow,
+            QuitAnswer::StopAndSave => QuitOutcome::SaveThenExit {
+                title: match &self.record {
+                    RecordState::Recording(recording) => recording.title.clone(),
+                    _ => "Recording".to_string(),
+                },
+            },
+        })
+    }
+
+    // ---- job cancel (M9e, P2-2) ---------------------------------------------
+
+    /// The transcribe card's Cancel control (or Esc on the transcribe screen):
+    /// set the in-flight job's cooperative token. The state stays `Running`
+    /// with `cancelling` set until the worker answers with `Cancelled` — the
+    /// job is not gone until the worker says so, and the card says
+    /// `cancelling…` in the meantime. Idempotent; inert without a running job.
+    pub fn cancel_job(&mut self) -> Vec<Effect> {
+        match &mut self.job {
+            Job::Running(run) if !run.cancelling => {
+                run.cancelling = true;
+                vec![Effect::CancelJob]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether the transcribe screen's Esc should cancel (M9e): a job is
+    /// running there — the same path as the Cancel control.
+    pub fn job_cancellable(&self) -> bool {
+        self.route == Route::Transcribe && matches!(self.job, Job::Running(_))
+    }
+
+    // ---- pending transcription resume (M9e, P1-1) ---------------------------
+
+    /// A quit-mid-recording Stop & Save entry was found at startup: run its
+    /// transcription now (the same import → job flow), with a visible status
+    /// saying where the recording came from. The entry is cleared once the
+    /// transcript is saved ([`AppState::on_transcript_saved`]).
+    ///
+    /// Returns no effects when the wav has vanished between the runtime's check
+    /// and here (the entry is then left for the runtime's cleanup path).
+    pub fn begin_pending_resume(
+        &mut self,
+        entry: &crate::pending_transcription::PendingTranscription,
+    ) -> Vec<Effect> {
+        self.resumed_pending = Some(entry.wav.clone());
+        let effects = self.begin_import(entry.wav.clone());
+        if effects.is_empty() {
+            self.resumed_pending = None;
+            return effects;
+        }
+        self.set_status(
+            format!("resuming the recording saved at quit — {}", entry.title),
+            false,
+        );
+        effects
     }
 
     /// Headless smoke harness (M9a): seeds a frozen-but-ticking demo recording
@@ -1222,6 +1386,7 @@ impl AppState {
             requested_engine: None,
             planned_engine: None,
             warnings: Vec::new(),
+            cancelling: false,
         });
         effects.push(Effect::SubmitJob { input });
         effects
@@ -1303,6 +1468,19 @@ impl AppState {
                 self.job_failed(message);
                 Vec::new()
             }
+            // M9e (P2-2): the worker stopped the job at a stage boundary. The
+            // job is gone (partial results were discarded by the pipeline) —
+            // home, with the shared status fade carrying the news. A stray
+            // Cancelled (no job in flight) is ignored like a stray Finished.
+            WorkerEvent::Cancelled { .. } => {
+                if !matches!(self.job, Job::Running(_)) {
+                    return Vec::new();
+                }
+                self.job = Job::Idle;
+                self.set_status("transcription cancelled", false);
+                self.route = Route::Home;
+                Vec::new()
+            }
         }
     }
 
@@ -1343,6 +1521,14 @@ impl AppState {
                     if transcript.audio_path.as_deref() == Some(path.as_path()) {
                         self.pending_recording_cleanup = None;
                         effects.push(Effect::DiscardRecording { path });
+                    }
+                }
+                // M9e (P1-1): the save completes a pending transcription that
+                // was auto-resumed at startup — its entry is cleared now.
+                if let Some(pending) = self.resumed_pending.clone() {
+                    if transcript.audio_path.as_deref() == Some(pending.as_path()) {
+                        self.resumed_pending = None;
+                        effects.push(Effect::ClearPendingTranscription);
                     }
                 }
                 effects
@@ -3570,5 +3756,211 @@ mod tests {
             }
             other => panic!("expected a recording, got {other:?}"),
         }
+    }
+
+    // ---- M9e (P1-1): the quit confirm ---------------------------------------
+
+    fn live_recording() -> AppState {
+        let mut state = AppState::new();
+        state.capture_available = true;
+        state.start_recording(Instant::now(), "2026-10-14 09:41:02");
+        state
+    }
+
+    /// Both quit paths (window close and the AppKit-vetoed terminate) turn into
+    /// the confirm while a capture session is live — and both proceed
+    /// unchanged when nothing is recording.
+    #[test]
+    fn both_quit_paths_confirm_only_while_a_session_is_live() {
+        let mut state = live_recording();
+        for source in [QuitSource::WindowClose, QuitSource::AppTerminate] {
+            state.quit_prompt = None;
+            assert_eq!(
+                state.request_quit(source),
+                QuitAction::ShowConfirm,
+                "{source:?} with a live session"
+            );
+            let prompt = state.quit_prompt.as_ref().expect("the confirm is up");
+            assert_eq!(prompt.source, source);
+            // A repeated request (a second Cmd-Q) is absorbed: one card, one
+            // answer.
+            assert_eq!(state.request_quit(source), QuitAction::ShowConfirm);
+            assert_eq!(state.quit_prompt.as_ref().unwrap().source, source);
+        }
+
+        // No live session: every path proceeds exactly as before M9e.
+        let mut idle = AppState::new();
+        for source in [QuitSource::WindowClose, QuitSource::AppTerminate] {
+            assert_eq!(idle.request_quit(source), QuitAction::Proceed);
+            assert!(idle.quit_prompt.is_none());
+        }
+    }
+
+    /// The three answers: Keep stays (the recording continues), Discard exits
+    /// now (today's behavior), Stop & Save carries the recording's title to the
+    /// frame loop's save step. One answer only.
+    #[test]
+    fn the_quit_answers_resolve_to_stay_exit_or_save_then_exit() {
+        let mut state = live_recording();
+        state.request_quit(QuitSource::WindowClose);
+
+        assert_eq!(state.answer_quit(QuitAnswer::Keep), Some(QuitOutcome::Stay));
+        assert!(state.quit_prompt.is_none());
+        assert!(
+            matches!(state.record, RecordState::Recording(_)),
+            "Keep Recording aborts the quit completely — still recording"
+        );
+        assert_eq!(
+            state.answer_quit(QuitAnswer::Keep),
+            None,
+            "a second answer is a no-op (the prompt is gone)"
+        );
+
+        state.request_quit(QuitSource::AppTerminate);
+        assert_eq!(
+            state.answer_quit(QuitAnswer::Discard),
+            Some(QuitOutcome::ExitNow)
+        );
+
+        state.request_quit(QuitSource::WindowClose);
+        match state.answer_quit(QuitAnswer::StopAndSave) {
+            Some(QuitOutcome::SaveThenExit { title }) => {
+                assert_eq!(title, "Recording 2026-10-14 09:41:02")
+            }
+            other => panic!("expected SaveThenExit, got {other:?}"),
+        }
+    }
+
+    /// A recording that is already finalizing (`stopping`) still confirms: the
+    /// buffers are live until the runtime takes them.
+    #[test]
+    fn a_stopping_session_still_confirms() {
+        let mut state = live_recording();
+        state.stop_recording();
+        assert_eq!(
+            state.request_quit(QuitSource::WindowClose),
+            QuitAction::ShowConfirm
+        );
+    }
+
+    // ---- M9e (P2-2): the job cancel ------------------------------------------
+
+    /// Cancel: one token per press, the card flips to `cancelling…` and the
+    /// worker's `Cancelled` event lands Home with the shared status.
+    #[test]
+    fn cancel_job_sets_cancelling_then_the_cancelled_event_goes_home() {
+        let mut state = AppState::new();
+        state.begin_import(temp_wav("cancel"));
+        assert_eq!(state.route, Route::Transcribe);
+        assert!(state.job_cancellable());
+
+        let effects = state.cancel_job();
+        assert!(matches!(effects.as_slice(), [Effect::CancelJob]));
+        match &state.job {
+            Job::Running(run) => assert!(run.cancelling),
+            other => panic!("expected a running job, got {other:?}"),
+        }
+        // Idempotent: a second press (or Esc) is a no-op.
+        assert!(state.cancel_job().is_empty());
+
+        let effects = state.on_worker_event(WorkerEvent::Cancelled { job_id: 1 });
+        assert!(effects.is_empty());
+        assert!(matches!(state.job, Job::Idle));
+        assert_eq!(state.route, Route::Home, "cancel lands on Home");
+        let status = state.status.as_ref().expect("a status line");
+        assert_eq!(status.text, "transcription cancelled");
+        assert!(!status.error);
+        assert!(!state.busy());
+    }
+
+    /// A `Cancelled` for a job that is not in flight (the job finished first)
+    /// changes nothing — the same stray-event rule as `Finished`.
+    #[test]
+    fn a_stray_cancelled_event_changes_nothing() {
+        let mut state = AppState::new();
+        let effects = state.on_worker_event(WorkerEvent::Cancelled { job_id: 9 });
+        assert!(effects.is_empty());
+        assert!(matches!(state.job, Job::Idle));
+        assert_eq!(state.route, Route::Home);
+        assert!(state.status.is_none());
+    }
+
+    /// Cancel is only offered while a job runs: a failed job's screen has no
+    /// cancel path (Esc stays inert there — the keymap reads the same flag).
+    #[test]
+    fn cancel_is_inert_outside_a_running_job() {
+        let mut state = AppState::new();
+        assert!(!state.job_cancellable());
+        assert!(state.cancel_job().is_empty());
+        state.begin_import(temp_wav("cancel-failed"));
+        state.job_failed("boom".to_string());
+        assert!(!state.job_cancellable());
+        assert!(state.cancel_job().is_empty());
+    }
+
+    // ---- M9e (P1-1): the pending-transcription resume ------------------------
+
+    /// A pending entry found at startup runs the import flow with a visible
+    /// status, remembers its wav, and is cleared exactly when that transcript
+    /// is saved.
+    #[test]
+    fn a_pending_resume_runs_the_job_and_clears_its_entry_on_save() {
+        let wav = temp_wav("pending-resume");
+        let entry = crate::pending_transcription::PendingTranscription::new(
+            "Recording 2026-10-14 09:41:02",
+            wav.clone(),
+        );
+        let mut state = AppState::new();
+        let effects = state.begin_pending_resume(&entry);
+        assert!(
+            matches!(effects.as_slice(), [Effect::SubmitJob { .. }]),
+            "the resume is the normal import flow: {effects:?}"
+        );
+        assert_eq!(state.route, Route::Transcribe);
+        assert_eq!(state.resumed_pending.as_deref(), Some(wav.as_path()));
+        let status = state.status.as_ref().expect("a status line");
+        assert!(
+            status
+                .text
+                .starts_with("resuming the recording saved at quit"),
+            "unexpected status: {}",
+            status.text
+        );
+
+        // The job finishes and saves: the entry is cleared in the same batch.
+        let mut saved = transcript("pending-resume.wav");
+        saved.audio_path = Some(wav.clone());
+        state.on_worker_event(finished_event(saved.clone()));
+        let effects = state.on_transcript_saved(saved, Ok(()));
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ClearPendingTranscription)),
+            "the saved resume clears its entry: {effects:?}"
+        );
+        assert!(state.resumed_pending.is_none());
+
+        // A save of an unrelated transcript never touches the entry.
+        let mut state = AppState::new();
+        state.resumed_pending = Some(wav.clone());
+        let effects = state.on_transcript_saved(transcript("other.wav"), Ok(()));
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ClearPendingTranscription)));
+    }
+
+    /// A resume whose wav vanished before the import starts leaves no state
+    /// behind (no half-resumed job).
+    #[test]
+    fn a_pending_resume_with_a_vanished_wav_is_a_no_op() {
+        let entry = crate::pending_transcription::PendingTranscription::new(
+            "Recording gone",
+            PathBuf::from("/definitely/not/here.wav"),
+        );
+        let mut state = AppState::new();
+        let effects = state.begin_pending_resume(&entry);
+        assert!(effects.is_empty());
+        assert!(state.resumed_pending.is_none());
+        assert!(matches!(state.job, Job::Idle));
     }
 }

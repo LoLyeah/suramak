@@ -35,6 +35,7 @@ use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
 };
 
+use crate::cancel::CancelToken;
 use crate::engine::{EngineAvailability, EngineDecision, EngineId};
 
 /// Errors raised by the ASR layer.
@@ -69,6 +70,12 @@ pub enum AsrError {
 
     #[error("suramak worker is no longer running")]
     WorkerStopped,
+
+    /// M9e (P2-2): the job's [`crate::CancelToken`] was set and the pipeline
+    /// stopped at a stage boundary. Partial results were discarded; the
+    /// whisper context is untouched.
+    #[error("transcription cancelled")]
+    Cancelled,
 }
 
 /// Decode thread count suggestion: physical parallelism, clamped to 2..=8.
@@ -413,10 +420,35 @@ unsafe extern "C" fn progress_trampoline(
     (progress_ctx.on_progress)(pct);
 }
 
+/// C trampoline for `FullParams::set_abort_callback` — the M9e cancel token's
+/// check point inside whisper's decoding loop.
+///
+/// whisper.cpp calls it between decoding chunks and aborts the run when it
+/// returns `true` (the engine's own designed abort path — the same mechanism
+/// whisper.cpp's server uses for client disconnects; the context is not torn).
+///
+/// # Safety
+///
+/// `user_data` must point to a live [`CancelToken`] for the whole duration of
+/// the `full()` call. whisper.cpp invokes the callback synchronously on the
+/// decoding thread, so a stack local of [`transcribe`] satisfies this.
+unsafe extern "C" fn abort_trampoline(user_data: *mut c_void) -> bool {
+    if user_data.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `user_data` points to a live CancelToken.
+    let token = &*(user_data as *const CancelToken);
+    token.is_cancelled()
+}
+
 /// Runs whisper on 16 kHz mono f32 `samples` and returns timed segments plus the engine
 /// that ran.
 ///
 /// `on_progress` receives whisper.cpp's progress percentage (0–100) as decoding advances.
+/// `cancel` is checked by whisper.cpp itself between decoding chunks (the abort
+/// callback, M9e P2-2) and once after the run: a cancelled call returns
+/// [`AsrError::Cancelled`] and **no** segments — partial results are discarded
+/// and the whisper context (the cached engine) is never touched.
 /// Params exactly per docs/PLAN-NOTES.md §3: `Greedy { best_of: 1 }`, `set_n_threads`,
 /// all `set_print_*` off, `set_token_timestamps(true)`, language from the [`LangMode`],
 /// initial prompt only when set.
@@ -432,6 +464,7 @@ pub fn transcribe(
     initial_prompt: Option<&str>,
     n_threads: i32,
     plan: &EngineDecision,
+    cancel: &CancelToken,
     mut on_progress: impl FnMut(u8),
 ) -> Result<TranscribeOutcome, AsrError> {
     let mut warnings = Vec::new();
@@ -470,9 +503,26 @@ pub fn transcribe(
         );
     }
 
-    state
-        .full(params, samples)
-        .map_err(|e| AsrError::Inference(e.to_string()))?;
+    // M9e (P2-2): the cooperative cancel token rides whisper.cpp's own abort
+    // callback — checked inside the decoding loop, between chunks. `cancel`
+    // lives on the caller's stack for the whole call (the same lifetime rule as
+    // `progress_ctx` above); the callback only reads the atomic flag.
+    // SAFETY: `cancel` outlives `state.full()` (a borrow of the caller's
+    // parameter); the trampoline reads one atomic and never touches the state.
+    unsafe {
+        params.set_abort_callback(Some(abort_trampoline));
+        params.set_abort_callback_user_data(cancel as *const CancelToken as *mut c_void);
+    }
+
+    let full = state.full(params, samples);
+    // A cancelled run surfaces as a whisper error (the engine aborted the
+    // compute graph); the honest answer is `Cancelled`, checked before the
+    // error is interpreted. No segments are read either way — the partial
+    // results are discarded here.
+    if cancel.is_cancelled() {
+        return Err(AsrError::Cancelled);
+    }
+    full.map_err(|e| AsrError::Inference(e.to_string()))?;
 
     let n_segments = state.full_n_segments();
     if n_segments < 0 {

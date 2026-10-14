@@ -330,6 +330,9 @@ fn recording_body(
     let mut stop_clicked = false;
     ui.scope_builder(egui::UiBuilder::new().max_rect(controls), |ui| {
         ui.horizontal(|ui| {
+            // M9e (P1-1): Stop is disabled while the quit confirm is up — the
+            // confirm is modal and a stray click must not finalize the very
+            // recording the confirm is asking about.
             let stop = controls::button(
                 ui,
                 tokens,
@@ -337,7 +340,7 @@ fn recording_body(
                 "record-stop",
                 "Stop",
                 Tier::Secondary,
-                !stopping,
+                !stopping && state.quit_prompt.is_none(),
             )
             .on_hover_text("Stop the recording and run the final transcription pass");
             if stop.clicked() {

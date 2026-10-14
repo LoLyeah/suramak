@@ -16,6 +16,9 @@
 //!   prints `SMOKE-JOB-OK`, writes `build/smoke_job_ok.txt` and exits 0.
 //!   `SURAMAK_SMOKE_SECS` is the watchdog: exit 1 (no file) when the job has not
 //!   completed by then.
+//! * `SURAMAK_SMOKE_QUIT_ANSWER=stop-save|discard|keep` (M9e, smoke modes only)
+//!   — answers the quit confirm deterministically the moment it appears (the
+//!   scripted quit-while-recording smoke); inert in normal runs.
 //!
 //! Quit path (WORKORDER-HOTFIX-QUIT): every quit flavor — menu Quit, Cmd-Q, the
 //! window's close button, a smoke run's `event_loop.exit()` — dispatches winit's
@@ -24,12 +27,22 @@
 //! Metal-device destructor (`shutdown.rs` documents why that exit must be
 //! `_exit(2)` on macOS and not `std::process::exit`). Smoke exit codes are
 //! unchanged (0 / 1).
+//!
+//! M9e (P1-1): with a live capture session, BOTH quit paths first present the
+//! in-app confirm — the window's close button is ignored and turned into
+//! [`app::QuitAction::ShowConfirm`] here, and Cmd-Q/menu Quit is vetoed inside
+//! AppKit (`applicationShouldTerminate:` → `NSTerminateCancel`, installed by
+//! `suramak-glass`); the vetoed request arrives as a pending flag the frame
+//! loop drains into the same funnel. The three answers: Stop & Save finalizes
+//! the wav + writes the pending-transcription entry and then exits through the
+//! unchanged funnel; Discard exits exactly as before; Keep aborts the quit.
 
 mod app;
 mod cadence;
 mod framestats;
 mod instance;
 mod motion;
+mod pending_transcription;
 mod runtime;
 mod shell;
 mod shutdown;
@@ -38,8 +51,8 @@ mod theme;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use app::{Effect, Job, RecordState};
-use runtime::Runtime;
+use app::{Effect, Job, QuitAction, QuitAnswer, QuitOutcome, QuitSource, RecordState};
+use runtime::{PendingResume, Runtime};
 use shell::Shell;
 use suramak_core::paths;
 use suramak_core::store::Store;
@@ -208,6 +221,12 @@ struct App {
     /// interval (recording / playing / download / autosave due), cleared when it
     /// does not; a wake that finds the deadline passed repaints and re-arms.
     repaint_due: Option<Instant>,
+    /// M9e (P1-1): the quit confirm's answer, waiting for the frame loop to
+    /// execute it (only the loop can exit the process).
+    pending_quit: Option<QuitOutcome>,
+    /// M9e (P1-1): the smoke-only auto-answer for the quit confirm
+    /// (`SURAMAK_SMOKE_QUIT_ANSWER`), consumed once. `None` in normal runs.
+    smoke_quit_answer: Option<QuitAnswer>,
 }
 
 impl App {
@@ -215,6 +234,18 @@ impl App {
         smoke: Option<Smoke>,
         accesskit_proxy: Option<EventLoopProxy<AccessKitEnabler>>,
     ) -> Self {
+        // M9e smoke harness: a scripted answer for the quit confirm, only when
+        // a smoke mode is active (same discipline as SURAMAK_SMOKE_RECORD).
+        let smoke_quit_answer = if smoke.is_some() {
+            match std::env::var("SURAMAK_SMOKE_QUIT_ANSWER").as_deref() {
+                Ok("stop-save") => Some(QuitAnswer::StopAndSave),
+                Ok("discard") => Some(QuitAnswer::Discard),
+                Ok("keep") => Some(QuitAnswer::Keep),
+                _ => None,
+            }
+        } else {
+            None
+        };
         Self {
             egui_ctx: egui::Context::default(),
             shell: None,
@@ -224,6 +255,8 @@ impl App {
             shutdown_done: false,
             accesskit_proxy,
             repaint_due: None,
+            pending_quit: None,
+            smoke_quit_answer,
         }
     }
 
@@ -304,7 +337,7 @@ impl App {
         }
         let events = self
             .runtime
-            .as_ref()
+            .as_mut()
             .map(|runtime| runtime.drain_worker())
             .unwrap_or_default();
         if !events.is_empty() {
@@ -423,21 +456,152 @@ impl App {
     /// (M9a): a settings save may have changed `settings.ui.appearance`, and
     /// `sync_appearance` is a no-op unless the resolved theme or the Reduce
     /// Motion flag actually moved.
+    ///
+    /// M9e (P1-1): [`Effect::Quit`] is filtered out here — only the frame loop
+    /// can exit the process — and parked in `pending_quit` for
+    /// [`App::drain_quit`] at the end of the event handler.
     fn apply(&mut self, effects: Vec<Effect>) {
         let (Some(shell), Some(runtime)) = (self.shell.as_mut(), self.runtime.as_mut()) else {
             return;
         };
-        runtime.apply(effects, &mut shell.app);
+        let mut quit = None;
+        let rest: Vec<Effect> = effects
+            .into_iter()
+            .filter_map(|effect| match effect {
+                Effect::Quit(outcome) => {
+                    quit = Some(outcome);
+                    None
+                }
+                other => Some(other),
+            })
+            .collect();
+        runtime.apply(rest, &mut shell.app);
         shell.sync_appearance(runtime.appearance());
+        if quit.is_some() {
+            self.pending_quit = quit;
+        }
     }
 
-    /// Draws one frame and executes what it asked for.
-    fn redraw(&mut self) {
+    /// M9e (P1-1): a quit was requested — the window's close button or a
+    /// vetoed AppKit termination (Cmd-Q / menu Quit). With a live capture
+    /// session the request becomes the in-app confirm; otherwise the quit
+    /// proceeds exactly as before this slice.
+    fn handle_quit_request(&mut self, event_loop: &ActiveEventLoop, source: QuitSource) {
+        let action = self
+            .shell
+            .as_mut()
+            .map(|shell| shell.app.request_quit(source));
+        match action {
+            Some(QuitAction::ShowConfirm) => {
+                tracing::info!(?source, "quit: live recording — showing the confirm");
+                if let Some(shell) = &self.shell {
+                    shell.window.request_redraw();
+                }
+            }
+            _ => {
+                // No shell (startup), no runtime, or no live recording: the
+                // pre-M9e behavior — exit through the one quit funnel.
+                event_loop.exit();
+            }
+        }
+    }
+
+    /// M9e (P1-1): drains a vetoed AppKit termination (the flag the glass
+    /// callback set) into the same funnel as the window close.
+    fn poll_terminate_veto(&mut self, event_loop: &ActiveEventLoop) {
+        let pending = self
+            .shell
+            .as_ref()
+            .is_some_and(|shell| shell.quit_veto.take_pending());
+        if pending {
+            self.handle_quit_request(event_loop, QuitSource::AppTerminate);
+        }
+    }
+
+    /// M9e (P1-1): executes an answered quit confirm. Stop & Save finalizes +
+    /// persists first (bounded — no transcription runs here), then both
+    /// exiting outcomes go through `event_loop.exit()` → `exiting()` → the
+    /// unchanged HOTFIX-QUIT funnel (bounded teardown + `_exit`).
+    fn drain_quit(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(outcome) = self.pending_quit.take() else {
+            return;
+        };
+        match outcome {
+            QuitOutcome::Stay => {
+                // Keep Recording: nothing happens; the card fades out.
+                if let Some(shell) = &self.shell {
+                    shell.window.request_redraw();
+                }
+            }
+            QuitOutcome::ExitNow => {
+                tracing::info!("quit: discard answered — exiting as before");
+                event_loop.exit();
+            }
+            QuitOutcome::SaveThenExit { title } => {
+                self.save_recording_for_quit(&title);
+                event_loop.exit();
+            }
+        }
+    }
+
+    /// M9e (P1-1): the Stop & Save save step — the recording's wav and the
+    /// pending-transcription entry, timed (the smoke's bounded-exit number).
+    /// A failure is logged and the quit continues: the user asked to quit and
+    /// the app must not hold the process hostage to a disk error.
+    fn save_recording_for_quit(&mut self, title: &str) {
         let (Some(shell), Some(runtime)) = (self.shell.as_mut(), self.runtime.as_mut()) else {
             return;
         };
-        let effects = shell.redraw_or_log();
-        runtime.apply(effects, &mut shell.app);
+        let started = Instant::now();
+        match runtime.save_recording_for_quit(&mut shell.app) {
+            Ok(Some(wav)) => tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                wav = %wav.display(),
+                title,
+                "quit: stop & save finished"
+            ),
+            Ok(None) => tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                title,
+                "quit: stop & save finished (no capture session — entry only)"
+            ),
+            Err(err) => tracing::warn!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error = %err,
+                "quit: stop & save failed — exiting anyway"
+            ),
+        }
+    }
+
+    /// M9e (P1-1) smoke harness: answers the quit confirm automatically when
+    /// `SURAMAK_SMOKE_QUIT_ANSWER` is set and a smoke mode is active (the
+    /// scripted quit-while-recording smoke). Inert in normal runs.
+    fn smoke_answer_quit(&mut self) {
+        let Some(answer) = self.smoke_quit_answer else {
+            return;
+        };
+        let Some(shell) = self.shell.as_mut() else {
+            return;
+        };
+        if shell.app.quit_prompt.is_none() {
+            return;
+        }
+        self.smoke_quit_answer = None; // one-shot
+        tracing::info!(?answer, "smoke: auto-answering the quit confirm");
+        if let Some(outcome) = shell.app.answer_quit(answer) {
+            self.pending_quit = Some(outcome);
+        }
+    }
+
+    /// Draws one frame and executes what it asked for. Effects go through
+    /// [`App::apply`], so a quit answer produced by the frame (the confirm
+    /// card's controls) is parked for [`App::drain_quit`] like any other.
+    fn redraw(&mut self) {
+        let effects = match self.shell.as_mut() {
+            Some(shell) => shell.redraw_or_log(),
+            None => return,
+        };
+        self.apply(effects);
     }
 
     /// Plain smoke (M1 semantics): at the deadline, require ≥1 presented frame,
@@ -600,6 +764,28 @@ impl ApplicationHandler<AccessKitEnabler> for App {
                 let initial = shell.app.initial_effects();
                 runtime.apply(initial, &mut shell.app);
 
+                // M9e (P1-1): a quit-mid-recording Stop & Save left a pending
+                // entry — auto-run its transcription now (the status line says
+                // where it came from). An entry whose audio is gone is cleared
+                // by the runtime and reported honestly here instead.
+                match runtime.pending_transcription() {
+                    Some(PendingResume::Resume(entry)) => {
+                        let effects = shell.app.begin_pending_resume(&entry);
+                        runtime.apply(effects, &mut shell.app);
+                    }
+                    Some(PendingResume::MissingAudio { title }) => {
+                        tracing::warn!(
+                            title,
+                            "pending transcription: the entry had no audio — reported to the user"
+                        );
+                        shell.app.set_status(
+                            "a recording saved at quit has no audio on disk — nothing to transcribe",
+                            false,
+                        );
+                    }
+                    None => {}
+                }
+
                 if let Some(smoke) = &mut self.smoke {
                     let now = Instant::now();
                     smoke.deadline = Some(now + Duration::from_secs(smoke.secs));
@@ -670,7 +856,12 @@ impl ApplicationHandler<AccessKitEnabler> for App {
             shell.window.request_redraw();
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            // M9e (P1-1): a close request with a live capture session is
+            // ignored and turned into the in-app confirm (nothing is discarded
+            // until it is answered); without one it exits as before.
+            WindowEvent::CloseRequested => {
+                self.handle_quit_request(event_loop, QuitSource::WindowClose)
+            }
             WindowEvent::ThemeChanged(_) => {
                 // M9a: the OS appearance changed — re-resolve (System follows;
                 // forced modes keep their pin) and repaint.
@@ -706,6 +897,8 @@ impl ApplicationHandler<AccessKitEnabler> for App {
             }
             _ => {}
         }
+        // M9e (P1-1): a frame or a click may have answered the confirm.
+        self.drain_quit(event_loop);
     }
 
     /// M9b: AccessKit's platform adapter posts its events through the winit
@@ -733,6 +926,16 @@ impl ApplicationHandler<AccessKitEnabler> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // M9e (P1-1): a vetoed AppKit termination (Cmd-Q during a recording)
+        // arrives as a flag the glass callback set; it goes through the same
+        // funnel as the window close.
+        self.poll_terminate_veto(event_loop);
+        // M9e smoke harness: answer the confirm when the scripted smoke asked.
+        self.smoke_answer_quit();
+        // M9e (P1-1): the frame loop executes quit answers (Stop & Save's
+        // save + the exit itself) — before any further pumping.
+        self.drain_quit(event_loop);
+
         let changed = self.pump();
 
         let smoke_active = self.smoke.as_ref().is_some_and(|smoke| !smoke.finished);

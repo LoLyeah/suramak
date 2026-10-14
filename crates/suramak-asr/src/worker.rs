@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use suramak_core::settings::{EngineSetting, LangMode};
 use suramak_core::transcript::{Segment, Transcript};
 
+use crate::cancel::CancelToken;
 use crate::engine::{self, EngineId};
 use crate::pipeline;
 use crate::whisper::{self, AsrError, ContextCache};
@@ -29,6 +30,12 @@ pub struct Job {
     /// Requested engine; absent in older callers → `Auto`.
     #[serde(default)]
     pub engine: EngineSetting,
+    /// M9e (P2-2): the cooperative cancel token for this job. The submitter
+    /// keeps a clone and sets it; the worker/pipeline observe it at stage
+    /// boundaries. Not serialized (a token is a live process handle; the CLI
+    /// and UI both construct jobs in-process).
+    #[serde(skip)]
+    pub cancel: CancelToken,
 }
 
 /// Events emitted by the worker.
@@ -48,6 +55,10 @@ pub enum WorkerEvent {
     },
     /// The job failed; `message` is human-readable.
     Error { job_id: u64, message: String },
+    /// M9e (P2-2): the job was cancelled through its [`CancelToken`] — the
+    /// pipeline stopped at a stage boundary, partial results were discarded
+    /// and the worker is ready for the next job. Terminal, like `Finished`.
+    Cancelled { job_id: u64 },
 }
 
 /// Handle to the `suramak-worker` thread.
@@ -121,6 +132,15 @@ fn run_worker(jobs: Receiver<Job>, events: Sender<WorkerEvent>) {
         let job_id = job.id;
         let _ = events.send(WorkerEvent::Progress { job_id, pct: 0 });
 
+        // M9e (P2-2): the first cooperative check point — a cancel that landed
+        // before this job started (the token can be set while the job sits in
+        // the channel) exits here, before the model is even loaded.
+        if job.cancel.is_cancelled() {
+            tracing::info!(job_id, "job cancelled before it started");
+            let _ = events.send(WorkerEvent::Cancelled { job_id });
+            continue;
+        }
+
         // Engine selection is a pure function of (setting, language, availability).
         let language = match &job.lang {
             LangMode::Auto => None,
@@ -148,6 +168,7 @@ fn run_worker(jobs: Receiver<Job>, events: Sender<WorkerEvent>) {
             job.initial_prompt.as_deref(),
             whisper::default_threads(),
             &plan,
+            &job.cancel,
             move |pct| {
                 let _ = progress_events.send(WorkerEvent::Progress { job_id, pct });
             },
@@ -166,6 +187,13 @@ fn run_worker(jobs: Receiver<Job>, events: Sender<WorkerEvent>) {
                     warnings: outcome.warnings,
                 });
             }
+            // M9e (P2-2): a cancelled job is terminal but is not a failure —
+            // the partial results were dropped by the pipeline and the worker
+            // (and its context cache) stays healthy for the next job.
+            Err(AsrError::Cancelled) => {
+                tracing::info!(job_id, "job cancelled at a stage boundary");
+                let _ = events.send(WorkerEvent::Cancelled { job_id });
+            }
             Err(err) => {
                 let _ = events.send(WorkerEvent::Error {
                     job_id,
@@ -173,5 +201,88 @@ fn run_worker(jobs: Receiver<Job>, events: Sender<WorkerEvent>) {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(id: u64, cancel: CancelToken) -> Job {
+        Job {
+            id,
+            input: PathBuf::from("/nonexistent/suramak/input.wav"),
+            model_path: PathBuf::from("/nonexistent/suramak/ggml-tiny.bin"),
+            lang: LangMode::Auto,
+            initial_prompt: None,
+            engine: EngineSetting::Auto,
+            cancel,
+        }
+    }
+
+    /// M9e (P2-2): a job whose token is set before the worker picks it up
+    /// exits at the first check point — before the model load — as a terminal
+    /// `Cancelled`, and the worker stays alive: the next job runs normally
+    /// (here it fails on the missing model, which proves the thread and its
+    /// loop survived the cancellation cleanly).
+    #[test]
+    fn a_cancelled_job_exits_cleanly_and_the_worker_keeps_going() {
+        let worker = Worker::spawn();
+        let token = CancelToken::new();
+        token.cancel();
+        worker.submit(job(1, token)).expect("submit");
+        assert!(matches!(
+            worker.recv(),
+            Some(WorkerEvent::Progress { job_id: 1, pct: 0 })
+        ));
+        match worker.recv() {
+            Some(WorkerEvent::Cancelled { job_id }) => assert_eq!(job_id, 1),
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+
+        // The worker is still running: a fresh (uncancelled) job reaches the
+        // model load and fails there — an Error, not a hang, not a dead thread.
+        worker
+            .submit(job(2, CancelToken::new()))
+            .expect("submit after a cancellation");
+        assert!(matches!(
+            worker.recv(),
+            Some(WorkerEvent::Progress { job_id: 2, pct: 0 })
+        ));
+        match worker.recv() {
+            Some(WorkerEvent::Error { job_id, message }) => {
+                assert_eq!(job_id, 2);
+                assert!(
+                    message.contains("model file not found"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// A cancellation that lands while the job waits in the channel (before
+    /// the worker picks it up) is observed at the same first check point.
+    #[test]
+    fn a_cancel_queued_with_the_job_is_observed_before_the_model_load() {
+        let worker = Worker::spawn();
+        let token = CancelToken::new();
+        worker.submit(job(7, token.clone())).expect("submit");
+        // The token is set right after submission; the worker may or may not
+        // have started — either way the answer is Cancelled (never an Error).
+        token.cancel();
+        let mut cancelled = false;
+        for _ in 0..4 {
+            match worker.recv() {
+                Some(WorkerEvent::Cancelled { job_id }) => {
+                    assert_eq!(job_id, 7);
+                    cancelled = true;
+                    break;
+                }
+                Some(_) => continue,
+                None => break,
+            }
+        }
+        assert!(cancelled, "the queued cancellation must be observed");
     }
 }

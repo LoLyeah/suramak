@@ -98,6 +98,18 @@ mod tests {
     use crate::theme::{tokens, AppTheme};
     use egui::{pos2, vec2};
 
+    /// The audit's `ENABLED` flag is process-global, so the two tests that
+    /// drive it must never interleave (a parallel run had one test's teardown
+    /// blank the other's recordings — the empty-list failure mode). Poisoning
+    /// is ignored so one failure never cascades.
+    static AUDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn audit_serial() -> std::sync::MutexGuard<'static, ()> {
+        AUDIT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn showcase_frame(ctx: &egui::Context, tokens: &crate::theme::Tokens) -> egui::FullOutput {
         let motion = Motion::new(false);
         let input = egui::RawInput {
@@ -185,6 +197,7 @@ mod tests {
     /// asked for, swept over the whole control system.
     #[test]
     fn no_control_shape_escapes_its_allocated_rect() {
+        let _serial = audit_serial();
         set_enabled(true);
         let ctx = egui::Context::default();
         let tokens = tokens(AppTheme::Light);
@@ -204,6 +217,7 @@ mod tests {
     /// `rect.expand(FOCUS_RING_EXPAND + focus stroke)`.
     #[test]
     fn the_focus_ring_is_the_only_sanctioned_excess() {
+        let _serial = audit_serial();
         set_enabled(true);
         let ctx = egui::Context::default();
         let tokens = tokens(AppTheme::Light);

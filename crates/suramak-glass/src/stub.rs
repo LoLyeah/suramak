@@ -25,6 +25,14 @@ impl Handle {
     /// No-op (M9a): no AppKit appearance exists here; the app's own token
     /// ladder carries light/dark on this platform.
     pub fn set_appearance(&mut self, _mode: ThemeMode) {}
+
+    /// No-op (M9e): there is no AppKit terminate to veto on this platform —
+    /// the window-close path is the quit path, handled in the app itself.
+    pub fn set_terminate_veto(
+        &mut self,
+        _veto: Option<Box<dyn Fn() -> bool + Send + Sync + 'static>>,
+    ) {
+    }
 }
 
 /// Does nothing, always succeeds.

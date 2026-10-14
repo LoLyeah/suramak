@@ -206,6 +206,7 @@ mod tests {
             requested_engine: None,
             planned_engine: None,
             warnings: Vec::new(),
+            cancelling: false,
         });
         assert_eq!(classify(&state), FrameState::Job);
 

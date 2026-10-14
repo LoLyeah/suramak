@@ -7,7 +7,7 @@
 
 use egui::{pos2, vec2, Align2, CornerRadius, FontFamily, FontId, Rect};
 
-use crate::app::controls;
+use crate::app::controls::{self, Tier};
 use crate::motion::Motion;
 use crate::theme::Tokens;
 
@@ -25,7 +25,7 @@ pub fn ui(
     let left = rect.left() + PANE_PAD_X;
     let right = rect.right() - PANE_PAD_X;
 
-    let (file_name, pct, model, planned, warnings, failure) = match &state.job {
+    let (file_name, pct, model, planned, warnings, failure, cancelling) = match &state.job {
         Job::Running(run) => (
             run.input
                 .file_name()
@@ -36,6 +36,7 @@ pub fn ui(
             run.planned_engine.clone(),
             run.warnings.clone(),
             None,
+            run.cancelling,
         ),
         Job::Failed { input, message } => (
             input
@@ -47,17 +48,22 @@ pub fn ui(
             None,
             Vec::new(),
             Some(message.clone()),
+            false,
         ),
-        Job::Idle => ("—".to_string(), 0, None, None, Vec::new(), None),
+        Job::Idle => ("—".to_string(), 0, None, None, Vec::new(), None, false),
     };
+    let running = matches!(state.job, Job::Running(_));
 
     ui.horizontal(|ui| {
         ui.add_space(PANE_PAD_X - 8.0);
         ui.vertical(|ui| {
             pane_title(ui, &file_name, tokens);
-            let caption = match &failure {
-                Some(_) => "transcription failed".to_string(),
-                None => "transcribing on this machine…".to_string(),
+            let caption = match (&failure, cancelling) {
+                (Some(_), _) => "transcription failed".to_string(),
+                // M9e (P2-2): the cancel was pressed — the worker answers at
+                // its next stage boundary; the card says what is happening.
+                (None, true) => "cancelling…".to_string(),
+                (None, false) => "transcribing on this machine…".to_string(),
             };
             pane_caption(ui, &caption, tokens, failure.is_some());
         });
@@ -112,6 +118,34 @@ pub fn ui(
             FontId::new(11.5, FontFamily::Monospace),
             tokens.ink_soft,
         );
+    }
+
+    // M9e (P2-2): the quiet tertiary Cancel, in the card's top-right corner —
+    // enabled while the job runs, disabled once the cancel is in flight (the
+    // worker answers at its next stage boundary and the caption says
+    // `cancelling…`). Esc on this screen is the same path (the central keymap).
+    if running {
+        let cancel_row = Rect::from_min_size(
+            pos2(card.left() + 22.0, card.top() + 6.0),
+            vec2(card.width() - 44.0, 24.0),
+        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(cancel_row), |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let cancel = controls::button(
+                    ui,
+                    tokens,
+                    motion,
+                    "transcribe-cancel",
+                    "Cancel",
+                    Tier::Tertiary,
+                    !cancelling,
+                )
+                .on_hover_text("Cancel this transcription");
+                if cancel.clicked() {
+                    effects.extend(state.cancel_job());
+                }
+            });
+        });
     }
 
     let mut y = card.bottom() + 16.0;

@@ -58,6 +58,15 @@ impl Handle {
     /// switching on Windows is not wired up and is documented in the M9a
     /// report. The app's own token ladder still carries light/dark.
     pub fn set_appearance(&mut self, _mode: ThemeMode) {}
+
+    /// No-op (M9e, compile-checked only): the AppKit terminate veto has no
+    /// Windows equivalent wired up; the window-close path is handled in the
+    /// app itself.
+    pub fn set_terminate_veto(
+        &mut self,
+        _veto: Option<Box<dyn Fn() -> bool + Send + Sync + 'static>>,
+    ) {
+    }
 }
 
 /// Applies the DWM backdrop, immersive dark mode and frame extension to `window`.

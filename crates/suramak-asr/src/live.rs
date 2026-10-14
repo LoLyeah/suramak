@@ -65,6 +65,7 @@ use suramak_core::resample::TARGET_RATE;
 use suramak_core::settings::LangMode;
 use suramak_core::transcript::Segment;
 
+use crate::cancel::CancelToken;
 use crate::engine::EngineDecision;
 use crate::whisper::{self, AsrError, ContextCache};
 
@@ -739,6 +740,11 @@ fn decode_window(
             settings.initial_prompt.as_deref(),
             settings.n_threads,
             &settings.plan,
+            // M9e (P2-2): the live path takes the signature's token but never
+            // sets it — a fresh, uncancelled token per window. The live
+            // machinery is torn down by its existing shutdown path, not by the
+            // job-cancel mechanism (the audio path stays untouched).
+            &CancelToken::new(),
             |_| {},
         )?;
         Ok(outcome.segments)

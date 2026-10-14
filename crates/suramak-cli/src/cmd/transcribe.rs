@@ -128,6 +128,8 @@ pub fn run(args: TranscribeArgs) -> Result<()> {
         lang,
         initial_prompt: args.initial_prompt,
         engine,
+        // M9e: the CLI never cancels — a fresh, uncancelled token.
+        cancel: suramak_asr::CancelToken::new(),
     })?;
 
     let mut next_pct = 0u8;
@@ -147,6 +149,12 @@ pub fn run(args: TranscribeArgs) -> Result<()> {
                 warnings,
                 ..
             }) => break (transcript, engine_used, warnings),
+            // Unreachable for the CLI (its token is never set) — handled so a
+            // future cancellation surface cannot hang the loop.
+            Some(WorkerEvent::Cancelled { .. }) => {
+                eprintln!();
+                bail!("transcription cancelled");
+            }
             Some(WorkerEvent::Error { message, .. }) => {
                 eprintln!();
                 bail!("transcription failed: {message}");

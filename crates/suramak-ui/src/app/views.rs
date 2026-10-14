@@ -107,6 +107,10 @@ pub fn draw(ctx: &egui::Context, state: &mut AppState) -> Vec<Effect> {
     // The floating record control rides above every panel (M8.5).
     float_control(ctx, &tokens, &motion, state, &mut effects);
 
+    // M9e (P1-1): the quit-mid-recording confirm rides above everything (it is
+    // modal: the pill is disabled and the scrim absorbs clicks behind it).
+    super::quit_confirm::ui(ctx, &tokens, &motion, state, &mut effects);
+
     effects
 }
 
@@ -205,6 +209,11 @@ fn float_control(
     let recording = matches!(state.record, super::RecordState::Recording(_));
     let stopping = matches!(&state.record, super::RecordState::Recording(rec) if rec.stopping);
     let enabled = state.can_record() || recording;
+    // M9e (P1-1): while the quit confirm is up the pill is modal-disabled —
+    // dimmed, no hover/press response, and its click is absorbed (a stray
+    // click must never stop the recording the confirm is asking about).
+    let modal = state.quit_prompt.is_some();
+    let interactive = enabled && !modal;
 
     egui::Area::new(egui::Id::new("suramak-record-float"))
         .order(egui::Order::Foreground)
@@ -250,13 +259,13 @@ fn float_control(
             let hover = motion.factor(
                 ctx,
                 egui::Id::new("suramak-pill-hover"),
-                enabled && response.hovered(),
+                interactive && response.hovered(),
                 motion::FAST,
             );
             let press = motion.factor(
                 ctx,
                 egui::Id::new("suramak-pill-press"),
-                enabled && response.is_pointer_button_down_on(),
+                interactive && response.is_pointer_button_down_on(),
                 motion::FAST,
             );
 
@@ -267,7 +276,7 @@ fn float_control(
             // brief's gentle scale component: a ≤1.5 % dip that peaks
             // mid-crossfade and returns to 1.0 — the existing label/colour
             // crossfade is untouched.
-            let press_target = if enabled && response.is_pointer_button_down_on() {
+            let press_target = if interactive && response.is_pointer_button_down_on() {
                 motion::SPRING_PRESS_SCALE
             } else {
                 1.0
@@ -328,7 +337,11 @@ fn float_control(
                 // spring (fonts, dot, gaps) so the press reads as the whole
                 // pill compressing — on macOS that is the content inside the
                 // fixed glass body (the material's frame is an M8.5 contract).
-                let label_color = if enabled { tokens.ink } else { tokens.ink_soft };
+                let label_color = if interactive {
+                    tokens.ink
+                } else {
+                    tokens.ink_soft
+                };
                 let galley = painter.layout_no_wrap(
                     "Record".to_owned(),
                     FontId::new(15.0 * scale, FontFamily::Proportional),
@@ -338,7 +351,7 @@ fn float_control(
                 let gap = 10.0 * scale;
                 let total = dot_radius * 2.0 + gap + galley.size().x;
                 let left = body.center().x - total / 2.0;
-                let dot_color = if enabled {
+                let dot_color = if interactive {
                     tokens.record_red
                 } else {
                     tokens.record_red.gamma_multiply(0.35)
@@ -375,7 +388,7 @@ fn float_control(
                 let gap = 12.0 * scale;
                 let total = glyph_size + gap + galley.size().x;
                 let left = body.center().x - total / 2.0;
-                let glyph_color = if stopping || !enabled {
+                let glyph_color = if stopping || !interactive {
                     tokens.record_red.gamma_multiply(0.4)
                 } else {
                     tokens.record_red
@@ -396,10 +409,10 @@ fn float_control(
                 );
             }
 
-            if response.hovered() {
+            if interactive && response.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            if response.clicked() {
+            if response.clicked() && !modal {
                 let date = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
                 effects.extend(state.toggle_record(Instant::now(), &date));
             }
@@ -418,17 +431,25 @@ pub fn pane_title(ui: &mut egui::Ui, text: &str, tokens: &Tokens) {
 
 /// Small dim caption line under a pane title. M9d: errors read in the
 /// **text-safe** red (WCAG AA at 12 px on every light surface).
+///
+/// M9e (P2-3): the label wraps at its available width (`Label::wrap()`) — in a
+/// horizontal layout egui's default (`Extend`) lays the text out on one line
+/// and lets it clip at the pane edge; captions must wrap instead ("…after the
+/// transcript te" was exactly this).
 pub fn pane_caption(ui: &mut egui::Ui, text: &str, tokens: &Tokens, error: bool) {
     let color = if error {
         tokens.record_red_text
     } else {
         tokens.ink_soft
     };
-    ui.label(
-        egui::RichText::new(text)
-            .size(12.0)
-            .color(color)
-            .family(FontFamily::Proportional),
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(text)
+                .size(12.0)
+                .color(color)
+                .family(FontFamily::Proportional),
+        )
+        .wrap(),
     );
 }
 

@@ -29,7 +29,7 @@ use suramak_asr::live::{LiveConfig, LiveSession};
 use suramak_asr::pipeline::{model_id_from_path, parse_lang, transcribe_file};
 use suramak_asr::whisper::{self, ContextCache};
 use suramak_asr::worker::{Job, Worker, WorkerEvent};
-use suramak_asr::{resolve_for, AsrError};
+use suramak_asr::{resolve_for, AsrError, CancelToken};
 use suramak_core::settings::{EngineSetting, LangMode};
 
 fn fixture(name: &str) -> PathBuf {
@@ -194,6 +194,7 @@ fn worker_reports_missing_model_as_error_event() {
             lang: LangMode::Fixed("en".to_string()),
             initial_prompt: None,
             engine: EngineSetting::Auto,
+            cancel: CancelToken::new(),
         })
         .expect("submit job");
 
@@ -240,6 +241,7 @@ fn e2e_en_fixture_contains_fox() {
         None,
         whisper::default_threads(),
         &plan,
+        &CancelToken::new(),
         |_| {},
     )
     .expect("transcribe en.wav");
@@ -287,6 +289,7 @@ fn e2e_id_fixture_has_non_empty_segment() {
         None,
         whisper::default_threads(),
         &plan,
+        &CancelToken::new(),
         |_| {},
     )
     .expect("transcribe id.wav");
@@ -338,6 +341,7 @@ fn e2e_video_fixture_matches_the_source_mp3_words() {
             None,
             whisper::default_threads(),
             &plan,
+            &CancelToken::new(),
             |_| {},
         )
         .unwrap_or_else(|err| panic!("transcribe {}: {err}", path.display()))
@@ -428,6 +432,7 @@ fn e2e_live_partials_then_the_final_pass_replaces_them() {
         None,
         whisper::default_threads(),
         &plan,
+        &CancelToken::new(),
         |_| {},
     )
     .expect("baseline final pass");
@@ -456,6 +461,7 @@ fn e2e_live_partials_then_the_final_pass_replaces_them() {
                 None,
                 whisper::default_threads(),
                 &plan,
+                &CancelToken::new(),
                 |_| {},
             )
             .expect("live window decode");
@@ -501,6 +507,7 @@ fn e2e_live_partials_then_the_final_pass_replaces_them() {
         None,
         whisper::default_threads(),
         &plan,
+        &CancelToken::new(),
         |_| {},
     )
     .expect("final pass after the live session");
@@ -597,6 +604,7 @@ fn e2e_coreml_encoder_engaged_macos() {
         None,
         whisper::default_threads(),
         &plan,
+        &CancelToken::new(),
         |_| {},
     )
     .expect("transcribe en.wav with Core ML");
@@ -608,4 +616,69 @@ fn e2e_coreml_encoder_engaged_macos() {
         outcome.warnings
     );
     assert!(!outcome.transcript.segments.is_empty());
+}
+
+/// M9e (P2-2) end-to-end: a cancel that lands while a whisper run is in
+/// flight stops the job at a chunk boundary (the abort callback) — the run
+/// returns `Cancelled` with no segments — and the cached whisper context (the
+/// engine) is **not corrupted**: the same context transcribes the fixture
+/// normally straight after.
+///
+/// The token is set from the progress callback's first tick: the cancel then
+/// races the decoding loop, which is exactly the production shape (the UI sets
+/// the token while the worker decodes).
+#[test]
+#[ignore = "release-only e2e: debug whisper is ~50x too slow (run with --release -- --ignored)"]
+fn e2e_cancel_mid_run_stops_cleanly_and_the_engine_stays_healthy() {
+    let _serial = e2e_serial();
+    let Some(model_path) = tiny_model_or_skip() else {
+        return;
+    };
+    let plan = resolve_for(&model_path, EngineSetting::Auto, Some("en"));
+    let mut cache = ContextCache::new();
+    let ctx = cache
+        .get_or_load(&model_path, plan.engine.use_gpu())
+        .expect("load tiny model");
+
+    let token = CancelToken::new();
+    let cancel_from_progress = token.clone();
+    let result = transcribe_file(
+        ctx,
+        &fixture("en.wav"),
+        &model_path,
+        &LangMode::Fixed("en".to_string()),
+        None,
+        whisper::default_threads(),
+        &plan,
+        &token,
+        move |_pct| cancel_from_progress.cancel(),
+    );
+    match result {
+        Err(AsrError::Cancelled) => {}
+        Err(other) => panic!("expected Cancelled, got an error: {other:?}"),
+        Ok(outcome) => panic!(
+            "expected Cancelled; the run finished first with {} segment(s) — \
+             a cancelled job must never produce segments",
+            outcome.transcript.segments.len()
+        ),
+    }
+
+    // The engine is healthy: the same context runs the fixture again, whole.
+    let outcome = transcribe_file(
+        ctx,
+        &fixture("en.wav"),
+        &model_path,
+        &LangMode::Fixed("en".to_string()),
+        None,
+        whisper::default_threads(),
+        &plan,
+        &CancelToken::new(),
+        |_| {},
+    )
+    .expect("the context must still transcribe after a cancelled run");
+    assert!(
+        words(&outcome.transcript).contains("fox"),
+        "unexpected transcript after a cancelled run: {}",
+        words(&outcome.transcript)
+    );
 }

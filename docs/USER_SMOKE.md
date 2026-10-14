@@ -215,6 +215,21 @@ The shell has been rebuilt (M9 slice 1). The editor now reads as **one** surface
 - **Click the waveform** far from the playhead: the playhead eases to the spot (nearby clicks stay instant — no lag while playing). During playback, the transcript's follow-scroll animates.
 - **Reduce Motion** (System Settings → Accessibility → Display): everything above snaps — including the spring.
 
+## 27. The three pre-release fixes (M9e)
+
+- **Quit while recording**: close the window mid-recording → a card asks what happens to
+  the take. **Stop & Save** keeps the audio and finishes its transcription automatically
+  the next time you open the app; **Discard** does what the old behavior did;
+  **Keep Recording** (or Esc) stays put. Try all three. On your Mac, **⌘Q** must show the
+  same card — that path (the AppKit veto) is the one piece I could only compile-check on
+  the VPS, so you’re its first real test.
+- **Cancel a running transcription**: start one, then hit the quiet **Cancel** on the job
+  card (Esc works too) — it should return you Home with “transcription cancelled”,
+  stopping cleanly between stages.
+- **Small windows**: drag the window down to its minimum (900×600). Settings scrolls
+  end-to-end — Save and Reset are reachable and clear of the Record pill; the Models
+  list keeps its columns apart (no mashed headers) and you can scroll to the end.
+
 ## Report
 
 Anything that deviates from an expected result, with: what you did, what happened, what you expected.

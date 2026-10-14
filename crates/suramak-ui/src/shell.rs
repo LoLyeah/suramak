@@ -3,7 +3,12 @@
 //! M8.5: the shell also owns the window-material handle and keeps the floating
 //! record control's glass glued to the shared `suramak_glass::float_rect`
 //! (applied on creation, on every resize and after any geometry change).
+//!
+//! M9e: the shell also owns the **quit-veto bridge** — the state AppKit's
+//! `applicationShouldTerminate:` consults (through `suramak-glass`) so Cmd-Q
+//! during a recording can be cancelled and answered in-app.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -13,7 +18,7 @@ use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::window::{Window, WindowAttributes};
 
-use crate::app::{self, AppState};
+use crate::app::{self, AppState, RecordState};
 use crate::framestats::FrameStats;
 use crate::theme::{self, AppTheme};
 use crate::AccessKitEnabler;
@@ -21,6 +26,50 @@ use crate::AccessKitEnabler;
 const WINDOW_TITLE: &str = "Suramak";
 const INITIAL_SIZE: LogicalSize<f64> = LogicalSize::new(1280.0, 800.0);
 const MIN_SIZE: LogicalSize<f64> = LogicalSize::new(900.0, 600.0);
+
+/// M9e (P1-1): the quit-veto bridge.
+///
+/// `live` mirrors the recording state as of the last frame; `pending` records a
+/// vetoed termination. The AppKit delegate callback (installed through
+/// `suramak-glass`) reads `live` and sets `pending` — the app's frame loop
+/// drains `pending` and runs the same quit funnel as the window-close path.
+#[derive(Debug, Default)]
+pub struct QuitVeto {
+    live: AtomicBool,
+    pending: AtomicBool,
+}
+
+impl QuitVeto {
+    /// Keeps the recording state current (called once per frame).
+    pub fn set_live(&self, live: bool) {
+        self.live.store(live, Ordering::SeqCst);
+    }
+
+    /// Takes the pending vetoed-termination flag (one-shot).
+    pub fn take_pending(&self) -> bool {
+        self.pending.swap(false, Ordering::SeqCst)
+    }
+
+    /// The callback `suramak-glass` consults inside AppKit's
+    /// `applicationShouldTerminate:`: `true` cancels the termination so the
+    /// app can show its confirm. Records the request and wakes the loop (the
+    /// egui repaint callback turns into `window.request_redraw()`).
+    pub fn callback(
+        self: &Arc<Self>,
+        ctx: egui::Context,
+    ) -> Box<dyn Fn() -> bool + Send + Sync + 'static> {
+        let veto = Arc::clone(self);
+        Box::new(move || {
+            if veto.live.load(Ordering::SeqCst) {
+                veto.pending.store(true, Ordering::SeqCst);
+                ctx.request_repaint();
+                true
+            } else {
+                false
+            }
+        })
+    }
+}
 
 /// Everything that exists once the event loop resumes: the winit window, the
 /// transparent wgpu surface, and the egui input/render pair.
@@ -40,6 +89,11 @@ pub struct Shell {
     /// glass. `None` on platforms without the macOS material (see
     /// [`apply_glass`]) — the UI then paints its fallback pill.
     glass: Option<suramak_glass::GlassHandle>,
+    /// M9e (P1-1): the quit-veto bridge (see [`QuitVeto`]). Installed into the
+    /// AppKit delegate on macOS; on other platforms it exists but nothing ever
+    /// sets `pending` (there is no menu Quit) — the window-close path handles
+    /// quitting there.
+    pub quit_veto: Arc<QuitVeto>,
     /// The window geometry the float rect was last applied for (physical
     /// width, height, scale-factor bits). The per-frame sync re-applies the
     /// rect whenever this changes — a scale-factor change can arrive without a
@@ -164,6 +218,15 @@ impl Shell {
 
         let glass = apply_glass(&window);
 
+        // M9e (P1-1): install the quit veto (macOS: the AppKit delegate
+        // method; elsewhere a no-op). The callback reads the recording state
+        // and wakes the loop so the confirm paints.
+        let quit_veto = Arc::new(QuitVeto::default());
+        let mut glass = glass;
+        if let Some(handle) = glass.as_mut() {
+            handle.set_terminate_veto(Some(quit_veto.callback(egui_ctx.clone())));
+        }
+
         let mut shell = Self {
             window,
             egui_state,
@@ -177,6 +240,7 @@ impl Shell {
             config,
             app: AppState::new(),
             glass,
+            quit_veto,
             float_applied: None,
             egui_ctx: egui_ctx.clone(),
             surface: init.surface,
@@ -319,6 +383,11 @@ impl Shell {
     }
 
     fn render(&mut self) -> Result<Vec<app::Effect>, wgpu::SurfaceError> {
+        // M9e (P1-1): the AppKit veto reads this flag inside
+        // `applicationShouldTerminate:` — keep it current as of this frame's
+        // state (effects were applied before the frame started).
+        self.quit_veto
+            .set_live(matches!(self.app.record, RecordState::Recording(_)));
         let mut raw_input = self.egui_state.take_egui_input(&self.window);
         // M9b keyboard map: dispatched on the raw input BEFORE egui sees it — a
         // matched shortcut's key event is consumed here, so a focused widget,
@@ -572,4 +641,47 @@ fn apply_glass(window: &Window) -> Option<suramak_glass::GlassHandle> {
 #[cfg(not(target_os = "macos"))]
 fn apply_glass(_window: &Window) -> Option<suramak_glass::GlassHandle> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M9e (P1-1): the veto bridge — the callback vetoes only while a
+    /// recording is live, records the request, and the frame loop takes it
+    /// exactly once. Without a recording the callback answers "proceed"
+    /// (AppKit's `NSTerminateNow` — the pre-M9e behaviour).
+    #[test]
+    fn the_quit_veto_vetoes_only_a_live_recording_and_takes_pending_once() {
+        let ctx = egui::Context::default();
+        // Count the wakes: a veto must ask for a repaint (that is what makes
+        // the confirm paint without any further input).
+        let wakes = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter = Arc::clone(&wakes);
+        ctx.set_request_repaint_callback(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        let veto = Arc::new(QuitVeto::default());
+        let callback = veto.callback(ctx);
+
+        assert!(
+            !callback(),
+            "no recording: the quit proceeds (NSTerminateNow)"
+        );
+        assert!(!veto.take_pending(), "nothing was recorded");
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            0,
+            "a proceeding quit does not wake"
+        );
+
+        veto.set_live(true);
+        assert!(callback(), "live recording: the termination is cancelled");
+        assert!(veto.take_pending(), "the request is recorded");
+        assert!(!veto.take_pending(), "the pending flag is one-shot");
+        assert_eq!(wakes.load(Ordering::SeqCst), 1, "the veto woke the loop");
+
+        veto.set_live(false);
+        assert!(!callback(), "the recording ended: the quit proceeds");
+    }
 }
