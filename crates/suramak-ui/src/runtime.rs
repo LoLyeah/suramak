@@ -150,6 +150,12 @@ impl Runtime {
         polish::polish_config(&self.settings, key_present()).is_ok()
     }
 
+    /// M9a: the persisted appearance setting (`settings.ui.appearance`), which
+    /// the shell resolves against the OS theme and applies live.
+    pub fn appearance(&self) -> suramak_core::settings::Appearance {
+        self.settings.ui.appearance
+    }
+
     /// Outcome of the background polish run, if one finished since the last
     /// poll. Terminal-once, like [`Runtime::download_status`].
     pub fn polish_status(&mut self) -> Option<Result<Vec<Segment>, String>> {

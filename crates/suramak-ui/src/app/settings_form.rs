@@ -5,7 +5,9 @@
 //! [`Effect::SaveSettings`](super::Effect::SaveSettings); `crate::runtime`
 //! applies it (toml write + keychain on macOS/Windows).
 
-use suramak_core::settings::{EngineSetting, LangMode, PolishSettings, RecordSource, Settings};
+use suramak_core::settings::{
+    Appearance, EngineSetting, LangMode, PolishSettings, RecordSource, Settings,
+};
 
 /// Language selector values offered in the UI (PLAN-NOTES §4 — Indonesian needs a
 /// forced language; auto-detect translated it to English).
@@ -85,6 +87,9 @@ pub struct SettingsForm {
     /// Free-text draft for the custom language code; validated on save.
     pub language_draft: String,
     pub keep_audio: bool,
+    /// M9a: System | Light | Dark — persisted as `settings.ui.appearance` and
+    /// applied live by the shell when the form saves.
+    pub appearance: Appearance,
     /// M6: the checked recording sources (canonical order). This is what the
     /// record pipeline reads at start; ≥1 entry is required to save
     /// ([`SettingsForm::sources_problem`]).
@@ -124,6 +129,7 @@ impl SettingsForm {
             language_custom,
             language_draft,
             keep_audio: settings.storage.keep_audio,
+            appearance: settings.ui.appearance,
             sources,
             polish_base_url: settings
                 .polish
@@ -254,6 +260,7 @@ impl SettingsForm {
             settings.asr.language = lang_mode(&code);
         }
         settings.storage.keep_audio = self.keep_audio;
+        settings.ui.appearance = self.appearance;
         if self.sources_problem().is_none() {
             settings.recording.sources = self.sources.clone();
             // The legacy single-source field follows the first entry, so older
@@ -364,10 +371,33 @@ mod tests {
         assert_eq!(form.model_id, "turbo-q5-0");
         assert_eq!(form.language, "auto");
         assert!(!form.keep_audio);
+        assert_eq!(form.appearance, Appearance::System);
         assert_eq!(form.sources, vec![RecordSource::Default]);
         assert!(form.polish_base_url.is_empty() && form.polish_model.is_empty());
         assert!(form.api_key.is_empty(), "the key field always starts empty");
         assert!(!form.dirty);
+    }
+
+    // ---- M9a: appearance (live apply) ---------------------------------------
+
+    #[test]
+    fn appearance_roundtrips_form_settings_file_and_back() {
+        let mut settings = Settings::default();
+        let mut form = SettingsForm::from_settings(&settings);
+        assert_eq!(form.appearance, Appearance::System);
+        for appearance in Appearance::ALL {
+            form.appearance = appearance;
+            form.apply(&mut settings);
+            assert_eq!(settings.ui.appearance, appearance);
+
+            let path = temp_path("appearance");
+            settings.save(&path).expect("save");
+            let reloaded = Settings::load(&path).expect("reload");
+            assert_eq!(reloaded.ui.appearance, appearance, "toml round-trip");
+            let form2 = SettingsForm::from_settings(&reloaded);
+            assert_eq!(form2.appearance, appearance, "the form follows the file");
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
     }
 
     #[test]

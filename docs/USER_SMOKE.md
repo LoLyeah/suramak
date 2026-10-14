@@ -166,6 +166,29 @@ Quit behavior is **owner-verified on the Mac** — the ggml-metal teardown abort
 - **Quit while a job runs**: import a file and Cmd-Q during `transcribing on this machine…`. Expected: same clean exit (no abort/assert); the half-done job is not saved, the app is gone within a moment (the quit waits at most ~¼ s for workers, never for the whole job).
 - **Quit after live transcription**: record >5 s so the live transcript card fills in, Stop, wait for the final transcript, then Cmd-Q. Expected: same clean exit.
 
+## 20. The remade editor — the Deck (M9a)
+
+The shell has been rebuilt (M9 slice 1). The editor now reads as **one** surface system: a **control deck** band under the titlebar — compact transport capsule (skip-to-start, play/pause), the waveform strip, a `mm:ss.mmm / mm:ss.mmm` readout, and one **Export…** button; below it the title line with a quiet **Polish**; the transcript as clean rows (mono timecode gutter; the active segment carries a thin blue edge bar and a faint tint).
+
+- Open a transcript from the library. Expected: **no black bars behind any text anywhere** (that was the old look), the deck spans the pane, the readout ticks as playback runs, and **Export…** opens a small sheet anchored under itself (format chips + destination + Save as…). Clicking outside or leaving the editor closes it.
+- Press play: the playhead moves along the strip and the active-row bar follows. Click or drag the strip to seek.
+- Check the floating pill: it should float over the transcript area in every state — **never** covering the export sheet or any button.
+- The delete affordance sits on the title line (quiet, far right); its in-place confirm is now painted check/cross glyphs (no emoji).
+
+## 21. Appearance: System / Light / Dark (M9a)
+
+- Open **Settings → Appearance**. The Theme control offers *System / Light / Dark* (default **System**).
+- Pick **Light**, press **Save**. Expected: the app flips to light **without a restart** — window material, text, controls and the glass all re-resolve; same with **Dark**.
+- Set it back to **System**, then flip your Mac's appearance (System Settings → Appearance) with the app open. Expected: the app follows **live**, both directions.
+- The choice persists across relaunches.
+
+## 22. Motion (M9a)
+
+- Move between screens (Home ⇄ Editor ⇄ Settings ⇄ Record). Expected: a quick fade with a small rise — no teleports.
+- Start and stop a recording: the floating pill **morphs** between idle and recording forms (label/color crossfade, gentle lift on press).
+- Hover and press controls (buttons, glyphs, transport): subtle fast transitions everywhere; nothing animates forever.
+- With **Reduce Motion** enabled (System Settings → Accessibility → Display), the same actions snap instantly instead of animating.
+
 ## Report
 
 Anything that deviates from an expected result, with: what you did, what happened, what you expected.
@@ -175,5 +198,5 @@ Worth a note even if not fatal:
 - the TCC prompt text you saw, and whether denial produced the actionable message;
 - any recording that came back silent or garbled (device name shown);
 - polish: endpoint used, error text if it failed;
-- window chrome/glass: does the window read as the M1 design (dark, rounded, translucent titlebar band);
+- window chrome/glass: does the window read as the intended glass shell (rounded, translucent), and does it follow your Mac's light/dark (or the Appearance override you set);
 - anything about the app icon.

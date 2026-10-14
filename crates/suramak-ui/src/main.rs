@@ -27,6 +27,7 @@
 
 mod app;
 mod instance;
+mod motion;
 mod runtime;
 mod shell;
 mod shutdown;
@@ -342,12 +343,16 @@ impl App {
         self.apply(effects);
     }
 
-    /// Executes effects through the runtime.
+    /// Executes effects through the runtime, then re-syncs the appearance
+    /// (M9a): a settings save may have changed `settings.ui.appearance`, and
+    /// `sync_appearance` is a no-op unless the resolved theme or the Reduce
+    /// Motion flag actually moved.
     fn apply(&mut self, effects: Vec<Effect>) {
         let (Some(shell), Some(runtime)) = (self.shell.as_mut(), self.runtime.as_mut()) else {
             return;
         };
         runtime.apply(effects, &mut shell.app);
+        shell.sync_appearance(runtime.appearance());
     }
 
     /// Draws one frame and executes what it asked for.
@@ -511,6 +516,9 @@ impl ApplicationHandler for App {
                 }
                 // The settings screen opens on the persisted values (M3).
                 shell.app.settings_form = runtime.settings_form();
+                // M9a: resolve + apply the persisted appearance (System follows
+                // the OS theme; forced modes override) before the first frame.
+                shell.sync_appearance(runtime.appearance());
                 // Polish availability is derived from the settings + key policy (M4).
                 shell.app.polish_configured = runtime.polish_configured();
                 let initial = shell.app.initial_effects();
@@ -520,6 +528,13 @@ impl ApplicationHandler for App {
                     let now = Instant::now();
                     smoke.deadline = Some(now + Duration::from_secs(smoke.secs));
                     smoke.started = Some(now);
+                    // M9a harness: seed a demo recording so the protected
+                    // Record composition can be captured on builds without
+                    // capture (Linux/Xvfb). Smoke modes only — a normal run
+                    // never sees this.
+                    if std::env::var_os("SURAMAK_SMOKE_RECORD").is_some() {
+                        shell.app.seed_demo_recording();
+                    }
                     if let Some(input) = smoke.job.clone() {
                         let effects = shell.app.begin_import(input);
                         runtime.apply(effects, &mut shell.app);
@@ -562,6 +577,14 @@ impl ApplicationHandler for App {
         }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::ThemeChanged(_) => {
+                // M9a: the OS appearance changed — re-resolve (System follows;
+                // forced modes keep their pin) and repaint.
+                if let Some(shell) = &mut self.shell {
+                    let setting = shell.app.appearance;
+                    shell.sync_appearance(setting);
+                }
+            }
             WindowEvent::Resized(size) => {
                 if let Some(shell) = &mut self.shell {
                     shell.resize(size);

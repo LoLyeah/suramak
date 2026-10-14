@@ -36,16 +36,16 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyClass;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{
-    NSAppearance, NSAppearanceCustomization, NSAppearanceNameDarkAqua, NSAutoresizingMaskOptions,
-    NSColor, NSGlassEffectView, NSGlassEffectViewStyle, NSView, NSVisualEffectBlendingMode,
-    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindowOrderingMode,
-    NSWindowStyleMask, NSWindowTitleVisibility,
+    NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
+    NSAutoresizingMaskOptions, NSColor, NSGlassEffectView, NSGlassEffectViewStyle, NSView,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSWindow, NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility, NSWorkspace,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
-use crate::{FloatRect, GlassConfig, GlassError, GlassMode};
+use crate::{FloatRect, GlassConfig, GlassError, GlassMode, ThemeMode};
 
 /// Applies PLAN §1 steps 1–6 and returns the handle that drives the floating
 /// record control's glass (M8.5). Must run on the main thread.
@@ -71,12 +71,9 @@ pub fn apply(window: &Window, config: GlassConfig) -> Result<Handle, GlassError>
     ns_window.setStyleMask(ns_window.styleMask() | NSWindowStyleMask::FullSizeContentView);
     ns_window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
 
-    // M1 placeholder: pin the window to DarkAqua so the static light-on-glass
-    // shell reads the same whatever the user's system appearance is. Revisited
-    // when the real UI lands (M2+).
-    if let Some(dark) = NSAppearance::appearanceNamed(unsafe { NSAppearanceNameDarkAqua }) {
-        ns_window.setAppearance(Some(&dark));
-    }
+    // M9a: the M1 DarkAqua pin is gone — the window keeps no explicit
+    // appearance here and follows the system; `Handle::set_appearance` pins or
+    // clears it live when `settings.ui.appearance` changes.
 
     // Steps 5–6: the material wraps the render surface.
     //
@@ -111,6 +108,8 @@ pub fn apply(window: &Window, config: GlassConfig) -> Result<Handle, GlassError>
                 }),
                 float: None,
                 mtm: Some(mtm),
+                window: Some(ns_window),
+                base: Some(BaseView::Glass(glass)),
             })
         }
         Material::Visual(effect) => {
@@ -121,9 +120,26 @@ pub fn apply(window: &Window, config: GlassConfig) -> Result<Handle, GlassError>
             effect.addSubview(&winit_view);
             winit_view.setAutoresizingMask(resize_both());
             ns_window.setContentView(Some(&effect));
-            Ok(Handle::none())
+            Ok(Handle {
+                placement: None,
+                float: None,
+                mtm: Some(mtm),
+                window: Some(ns_window),
+                base: Some(BaseView::Visual(effect)),
+            })
         }
     }
+}
+
+/// Whether macOS asks for reduced motion (`NSWorkspace` accessibility
+/// preference, M9a). Must run on the main thread; `false` when it cannot be
+/// read (no marker) rather than failing the caller.
+pub fn reduce_motion() -> bool {
+    if MainThreadMarker::new().is_none() {
+        return false;
+    }
+    let workspace = NSWorkspace::sharedWorkspace();
+    workspace.accessibilityDisplayShouldReduceMotion()
 }
 
 /// The handle `suramak-ui` drives the floating record control through (M8.5).
@@ -138,6 +154,18 @@ pub struct Handle {
     float: Option<Retained<NSGlassEffectView>>,
     /// Main-thread token for the lazy creation; `None` in [`Handle::none`].
     mtm: Option<MainThreadMarker>,
+    /// The window the appearance is set on (M9a); `None` when no material was
+    /// applied at all.
+    window: Option<Retained<NSWindow>>,
+    /// The base material view the appearance is also set on (M9a): the glass
+    /// view (macOS 26+) or the `NSVisualEffectView` fallback.
+    base: Option<BaseView>,
+}
+
+/// The base material view, either flavour — only used for appearance pinning.
+enum BaseView {
+    Glass(Retained<NSGlassEffectView>),
+    Visual(Retained<NSVisualEffectView>),
 }
 
 /// The ordered subview list the float glass is inserted into.
@@ -156,6 +184,32 @@ impl Handle {
             placement: None,
             float: None,
             mtm: None,
+            window: None,
+            base: None,
+        }
+    }
+
+    /// Sets (`Light`/`Dark`) or clears (`System`) the window's `NSAppearance`
+    /// on the window, its material container and the base material view — so
+    /// the real blur re-resolves with the forced appearance (M9a).
+    pub fn set_appearance(&mut self, mode: ThemeMode) {
+        let appearance = match mode {
+            ThemeMode::System => None,
+            ThemeMode::Light => NSAppearance::appearanceNamed(unsafe { NSAppearanceNameAqua }),
+            ThemeMode::Dark => NSAppearance::appearanceNamed(unsafe { NSAppearanceNameDarkAqua }),
+        };
+        let appearance = appearance.as_deref();
+        if let Some(window) = &self.window {
+            window.setAppearance(appearance);
+        }
+        if let Some(base) = &self.base {
+            match base {
+                BaseView::Glass(view) => view.setAppearance(appearance),
+                BaseView::Visual(view) => view.setAppearance(appearance),
+            }
+        }
+        if let Some(placement) = &self.placement {
+            placement.host.setAppearance(appearance);
         }
     }
 

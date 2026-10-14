@@ -1,12 +1,17 @@
 //! Models route (M3): the model manager table — manifest rows with install /
 //! encoder state, a default marker, and download / delete / set-default actions.
 //!
+//! M9a: tokens, the unified control system (painted tiers, every state) and the
+//! one navigation pattern (Home, top-right) — the composition is unchanged.
+//!
 //! All decisions live in `app::model_manager` (egui-free, unit-tested); this view
 //! only renders rows and requests effects.
 
 use egui::{pos2, vec2, Align2, CornerRadius, FontFamily, FontId, Rect};
 
-use crate::theme::Palette;
+use crate::app::controls::{self, Tier};
+use crate::motion::Motion;
+use crate::theme::Tokens;
 
 use super::model_manager::{human_size, DownloadState, InstallState, ModelRow};
 use super::views::{pane_caption, pane_title, PANE_PAD_X};
@@ -14,7 +19,13 @@ use super::{AppState, Effect};
 
 const ROW_HEIGHT: f32 = 46.0;
 
-pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &mut Vec<Effect>) {
+pub fn ui(
+    ui: &mut egui::Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    state: &mut AppState,
+    effects: &mut Vec<Effect>,
+) {
     let rect = ui.max_rect();
     let left = rect.left() + PANE_PAD_X;
     let right = rect.right() - PANE_PAD_X;
@@ -22,13 +33,19 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
     ui.horizontal(|ui| {
         ui.add_space(PANE_PAD_X - 8.0);
         ui.vertical(|ui| {
-            pane_title(ui, "Models", palette);
+            pane_title(ui, "Models", tokens);
             pane_caption(
                 ui,
                 "whisper.cpp models — downloaded from HuggingFace, sha256-verified, kept on this machine",
-                palette,
+                tokens,
                 false,
             );
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+            ui.add_space(PANE_PAD_X - 8.0);
+            if controls::nav_home(ui, tokens, motion, "models-nav").clicked() {
+                effects.extend(state.back_home());
+            }
         });
     });
 
@@ -38,11 +55,17 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
             .max_rect(Rect::from_min_size(pos2(left, y), vec2(right - left, 20.0))),
         |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Back").clicked() {
-                    effects.extend(state.back_home());
-                }
-                ui.add_space(6.0);
-                if ui.button("Re-check").clicked() {
+                let recheck = controls::button(
+                    ui,
+                    tokens,
+                    motion,
+                    "models-recheck",
+                    "Re-check",
+                    Tier::Tertiary,
+                    true,
+                )
+                .on_hover_text("Re-read the manifest and the models folder");
+                if recheck.clicked() {
                     effects.push(Effect::RefreshModels);
                 }
             });
@@ -51,7 +74,7 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
     y += 30.0;
 
     // Column header.
-    header_row(ui, palette, y, left, right);
+    header_row(ui, tokens, y, left, right);
     y += 24.0;
 
     let rows = state.model_manager.rows.clone();
@@ -62,7 +85,7 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
                 .max_rect(Rect::from_min_size(pos2(left, y), vec2(right - left, 22.0))),
             |ui| {
                 ui.horizontal(|ui| {
-                    pane_caption(ui, "reading the manifest…", palette, false);
+                    pane_caption(ui, "reading the manifest…", tokens, false);
                 });
             },
         );
@@ -71,7 +94,9 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
         if y + ROW_HEIGHT > rect.bottom() - 40.0 {
             break;
         }
-        model_row(ui, palette, state, effects, row, &download, y, left, right);
+        model_row(
+            ui, tokens, motion, state, effects, row, &download, y, left, right,
+        );
         y += ROW_HEIGHT;
     }
 
@@ -84,18 +109,18 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
             )),
             |ui| {
                 ui.horizontal(|ui| match status {
-                    Ok(note) => pane_caption(ui, note, palette, false),
-                    Err(err) => pane_caption(ui, err, palette, true),
+                    Ok(note) => pane_caption(ui, note, tokens, false),
+                    Err(err) => pane_caption(ui, err, tokens, true),
                 });
             },
         );
     }
 }
 
-fn header_row(ui: &mut egui::Ui, palette: &Palette, y: f32, left: f32, right: f32) {
+fn header_row(ui: &mut egui::Ui, tokens: &Tokens, y: f32, left: f32, right: f32) {
     let painter = ui.painter();
     let font = FontId::new(10.5, FontFamily::Monospace);
-    let dim = palette.text_dim;
+    let dim = tokens.ink_soft;
     painter.text(
         pos2(left + 4.0, y),
         Align2::LEFT_TOP,
@@ -136,7 +161,8 @@ fn header_row(ui: &mut egui::Ui, palette: &Palette, y: f32, left: f32, right: f3
 #[allow(clippy::too_many_arguments)]
 fn model_row(
     ui: &mut egui::Ui,
-    palette: &Palette,
+    tokens: &Tokens,
+    motion: &Motion,
     state: &mut AppState,
     effects: &mut Vec<Effect>,
     row: &ModelRow,
@@ -147,7 +173,13 @@ fn model_row(
 ) {
     let rect = Rect::from_min_size(pos2(left, y), vec2(right - left, ROW_HEIGHT - 4.0));
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(6), palette.card);
+    painter.rect_filled(rect, CornerRadius::same(tokens.radius.row), tokens.card);
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(tokens.radius.row),
+        egui::Stroke::new(tokens.stroke.hairline, tokens.hairline),
+        egui::StrokeKind::Inside,
+    );
 
     let mono = FontId::new(12.0, FontFamily::Monospace);
     let small = FontId::new(11.0, FontFamily::Monospace);
@@ -156,26 +188,26 @@ fn model_row(
         Align2::LEFT_TOP,
         row.id,
         mono.clone(),
-        palette.text,
+        tokens.ink,
     );
     painter.text(
         pos2(left + 10.0, y + 24.0),
         Align2::LEFT_TOP,
         row.role,
         FontId::new(10.0, FontFamily::Proportional),
-        palette.text_dim,
+        tokens.ink_soft,
     );
     painter.text(
         pos2(left + 120.0, y + 8.0),
         Align2::LEFT_TOP,
         human_size(row.size_bytes),
         small.clone(),
-        palette.text_dim,
+        tokens.ink_soft,
     );
     let install_color = match row.install {
-        InstallState::Installed => palette.text,
-        InstallState::Partial => palette.accent,
-        InstallState::Missing => palette.text_dim,
+        InstallState::Installed => tokens.ink,
+        InstallState::Partial => tokens.accent,
+        InstallState::Missing => tokens.ink_soft,
     };
     painter.text(
         pos2(left + 200.0, y + 8.0),
@@ -189,7 +221,7 @@ fn model_row(
         Align2::LEFT_TOP,
         row.encoder.label(),
         small.clone(),
-        palette.text_dim,
+        tokens.ink_soft,
     );
     if row.is_default {
         painter.text(
@@ -197,7 +229,7 @@ fn model_row(
             Align2::LEFT_TOP,
             "● default",
             small.clone(),
-            palette.accent,
+            tokens.accent,
         );
     }
 
@@ -215,11 +247,11 @@ fn model_row(
                 (*bytes_done as f32 / *bytes_total as f32).clamp(0.0, 1.0)
             };
             let bar = Rect::from_min_size(pos2(left + 220.0, y + 27.0), vec2(260.0, 6.0));
-            painter.rect_filled(bar, CornerRadius::same(3), palette.pane);
+            painter.rect_filled(bar, CornerRadius::same(3), tokens.panel_faint);
             painter.rect_filled(
                 Rect::from_min_size(bar.min, vec2(bar.width() * fraction, bar.height())),
                 CornerRadius::same(3),
-                palette.accent,
+                tokens.accent,
             );
             painter.text(
                 pos2(bar.right() + 8.0, y + 24.0),
@@ -231,7 +263,7 @@ fn model_row(
                     human_size(*bytes_total)
                 ),
                 small.clone(),
-                palette.text_dim,
+                tokens.ink_soft,
             );
         }
     }
@@ -244,27 +276,42 @@ fn model_row(
     let mut default_clicked = false;
     ui.scope_builder(egui::UiBuilder::new().max_rect(actions), |ui| {
         ui.horizontal(|ui| {
-            ui.add_enabled_ui(
+            let download = controls::button(
+                ui,
+                tokens,
+                motion,
+                ("model-download", row.id),
+                "Download",
+                Tier::Secondary,
                 row.install != InstallState::Installed && !downloaded,
-                |ui| {
-                    if ui.button("Download").clicked() {
-                        download_clicked = true;
-                    }
-                },
             );
-            ui.add_enabled_ui(row.install != InstallState::Missing && !downloaded, |ui| {
-                if ui.button("Delete").clicked() {
-                    delete_clicked = true;
-                }
-            });
-            ui.add_enabled_ui(
+            if download.clicked() {
+                download_clicked = true;
+            }
+            let delete = controls::button(
+                ui,
+                tokens,
+                motion,
+                ("model-delete", row.id),
+                "Delete",
+                Tier::Tertiary,
+                row.install != InstallState::Missing && !downloaded,
+            );
+            if delete.clicked() {
+                delete_clicked = true;
+            }
+            let set_default = controls::button(
+                ui,
+                tokens,
+                motion,
+                ("model-default", row.id),
+                "Set default",
+                Tier::Tertiary,
                 row.install == InstallState::Installed && !row.is_default && !downloaded,
-                |ui| {
-                    if ui.button("Set default").clicked() {
-                        default_clicked = true;
-                    }
-                },
             );
+            if set_default.clicked() {
+                default_clicked = true;
+            }
         });
     });
     if download_clicked {

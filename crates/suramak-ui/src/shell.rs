@@ -7,12 +7,13 @@
 use std::sync::Arc;
 
 use egui_wgpu::wgpu;
+use suramak_core::settings::Appearance;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowAttributes};
 
 use crate::app::{self, AppState};
-use crate::theme;
+use crate::theme::{self, AppTheme};
 
 const WINDOW_TITLE: &str = "Suramak";
 const INITIAL_SIZE: LogicalSize<f64> = LogicalSize::new(1280.0, 800.0);
@@ -117,7 +118,9 @@ impl Shell {
         );
 
         theme::install_fonts(egui_ctx);
-        egui_ctx.set_theme(egui::ThemePreference::Dark);
+        // A sane first ladder before `sync_appearance` runs (it resolves the
+        // persisted appearance against the OS theme right after startup).
+        theme::install(egui_ctx, AppTheme::Dark, false);
 
         // Wake the winit loop for egui-side repaint requests (worker events
         // arrive on the bridge thread and call `Context::request_repaint`).
@@ -172,6 +175,49 @@ impl Shell {
         // Applied immediately; the next frame's sync re-applies it with settled
         // AppKit bounds in case the views had not caught up with the resize yet.
         self.apply_float_rect();
+    }
+
+    /// M9a: resolve the effective appearance and apply it everywhere it
+    /// matters — the egui token visuals, the macOS window + glass material
+    /// (`suramak-glass::set_appearance`), and the Reduce Motion policy.
+    ///
+    /// `System` follows the OS theme live (winit `Window::theme()`; Linux
+    /// System → Light is pinned in [`theme::effective_theme`]); forced modes
+    /// override. Cheap and idempotent — called at startup, on
+    /// `WindowEvent::ThemeChanged` and after every effect batch (a settings
+    /// save lands through the same path); it only touches anything when the
+    /// resolved theme or the Reduce Motion flag actually changed.
+    pub fn sync_appearance(&mut self, setting: Appearance) {
+        let system = match self.window.theme() {
+            Some(winit::window::Theme::Light) => Some(theme::SystemTheme::Light),
+            Some(winit::window::Theme::Dark) => Some(theme::SystemTheme::Dark),
+            None => None,
+        };
+        let effective = theme::effective_theme(setting, system);
+        // Read on the main thread; the settings screen's open/apply moments are
+        // exactly when this runs (startup, settings save, system theme change).
+        let reduce = suramak_glass::reduce_motion();
+        self.app.appearance = setting;
+        if effective == self.app.theme && reduce == self.app.reduce_motion {
+            return;
+        }
+        self.app.theme = effective;
+        self.app.reduce_motion = reduce;
+        theme::install(&self.egui_ctx, effective, reduce);
+        if let Some(glass) = self.glass.as_mut() {
+            glass.set_appearance(match setting {
+                Appearance::System => suramak_glass::ThemeMode::System,
+                Appearance::Light => suramak_glass::ThemeMode::Light,
+                Appearance::Dark => suramak_glass::ThemeMode::Dark,
+            });
+        }
+        tracing::info!(
+            setting = ?setting,
+            effective = ?effective,
+            reduce_motion = reduce,
+            "appearance applied"
+        );
+        self.window.request_redraw();
     }
 
     /// Re-applies the floating control's rect whenever the window's logical

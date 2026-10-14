@@ -38,7 +38,7 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::UI::Controls::MARGINS;
 use winit::window::Window;
 
-use crate::{FloatRect, GlassConfig, GlassError, GlassMode, WindowsBackdrop};
+use crate::{FloatRect, GlassConfig, GlassError, GlassMode, ThemeMode, WindowsBackdrop};
 
 /// The Windows handle: DWM materials only; no floating glass (the UI's painted
 /// pill is the fallback — M8.5).
@@ -52,6 +52,12 @@ impl Handle {
     pub fn float_glass_available(&self) -> bool {
         false
     }
+
+    /// No-op (M9a, compile-checked only like the rest of this file): the
+    /// immersive-dark-mode attribute is set once at `apply`; live appearance
+    /// switching on Windows is not wired up and is documented in the M9a
+    /// report. The app's own token ladder still carries light/dark.
+    pub fn set_appearance(&mut self, _mode: ThemeMode) {}
 }
 
 /// Applies the DWM backdrop, immersive dark mode and frame extension to `window`.

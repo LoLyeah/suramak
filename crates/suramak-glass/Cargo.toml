@@ -20,6 +20,7 @@ objc2-app-kit = { version = "0.3.1", features = [
     "NSView",
     "NSVisualEffectView",
     "NSWindow",
+    "NSWorkspace",       # M9a: accessibilityDisplayShouldReduceMotion
     "NSGlassEffectView", # typed wrapper (objc2-app-kit 0.3.2+, PLAN-NOTES §2); gated behind a runtime AnyClass check
     "NSGraphics",        # NSWindowOrderingMode — the float glass is ordered below the render surface (M8.5)
     "objc2-core-foundation", # CGFloat — the float glass's corner radius (M8.5)

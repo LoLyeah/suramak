@@ -1,17 +1,23 @@
 //! Home route: the drop zone (idle state), the import affordance and the recent
 //! recordings list bound to the store.
 //!
+//! M9a: composition unchanged (protect list) — tokens, the unified control
+//! system and the motion system only. The drop zone wears the one card recipe;
+//! the buttons are painted controls; rows crossfade their hover wash.
+//!
 //! Import paths: winit `WindowEvent::DroppedFile` (all platforms, handled in
 //! `main.rs`) plus — on macOS/Windows — an rfd open dialog; on Linux (rfd is
 //! deliberately not a dependency there) the path field + Enter.
 
 use std::path::PathBuf;
 
-use egui::{pos2, vec2, Align2, CornerRadius, FontFamily, FontId, Rect, Stroke, StrokeKind};
+use egui::{pos2, vec2, Align2, CornerRadius, FontFamily, FontId, Rect};
 
-use crate::theme::Palette;
+use crate::app::controls::{self, Tier};
+use crate::motion::{self, Motion};
+use crate::theme::{self, Tokens};
 
-use super::views::{pane_caption, pane_title, PANE_PAD_X};
+use super::views::{paint_card, pane_caption, pane_title, PANE_PAD_X};
 use super::{AppState, Effect};
 
 /// macOS/Windows: native open dialog (rfd). Linux: `None` — the path field is
@@ -37,7 +43,13 @@ fn pick_media_file() -> Option<PathBuf> {
 /// Whether this build offers the native "Choose file…" dialog.
 const HAS_NATIVE_DIALOG: bool = cfg!(any(target_os = "macos", target_os = "windows"));
 
-pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &mut Vec<Effect>) {
+pub fn ui(
+    ui: &mut egui::Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    state: &mut AppState,
+    effects: &mut Vec<Effect>,
+) {
     let rect = ui.max_rect();
     let left = rect.left() + PANE_PAD_X;
     let right = rect.right() - PANE_PAD_X;
@@ -45,18 +57,18 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
     ui.horizontal(|ui| {
         ui.add_space(PANE_PAD_X - 8.0);
         ui.vertical(|ui| {
-            pane_title(ui, "New transcription", palette);
+            pane_title(ui, "New transcription", tokens);
             pane_caption(
                 ui,
                 "Drop an audio or video file anywhere in this window, or import one below.",
-                palette,
+                tokens,
                 false,
             );
             if !state.capture_available {
                 pane_caption(
                     ui,
                     "Recording is not compiled into this build (feature `capture`) — import or drop audio or video files instead.",
-                    palette,
+                    tokens,
                     false,
                 );
             }
@@ -67,13 +79,24 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
     let zone_top = rect.top() + 84.0;
     let zone = Rect::from_min_size(pos2(left, zone_top), vec2(right - left, 168.0));
     let painter = ui.painter();
-    painter.rect_filled(zone, CornerRadius::same(10), palette.card);
-    let border = if state.home.drop_hover {
-        Stroke::new(1.6_f32, palette.accent)
-    } else {
-        Stroke::new(1.0_f32, palette.hairline)
-    };
-    painter.rect_stroke(zone, CornerRadius::same(10), border, StrokeKind::Inside);
+    paint_card(painter, zone, tokens);
+    // The hover ring crossfades with the fast token and scales in from a
+    // slightly inset rect (no instant stroke swap — critique P1-3).
+    let ring = motion.factor(
+        ui.ctx(),
+        egui::Id::new("suramak-drop-ring"),
+        state.home.drop_hover,
+        motion::FAST,
+    );
+    if ring > 0.01 {
+        let inset = motion::scale(ring, 4.0, 0.0);
+        painter.rect_stroke(
+            zone.shrink(inset),
+            CornerRadius::same(tokens.radius.card),
+            egui::Stroke::new(tokens.stroke.strong, tokens.accent.gamma_multiply(ring)),
+            egui::StrokeKind::Inside,
+        );
+    }
     painter.text(
         pos2(zone.center().x, zone.center().y - 12.0),
         Align2::CENTER_CENTER,
@@ -82,15 +105,15 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
         } else {
             "Drop a file here"
         },
-        FontId::new(24.0, crate::theme::serif_family()),
-        palette.text,
+        FontId::new(24.0, theme::serif_family()),
+        tokens.ink,
     );
     painter.text(
         pos2(zone.center().x, zone.center().y + 20.0),
         Align2::CENTER_CENTER,
         "wav · mp3 · m4a · flac · ogg · mp4 · mov · m4v · mkv — transcribed on this machine, never uploaded",
         FontId::new(12.0, FontFamily::Proportional),
-        palette.text_dim,
+        tokens.ink_soft,
     );
 
     // ---- import affordance --------------------------------------------------
@@ -102,22 +125,44 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
         )),
         |ui| {
             ui.horizontal(|ui| {
-                if HAS_NATIVE_DIALOG && ui.button("Choose file…").clicked() {
-                    if let Some(path) = pick_media_file() {
-                        effects.extend(state.begin_import(path));
+                if HAS_NATIVE_DIALOG {
+                    let choose = controls::button(
+                        ui,
+                        tokens,
+                        motion,
+                        "home-choose",
+                        "Choose file…",
+                        Tier::Secondary,
+                        true,
+                    );
+                    if choose.clicked() {
+                        if let Some(path) = pick_media_file() {
+                            effects.extend(state.begin_import(path));
+                        }
                     }
+                    ui.add_space(tokens.space.xs);
                 }
-                let field_width =
-                    ui.available_width() - if HAS_NATIVE_DIALOG { 84.0 } else { 96.0 };
+                let reserved = if HAS_NATIVE_DIALOG { 100.0 } else { 112.0 };
+                let field_width = (ui.available_width() - reserved).max(120.0);
                 let response = ui.add_sized(
-                    [field_width.max(120.0), 24.0],
+                    [field_width, 24.0],
                     egui::TextEdit::singleline(&mut state.home.path_field)
-                        .hint_text("path to an audio or video file — press Enter to import"),
+                        .hint_text("path to an audio or video file — press Enter to import")
+                        .text_color(tokens.ink),
                 );
                 let submitted =
                     response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                let clicked = ui.button("Import").clicked();
-                if submitted || clicked {
+                ui.add_space(tokens.space.xs);
+                let import = controls::button(
+                    ui,
+                    tokens,
+                    motion,
+                    "home-import",
+                    "Import",
+                    Tier::Secondary,
+                    true,
+                );
+                if submitted || import.clicked() {
                     effects.extend(state.import_from_field());
                 }
             });
@@ -128,7 +173,7 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.add_space(PANE_PAD_X - 8.0);
-            pane_caption(ui, error, palette, true);
+            pane_caption(ui, error, tokens, true);
         });
     }
 
@@ -141,10 +186,28 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
         )),
         |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Models").clicked() {
+                let models = controls::button(
+                    ui,
+                    tokens,
+                    motion,
+                    "home-models",
+                    "Models",
+                    Tier::Secondary,
+                    true,
+                );
+                if models.clicked() {
                     effects.extend(state.open_models());
                 }
-                if ui.button("Settings").clicked() {
+                let settings = controls::button(
+                    ui,
+                    tokens,
+                    motion,
+                    "home-settings",
+                    "Settings",
+                    Tier::Secondary,
+                    true,
+                );
+                if settings.clicked() {
                     effects.extend(state.open_settings());
                 }
             });
@@ -160,7 +223,7 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
             )),
             |ui| {
                 ui.horizontal(|ui| {
-                    pane_caption(ui, &status.text, palette, status.error);
+                    pane_caption(ui, &status.text, tokens, status.error);
                 });
             },
         );
@@ -175,15 +238,15 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
         )),
         |ui| {
             ui.vertical(|ui| {
-                super::views::section_title(ui, "Recent recordings", palette);
+                super::views::section_title(ui, "Recent recordings", tokens);
                 ui.add_space(6.0);
                 if let Some(error) = &state.library.error {
-                    pane_caption(ui, error, palette, true);
+                    pane_caption(ui, error, tokens, true);
                 } else if state.library.items.is_empty() {
                     pane_caption(
                         ui,
                         "Nothing yet — your transcriptions will appear here.",
-                        palette,
+                        tokens,
                         false,
                     );
                 } else {
@@ -202,7 +265,7 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
                                         ),
                                     )
                                 };
-                                if recording_row(ui, &title, &meta, palette) {
+                                if recording_row(ui, tokens, motion, index, &title, &meta) {
                                     effects.extend(state.select_library(index));
                                 }
                             }
@@ -214,27 +277,46 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
 }
 
 /// One clickable recording row (title + meta). Returns true when clicked.
-pub fn recording_row(ui: &mut egui::Ui, title: &str, meta: &str, palette: &Palette) -> bool {
+pub fn recording_row(
+    ui: &mut egui::Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    index: usize,
+    title: &str,
+    meta: &str,
+) -> bool {
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), 40.0), egui::Sense::click());
-    let hovered = response.hovered();
+    let hover = motion.factor(
+        ui.ctx(),
+        egui::Id::new(("suramak-home-row-hover", index)),
+        response.hovered(),
+        motion::FAST,
+    );
     let painter = ui.painter();
-    if hovered {
-        painter.rect_filled(rect, CornerRadius::same(6), palette.row_selected);
+    if hover > 0.01 {
+        painter.rect_filled(
+            rect,
+            CornerRadius::same(tokens.radius.row),
+            motion::tint_over(egui::Color32::TRANSPARENT, tokens.surface_hover, hover),
+        );
     }
     painter.text(
         pos2(rect.left() + 10.0, rect.top() + 5.0),
         Align2::LEFT_TOP,
         title,
         FontId::new(13.0, FontFamily::Proportional),
-        palette.text,
+        tokens.ink,
     );
     painter.text(
         pos2(rect.left() + 10.0, rect.top() + 22.0),
         Align2::LEFT_TOP,
         meta,
         FontId::new(11.0, FontFamily::Proportional),
-        palette.text_dim,
+        tokens.ink_soft,
     );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     response.clicked()
 }

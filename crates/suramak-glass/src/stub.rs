@@ -8,7 +8,7 @@
 
 use winit::window::Window;
 
-use crate::{FloatRect, GlassConfig, GlassError};
+use crate::{FloatRect, GlassConfig, GlassError, ThemeMode};
 
 /// The Linux handle: no material, no floating glass — every call is a no-op.
 pub struct Handle;
@@ -21,6 +21,10 @@ impl Handle {
     pub fn float_glass_available(&self) -> bool {
         false
     }
+
+    /// No-op (M9a): no AppKit appearance exists here; the app's own token
+    /// ladder carries light/dark on this platform.
+    pub fn set_appearance(&mut self, _mode: ThemeMode) {}
 }
 
 /// Does nothing, always succeeds.

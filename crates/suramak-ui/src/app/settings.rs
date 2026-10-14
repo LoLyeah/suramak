@@ -1,18 +1,23 @@
-//! Settings route (M3; M6 multi-source list): engine, default model/language,
-//! keep_audio + the **checkbox list of recording inputs** (devices, system
-//! audio, "Only an app…" with its running-audio-process picker), the recordings
-//! folder, and the polish section (base URL / model / keychain key).
+//! Settings route (M3; M6 multi-source list; M9a appearance row): engine,
+//! default model/language, **appearance (System | Light | Dark)**, keep_audio +
+//! the checkbox list of recording inputs (devices, system audio, "Only an
+//! app…" with its running-audio-process picker), the recordings folder, and the
+//! polish section (base URL / model / keychain key).
 //!
 //! All form rules live in `app::settings_form` (egui-free, unit-tested); this view
 //! edits that form and asks the runtime to persist it (`Effect::SaveSettings`).
+//! M9a: painted controls, the one navigation pattern (Home, top-right) and the
+//! tokens; the appearance is applied live when the form saves (no restart).
 
 use egui::{pos2, vec2, Align2, FontFamily, FontId, Rect};
 
 use suramak_asr::capture::AudioProcessInfo;
 use suramak_core::models as core_models;
-use suramak_core::settings::{EngineSetting, RecordSource};
+use suramak_core::settings::{Appearance, EngineSetting, RecordSource};
 
-use crate::theme::Palette;
+use crate::app::controls::{self, Tier};
+use crate::motion::Motion;
+use crate::theme::Tokens;
 
 use super::settings_form::{self, SettingsForm, LANGUAGES};
 use super::views::{pane_caption, pane_title, PANE_PAD_X};
@@ -24,7 +29,13 @@ const SYSTEM_AUDIO_OFFERED: bool = cfg!(target_os = "macos");
 const ROW_H: f32 = 26.0;
 const LABEL_W: f32 = 150.0;
 
-pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &mut Vec<Effect>) {
+pub fn ui(
+    ui: &mut egui::Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    state: &mut AppState,
+    effects: &mut Vec<Effect>,
+) {
     let rect = ui.max_rect();
     let left = rect.left() + PANE_PAD_X;
     let right = rect.right() - PANE_PAD_X;
@@ -32,13 +43,19 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
     ui.horizontal(|ui| {
         ui.add_space(PANE_PAD_X - 8.0);
         ui.vertical(|ui| {
-            pane_title(ui, "Settings", palette);
+            pane_title(ui, "Settings", tokens);
             pane_caption(
                 ui,
                 "Everything is stored locally (settings.toml); nothing here leaves this machine except model downloads and polish calls",
-                palette,
+                tokens,
                 false,
             );
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+            ui.add_space(PANE_PAD_X - 8.0);
+            if controls::nav_home(ui, tokens, motion, "settings-nav").clicked() {
+                effects.extend(state.back_home());
+            }
         });
     });
 
@@ -54,10 +71,12 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
     let mut dirty = false;
     {
         let form = &mut state.settings_form;
-        dirty |= transcription_section(ui, palette, form, left, right, &mut y);
+        dirty |= transcription_section(ui, tokens, form, left, right, &mut y);
+        dirty |= appearance_section(ui, tokens, motion, form, left, right, &mut y);
         dirty |= audio_source_section(
             ui,
-            palette,
+            tokens,
+            motion,
             form,
             &devices,
             device_error.as_deref(),
@@ -69,21 +88,36 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
             right,
             &mut y,
         );
-        dirty |= polish_section(ui, palette, form, left, right, &mut y);
+        dirty |= polish_section(ui, tokens, form, left, right, &mut y);
     }
 
     // ---- actions ------------------------------------------------------------
     let actions = Rect::from_min_size(pos2(left, y + 8.0), vec2(right - left, 62.0));
     ui.scope_builder(egui::UiBuilder::new().max_rect(actions), |ui| {
         ui.horizontal(|ui| {
-            if ui.button("Back").clicked() {
-                effects.extend(state.back_home());
-            }
-            ui.add_space(6.0);
-            if ui.button("Save").clicked() {
+            let save = controls::button(
+                ui,
+                tokens,
+                motion,
+                "settings-save",
+                "Save",
+                Tier::Primary,
+                true,
+            );
+            if save.clicked() {
                 effects.extend(state.save_settings());
             }
-            if ui.button("Reset to defaults").clicked() {
+            ui.add_space(6.0);
+            let reset = controls::button(
+                ui,
+                tokens,
+                motion,
+                "settings-reset",
+                "Reset to defaults",
+                Tier::Tertiary,
+                true,
+            );
+            if reset.clicked() {
                 state.reset_settings_form();
             }
         });
@@ -91,11 +125,11 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
         ui.horizontal(|ui| {
             if let Some(status) = &state.settings_form.status {
                 match status {
-                    Ok(note) => pane_caption(ui, note, palette, false),
-                    Err(err) => pane_caption(ui, err, palette, true),
+                    Ok(note) => pane_caption(ui, note, tokens, false),
+                    Err(err) => pane_caption(ui, err, tokens, true),
                 }
             } else if dirty {
-                pane_caption(ui, "unsaved changes — press Save", palette, false);
+                pane_caption(ui, "unsaved changes — press Save", tokens, false);
             }
         });
     });
@@ -105,17 +139,17 @@ pub fn ui(ui: &mut egui::Ui, palette: &Palette, state: &mut AppState, effects: &
 /// Returns whether the user changed something.
 fn transcription_section(
     ui: &mut egui::Ui,
-    palette: &Palette,
+    tokens: &Tokens,
     form: &mut SettingsForm,
     left: f32,
     right: f32,
     y: &mut f32,
 ) -> bool {
     let mut dirty = false;
-    section(ui, palette, left, y, "Transcription");
+    section(ui, tokens, left, y, "Transcription");
 
     // Engine.
-    label(ui, palette, left, *y, "Engine");
+    label(ui, tokens, left, *y, "Engine");
     inside(ui, left, right, *y, |ui| {
         for (setting, name) in [
             (EngineSetting::Auto, "auto"),
@@ -134,7 +168,7 @@ fn transcription_section(
     *y += ROW_H;
 
     // Default model.
-    label(ui, palette, left, *y, "Default model");
+    label(ui, tokens, left, *y, "Default model");
     let current = form.model_id.clone();
     let mut chosen = current.clone();
     inside(ui, left, right, *y, |ui| {
@@ -149,7 +183,7 @@ fn transcription_section(
             pane_caption(
                 ui,
                 "not a manifest id — treated as a file path at transcribe time",
-                palette,
+                tokens,
                 false,
             );
         }
@@ -163,7 +197,7 @@ fn transcription_section(
     // Default language: the presets plus a free-text "Custom…" entry (M4.5).
     // The value that persists is whatever `settings_form` validates; an invalid
     // draft is refused there and only the inline hint shows it here.
-    label(ui, palette, left, *y, "Default language");
+    label(ui, tokens, left, *y, "Default language");
     let mut custom_clicked = false;
     inside(ui, left, right, *y, |ui| {
         for value in LANGUAGES {
@@ -184,7 +218,9 @@ fn transcription_section(
         if form.language_custom {
             let response = ui.add_sized(
                 [110.0, 22.0],
-                egui::TextEdit::singleline(&mut form.language_draft).hint_text("es, jv…"),
+                egui::TextEdit::singleline(&mut form.language_draft)
+                    .hint_text("es, jv…")
+                    .text_color(tokens.ink),
             );
             if response.changed() {
                 dirty = true;
@@ -206,13 +242,13 @@ fn transcription_section(
     if form.language_custom {
         inside(ui, left, right, *y, |ui| {
             let (hint, error) = form.language_hint();
-            pane_caption(ui, &hint, palette, error);
+            pane_caption(ui, &hint, tokens, error);
         });
         *y += 22.0;
     }
 
     // keep_audio.
-    label(ui, palette, left, *y, "Keep recordings");
+    label(ui, tokens, left, *y, "Keep recordings");
     inside(ui, left, right, *y, |ui| {
         if ui
             .checkbox(&mut form.keep_audio, "keep audio after transcription")
@@ -224,7 +260,7 @@ fn transcription_section(
     *y += ROW_H;
 
     // Recordings folder display.
-    label(ui, palette, left, *y, "Recordings folder");
+    label(ui, tokens, left, *y, "Recordings folder");
     let recordings = suramak_core::paths::recordings_dir()
         .map(|dir| dir.display().to_string())
         .unwrap_or_else(|_| "unavailable".to_string());
@@ -239,10 +275,57 @@ fn transcription_section(
             egui::RichText::new(text)
                 .family(FontFamily::Monospace)
                 .size(11.5)
-                .color(palette.text_dim),
+                .color(tokens.ink_soft),
         );
     });
     *y += ROW_H + 8.0;
+    dirty
+}
+
+/// M9a appearance: System (follows the OS live) | Light | Dark, as a segmented
+/// control. Applied when the form saves — no restart.
+fn appearance_section(
+    ui: &mut egui::Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    form: &mut SettingsForm,
+    left: f32,
+    right: f32,
+    y: &mut f32,
+) -> bool {
+    let mut dirty = false;
+    section(ui, tokens, left, y, "Appearance");
+
+    label(ui, tokens, left, *y, "Theme");
+    inside(ui, left, right, *y, |ui| {
+        let mut appearance = form.appearance;
+        let options: Vec<(Appearance, &str)> = Appearance::ALL
+            .iter()
+            .map(|option| (*option, option.label()))
+            .collect();
+        if controls::segmented(
+            ui,
+            tokens,
+            motion,
+            "settings-appearance",
+            &mut appearance,
+            &options,
+        ) {
+            form.appearance = appearance;
+            dirty = true;
+        }
+    });
+    *y += ROW_H;
+
+    inside(ui, left, right, *y, |ui| {
+        pane_caption(
+            ui,
+            "System follows the macOS light/dark setting live; Light or Dark forces this app's appearance. Applied when you press Save.",
+            tokens,
+            false,
+        );
+    });
+    *y += 24.0;
     dirty
 }
 
@@ -253,7 +336,8 @@ fn transcription_section(
 #[allow(clippy::too_many_arguments)]
 fn audio_source_section(
     ui: &mut egui::Ui,
-    palette: &Palette,
+    tokens: &Tokens,
+    motion: &Motion,
     form: &mut SettingsForm,
     devices: &[String],
     device_error: Option<&str>,
@@ -266,14 +350,14 @@ fn audio_source_section(
     y: &mut f32,
 ) -> bool {
     let mut dirty = false;
-    section(ui, palette, left, y, "Audio sources");
+    section(ui, tokens, left, y, "Audio sources");
 
-    label(ui, palette, left, *y, "Inputs");
+    label(ui, tokens, left, *y, "Inputs");
     inside(ui, left, right, *y, |ui| {
         pane_caption(
             ui,
             "pick one or more — everything ticked is recorded together into one 16 kHz recording",
-            palette,
+            tokens,
             false,
         );
     });
@@ -335,7 +419,8 @@ fn audio_source_section(
             let apps = apps.to_vec();
             dirty |= app_picker(
                 ui,
-                palette,
+                tokens,
+                motion,
                 form,
                 processes,
                 processes_error,
@@ -358,7 +443,7 @@ fn audio_source_section(
             )),
             |ui| {
                 ui.horizontal(|ui| {
-                    pane_caption(ui, &problem, palette, true);
+                    pane_caption(ui, &problem, tokens, true);
                 });
             },
         );
@@ -374,12 +459,12 @@ fn audio_source_section(
         |ui| {
             ui.horizontal(|ui| {
                 if let Some(error) = device_error {
-                    pane_caption(ui, &format!("input devices: {error}"), palette, true);
+                    pane_caption(ui, &format!("input devices: {error}"), tokens, true);
                 } else if devices.is_empty() {
                     pane_caption(
                         ui,
                         "no input devices enumerated — the default entry still opens the system default input",
-                        palette,
+                        tokens,
                         false,
                     );
                 } else {
@@ -389,7 +474,7 @@ fn audio_source_section(
                             "{} input device(s) enumerated (virtual loopback devices like BlackHole appear here)",
                             devices.len()
                         ),
-                        palette,
+                        tokens,
                         false,
                     );
                 }
@@ -399,7 +484,7 @@ fn audio_source_section(
                     pane_caption(
                         ui,
                         "recording is not compiled into this build (feature `capture`) — the input list is read-only",
-                        palette,
+                        tokens,
                         true,
                     );
                 });
@@ -440,7 +525,8 @@ fn source_checkbox(
 #[allow(clippy::too_many_arguments)]
 fn app_picker(
     ui: &mut egui::Ui,
-    palette: &Palette,
+    tokens: &Tokens,
+    motion: &Motion,
     form: &mut SettingsForm,
     processes: &[AudioProcessInfo],
     processes_error: Option<&str>,
@@ -464,10 +550,19 @@ fn app_picker(
                 pane_caption(
                     ui,
                     "the tap captures only the ticked apps (a stereo mixdown of exactly those processes)",
-                    palette,
+                    tokens,
                     false,
                 );
-                if ui.small_button("Refresh").clicked() {
+                let refresh = controls::button(
+                    ui,
+                    tokens,
+                    motion,
+                    "settings-refresh-apps",
+                    "Refresh",
+                    Tier::Tertiary,
+                    true,
+                );
+                if refresh.clicked() {
                     effects.push(Effect::RefreshAudioProcesses);
                 }
             });
@@ -486,7 +581,7 @@ fn app_picker(
                     pane_caption(
                         ui,
                         &format!("running audio processes: {error}"),
-                        palette,
+                        tokens,
                         true,
                     );
                 });
@@ -504,7 +599,7 @@ fn app_picker(
                     pane_caption(
                         ui,
                         "no app is producing audio right now — start playback, then Refresh",
-                        palette,
+                        tokens,
                         false,
                     );
                 });
@@ -559,21 +654,22 @@ fn process_label(process: &AudioProcessInfo) -> String {
 /// Polish section: base URL / model / keychain key (macOS/Windows only).
 fn polish_section(
     ui: &mut egui::Ui,
-    palette: &Palette,
+    tokens: &Tokens,
     form: &mut SettingsForm,
     left: f32,
     right: f32,
     y: &mut f32,
 ) -> bool {
     let mut dirty = false;
-    section(ui, palette, left, y, "Polish (LLM tidy-up)");
+    section(ui, tokens, left, y, "Polish (LLM tidy-up)");
 
-    label(ui, palette, left, *y, "Base URL");
+    label(ui, tokens, left, *y, "Base URL");
     inside(ui, left, right, *y, |ui| {
         let response = ui.add_sized(
             [360.0, 22.0],
             egui::TextEdit::singleline(&mut form.polish_base_url)
-                .hint_text(settings_form::DEFAULT_POLISH_BASE_URL),
+                .hint_text(settings_form::DEFAULT_POLISH_BASE_URL)
+                .text_color(tokens.ink),
         );
         if response.changed() {
             dirty = true;
@@ -581,11 +677,13 @@ fn polish_section(
     });
     *y += ROW_H;
 
-    label(ui, palette, left, *y, "Model");
+    label(ui, tokens, left, *y, "Model");
     inside(ui, left, right, *y, |ui| {
         let response = ui.add_sized(
             [360.0, 22.0],
-            egui::TextEdit::singleline(&mut form.polish_model).hint_text("e.g. gpt-4o-mini"),
+            egui::TextEdit::singleline(&mut form.polish_model)
+                .hint_text("e.g. gpt-4o-mini")
+                .text_color(tokens.ink),
         );
         if response.changed() {
             dirty = true;
@@ -593,14 +691,15 @@ fn polish_section(
     });
     *y += ROW_H;
 
-    label(ui, palette, left, *y, "API key");
+    label(ui, tokens, left, *y, "API key");
     inside(ui, left, right, *y, |ui| {
         if settings_form::api_key_supported() {
             let response = ui.add_sized(
                 [360.0, 22.0],
                 egui::TextEdit::singleline(&mut form.api_key)
                     .password(true)
-                    .hint_text("stored in the OS keychain — never in settings.toml"),
+                    .hint_text("stored in the OS keychain — never in settings.toml")
+                    .text_color(tokens.ink),
             );
             if response.changed() {
                 dirty = true;
@@ -610,7 +709,7 @@ fn polish_section(
                 ui,
                 "hidden on this platform — the key lives in the OS keychain on macOS/Windows; \
                  here set SURAMAK_OPENAI_API_KEY in the environment",
-                palette,
+                tokens,
                 false,
             );
         }
@@ -631,7 +730,7 @@ fn model_options(current: &str) -> Vec<String> {
 }
 
 /// Section heading; advances `y` past it.
-fn section(ui: &mut egui::Ui, palette: &Palette, left: f32, y: &mut f32, title: &str) {
+fn section(ui: &mut egui::Ui, tokens: &Tokens, left: f32, y: &mut f32, title: &str) {
     ui.scope_builder(
         egui::UiBuilder::new().max_rect(Rect::from_min_size(pos2(left, *y), vec2(400.0, 26.0))),
         |ui| {
@@ -639,7 +738,7 @@ fn section(ui: &mut egui::Ui, palette: &Palette, left: f32, y: &mut f32, title: 
                 ui.label(
                     egui::RichText::new(title)
                         .font(FontId::new(17.0, crate::theme::serif_family()))
-                        .color(palette.text),
+                        .color(tokens.ink),
                 );
             });
         },
@@ -648,13 +747,13 @@ fn section(ui: &mut egui::Ui, palette: &Palette, left: f32, y: &mut f32, title: 
 }
 
 /// Left-hand row label painted at `y`.
-fn label(ui: &mut egui::Ui, palette: &Palette, left: f32, y: f32, text: &str) {
+fn label(ui: &mut egui::Ui, tokens: &Tokens, left: f32, y: f32, text: &str) {
     ui.painter().text(
         pos2(left + 2.0, y + 4.0),
         Align2::LEFT_TOP,
         text,
         FontId::new(12.0, FontFamily::Proportional),
-        palette.text_dim,
+        tokens.ink_soft,
     );
 }
 

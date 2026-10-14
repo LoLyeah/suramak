@@ -49,6 +49,21 @@ impl GlassConfig {
     }
 }
 
+/// Which appearance the window material should resolve against (M9a).
+///
+/// The app's `settings.ui.appearance` maps onto this: `System` clears any
+/// explicit `NSAppearance` so the material follows the OS live; `Light`/`Dark`
+/// pin the window AND its material view(s) so the real blur follows the forced
+/// appearance too. On platforms without an AppKit appearance this is a no-op.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ThemeMode {
+    /// Follow the system (no explicit appearance — the AppKit default).
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
 /// The Windows system-backdrop flavour the M4 policy selects from a [`GlassMode`].
 ///
 /// Kept platform-independent (and unit-tested on every platform) so the
@@ -216,6 +231,31 @@ impl GlassHandle {
     /// UI's cue to paint its honest fallback pill instead.
     pub fn float_glass_available(&self) -> bool {
         self.imp.float_glass_available()
+    }
+
+    /// Sets (`Light`/`Dark`) or clears (`System`) the window's `NSAppearance`,
+    /// on the window and its material container view(s) (M9a). A no-op on
+    /// platforms without an AppKit appearance; the only glass edit M9a makes.
+    pub fn set_appearance(&mut self, mode: ThemeMode) {
+        self.imp.set_appearance(mode);
+    }
+}
+
+/// Whether the OS asks for reduced motion (macOS
+/// `NSWorkspace.accessibilityDisplayShouldReduceMotion`; `false` elsewhere —
+/// Linux/Windows have no equivalent wired up yet, documented in the M9a report).
+///
+/// Read on the main thread when the settings screen opens/applies (the app's
+/// refresh points) — the property is cheap, but the UI only needs it at those
+/// moments.
+pub fn reduce_motion() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos::reduce_motion()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
     }
 }
 

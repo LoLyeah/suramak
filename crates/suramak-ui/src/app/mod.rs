@@ -15,7 +15,7 @@ use suramak_asr::worker::WorkerEvent;
 use suramak_asr::EngineId;
 use suramak_core::export as core_export;
 use suramak_core::models as core_models;
-use suramak_core::settings::{EngineSetting, RecordSource};
+use suramak_core::settings::{Appearance, EngineSetting, RecordSource};
 use suramak_core::transcript::{Segment, Transcript};
 use suramak_playback::{
     resolve_playback_source, transcript_duration_ms, Command as PlaybackCommand, Playback,
@@ -23,10 +23,13 @@ use suramak_playback::{
 };
 use uuid::Uuid;
 
+use crate::theme::AppTheme;
+
 use self::model_manager::{ModelManager, ModelRow};
 use self::polish::{PolishState, PolishUndo};
 use self::settings_form::SettingsForm;
 
+pub mod controls;
 pub mod editor;
 pub mod export;
 pub mod home;
@@ -104,6 +107,10 @@ pub struct Recording {
     /// decoder could not keep up). Surfaced subtly in the record view; reset
     /// with the provisional list.
     pub provisional_skipped: u64,
+    /// M9a: first-seen instant per provisional segment (same order as
+    /// [`Recording::provisional`]), so the record view can fade+rise each line
+    /// as it arrives. Internal bookkeeping — not shown anywhere.
+    pub provisional_arrivals: Vec<Instant>,
     /// Set while the runtime is finalising the wav (Stop pressed once).
     pub stopping: bool,
 }
@@ -157,6 +164,16 @@ pub fn format_elapsed(elapsed: Duration) -> String {
     let minutes = total_secs / 60;
     let seconds = total_secs % 60;
     format!("{minutes:02}:{seconds:02}.{tenths}")
+}
+
+/// `mm:ss.mmm` transport readout for the deck (`01:02.480`; hours fold into
+/// minutes). The brief's one-time-format system: recordings use `hh:mm:ss`
+/// elapsed, the transport uses `mm:ss.mmm`, and nothing else shows a clock.
+pub fn format_transport(ms: u32) -> String {
+    let minutes = ms / 60_000;
+    let seconds = (ms % 60_000) / 1000;
+    let millis = ms % 1000;
+    format!("{minutes:02}:{seconds:02}.{millis:03}")
 }
 
 /// Lifecycle of the in-app transcription job.
@@ -357,6 +374,10 @@ pub struct ExportState {
     pub follows_default: bool,
     /// Last result line (error or "wrote …").
     pub result: Option<Result<String, String>>,
+    /// M9a: the export sheet (anchored under the deck's `Export…` button) is
+    /// open. The old fixed bottom band is gone — it collided with the floating
+    /// record pill (critique P1/H8).
+    pub open: bool,
 }
 
 impl Default for ExportState {
@@ -366,6 +387,7 @@ impl Default for ExportState {
             dest: String::new(),
             follows_default: true,
             result: None,
+            open: false,
         }
     }
 }
@@ -439,6 +461,17 @@ pub struct AppState {
     /// fallback pill. Seeded by the shell at startup; a field so the state is
     /// testable headless.
     pub float_glass: bool,
+    /// M9a: the effective appearance the token ladder is drawn with (System has
+    /// been resolved against the OS theme). Seeded + kept current by the shell
+    /// (`Shell::sync_appearance`).
+    pub theme: AppTheme,
+    /// M9a: the appearance *setting* (System | Light | Dark) — what the
+    /// Settings row edits and the shell resolves.
+    pub appearance: Appearance,
+    /// M9a: macOS Reduce Motion (or the platform default `false`). Kept current
+    /// by the shell at startup and whenever settings apply; every motion
+    /// helper reads it through [`crate::motion::Motion`].
+    pub reduce_motion: bool,
 }
 
 /// Side effects the runtime executes after a frame (or an event).
@@ -531,6 +564,12 @@ impl AppState {
             // Seeded by the shell at startup (`GlassHandle::float_glass_available`);
             // false until then — headless/non-macOS builds paint the pill.
             float_glass: false,
+            // M9a: seeded + kept current by the shell (`Shell::sync_appearance`);
+            // the defaults keep headless tests deterministic (dark ladder,
+            // System setting, no reduced motion).
+            theme: AppTheme::Dark,
+            appearance: Appearance::System,
+            reduce_motion: false,
         }
     }
 
@@ -621,6 +660,7 @@ impl AppState {
             sources: Vec::new(),
             provisional: Vec::new(),
             provisional_skipped: 0,
+            provisional_arrivals: Vec::new(),
             stopping: false,
         });
         self.route = Route::Record;
@@ -687,10 +727,29 @@ impl AppState {
     /// merged new segments (or the skipped-window count moved).
     ///
     /// Ignored once Stop was pressed: provisional content is **always**
-    /// discarded on Stop and the final pass takes over.
+    /// discarded on Stop and the final pass takes over. M9a: segments seen for
+    /// the first time get an arrival instant (matched by `idx`), so the record
+    /// view can fade+rise each new line.
     pub fn record_provisional(&mut self, segments: Vec<Segment>, skipped_windows: u64) {
         if let RecordState::Recording(recording) = &mut self.record {
             if !recording.stopping {
+                let now = Instant::now();
+                let previous: Vec<(u32, Instant)> = recording
+                    .provisional
+                    .iter()
+                    .zip(recording.provisional_arrivals.iter())
+                    .map(|(segment, at)| (segment.idx, *at))
+                    .collect();
+                recording.provisional_arrivals = segments
+                    .iter()
+                    .map(|segment| {
+                        previous
+                            .iter()
+                            .find(|(idx, _)| *idx == segment.idx)
+                            .map(|(_, at)| *at)
+                            .unwrap_or(now)
+                    })
+                    .collect();
                 recording.provisional = segments;
                 recording.provisional_skipped = skipped_windows;
             }
@@ -707,6 +766,7 @@ impl AppState {
             RecordState::Recording(recording) if !recording.stopping => {
                 recording.stopping = true;
                 recording.provisional.clear();
+                recording.provisional_arrivals.clear();
                 recording.provisional_skipped = 0;
                 vec![Effect::StopCapture {
                     title: recording.title.clone(),
@@ -746,6 +806,76 @@ impl AppState {
         self.record = RecordState::Idle;
         self.route = Route::Home;
         Vec::new()
+    }
+
+    /// Headless smoke harness (M9a): seeds a frozen-but-ticking demo recording
+    /// so the Record view's composition can be captured on builds without
+    /// capture (the Linux VPS). Only `main.rs` calls this, only when
+    /// `SURAMAK_SMOKE_RECORD` is set AND a smoke mode is active; it starts no
+    /// capture session and touches no pipeline — the view merely draws this
+    /// state. Everything in it is shaped exactly like a real session's state.
+    pub fn seed_demo_recording(&mut self) {
+        let now = Instant::now();
+        let waveform: Vec<f32> = (0..RECORD_WAVEFORM_BARS)
+            .map(|index| {
+                let phase = index as f32 * 0.35;
+                (0.24 + 0.6 * (phase.sin().abs() * 0.75 + (index % 7) as f32 * 0.018))
+                    .clamp(0.05, 0.95)
+            })
+            .collect();
+        let provisional = vec![
+            Segment {
+                idx: 0,
+                start_ms: 0,
+                end_ms: 4200,
+                text: "The quick brown fox jumps over the lazy dog.".to_string(),
+            },
+            Segment {
+                idx: 1,
+                start_ms: 4200,
+                end_ms: 12000,
+                text: "Suramak keeps every recording on this machine and never sends audio to the cloud."
+                    .to_string(),
+            },
+            Segment {
+                idx: 2,
+                start_ms: 12000,
+                end_ms: 18600,
+                text: "Halo, halo! Apa yang ini?".to_string(),
+            },
+        ];
+        let provisional_arrivals = vec![
+            now - Duration::from_millis(9_000),
+            now - Duration::from_millis(4_000),
+            now - Duration::from_millis(1_200),
+        ];
+        self.record = RecordState::Recording(Recording {
+            title: "Recording 2026-10-14 09:41:02".to_string(),
+            started_at: now - Duration::from_millis(42_600),
+            elapsed: Duration::from_millis(42_600),
+            rms: 0.62,
+            waveform,
+            device: Some(
+                "Default microphone + System audio (all processes except Suramak)".to_string(),
+            ),
+            sources: vec![
+                RecordingSource {
+                    label: "Default microphone".to_string(),
+                    gain: 1.0,
+                    muted: false,
+                },
+                RecordingSource {
+                    label: "System audio (all processes except Suramak)".to_string(),
+                    gain: 0.8,
+                    muted: false,
+                },
+            ],
+            provisional,
+            provisional_skipped: 0,
+            provisional_arrivals,
+            stopping: false,
+        });
+        self.route = Route::Record;
     }
 
     // ---- playback (M8) ------------------------------------------------------
@@ -1189,9 +1319,10 @@ impl AppState {
     }
 
     /// Back to the home route (pending edits are flushed first; M8: playback
-    /// stops and the playhead resets).
+    /// stops and the playhead resets; M9a: the export sheet closes).
     pub fn back_home(&mut self) -> Vec<Effect> {
         self.route = Route::Home;
+        self.export.open = false;
         let mut effects = self.stop_playback();
         effects.extend(self.flush_edits());
         effects
@@ -1255,6 +1386,12 @@ impl AppState {
         self.export.result = None;
     }
 
+    /// M9a: the deck's `Export…` button toggles the export sheet (anchored
+    /// under the button — never a bottom band over the floating pill).
+    pub fn toggle_export(&mut self) {
+        self.export.open = !self.export.open;
+    }
+
     /// Destination typed/edited by the user (or set by the save dialog).
     pub fn set_export_dest(&mut self, dest: String) {
         self.export.dest = dest;
@@ -1316,6 +1453,7 @@ impl AppState {
         self.export.dest = default_dest(&transcript.title, self.export.format);
         self.export.follows_default = true;
         self.export.result = None;
+        self.export.open = false;
         self.library.selected = self.library.items.iter().position(|t| t.id == id);
         self.editor = Some(Editor::open(transcript));
         // A pending polish review (or one-step undo) belongs to the transcript
@@ -2893,5 +3031,89 @@ mod tests {
         assert_eq!(suramak_playback::segment_index_at(segments, 900), None);
         assert_eq!(suramak_playback::segment_index_at(segments, 1_000), Some(1));
         assert_eq!(suramak_playback::segment_index_at(segments, 5_000), None);
+    }
+
+    // ---- M9a: deck readout / export sheet / arrival tracking -----------------
+
+    #[test]
+    fn the_transport_readout_is_mm_ss_mmm() {
+        assert_eq!(format_transport(0), "00:00.000");
+        assert_eq!(format_transport(1_234), "00:01.234");
+        assert_eq!(format_transport(62_480), "01:02.480");
+        // Hours fold into minutes — one format, never a third clock style.
+        assert_eq!(format_transport(3_661_007), "61:01.007");
+    }
+
+    #[test]
+    fn the_export_sheet_toggles_and_closes_when_the_editor_is_left() {
+        let mut state = AppState::new();
+        state.on_transcript_loaded(transcript("sheet.wav"));
+        assert!(!state.export.open, "closed when a transcript opens");
+        state.toggle_export();
+        assert!(state.export.open);
+        state.toggle_export();
+        assert!(!state.export.open);
+        state.toggle_export();
+        let _ = state.back_home();
+        assert!(!state.export.open, "leaving the editor closes the sheet");
+    }
+
+    #[test]
+    fn provisional_arrivals_track_first_seen_per_segment() {
+        let mut state = recording_state();
+        state.start_recording(Instant::now(), "2026-10-14 09:41:02");
+        state.record_provisional(vec![segment(0, "one")], 0);
+        let first = match &state.record {
+            RecordState::Recording(rec) => rec.provisional_arrivals.clone(),
+            other => panic!("expected a recording, got {other:?}"),
+        };
+        assert_eq!(first.len(), 1);
+
+        // A later update keeps segment 0's arrival and stamps the new segment.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        state.record_provisional(vec![segment(0, "one"), segment(1, "two")], 0);
+        match &state.record {
+            RecordState::Recording(rec) => {
+                assert_eq!(rec.provisional_arrivals.len(), 2);
+                assert_eq!(
+                    rec.provisional_arrivals[0], first[0],
+                    "an existing segment keeps its arrival instant"
+                );
+                assert!(
+                    rec.provisional_arrivals[1] >= first[0],
+                    "a new segment is stamped now"
+                );
+            }
+            other => panic!("expected a recording, got {other:?}"),
+        }
+
+        // Stop clears the arrival bookkeeping with the provisional list.
+        state.stop_recording();
+        match &state.record {
+            RecordState::Recording(rec) => {
+                assert!(rec.provisional_arrivals.is_empty());
+                assert!(rec.provisional.is_empty());
+            }
+            other => panic!("expected a recording, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_demo_recording_seed_shapes_a_real_session_state() {
+        let mut state = AppState::new();
+        state.seed_demo_recording();
+        assert_eq!(state.route, Route::Record);
+        assert!(state.busy(), "a live recording keeps the tick alive");
+        match &state.record {
+            RecordState::Recording(rec) => {
+                assert_eq!(rec.waveform.len(), RECORD_WAVEFORM_BARS);
+                assert_eq!(rec.sources.len(), 2);
+                assert_eq!(rec.provisional.len(), 3);
+                assert_eq!(rec.provisional_arrivals.len(), 3);
+                assert!(!rec.stopping);
+                assert!(rec.device.as_deref().unwrap().contains("System audio"));
+            }
+            other => panic!("expected a recording, got {other:?}"),
+        }
     }
 }

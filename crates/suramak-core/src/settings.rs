@@ -187,11 +187,40 @@ pub enum GlassMode {
     Never,
 }
 
+/// Appearance mode (`settings.ui.appearance`, M9a): follow the system's
+/// light/dark setting (the default) or force Light/Dark. Missing in older
+/// settings files → `System`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Appearance {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl Appearance {
+    /// Every variant, in the order the Settings row offers them.
+    pub const ALL: [Appearance; 3] = [Appearance::System, Appearance::Light, Appearance::Dark];
+
+    /// The label shown on the segmented control.
+    pub fn label(self) -> &'static str {
+        match self {
+            Appearance::System => "System",
+            Appearance::Light => "Light",
+            Appearance::Dark => "Dark",
+        }
+    }
+}
+
 /// UI settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiSettings {
     pub glass: GlassMode,
     pub font_scale: f32,
+    /// M9a: System (default) | Light | Dark. Older files have no key.
+    #[serde(default)]
+    pub appearance: Appearance,
 }
 
 /// Top-level application settings persisted to `settings.toml`.
@@ -221,6 +250,7 @@ impl Default for Settings {
             ui: UiSettings {
                 glass: GlassMode::Auto,
                 font_scale: 1.0,
+                appearance: Appearance::System,
             },
             recording: RecordingSettings::default(),
         }
@@ -306,6 +336,50 @@ font_scale = 1.0
         assert_eq!(settings.asr.engine, EngineSetting::Auto);
         assert_eq!(settings.asr.model_id, "turbo-q5-0");
         assert_eq!(settings.recording.audio_source, AudioSource::Default);
+        assert_eq!(settings.ui.appearance, Appearance::System);
+    }
+
+    // ---- M9a: appearance ----------------------------------------------------
+
+    #[test]
+    fn appearance_roundtrips_through_toml() {
+        for appearance in Appearance::ALL {
+            let mut settings = Settings::default();
+            settings.ui.appearance = appearance;
+            let text = toml::to_string_pretty(&settings).expect("serialize settings");
+            let back: Settings = toml::from_str(&text).expect("deserialize settings");
+            assert_eq!(back.ui.appearance, appearance, "toml: {text}");
+        }
+        // The serialized spelling is the lowercase name the Settings row shows.
+        let mut settings = Settings::default();
+        settings.ui.appearance = Appearance::Dark;
+        let text = toml::to_string_pretty(&settings).unwrap();
+        assert!(
+            text.contains("appearance = \"dark\""),
+            "unexpected TOML: {text}"
+        );
+        assert_eq!(Appearance::default(), Appearance::System);
+        assert_eq!(Appearance::Light.label(), "Light");
+    }
+
+    #[test]
+    fn appearance_defaults_to_system_when_absent() {
+        // A settings file written before M9a has no `appearance` key.
+        let text = r#"
+[asr]
+model_id = "tiny"
+language = "auto"
+translate_to_english = false
+
+[storage]
+keep_audio = false
+
+[ui]
+glass = "auto"
+font_scale = 1.0
+"#;
+        let settings: Settings = toml::from_str(text).expect("legacy settings must load");
+        assert_eq!(settings.ui.appearance, Appearance::System);
     }
 
     #[test]
