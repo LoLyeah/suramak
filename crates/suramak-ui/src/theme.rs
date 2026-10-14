@@ -141,7 +141,13 @@ pub struct Tokens {
     pub accent_active: Color32,
     /// The faint accent wash: active-segment tint, selection backgrounds.
     pub accent_tint: Color32,
+    /// The record red — the dot, the pill's stop glyph, the recording accent.
+    /// A non-text indicator (WCAG's 3:1 UI-component threshold applies).
     pub record_red: Color32,
+    /// M9d: the **text-safe** record red — the 12 px `recording` word and every
+    /// red caption. Clears WCAG AA for small text (≥ 4.5:1) on the light
+    /// ladder's worst surface (the window tone); see the contrast test.
+    pub record_red_text: Color32,
     /// Text/icon ink on an accent fill (white on the light ladder's deep blue,
     /// near-black on the dark ladder's light blue).
     pub on_accent: Color32,
@@ -184,171 +190,237 @@ pub struct Tokens {
     pub stroke: Strokes,
 }
 
-/// The token ladder for one appearance.
+/// The token ladder for one appearance, on this platform.
 pub fn tokens(theme: AppTheme) -> Tokens {
-    let space = SPACE;
-    let radius = RADII;
-    let stroke = STROKES;
-
     #[cfg(target_os = "macos")]
     {
-        // Real material behind a transparent surface: translucent washes and
-        // dark-or-light system ink. (M9a: the window is no longer pinned to
-        // DarkAqua — `suramak-glass` clears/sets NSAppearance per this ladder.)
-        match theme {
-            AppTheme::Light => Tokens {
-                ink: Color32::from_rgb(0x1c, 0x1f, 0x26),
-                ink_soft: Color32::from_rgb(0x59, 0x61, 0x71),
-                ink_faint: Color32::from_rgb(0x8a, 0x92, 0xa2),
-                hairline: Color32::from_black_alpha(36),
-                hairline_strong: Color32::from_black_alpha(72),
-                accent: Color32::from_rgb(0x2f, 0x6f, 0xed),
-                accent_hover: Color32::from_rgb(0x4a, 0x84, 0xf2),
-                accent_active: Color32::from_rgb(0x24, 0x5c, 0xcf),
-                accent_tint: Color32::from_rgba_unmultiplied(0x2f, 0x6f, 0xed, 44),
-                record_red: Color32::from_rgb(0xe0, 0x35, 0x2b),
-                on_accent: Color32::WHITE,
-                window: Color32::TRANSPARENT,
-                panel: Color32::from_white_alpha(96),
-                panel_faint: Color32::from_white_alpha(56),
-                card: Color32::from_white_alpha(150),
-                card_shadow: Shadow {
-                    offset: [0, 8],
-                    blur: 20,
-                    spread: 0,
-                    color: Color32::from_black_alpha(40),
-                },
-                control_fill: Color32::from_white_alpha(140),
-                control_fill_hover: Color32::from_white_alpha(184),
-                control_fill_active: Color32::from_white_alpha(96),
-                surface_hover: Color32::from_black_alpha(14),
-                surface_active: Color32::from_black_alpha(26),
-                selection_bg: Color32::from_rgba_unmultiplied(0x2f, 0x6f, 0xed, 44),
-                disabled_alpha: 0.45,
-                wave: Color32::from_rgb(0x54, 0x5c, 0x6b),
-                wave_dim: Color32::from_rgb(0x8b, 0x93, 0xa3),
-                float_fill: Color32::from_white_alpha(200),
-                space,
-                radius,
-                stroke,
-            },
-            AppTheme::Dark => Tokens {
-                ink: Color32::from_rgb(0xec, 0xed, 0xf2),
-                ink_soft: Color32::from_rgb(0xa9, 0xb1, 0xc2),
-                ink_faint: Color32::from_rgb(0x7e, 0x87, 0x9a),
-                hairline: Color32::from_white_alpha(40),
-                hairline_strong: Color32::from_white_alpha(80),
-                accent: Color32::from_rgb(0x6e, 0xa8, 0xff),
-                accent_hover: Color32::from_rgb(0x8a, 0xba, 0xff),
-                accent_active: Color32::from_rgb(0x58, 0x90, 0xe8),
-                accent_tint: Color32::from_rgba_unmultiplied(0x6e, 0xa8, 0xff, 52),
-                record_red: Color32::from_rgb(0xff, 0x45, 0x3a),
-                on_accent: Color32::from_rgb(0x0b, 0x12, 0x26),
-                window: Color32::TRANSPARENT,
-                panel: Color32::from_white_alpha(20),
-                panel_faint: Color32::from_white_alpha(10),
-                card: Color32::from_white_alpha(32),
-                card_shadow: Shadow {
-                    offset: [0, 10],
-                    blur: 24,
-                    spread: 0,
-                    color: Color32::from_black_alpha(120),
-                },
-                control_fill: Color32::from_white_alpha(24),
-                control_fill_hover: Color32::from_white_alpha(40),
-                control_fill_active: Color32::from_white_alpha(52),
-                surface_hover: Color32::from_white_alpha(18),
-                surface_active: Color32::from_white_alpha(30),
-                selection_bg: Color32::from_rgba_unmultiplied(0x6e, 0xa8, 0xff, 52),
-                disabled_alpha: 0.45,
-                wave: Color32::from_rgb(0xae, 0xb7, 0xc5),
-                wave_dim: Color32::from_rgb(0x83, 0x86, 0x8e),
-                float_fill: Color32::from_white_alpha(22),
-                space,
-                radius,
-                stroke,
-            },
-        }
+        macos_ladder(theme)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        // Opaque window (glass is a macOS-only no-op here): the ladder's tones
-        // are carried by the tokens themselves, both appearances.
-        match theme {
-            AppTheme::Light => Tokens {
-                ink: Color32::from_rgb(0x1c, 0x1f, 0x26),
-                ink_soft: Color32::from_rgb(0x59, 0x61, 0x71),
-                ink_faint: Color32::from_rgb(0x8a, 0x92, 0xa2),
-                hairline: Color32::from_black_alpha(30),
-                hairline_strong: Color32::from_black_alpha(64),
-                accent: Color32::from_rgb(0x2f, 0x6f, 0xed),
-                accent_hover: Color32::from_rgb(0x4a, 0x84, 0xf2),
-                accent_active: Color32::from_rgb(0x24, 0x5c, 0xcf),
-                accent_tint: Color32::from_rgba_unmultiplied(0x2f, 0x6f, 0xed, 40),
-                record_red: Color32::from_rgb(0xe0, 0x35, 0x2b),
-                on_accent: Color32::WHITE,
-                window: Color32::from_rgb(0xe9, 0xeb, 0xf0),
-                panel: Color32::from_rgb(0xf4, 0xf6, 0xfa),
-                panel_faint: Color32::from_rgb(0xed, 0xef, 0xf4),
-                card: Color32::from_rgb(0xff, 0xff, 0xff),
-                card_shadow: Shadow {
-                    offset: [0, 8],
-                    blur: 20,
-                    spread: 0,
-                    color: Color32::from_black_alpha(38),
-                },
-                control_fill: Color32::from_rgb(0xff, 0xff, 0xff),
-                control_fill_hover: Color32::from_rgb(0xf1, 0xf4, 0xf9),
-                control_fill_active: Color32::from_rgb(0xe4, 0xe8, 0xf0),
-                surface_hover: Color32::from_black_alpha(12),
-                surface_active: Color32::from_black_alpha(24),
-                selection_bg: Color32::from_rgba_unmultiplied(0x2f, 0x6f, 0xed, 40),
-                disabled_alpha: 0.45,
-                wave: Color32::from_rgb(0x54, 0x5c, 0x6b),
-                wave_dim: Color32::from_rgb(0x8b, 0x93, 0xa3),
-                float_fill: Color32::from_rgba_unmultiplied(0xff, 0xff, 0xff, 0xe8),
-                space,
-                radius,
-                stroke,
+        desktop_ladder(theme)
+    }
+}
+
+/// The macOS ladder: real material behind a transparent surface — translucent
+/// washes and dark-or-light system ink. (M9a: the window is no longer pinned
+/// to DarkAqua — `suramak-glass` clears/sets NSAppearance per this ladder.)
+///
+/// M9d: split out of [`tokens`] as a **pure, portable** function so the
+/// contrast test can exercise the macOS values from any platform (the
+/// platform only decides *which* ladder [`tokens`] picks).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the contrast test off-macOS
+pub fn macos_ladder(theme: AppTheme) -> Tokens {
+    let space = SPACE;
+    let radius = RADII;
+    let stroke = STROKES;
+    match theme {
+        AppTheme::Light => Tokens {
+            ink: Color32::from_rgb(0x1c, 0x1f, 0x26),
+            ink_soft: Color32::from_rgb(0x59, 0x61, 0x71),
+            ink_faint: Color32::from_rgb(0x8a, 0x92, 0xa2),
+            hairline: Color32::from_black_alpha(36),
+            hairline_strong: Color32::from_black_alpha(72),
+            accent: Color32::from_rgb(0x2f, 0x6f, 0xed),
+            accent_hover: Color32::from_rgb(0x4a, 0x84, 0xf2),
+            accent_active: Color32::from_rgb(0x24, 0x5c, 0xcf),
+            accent_tint: Color32::from_rgba_unmultiplied(0x2f, 0x6f, 0xed, 44),
+            record_red: Color32::from_rgb(0xe0, 0x35, 0x2b),
+            record_red_text: Color32::from_rgb(0xc8, 0x28, 0x1e),
+            on_accent: Color32::WHITE,
+            window: Color32::TRANSPARENT,
+            panel: Color32::from_white_alpha(96),
+            panel_faint: Color32::from_white_alpha(56),
+            card: Color32::from_white_alpha(150),
+            card_shadow: Shadow {
+                offset: [0, 8],
+                blur: 20,
+                spread: 0,
+                color: Color32::from_black_alpha(40),
             },
-            AppTheme::Dark => Tokens {
-                ink: Color32::from_rgb(0xec, 0xed, 0xf2),
-                ink_soft: Color32::from_rgb(0xa9, 0xb1, 0xc2),
-                ink_faint: Color32::from_rgb(0x7e, 0x87, 0x9a),
-                hairline: Color32::from_white_alpha(34),
-                hairline_strong: Color32::from_white_alpha(72),
-                accent: Color32::from_rgb(0x6e, 0xa8, 0xff),
-                accent_hover: Color32::from_rgb(0x8a, 0xba, 0xff),
-                accent_active: Color32::from_rgb(0x58, 0x90, 0xe8),
-                accent_tint: Color32::from_rgba_unmultiplied(0x6e, 0xa8, 0xff, 48),
-                record_red: Color32::from_rgb(0xff, 0x45, 0x3a),
-                on_accent: Color32::from_rgb(0x0b, 0x12, 0x26),
-                window: Color32::from_rgb(0x0e, 0x15, 0x26),
-                panel: Color32::from_rgb(0x17, 0x20, 0x3a),
-                panel_faint: Color32::from_rgb(0x12, 0x1a, 0x30),
-                card: Color32::from_rgb(0x1a, 0x24, 0x40),
-                card_shadow: Shadow {
-                    offset: [0, 10],
-                    blur: 24,
-                    spread: 0,
-                    color: Color32::from_black_alpha(140),
-                },
-                control_fill: Color32::from_rgb(0x1c, 0x27, 0x46),
-                control_fill_hover: Color32::from_rgb(0x25, 0x33, 0x59),
-                control_fill_active: Color32::from_rgb(0x2f, 0x40, 0x6b),
-                surface_hover: Color32::from_white_alpha(16),
-                surface_active: Color32::from_white_alpha(28),
-                selection_bg: Color32::from_rgba_unmultiplied(0x6e, 0xa8, 0xff, 48),
-                disabled_alpha: 0.45,
-                wave: Color32::from_rgb(0xae, 0xb7, 0xc5),
-                wave_dim: Color32::from_rgb(0x83, 0x86, 0x8e),
-                float_fill: Color32::from_rgba_unmultiplied(0x1e, 0x2a, 0x54, 0xd9),
-                space,
-                radius,
-                stroke,
+            control_fill: Color32::from_white_alpha(140),
+            control_fill_hover: Color32::from_white_alpha(184),
+            control_fill_active: Color32::from_white_alpha(96),
+            surface_hover: Color32::from_black_alpha(14),
+            surface_active: Color32::from_black_alpha(26),
+            selection_bg: Color32::from_rgba_unmultiplied(0x2f, 0x6f, 0xed, 44),
+            disabled_alpha: 0.45,
+            wave: Color32::from_rgb(0x54, 0x5c, 0x6b),
+            wave_dim: Color32::from_rgb(0x8b, 0x93, 0xa3),
+            float_fill: Color32::from_white_alpha(200),
+            space,
+            radius,
+            stroke,
+        },
+        AppTheme::Dark => Tokens {
+            ink: Color32::from_rgb(0xec, 0xed, 0xf2),
+            ink_soft: Color32::from_rgb(0xa9, 0xb1, 0xc2),
+            ink_faint: Color32::from_rgb(0x7e, 0x87, 0x9a),
+            hairline: Color32::from_white_alpha(40),
+            hairline_strong: Color32::from_white_alpha(80),
+            accent: Color32::from_rgb(0x6e, 0xa8, 0xff),
+            accent_hover: Color32::from_rgb(0x8a, 0xba, 0xff),
+            accent_active: Color32::from_rgb(0x58, 0x90, 0xe8),
+            accent_tint: Color32::from_rgba_unmultiplied(0x6e, 0xa8, 0xff, 52),
+            record_red: Color32::from_rgb(0xff, 0x45, 0x3a),
+            record_red_text: Color32::from_rgb(0xff, 0x5a, 0x50),
+            on_accent: Color32::from_rgb(0x0b, 0x12, 0x26),
+            window: Color32::TRANSPARENT,
+            panel: Color32::from_white_alpha(20),
+            panel_faint: Color32::from_white_alpha(10),
+            card: Color32::from_white_alpha(32),
+            card_shadow: Shadow {
+                offset: [0, 10],
+                blur: 24,
+                spread: 0,
+                color: Color32::from_black_alpha(120),
             },
+            control_fill: Color32::from_white_alpha(24),
+            control_fill_hover: Color32::from_white_alpha(40),
+            control_fill_active: Color32::from_white_alpha(52),
+            surface_hover: Color32::from_white_alpha(18),
+            surface_active: Color32::from_white_alpha(30),
+            selection_bg: Color32::from_rgba_unmultiplied(0x6e, 0xa8, 0xff, 52),
+            disabled_alpha: 0.45,
+            wave: Color32::from_rgb(0xae, 0xb7, 0xc5),
+            wave_dim: Color32::from_rgb(0x83, 0x86, 0x8e),
+            float_fill: Color32::from_white_alpha(22),
+            space,
+            radius,
+            stroke,
+        },
+    }
+}
+
+/// The opaque desktop ladder (Linux/Windows — glass is a macOS-only no-op):
+/// the ladder's tones are carried by the tokens themselves, both appearances.
+///
+/// M9d: split out of [`tokens`] like [`macos_ladder`] — pure and portable, so
+/// the contrast test can exercise both ladders on any platform.
+#[cfg_attr(target_os = "macos", allow(dead_code))] // used by the contrast test on macOS
+pub fn desktop_ladder(theme: AppTheme) -> Tokens {
+    let space = SPACE;
+    let radius = RADII;
+    let stroke = STROKES;
+    match theme {
+        AppTheme::Light => Tokens {
+            ink: Color32::from_rgb(0x1c, 0x1f, 0x26),
+            ink_soft: Color32::from_rgb(0x59, 0x61, 0x71),
+            ink_faint: Color32::from_rgb(0x8a, 0x92, 0xa2),
+            hairline: Color32::from_black_alpha(30),
+            hairline_strong: Color32::from_black_alpha(64),
+            accent: Color32::from_rgb(0x2f, 0x6f, 0xed),
+            accent_hover: Color32::from_rgb(0x4a, 0x84, 0xf2),
+            accent_active: Color32::from_rgb(0x24, 0x5c, 0xcf),
+            accent_tint: Color32::from_rgba_unmultiplied(0x2f, 0x6f, 0xed, 40),
+            record_red: Color32::from_rgb(0xe0, 0x35, 0x2b),
+            record_red_text: Color32::from_rgb(0xc8, 0x28, 0x1e),
+            on_accent: Color32::WHITE,
+            window: Color32::from_rgb(0xe9, 0xeb, 0xf0),
+            panel: Color32::from_rgb(0xf4, 0xf6, 0xfa),
+            panel_faint: Color32::from_rgb(0xed, 0xef, 0xf4),
+            card: Color32::from_rgb(0xff, 0xff, 0xff),
+            card_shadow: Shadow {
+                offset: [0, 8],
+                blur: 20,
+                spread: 0,
+                color: Color32::from_black_alpha(38),
+            },
+            control_fill: Color32::from_rgb(0xff, 0xff, 0xff),
+            control_fill_hover: Color32::from_rgb(0xf1, 0xf4, 0xf9),
+            control_fill_active: Color32::from_rgb(0xe4, 0xe8, 0xf0),
+            surface_hover: Color32::from_black_alpha(12),
+            surface_active: Color32::from_black_alpha(24),
+            selection_bg: Color32::from_rgba_unmultiplied(0x2f, 0x6f, 0xed, 40),
+            disabled_alpha: 0.45,
+            wave: Color32::from_rgb(0x54, 0x5c, 0x6b),
+            wave_dim: Color32::from_rgb(0x8b, 0x93, 0xa3),
+            float_fill: Color32::from_rgba_unmultiplied(0xff, 0xff, 0xff, 0xe8),
+            space,
+            radius,
+            stroke,
+        },
+        AppTheme::Dark => Tokens {
+            ink: Color32::from_rgb(0xec, 0xed, 0xf2),
+            ink_soft: Color32::from_rgb(0xa9, 0xb1, 0xc2),
+            ink_faint: Color32::from_rgb(0x7e, 0x87, 0x9a),
+            hairline: Color32::from_white_alpha(34),
+            hairline_strong: Color32::from_white_alpha(72),
+            accent: Color32::from_rgb(0x6e, 0xa8, 0xff),
+            accent_hover: Color32::from_rgb(0x8a, 0xba, 0xff),
+            accent_active: Color32::from_rgb(0x58, 0x90, 0xe8),
+            accent_tint: Color32::from_rgba_unmultiplied(0x6e, 0xa8, 0xff, 48),
+            record_red: Color32::from_rgb(0xff, 0x45, 0x3a),
+            record_red_text: Color32::from_rgb(0xff, 0x5a, 0x50),
+            on_accent: Color32::from_rgb(0x0b, 0x12, 0x26),
+            window: Color32::from_rgb(0x0e, 0x15, 0x26),
+            panel: Color32::from_rgb(0x17, 0x20, 0x3a),
+            panel_faint: Color32::from_rgb(0x12, 0x1a, 0x30),
+            card: Color32::from_rgb(0x1a, 0x24, 0x40),
+            card_shadow: Shadow {
+                offset: [0, 10],
+                blur: 24,
+                spread: 0,
+                color: Color32::from_black_alpha(140),
+            },
+            control_fill: Color32::from_rgb(0x1c, 0x27, 0x46),
+            control_fill_hover: Color32::from_rgb(0x25, 0x33, 0x59),
+            control_fill_active: Color32::from_rgb(0x2f, 0x40, 0x6b),
+            surface_hover: Color32::from_white_alpha(16),
+            surface_active: Color32::from_white_alpha(28),
+            selection_bg: Color32::from_rgba_unmultiplied(0x6e, 0xa8, 0xff, 48),
+            disabled_alpha: 0.45,
+            wave: Color32::from_rgb(0xae, 0xb7, 0xc5),
+            wave_dim: Color32::from_rgb(0x83, 0x86, 0x8e),
+            float_fill: Color32::from_rgba_unmultiplied(0x1e, 0x2a, 0x54, 0xd9),
+            space,
+            radius,
+            stroke,
+        },
+    }
+}
+
+/// WCAG 2.x relative luminance of an sRGB colour (Rec. 709 weights on the
+/// linearised channels) — the numerator/denominator of the contrast ratio.
+#[allow(dead_code)] // the WCAG contrast artifact — exercised by the theme tests
+pub fn relative_luminance(color: Color32) -> f32 {
+    fn channel(value: u8) -> f32 {
+        let c = f32::from(value) / 255.0;
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
         }
     }
+    0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
+}
+
+/// The WCAG 2.x contrast ratio of two opaque colours (1.0..=21.0; AA for small
+/// text is ≥ 4.5:1, for large text and UI components ≥ 3:1).
+#[allow(dead_code)] // the WCAG contrast artifact — exercised by the theme tests
+pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// `fg` composited over an opaque `bg` — the effective colour of a translucent
+/// token (the macOS ladder's washes) on its surface. `Color32` stores
+/// **premultiplied** alpha, so the stored channels are already multiplied by
+/// the alpha; the composite is `fg + bg × (1 − α)`.
+#[allow(dead_code)] // the WCAG contrast artifact — exercised by the theme tests
+pub fn composite_over(fg: Color32, bg: Color32) -> Color32 {
+    let alpha = f32::from(fg.a()) / 255.0;
+    let over = |f: u8, b: u8| {
+        (f32::from(f) + f32::from(b) * (1.0 - alpha))
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Color32::from_rgb(
+        over(fg.r(), bg.r()),
+        over(fg.g(), bg.g()),
+        over(fg.b(), bg.b()),
+    )
 }
 
 /// Reworks egui's `Visuals` from the tokens — for BOTH theme slots, so no
@@ -579,6 +651,8 @@ mod tests {
             assert_ne!(t.panel, t.card, "{theme:?}: panel and card differ");
             assert_ne!(t.ink, t.ink_soft);
             assert_ne!(t.ink_soft, t.ink_faint);
+            // M9d: the text-safe red is its own token, distinct from the dot red.
+            assert_ne!(t.record_red, t.record_red_text);
             assert!(t.space.xs == 4.0 && t.space.xl == 24.0);
             assert!(t.radius.deck > 0 && t.radius.card > 0);
             // Control-state deltas are distinct at every step.
@@ -640,5 +714,91 @@ mod tests {
         assert_eq!(ctx.style().animation_time, crate::motion::FAST);
         install(&ctx, AppTheme::Dark, true);
         assert_eq!(ctx.style().animation_time, 0.0);
+    }
+
+    // ---- M9d item 7: the WCAG contrast artifact ----------------------------
+
+    /// The key text pairs must clear WCAG AA for small text (≥ 4.5:1) on
+    /// **both** ladders (macOS translucent + desktop opaque) and both
+    /// appearances. Each colour is composited over the surface it actually
+    /// sits on; the translucent macOS window is composited over a documented
+    /// worst-case backdrop (white in light, black in dark). The measured
+    /// ratios print under `--nocapture` (the report's numbers).
+    #[test]
+    fn wcag_contrast_clears_the_small_text_threshold_on_both_ladders() {
+        /// A named ladder builder — the test walks both.
+        type Ladder = (&'static str, fn(AppTheme) -> Tokens);
+        let ladders: [Ladder; 2] = [("macos", macos_ladder), ("desktop", desktop_ladder)];
+        let mut measured: Vec<String> = Vec::new();
+        for (ladder, build) in ladders {
+            for theme in [AppTheme::Light, AppTheme::Dark] {
+                let t = build(theme);
+                let backdrop = match theme {
+                    AppTheme::Light => Color32::WHITE,
+                    AppTheme::Dark => Color32::BLACK,
+                };
+                let window = composite_over(t.window, backdrop);
+                let panel = composite_over(t.panel, window);
+                let card = composite_over(t.card, window);
+                let pairs: [(&str, Color32, Color32); 9] = [
+                    ("ink on window", t.ink, window),
+                    ("ink on panel", t.ink, panel),
+                    ("ink on card", t.ink, card),
+                    ("ink_soft on window", t.ink_soft, window),
+                    ("ink_soft on panel", t.ink_soft, panel),
+                    ("ink_soft on card", t.ink_soft, card),
+                    ("record_red_text on window", t.record_red_text, window),
+                    ("record_red_text on panel", t.record_red_text, panel),
+                    ("record_red_text on card", t.record_red_text, card),
+                ];
+                for (name, fg, bg) in pairs {
+                    let ratio = contrast_ratio(fg, bg);
+                    measured.push(format!("{ladder} {theme:?}: {name}: {ratio:.2}:1"));
+                    assert!(
+                        ratio >= 4.5,
+                        "{ladder} {theme:?}: {name} = {ratio:.2}:1 — under the 4.5:1 small-text floor"
+                    );
+                }
+                // The record dot stays a legible non-text indicator (≥ 3:1).
+                let indicator = contrast_ratio(t.record_red, card);
+                measured.push(format!(
+                    "{ladder} {theme:?}: record_red dot on card: {indicator:.2}:1"
+                ));
+                assert!(
+                    indicator >= 3.0,
+                    "{ladder} {theme:?}: the record dot = {indicator:.2}:1 — under the 3:1 UI floor"
+                );
+            }
+        }
+        for line in &measured {
+            println!("{line}");
+        }
+    }
+
+    /// The measured helper itself: known WCAG anchors (black/white = 21:1,
+    /// a colour against itself = 1:1, the 4.5:1 boundary of the light text
+    /// red) and the compositing rule.
+    #[test]
+    fn contrast_math_matches_the_wcag_anchors() {
+        let black = Color32::BLACK;
+        let white = Color32::WHITE;
+        assert!((contrast_ratio(black, white) - 21.0).abs() < 0.01);
+        assert!((contrast_ratio(black, black) - 1.0).abs() < 1e-6);
+        // Order does not matter.
+        let a = Color32::from_rgb(0x1c, 0x1f, 0x26);
+        let b = Color32::from_rgb(0xf4, 0xf6, 0xfa);
+        assert!((contrast_ratio(a, b) - contrast_ratio(b, a)).abs() < 1e-6);
+        // An opaque colour composites to itself.
+        assert_eq!(composite_over(a, white), a);
+        // A half-transparent white over black is mid grey.
+        assert_eq!(
+            composite_over(Color32::from_white_alpha(128), black),
+            Color32::from_rgb(128, 128, 128)
+        );
+        // The old light red was under the floor on the light card; the
+        // text-safe variant clears it (the M9d fix, pinned here).
+        let card = Color32::WHITE;
+        assert!(contrast_ratio(Color32::from_rgb(0xe0, 0x35, 0x2b), card) < 4.5);
+        assert!(contrast_ratio(Color32::from_rgb(0xc8, 0x28, 0x1e), card) >= 4.5);
     }
 }

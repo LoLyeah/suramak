@@ -25,6 +25,21 @@ use crate::theme::Tokens;
 use super::views::{paint_card, pane_caption, pane_title, PANE_PAD_X};
 use super::{format_elapsed, AppState, Effect, RecordState, RecordingSource, RECORD_WAVEFORM_BARS};
 
+/// M9d item 2: the living dot's opacity-breath period (seconds). Subtle and
+/// slow — well above the 1 s floor, so it reads as "alive", never as a blink.
+pub const DOT_BREATH_PERIOD: f32 = 1.6;
+
+/// The living dot's opacity at `time` (seconds since app start): a subtle
+/// breath between 0.7 and 1.0 over [`DOT_BREATH_PERIOD`]; `1.0` (static) under
+/// Reduce Motion. Pure so the breath's range/period are pinned by a test.
+pub fn dot_breath(time: f32, reduce: bool) -> f32 {
+    if reduce {
+        return 1.0;
+    }
+    let phase = std::f32::consts::TAU * time / DOT_BREATH_PERIOD;
+    0.85 + 0.15 * phase.sin()
+}
+
 pub fn ui(
     ui: &mut egui::Ui,
     tokens: &Tokens,
@@ -176,24 +191,42 @@ fn recording_body(
         tokens.ink,
     );
     // The status word crossfades with the recording state (and reads at ink,
-    // not the near-invisible dim caption of the critique).
+    // not the near-invisible dim caption of the critique). M9d: the word reads
+    // in the **text-safe** red (WCAG AA at 12 px on the light card).
     let stopping_f = motion.factor(
         ui.ctx(),
         egui::Id::new("suramak-record-stopping"),
         stopping,
         motion::BASE,
     );
-    painter.text(
-        pos2(card.right() - 22.0, card.top() + 30.0),
-        Align2::RIGHT_TOP,
-        if stopping_f > 0.5 {
-            "finishing…"
-        } else {
-            "recording"
-        },
+    let status = if stopping_f > 0.5 {
+        "finishing…"
+    } else {
+        "recording"
+    };
+    let status_color =
+        motion::lerp_color(tokens.ink_soft, tokens.record_red_text, 1.0 - stopping_f);
+    let status_galley = painter.layout_no_wrap(
+        status.to_owned(),
         FontId::new(12.0, FontFamily::Monospace),
-        motion::lerp_color(tokens.ink_soft, tokens.record_red, 1.0 - stopping_f),
+        status_color,
     );
+    let status_left = card.right() - 22.0 - status_galley.size().x;
+    let status_top = card.top() + 30.0;
+    // M9d item 2 — the living dot (owner-confirmed: "a living dot + the real
+    // level meter only"): a small red dot beside the status word with a subtle
+    // opacity breath (0.7↔1.0 over a 1.6 s period — one-shot-friendly, and
+    // nothing else pulses; the waveform stays honest). Reduce Motion: a static
+    // dot. The breath samples the shared clock, so it rides the recording
+    // cadence (100 ms) without asking for a single extra frame.
+    let breath = dot_breath(ui.ctx().input(|input| input.time) as f32, motion.reduce);
+    let dot_color = motion::lerp_color(tokens.record_red, tokens.ink_soft, stopping_f);
+    painter.circle_filled(
+        pos2(status_left - 9.0, status_top + 7.0),
+        3.0,
+        dot_color.gamma_multiply(breath),
+    );
+    painter.galley(pos2(status_left, status_top), status_galley, status_color);
 
     // RMS meter.
     let meter_label = pos2(card.left() + 22.0, card.top() + 66.0);
@@ -256,7 +289,7 @@ fn recording_body(
             let mut muted = source.muted;
             ui.scope_builder(egui::UiBuilder::new().max_rect(row), |ui| {
                 ui.horizontal(|ui| {
-                    ui.add_sized(
+                    let label = ui.add_sized(
                         [220.0, 20.0],
                         egui::Label::new(
                             egui::RichText::new(&source.label)
@@ -266,6 +299,9 @@ fn recording_body(
                         )
                         .truncate(),
                     );
+                    // M9d item 5 (review §7.1): the truncated row carries the
+                    // full source label as its hover text.
+                    label.on_hover_text(&source.label);
                     if ui
                         .add_enabled(!stopping, egui::Checkbox::new(&mut muted, "mute"))
                         .changed()
@@ -490,5 +526,39 @@ fn draw_waveform(painter: &Painter, rect: Rect, values: &[f32], tokens: &Tokens)
         let half = (value.clamp(0.0, 1.0) * rect.height() * 0.5).max(1.0);
         let bar = Rect::from_center_size(pos2(x, rect.center().y), vec2(bar_width, half * 2.0));
         painter.rect_filled(bar, CornerRadius::same(1), tokens.wave);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M9d item 2: the living dot's breath is subtle (0.7↔1.0), slow (period
+    /// ≥ 1 s), periodic, and **static** under Reduce Motion. Nothing else in
+    /// the record view pulses — the meter and the waveform are data.
+    #[test]
+    fn the_living_dot_breaths_subtly_and_slowly() {
+        let period = DOT_BREATH_PERIOD;
+        assert!(period >= 1.0, "the period clears the 1 s floor: {period}");
+        let mut min = f32::MAX;
+        let mut max = f32::MIN;
+        for step in 0..=4000 {
+            let value = dot_breath(step as f32 / 1000.0, false);
+            min = min.min(value);
+            max = max.max(value);
+        }
+        assert!(min >= 0.699, "the breath never dips under 0.7: {min}");
+        assert!(max <= 1.0001, "the breath never exceeds 1.0: {max}");
+        assert!(
+            max - min > 0.25,
+            "the breath is a real breath, not a flicker: {min}..{max}"
+        );
+        // Periodic: one period later the value is back.
+        let at = 0.37;
+        assert!((dot_breath(at, false) - dot_breath(at + DOT_BREATH_PERIOD, false)).abs() < 1e-3);
+        // Reduce Motion: a static dot, at every instant.
+        for step in 0..200 {
+            assert_eq!(dot_breath(step as f32 * 0.05, true), 1.0);
+        }
     }
 }

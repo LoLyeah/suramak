@@ -43,6 +43,12 @@ fn pick_media_file() -> Option<PathBuf> {
 /// Whether this build offers the native "Choose file…" dialog.
 const HAS_NATIVE_DIALOG: bool = cfg!(any(target_os = "macos", target_os = "windows"));
 
+/// M9d item 4: the capture-free build's note. It is shown in the **message
+/// slot** (below the nav row) — drawn in the header flow it was covered by the
+/// absolutely-positioned drop zone, all but its first two letters ("Re").
+pub const CAPTURE_NOTE: &str =
+    "Recording is not compiled into this build (feature `capture`) — import or drop audio or video files instead.";
+
 pub fn ui(
     ui: &mut egui::Ui,
     tokens: &Tokens,
@@ -64,14 +70,6 @@ pub fn ui(
                 tokens,
                 false,
             );
-            if !state.capture_available {
-                pane_caption(
-                    ui,
-                    "Recording is not compiled into this build (feature `capture`) — import or drop audio or video files instead.",
-                    tokens,
-                    false,
-                );
-            }
         });
     });
 
@@ -209,6 +207,11 @@ pub fn ui(
     // One message slot (M9c): the import error takes priority over the
     // cross-view status; both fade in base / out fast. The old flow-positioned
     // error collided with the nav row on every error — one fixed slot.
+    //
+    // M9d item 4: the capture-free build's note lives HERE, not in the header
+    // flow — the absolutely-positioned drop zone covered all but the note's
+    // first two letters ("Re") in the header. Priority: error, then status,
+    // then the note; the note sits well below the zone's bottom edge.
     ui.scope_builder(
         egui::UiBuilder::new().max_rect(Rect::from_min_size(
             pos2(left, nav_top + 30.0),
@@ -219,6 +222,7 @@ pub fn ui(
                 let message = match (&state.home.error, &state.status) {
                     (Some(err), _) => Some((err.as_str(), true)),
                     (None, Some(status)) => Some((status.text.as_str(), status.error)),
+                    (None, None) if !state.capture_available => Some((CAPTURE_NOTE, false)),
                     (None, None) => None,
                 };
                 super::views::status_caption(ui, tokens, motion, "home-status", message);
@@ -379,4 +383,75 @@ pub fn recording_row(
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     response.clicked()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_home(ctx: &egui::Context, state: &mut AppState, time: f64) -> egui::FullOutput {
+        let tokens = crate::theme::tokens(crate::theme::AppTheme::Light);
+        let motion = crate::motion::Motion::new(false);
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            time: Some(time),
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    let mut effects = Vec::new();
+                    super::ui(ui, &tokens, &motion, state, &mut effects);
+                });
+        })
+    }
+
+    /// M9d item 4 (the fragment guard): on the capture-free build the note must
+    /// never render in the header flow under the drop zone's top edge (the old
+    /// "Re" fragment) — it lives in the message slot, below the zone — and the
+    /// header block itself ends above the zone's top edge.
+    #[test]
+    fn the_capture_note_never_renders_under_the_drop_zone() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut state = AppState::new();
+        state.capture_available = false;
+        // Two frames: the message slot's fade registers on the first.
+        let _ = run_home(&ctx, &mut state, 0.0);
+        let output = run_home(&ctx, &mut state, 0.3);
+
+        // The drop zone's rect for a pane at (0, 0)..(1280, 800) — the view's
+        // own constants (rect.top() + 84, 168 tall).
+        let zone_top = 84.0;
+        let zone_bottom = zone_top + 168.0;
+
+        let mut note: Option<Rect> = None;
+        let mut header_bottom = 0.0_f32;
+        for clipped in &output.shapes {
+            let rect = clipped.shape.visual_bounding_rect();
+            if !rect.is_finite() {
+                continue;
+            }
+            match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.text() == CAPTURE_NOTE => {
+                    note = Some(rect);
+                }
+                egui::Shape::Text(_) if rect.top() < zone_top => {
+                    header_bottom = header_bottom.max(rect.bottom());
+                }
+                _ => {}
+            }
+        }
+        let note = note.expect("the capture note is still shown (in the message slot)");
+        assert!(
+            note.top() >= zone_bottom,
+            "the note must sit below the drop zone, never under its top edge: {note:?}"
+        );
+        assert!(
+            header_bottom <= zone_top,
+            "the header block must end above the zone's top edge: {header_bottom} vs {zone_top}"
+        );
+    }
 }

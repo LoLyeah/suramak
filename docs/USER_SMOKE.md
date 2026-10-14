@@ -208,6 +208,13 @@ The shell has been rebuilt (M9 slice 1). The editor now reads as **one** surface
 - Copy: the record-view timer and the pill now read `hh:mm:ss`; next to Stop it says `the meter shows the last 10 seconds`; model names are human everywhere (`Tiny (fastest)`, `Large v3 Turbo (balanced)`).
 - The export sheet now fades open/closed (no teleport); Esc closes it.
 
+## 26. The confirmed motion details (M9d)
+
+- **Press and hold the floating pill**: it compresses ~3% and releases with a gentle spring — no bounce. (On macOS the glass frame itself stays fixed; the content compresses inside it — if you'd rather the whole glass capsule spring, say so, it's a small glass-runtime change.)
+- **While recording**, a small red dot beside the `recording` word breathes slowly — subtle, and nothing else pulses.
+- **Click the waveform** far from the playhead: the playhead eases to the spot (nearby clicks stay instant — no lag while playing). During playback, the transcript's follow-scroll animates.
+- **Reduce Motion** (System Settings → Accessibility → Display): everything above snaps — including the spring.
+
 ## Report
 
 Anything that deviates from an expected result, with: what you did, what happened, what you expected.

@@ -45,13 +45,19 @@ pub fn draw(ctx: &egui::Context, state: &mut AppState) -> Vec<Effect> {
 
     // Route-change motion (M9a): a fresh epoch id per route change animates the
     // slow fade+rise once; the animation ends (egui repaints only while a value
-    // is between 0 and 1).
-    let epoch = route_epoch(ctx, state.route);
-    let route_fade = motion.arrive(
-        ctx,
-        egui::Id::new(("suramak-route-fade", epoch)),
-        motion::SLOW,
-    );
+    // is between 0 and 1). M9d item 6: the app's **first presented frame**
+    // renders statically — the startup epoch is registered without an arrival
+    // (the brief's "the initial frame renders statically; only changes animate").
+    let (epoch, first_frame) = route_epoch(ctx, state.route);
+    let route_fade = if first_frame {
+        1.0
+    } else {
+        motion.arrive(
+            ctx,
+            egui::Id::new(("suramak-route-fade", epoch)),
+            motion::SLOW,
+        )
+    };
 
     egui::TopBottomPanel::top("suramak-titlebar")
         .exact_height(TITLEBAR_HEIGHT)
@@ -104,22 +110,27 @@ pub fn draw(ctx: &egui::Context, state: &mut AppState) -> Vec<Effect> {
     effects
 }
 
-/// A fresh animation epoch each time the route changes (M9a route motion).
-/// Stored in egui's temp data: `(route key, epoch)`.
-fn route_epoch(ctx: &egui::Context, route: Route) -> u64 {
+/// A fresh animation epoch each time the route changes (M9a route motion), plus
+/// whether this is the app's very first presented frame (M9d item 6: the
+/// startup epoch must render statically — no arrival fade). Stored in egui's
+/// temp data: `(route key, epoch)`.
+fn route_epoch(ctx: &egui::Context, route: Route) -> (u64, bool) {
     let id = egui::Id::new("suramak-route-epoch");
-    ctx.data_mut(|data| {
-        let (key, epoch) = data.get_temp::<(u64, u64)>(id).unwrap_or((u64::MAX, 0));
-        let key_now = route as u64;
-        if key == key_now {
-            (key, epoch)
-        } else {
-            let next = (key_now, epoch.wrapping_add(1));
+    ctx.data_mut(|data| match data.get_temp::<(u64, u64)>(id) {
+        Some((key, epoch)) if key == route as u64 => (epoch, false),
+        Some((_, epoch)) => {
+            let next = (route as u64, epoch.wrapping_add(1));
             data.insert_temp(id, next);
-            next
+            (next.1, false)
+        }
+        None => {
+            // Nothing drawn yet: the first frame registers the route without
+            // an arrival animation.
+            let next = (route as u64, 1);
+            data.insert_temp(id, next);
+            (next.1, true)
         }
     })
-    .1
 }
 
 /// Window chrome: drag surface, centred title, hairline under.
@@ -204,7 +215,6 @@ fn float_control(
         .show(ctx, |ui| {
             let (rect, response) = ui.allocate_exact_size(rect.size(), egui::Sense::click());
             let painter = ui.painter();
-            let radius = CornerRadius::same((rect.height() * 0.5).round().clamp(0.0, 255.0) as u8);
             // M9b a11y: the pill is a labeled button (Record ↔ Stop recording)
             // and carries the one focus ring when tabbed to.
             response.widget_info(|| {
@@ -250,6 +260,28 @@ fn float_control(
                 motion::FAST,
             );
 
+            // M9d item 1 — the spring (owner-confirmed: "gentle spring, no
+            // bounce"): pressing scales the pill to ≈0.97 with a springy
+            // release (overshoot ≤ 2 % of the travel, ends within 240 ms; a
+            // snap under Reduce Motion). The idle↔recording morph adds the
+            // brief's gentle scale component: a ≤1.5 % dip that peaks
+            // mid-crossfade and returns to 1.0 — the existing label/colour
+            // crossfade is untouched.
+            let press_target = if enabled && response.is_pointer_button_down_on() {
+                motion::SPRING_PRESS_SCALE
+            } else {
+                1.0
+            };
+            let spring =
+                motion.press_spring(ctx, egui::Id::new("suramak-pill-spring"), press_target);
+            let morph_dip = -0.015 * (std::f32::consts::PI * morph).sin();
+            let scale = spring + morph_dip;
+            // Everything the UI paints scales around the pill's centre. The
+            // interaction rect and the focus ring stay put: the M8.5 float
+            // rect — and on macOS the glass material behind it — is fixed.
+            let body = Rect::from_center_size(rect.center(), rect.size() * scale);
+            let radius = CornerRadius::same((body.height() * 0.5).round().clamp(0.0, 255.0) as u8);
+
             if !state.float_glass {
                 // The fallback material: a frosted pill — translucent fill,
                 // hairline, subtle shadow. Not a Liquid Glass imitation.
@@ -260,7 +292,7 @@ fn float_control(
                         spread: 0,
                         color: Color32::from_black_alpha(96),
                     }
-                    .as_shape(rect, radius),
+                    .as_shape(body, radius),
                 );
                 // The recording state carries a faint red cast (morph colour).
                 let fill = motion::lerp_color(
@@ -272,9 +304,9 @@ fn float_control(
                     ),
                     morph,
                 );
-                painter.rect_filled(rect, radius, fill);
+                painter.rect_filled(body, radius, fill);
                 painter.rect_stroke(
-                    rect,
+                    body,
                     radius,
                     Stroke::new(tokens.stroke.hairline, tokens.hairline),
                     StrokeKind::Inside,
@@ -283,26 +315,29 @@ fn float_control(
             // Hover/press lift (works over real glass too — it is painted on top).
             let lift = (hover * 12.0 + press * 10.0).round() as u8;
             if lift > 0 {
-                painter.rect_filled(rect, radius, Color32::from_white_alpha(lift));
+                painter.rect_filled(body, radius, Color32::from_white_alpha(lift));
             }
 
-            let center_y = rect.center().y;
+            let center_y = body.center().y;
             let idle_alpha = (1.0 - morph).clamp(0.0, 1.0);
             let record_alpha = morph.clamp(0.0, 1.0);
             let alpha = |color: Color32, a: f32| color.gamma_multiply(a);
 
             if idle_alpha > 0.01 {
-                // Red dot + "Record" label.
+                // Red dot + "Record" label. M9d: the content scales with the
+                // spring (fonts, dot, gaps) so the press reads as the whole
+                // pill compressing — on macOS that is the content inside the
+                // fixed glass body (the material's frame is an M8.5 contract).
                 let label_color = if enabled { tokens.ink } else { tokens.ink_soft };
                 let galley = painter.layout_no_wrap(
                     "Record".to_owned(),
-                    FontId::new(15.0, FontFamily::Proportional),
+                    FontId::new(15.0 * scale, FontFamily::Proportional),
                     alpha(label_color, idle_alpha),
                 );
-                let dot_radius = 6.5;
-                let gap = 10.0;
+                let dot_radius = 6.5 * scale;
+                let gap = 10.0 * scale;
                 let total = dot_radius * 2.0 + gap + galley.size().x;
-                let left = rect.center().x - total / 2.0;
+                let left = body.center().x - total / 2.0;
                 let dot_color = if enabled {
                     tokens.record_red
                 } else {
@@ -333,13 +368,13 @@ fn float_control(
                 let clock = super::format_elapsed(elapsed);
                 let galley = painter.layout_no_wrap(
                     clock,
-                    FontId::new(19.0, FontFamily::Monospace),
+                    FontId::new(19.0 * scale, FontFamily::Monospace),
                     alpha(tokens.ink, record_alpha),
                 );
-                let glyph_size = 16.0;
-                let gap = 12.0;
+                let glyph_size = 16.0 * scale;
+                let gap = 12.0 * scale;
                 let total = glyph_size + gap + galley.size().x;
-                let left = rect.center().x - total / 2.0;
+                let left = body.center().x - total / 2.0;
                 let glyph_color = if stopping || !enabled {
                     tokens.record_red.gamma_multiply(0.4)
                 } else {
@@ -381,10 +416,11 @@ pub fn pane_title(ui: &mut egui::Ui, text: &str, tokens: &Tokens) {
     );
 }
 
-/// Small dim caption line under a pane title.
+/// Small dim caption line under a pane title. M9d: errors read in the
+/// **text-safe** red (WCAG AA at 12 px on every light surface).
 pub fn pane_caption(ui: &mut egui::Ui, text: &str, tokens: &Tokens, error: bool) {
     let color = if error {
-        tokens.record_red
+        tokens.record_red_text
     } else {
         tokens.ink_soft
     };
@@ -425,7 +461,7 @@ pub fn status_caption(
     let stored = ctx.data_mut(|data| data.get_temp::<(String, bool)>(text_id));
     if let Some((text, error)) = stored {
         let color = if error {
-            tokens.record_red
+            tokens.record_red_text
         } else {
             tokens.ink_soft
         };
@@ -455,7 +491,7 @@ pub fn arriving_caption(
         motion::BASE,
     );
     let color = if error {
-        tokens.record_red
+        tokens.record_red_text
     } else {
         tokens.ink_soft
     };
@@ -518,4 +554,106 @@ pub fn paint_card(painter: &egui::Painter, rect: Rect, tokens: &Tokens) {
         Stroke::new(tokens.stroke.hairline, tokens.hairline),
         StrokeKind::Inside,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The painted alpha of a pane title's text shape in a frame — the route
+    /// fade multiplies every shape inside the pane, so this reads the pane's
+    /// effective opacity. `None` when the text is not in the frame at all.
+    fn title_alpha(output: &egui::FullOutput, text: &str) -> Option<u8> {
+        output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(shape) if shape.galley.text() == text => Some(
+                    shape
+                        .galley
+                        .rows
+                        .iter()
+                        .flat_map(|placed| placed.row.visuals.mesh.vertices.iter())
+                        .map(|vertex| vertex.color.a())
+                        .max()
+                        .unwrap_or(0),
+                ),
+                _ => None,
+            })
+    }
+
+    /// M9d item 6: the very first presented frame renders **statically** — the
+    /// startup route epoch is registered without an arrival fade (before this,
+    /// frame one painted at opacity 0 and faded in). A route *change* still
+    /// animates (only changes animate).
+    #[test]
+    fn the_first_presented_frame_is_static_and_route_changes_still_animate() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut state = AppState::new();
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
+        let run = |state: &mut AppState, time: f64| -> egui::FullOutput {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(time),
+                ..Default::default()
+            };
+            ctx.run(input, |ctx| {
+                draw(ctx, state);
+            })
+        };
+
+        // Frame one, fresh context: the Home pane is fully painted.
+        let first = run(&mut state, 0.0);
+        assert_eq!(
+            title_alpha(&first, "New transcription"),
+            Some(255),
+            "the first presented frame must render statically (no startup fade)"
+        );
+
+        // A route change still animates: the first frame of the new epoch
+        // registers the arrival (painted at opacity 0 — nothing on screen),
+        // the next frame is mid-flight, and the arrival ends fully painted.
+        state.route = Route::Settings;
+        let registered = run(&mut state, 0.016);
+        assert_eq!(
+            title_alpha(&registered, "Settings"),
+            None,
+            "the route change starts hidden (an arrival, not a teleport)"
+        );
+        let mid = run(&mut state, 0.10);
+        let alpha = title_alpha(&mid, "Settings");
+        assert!(
+            alpha.is_some_and(|alpha| alpha > 0 && alpha < 255),
+            "a route change must still animate (mid-arrival): {alpha:?}"
+        );
+        // …and the arrival ends.
+        let settled = run(&mut state, 0.6);
+        assert_eq!(
+            title_alpha(&settled, "Settings"),
+            Some(255),
+            "the route arrival ends at full opacity"
+        );
+    }
+
+    /// M9d item 1 (frame-level): the pill's spring is a scale around the float
+    /// rect's centre — at rest the drawn body is the M8.5 rect, and the spring
+    /// and morph dip are the only scale sources. The geometry contract (one
+    /// float rect, bottom-centre) is untouched.
+    #[test]
+    fn the_pill_body_is_the_float_rect_at_rest() {
+        let viewport = (1280.0_f32, 800.0_f32);
+        let float = suramak_glass::float_rect(viewport, 1.0);
+        let rect = Rect::from_min_size(pos2(float.x, float.y), vec2(float.width, float.height));
+        // At rest (scale 1.0, no morph dip) the drawn body IS the float rect.
+        let scale = 1.0;
+        let body = Rect::from_center_size(rect.center(), rect.size() * scale);
+        assert_eq!(body, rect);
+        // Pressed: 0.97 around the centre — inside the rect on every side.
+        let pressed =
+            Rect::from_center_size(rect.center(), rect.size() * motion::SPRING_PRESS_SCALE);
+        assert!(rect.contains_rect(pressed));
+        assert!((pressed.width() / rect.width() - 0.97).abs() < 1e-6);
+        assert!((pressed.center() - rect.center()).length() < 1e-6);
+    }
 }

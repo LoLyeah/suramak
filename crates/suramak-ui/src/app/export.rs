@@ -217,7 +217,7 @@ fn contents(
             ui.label(
                 egui::RichText::new(message)
                     .size(11.5)
-                    .color(tokens.record_red),
+                    .color(tokens.record_red_text),
             );
         }
         None => {

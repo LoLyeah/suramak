@@ -242,6 +242,15 @@ fn deck_band(
     // ---- waveform strip (middle) -------------------------------------------
     let total_ms = state.playback.duration_ms();
     let position_ms = state.playback.position_ms();
+    // M9d item 3: what the strip **draws** eases to a seek (base token) — the
+    // data/seek math above is untouched (the readout and the transport keep
+    // reading the true `position_ms`; `waveform_ms_at` is unchanged).
+    let drawn_ms = motion.seek_ease(
+        ui.ctx(),
+        egui::Id::new("suramak-playhead-ease"),
+        position_ms as f32,
+        motion::BASE,
+    );
     let hint = state.playback.hint().map(str::to_string);
     let peaks = state.strip_peaks();
     let transcript_id = state.editor.as_ref().map(|editor| editor.transcript.id);
@@ -279,7 +288,7 @@ fn deck_band(
             rect,
             tokens,
             total_ms,
-            position_ms,
+            drawn_ms,
             hint.as_deref(),
             peaks,
             peaks_fade,
@@ -333,13 +342,16 @@ fn deck_band(
 /// geometry — same band, same bar pitch, same playhead and click-to-seek. A
 /// source with no envelope (no audio, or the decode still in flight) draws a
 /// quiet flat baseline — never the old deterministic silhouette.
+///
+/// `drawn_ms` is the **eased** position ([`Motion::seek_ease`], M9d item 3);
+/// the data position lives on `Playback` and drives the readout.
 #[allow(clippy::too_many_arguments)]
 fn waveform_strip(
     ui: &egui::Ui,
     strip: Rect,
     tokens: &Tokens,
     total_ms: u32,
-    position_ms: u32,
+    drawn_ms: f32,
     unavailable: Option<&str>,
     peaks: Option<&Peaks>,
     peaks_fade: f32,
@@ -418,7 +430,7 @@ fn waveform_strip(
     }
 
     if total_ms > 0 {
-        let t = (position_ms as f32 / total_ms as f32).clamp(0.0, 1.0);
+        let t = (drawn_ms / total_ms as f32).clamp(0.0, 1.0);
         let x = waveform_axis_x(bars, t);
         painter.rect_filled(
             Rect::from_min_max(
@@ -443,6 +455,20 @@ fn waveform_ms_at(strip: Rect, x: f32, total_ms: u32) -> u32 {
     let bars = strip.shrink2(vec2(2.0, 2.0));
     let t = ((x - bars.left()) / bars.width().max(1.0)).clamp(0.0, 1.0);
     (t * total_ms as f32).round() as u32
+}
+
+/// The follow-scroll's scroll animation (M9d item 3): the transcript's
+/// active-row follow runs over the **base token** and ends exactly at the
+/// target; Reduce Motion is a snap (`ScrollAnimation::none()`). egui's scroll
+/// machinery carries the interruption discipline for free: a retarget
+/// mid-flight updates the target and continues from the current offset, and a
+/// user drag cancels it — nothing queues, nothing snaps back.
+fn follow_scroll_animation(motion: &Motion) -> egui::style::ScrollAnimation {
+    if motion.reduce {
+        egui::style::ScrollAnimation::none()
+    } else {
+        egui::style::ScrollAnimation::duration(motion::BASE)
+    }
 }
 
 /// The title line: the serif title painted into a **constant-height row**
@@ -969,7 +995,14 @@ fn transcript_rows(
                     );
                 }
                 if is_active && following {
-                    ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
+                    // M9d item 3: the active-row follow animates — an eased
+                    // scroll offset over the base token that ENDS, instead of
+                    // an instant `scroll_to_rect` snap; Reduce Motion snaps.
+                    ui.scroll_to_rect_animation(
+                        row_rect,
+                        Some(egui::Align::Center),
+                        follow_scroll_animation(motion),
+                    );
                 }
                 ui.add_space(tokens.space.xs);
             }
@@ -1145,6 +1178,101 @@ mod tests {
         // Clamped outside the axis.
         assert_eq!(waveform_ms_at(strip, bars.left() - 50.0, 18_000), 0);
         assert_eq!(waveform_ms_at(strip, bars.right() + 50.0, 18_000), 18_000);
+    }
+
+    // ---- M9d item 3: the follow scroll -------------------------------------
+
+    /// The animation seam: the base token and a fixed duration normally, a
+    /// zero-duration snap under Reduce Motion.
+    #[test]
+    fn follow_scroll_animation_is_the_base_token_or_a_snap() {
+        let full = follow_scroll_animation(&crate::motion::Motion::new(false));
+        assert_eq!(
+            full.duration,
+            egui::Rangef::new(crate::motion::BASE, crate::motion::BASE)
+        );
+        let reduced = follow_scroll_animation(&crate::motion::Motion::new(true));
+        assert_eq!(reduced.duration, egui::Rangef::new(0.0, 0.0));
+        assert!(
+            reduced.points_per_second.is_infinite(),
+            "a snap, not a speed"
+        );
+    }
+
+    /// Frame-level: a real ScrollArea whose follow targets a far row moves the
+    /// offset gradually (several intermediate frames — an ease, not a snap) and
+    /// ENDS exactly at the target; under Reduce Motion the offset is already at
+    /// the target on the first frame that applies it.
+    #[test]
+    fn the_follow_scroll_animates_and_ends_or_snaps_under_reduce_motion() {
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 240.0));
+        let run =
+            |ctx: &egui::Context, time: f64, motion: &crate::motion::Motion, follow: bool| -> f32 {
+                let mut offset = f32::NAN;
+                let input = egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(time),
+                    ..Default::default()
+                };
+                let _ = ctx.run(input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let out = egui::ScrollArea::vertical().show(ui, |ui| {
+                            for index in 0..30 {
+                                let (rect, _) =
+                                    ui.allocate_exact_size(vec2(200.0, 60.0), egui::Sense::hover());
+                                if follow && index == 29 {
+                                    ui.scroll_to_rect_animation(
+                                        rect,
+                                        Some(egui::Align::Center),
+                                        follow_scroll_animation(motion),
+                                    );
+                                }
+                            }
+                        });
+                        offset = out.state.offset.y;
+                    });
+                });
+                offset
+            };
+
+        // Settle at the top, then follow the last row.
+        let ctx = egui::Context::default();
+        let motion = crate::motion::Motion::new(false);
+        assert_eq!(run(&ctx, 0.0, &motion, false), 0.0);
+        // The first follow frame only *requests* the scroll; movement starts on
+        // the next frame and eases across several.
+        let mut time = 0.02;
+        let mut moving_frames = 0;
+        let mut previous = run(&ctx, time, &motion, true);
+        for _ in 0..20 {
+            time += 0.016;
+            let offset = run(&ctx, time, &motion, true);
+            if offset > previous + 0.5 {
+                moving_frames += 1;
+            }
+            previous = offset;
+        }
+        assert!(
+            moving_frames >= 3,
+            "the follow eases over several frames, not a snap: {moving_frames}"
+        );
+        // It ENDS: the offset is stable across late frames…
+        let end = run(&ctx, 5.0, &motion, true);
+        assert_eq!(run(&ctx, 5.1, &motion, true), end, "the follow ends");
+        // …and the last row is actually in view (the offset really moved).
+        assert!(end > 500.0, "the list scrolled to the last row: {end}");
+
+        // Reduce Motion: the very first frame that applies the request is
+        // already at the target — a snap.
+        let reduced_ctx = egui::Context::default();
+        let reduced = crate::motion::Motion::new(true);
+        assert_eq!(run(&reduced_ctx, 0.0, &reduced, false), 0.0);
+        let _request = run(&reduced_ctx, 0.016, &reduced, true);
+        let snapped = run(&reduced_ctx, 0.032, &reduced, true);
+        assert!(
+            (snapped - end).abs() < 0.5,
+            "Reduce Motion snaps to the target: {snapped} vs {end}"
+        );
     }
 
     // ---- M9c: the header's explicit rhythm (owner-directed fix 2) -----------
