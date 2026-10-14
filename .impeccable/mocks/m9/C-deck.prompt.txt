@@ -1,0 +1,11 @@
+High-fidelity UI comp of the main window of “Suramak”, a native macOS transcription app (macOS Tahoe design language, real Liquid Glass).
+
+FRAME: the app window only, edge to edge — no browser chrome, no desk, no device. Landscape 16:9. Real macOS Tahoe window over a dark blue-teal wallpaper so the translucent material shows: large rounded translucent glass window with a real blur. LIGHT appearance: soft white glass. Slim blurred titlebar, small “Suramak” wordmark, traffic lights top-left. ONE consistent surface system: the glass window, ONE translucent panel, ONE subtle card recipe (single hairline + soft shadow). No hard-edged black rectangles, no dark bars behind text.
+
+STRUCTURE (named in order):
+1. LIBRARY SIDEBAR left (~22%): heading “Recordings”; five rows (name + muted date + tiny waveform thumbnail); one selected.
+2. MAIN PANE — THE CONTROL DECK: directly under the window title bar, ONE full-width INTEGRATED DECK band (a single translucent surface, about 96px tall) that unifies the whole chrome into one system: on its left a compact transport (play triangle + skip glyph in one small capsule); through its middle a REAL waveform strip with thin peaks and a slim accent playhead; on its right the time readout “00:11 / 00:23” (SF Mono 12) and a labeled small button “Export…”. The deck is the entire control layer — nothing floats separately in the header. Directly under the deck, the recording title “suramak-sample-en.mp3” in New York serif (~20px) with a quiet “Polish” text button far right of the same line.
+3. TRANSCRIPT: the rest of the pane is the reading surface as clean ROWS: five rows, each = SF Mono timecode gutter (“00:00”) + New York serif sentence 16px on the panel directly (no bars); the second row active (accent edge bar + faint blue tint). Real content, exactly: “The quick brown fox jumps over the lazy dog.” / “Suramak keeps every recording on this machine and never sends audio to the cloud.” / “Halo, halo! Apa yang ini?” / “dan aku semua.” / “saya kawasan.”
+4. FLOATING PILL bottom-center: small rounded glass capsule (real material), red dot + “Record”, soft elevation (it floats just above the pane’s bottom margin).
+
+FEEL: the signature object (waveform) organizes the entire screen as one deck; the transcript is a clean typeset page beneath. Real working controls a developer could build; not a poster.
