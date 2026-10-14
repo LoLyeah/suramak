@@ -44,6 +44,13 @@ const HAS_NATIVE_DIALOG: bool = cfg!(any(target_os = "macos", target_os = "windo
 
 /// The export sheet: an anchored card under the deck's `Export…` button.
 /// Closes on a click outside (or when the editor is left).
+///
+/// M9c motion: **open = base fade + 2 pt rise; close = fast fade** (the brief's
+/// "exits faster than enters"). The fade id is computed on every editor frame —
+/// including while the sheet is closed — so the animation is registered at 0
+/// before the first open, and a rapid open/close flip retargets from the
+/// current value (never a snap-back, never a queue). Under Reduce Motion both
+/// directions snap.
 pub fn sheet(
     ctx: &egui::Context,
     tokens: &Tokens,
@@ -52,17 +59,24 @@ pub fn sheet(
     effects: &mut Vec<Effect>,
     anchor: Rect,
 ) {
+    let fade = sheet_fade(motion, ctx, state.export.open);
+    if !sheet_visible(fade) {
+        return;
+    }
     let pos = pos2(
         (anchor.right() - SHEET_WIDTH).max(anchor.left()),
-        anchor.bottom() + 8.0,
+        anchor.bottom() + 8.0 + crate::motion::rise(fade, 2.0),
     );
     let area = egui::Area::new(egui::Id::new("suramak-export-sheet"))
         .order(egui::Order::Foreground)
         .fixed_pos(pos)
         .movable(false)
         .constrain(true)
+        // The sheet does its own fade; a closing sheet takes no input.
+        .interactable(state.export.open)
         .fade_in(false)
         .show(ctx, |ui| {
+            ui.set_opacity(fade);
             egui::Frame::NONE
                 .fill(tokens.card)
                 .stroke(egui::Stroke::new(tokens.stroke.hairline, tokens.hairline))
@@ -78,14 +92,34 @@ pub fn sheet(
                 });
         });
 
-    // Click outside the sheet (and outside the deck button) dismisses it.
-    if ctx.input(|i| i.pointer.any_click()) {
+    // Click outside the sheet (and outside the deck button) dismisses it —
+    // only while it is open (the closing fade takes no input).
+    if state.export.open && ctx.input(|i| i.pointer.any_click()) {
         if let Some(pointer) = ctx.input(|i| i.pointer.interact_pos()) {
             if !area.response.rect.contains(pointer) && !anchor.contains(pointer) {
                 state.export.open = false;
             }
         }
     }
+}
+
+/// The sheet's open/close fade factor: enter base, exit fast. Called every
+/// editor frame (also while closed) so the animation id is registered before
+/// the first open — the first open animates instead of teleporting.
+pub fn sheet_fade(motion: &Motion, ctx: &egui::Context, open: bool) -> f32 {
+    motion.fade(
+        ctx,
+        egui::Id::new("suramak-export-sheet-fade"),
+        open,
+        crate::motion::BASE,
+        crate::motion::FAST,
+    )
+}
+
+/// Whether the sheet must be drawn at this fade value (it stays drawn while
+/// closing, until the fast fade has fully ended).
+pub fn sheet_visible(fade: f32) -> bool {
+    fade > 0.002
 }
 
 /// The sheet's contents: format chips, destination + actions, result line.
@@ -193,5 +227,94 @@ fn contents(
                     .color(tokens.ink_soft),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::motion::Motion;
+
+    fn frame(ctx: &egui::Context, time: f64, open: bool) -> f32 {
+        let motion = Motion::new(false);
+        let mut value = f32::NAN;
+        let input = egui::RawInput {
+            time: Some(time),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            value = sheet_fade(&motion, ctx, open);
+        });
+        value
+    }
+
+    /// The named M9c leftover: the sheet's open/close is no longer a teleport.
+    /// Open = base fade (+2 pt rise), close = fast fade; the sheet keeps being
+    /// drawn while it closes, then stops.
+    #[test]
+    fn the_sheet_fades_in_over_base_and_out_over_fast() {
+        let ctx = egui::Context::default();
+        // Registered closed (the editor draws the fade id every frame).
+        assert_eq!(frame(&ctx, 0.0, false), 0.0);
+        assert!(!sheet_visible(0.0), "a closed sheet draws nothing");
+        // Opening: mid-flight during the base token, drawn while it fades.
+        let opening = frame(&ctx, 0.050, true);
+        assert!(opening > 0.0 && opening < 1.0, "opening: {opening}");
+        assert!(sheet_visible(opening), "the opening sheet is drawn");
+        // Settled open.
+        assert_eq!(frame(&ctx, 1.0, true), 1.0);
+        // Closing: still drawn mid-flight (the fast token)…
+        let closing = frame(&ctx, 1.050, false);
+        assert!(closing > 0.0 && closing < 1.0, "closing: {closing}");
+        assert!(sheet_visible(closing), "the closing sheet keeps drawing");
+        // …and gone once the fast token elapsed.
+        assert_eq!(frame(&ctx, 1.2, false), 0.0);
+        assert!(!sheet_visible(0.0));
+    }
+
+    /// Reduce Motion: both directions snap (never a fade, never a rise).
+    #[test]
+    fn the_sheet_fade_snaps_under_reduce_motion() {
+        let ctx = egui::Context::default();
+        let motion = Motion::new(true);
+        let run = |time: f64, open: bool| -> f32 {
+            let mut value = f32::NAN;
+            let input = egui::RawInput {
+                time: Some(time),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                value = sheet_fade(&motion, ctx, open);
+            });
+            value
+        };
+        assert_eq!(run(0.0, false), 0.0);
+        assert_eq!(run(0.01, true), 1.0, "the open is a snap");
+        assert_eq!(run(0.02, false), 0.0, "the close is a snap");
+    }
+
+    /// A rapid open → close → open retargets from the current value: the
+    /// re-open never snaps back to 0 and the close never queues.
+    #[test]
+    fn a_rapid_toggle_retargets_from_the_current_value() {
+        let ctx = egui::Context::default();
+        assert_eq!(frame(&ctx, 0.0, false), 0.0);
+        let climbing = frame(&ctx, 0.030, true);
+        assert!(climbing > 0.0 && climbing < 1.0, "in flight: {climbing}");
+        // Flip closed: the value moves down from where it was…
+        let closing = frame(&ctx, 0.045, false);
+        assert!(
+            closing < climbing,
+            "retargets down: {climbing} -> {closing}"
+        );
+        // …then re-open mid-close: it climbs again from the current value
+        // (above the trough, never a snap to 0).
+        let reopening = frame(&ctx, 0.060, true);
+        assert!(
+            reopening > 0.0 && reopening >= closing,
+            "the re-open retargets from the current value: {closing} -> {reopening}"
+        );
+        // And it settles exactly at 1.
+        assert_eq!(frame(&ctx, 5.0, true), 1.0);
     }
 }

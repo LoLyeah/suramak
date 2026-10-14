@@ -201,6 +201,13 @@ The shell has been rebuilt (M9 slice 1). The editor now reads as **one** surface
 - All of those must stay silent while you're typing inside a transcript row (Esc excepted).
 - Press **Tab** repeatedly: every control gets a visible blue focus ring (sidebar rows → transport → waveform strip → Export… → trash…).
 
+## 25. Your two fixes — the title-line buttons + the header line (M9c)
+
+- Open any transcript. The **trash and Polish controls are now real buttons** — translucent capsule bodies with edges, a clear gap between them, gentle press response (the pill's material family). Hover and press them.
+- **The line behind the title**: root-caused — the header's vertical rhythm mixed measured-text placement with fixed offsets, so it only collided under your Mac's real fonts. The header is now built from explicit pixel constants and **exactly one rule** is allowed in that zone. Check the title/caption area: no line should cross any text. **If it's still there, screenshot it** — that pins the last piece.
+- Copy: the record-view timer and the pill now read `hh:mm:ss`; next to Stop it says `the meter shows the last 10 seconds`; model names are human everywhere (`Tiny (fastest)`, `Large v3 Turbo (balanced)`).
+- The export sheet now fades open/closed (no teleport); Esc closes it.
+
 ## Report
 
 Anything that deviates from an expected result, with: what you did, what happened, what you expected.

@@ -22,7 +22,7 @@ use egui::{
 use crate::motion::{self, Motion};
 use crate::theme::Tokens;
 
-/// The three control tiers.
+/// The control tiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
     /// Accent-filled call to action.
@@ -31,6 +31,13 @@ pub enum Tier {
     Secondary,
     /// Quiet text or glyph action.
     Tertiary,
+    /// A translucent capsule/rounded-rect body — the iOS-26-style "real
+    /// button" treatment (owner-directed, 2026-10-14). Used by the editor's
+    /// title-line cluster (trash / Polish / Undo); rests on the control fill,
+    /// hovers to the surface wash, and reads in the floating pill's material
+    /// family (translucent fill + hairline). The body is a capsule: its corner
+    /// radius is half its height.
+    Capsule,
 }
 
 /// Every control state, defined for every tier.
@@ -113,6 +120,25 @@ pub fn tier_colors(tokens: &Tokens, tier: Tier, state: State) -> StateColors {
             Color32::TRANSPARENT,
             dim(tokens.ink_soft),
         ),
+        // Capsule (the title-line cluster): a translucent body at rest — the
+        // pill's material family — brightening on hover/press.
+        (Tier::Capsule, State::Rest) => (tokens.control_fill, tokens.hairline, tokens.ink),
+        (Tier::Capsule, State::Hover) => (
+            tokens.control_fill_hover,
+            tokens.hairline_strong,
+            tokens.ink,
+        ),
+        (Tier::Capsule, State::Active) => (
+            tokens.control_fill_active,
+            tokens.hairline_strong,
+            tokens.ink,
+        ),
+        (Tier::Capsule, State::Focus) => (tokens.control_fill, tokens.accent, tokens.ink),
+        (Tier::Capsule, State::Disabled) => (
+            dim(tokens.control_fill),
+            dim(tokens.hairline),
+            dim(tokens.ink),
+        ),
     };
     StateColors { fill, stroke, text }
 }
@@ -138,8 +164,64 @@ pub enum Glyph {
     ChevronLeft,
 }
 
-/// Paints `glyph` centred in `rect` in `color`.
-pub fn paint_glyph(painter: &egui::Painter, rect: Rect, glyph: Glyph, color: Color32) {
+/// The painted ink bounds of `glyph` centred in `rect`, **without painting** —
+/// the pure mirror of [`paint_glyph`]'s shape math (stroke widths included:
+/// line strokes are centred on their segment, filled rects expand by nothing).
+/// The audit (`app::bounds`) and the `debug_assert` inside [`paint_glyph`] use
+/// it to guarantee every glyph's ink fits the rect its control allocated.
+pub fn glyph_bounds(glyph: Glyph, rect: Rect) -> Rect {
+    let center = rect.center();
+    let half = 0.8; // half of the 1.6 pt glyph stroke
+    let stroke_pad = |min: egui::Pos2, max: egui::Pos2| {
+        Rect::from_min_max(
+            pos2(min.x - half, min.y - half),
+            pos2(max.x + half, max.y + half),
+        )
+    };
+    match glyph {
+        Glyph::Play => Rect::from_min_max(
+            pos2(center.x - 5.0, center.y - 7.5),
+            pos2(center.x + 7.5, center.y + 7.5),
+        ),
+        Glyph::Pause => Rect::from_min_max(
+            pos2(center.x - 6.5, center.y - 7.5),
+            pos2(center.x + 6.5, center.y + 7.5),
+        ),
+        Glyph::SkipStart => Rect::from_min_max(
+            pos2(center.x - 7.75, center.y - 7.0),
+            pos2(center.x + 6.0, center.y + 7.0),
+        ),
+        Glyph::Trash => stroke_pad(
+            pos2(center.x - 7.0, center.y - 7.0),
+            pos2(center.x + 7.0, center.y + 7.0),
+        ),
+        Glyph::Check => stroke_pad(
+            pos2(center.x - 6.0, center.y - 5.0),
+            pos2(center.x + 6.5, center.y + 4.5),
+        ),
+        Glyph::Cross => stroke_pad(
+            pos2(center.x - 5.0, center.y - 5.0),
+            pos2(center.x + 5.0, center.y + 5.0),
+        ),
+        Glyph::Stop => Rect::from_center_size(center, vec2(13.0, 13.0)),
+        Glyph::ChevronLeft => stroke_pad(
+            pos2(center.x - 3.0, center.y - 5.0),
+            pos2(center.x + 2.5, center.y + 5.0),
+        ),
+    }
+}
+
+/// Paints `glyph` centred in `rect` in `color`, returning its ink bounds.
+///
+/// The `debug_assert` is the painted-bounds invariant enforced at the source:
+/// a glyph may never paint outside the rect its control allocated (every call
+/// site allocates at least a 26 pt body around it).
+pub fn paint_glyph(painter: &egui::Painter, rect: Rect, glyph: Glyph, color: Color32) -> Rect {
+    let bounds = glyph_bounds(glyph, rect);
+    debug_assert!(
+        rect.expand(0.01).contains_rect(bounds),
+        "glyph {glyph:?} paints outside its allocated rect {rect:?} (ink {bounds:?})"
+    );
     let center = rect.center();
     let stroke = Stroke::new(1.6_f32, color);
     match glyph {
@@ -190,8 +272,8 @@ pub fn paint_glyph(painter: &egui::Painter, rect: Rect, glyph: Glyph, color: Col
             );
             painter.line_segment(
                 [
-                    pos2(center.x - 2.5, center.y - 7.5),
-                    pos2(center.x + 2.5, center.y - 7.5),
+                    pos2(center.x - 2.5, center.y - 7.0),
+                    pos2(center.x + 2.5, center.y - 7.0),
                 ],
                 stroke,
             );
@@ -270,12 +352,27 @@ pub fn paint_glyph(painter: &egui::Painter, rect: Rect, glyph: Glyph, color: Col
             );
         }
     }
+    bounds
 }
 
 /// The resolved interaction of a painted control (state + animated factors).
 struct Painted {
     response: Response,
     colors: StateColors,
+}
+
+/// The one sanctioned excess beyond a control's allocated rect: the focus
+/// ring's path sits at `rect.expand(FOCUS_RING_EXPAND)` (its 2 pt outside
+/// stroke rides on that path; `app::bounds` audits the total).
+pub const FOCUS_RING_EXPAND: f32 = 1.5;
+
+/// The body radius for a tier: a capsule (height/2) for [`Tier::Capsule`], the
+/// control radius for the rest.
+fn body_radius(tokens: &Tokens, tier: Tier, rect: Rect) -> CornerRadius {
+    match tier {
+        Tier::Capsule => CornerRadius::same((rect.height() / 2.0).round().clamp(0.0, 255.0) as u8),
+        _ => CornerRadius::same(tokens.radius.control),
+    }
 }
 
 /// Paints one control body from its tier × state and returns the response.
@@ -334,7 +431,7 @@ fn painted_body(
         base
     };
 
-    let radius = CornerRadius::same(tokens.radius.control);
+    let radius = body_radius(tokens, tier, rect);
     if colors.fill != Color32::TRANSPARENT {
         ui.painter().rect_filled(rect, radius, colors.fill);
     }
@@ -348,7 +445,7 @@ fn painted_body(
     }
     if response.has_focus() && enabled {
         ui.painter().rect_stroke(
-            rect.expand(1.5),
+            rect.expand(FOCUS_RING_EXPAND),
             CornerRadius::same(tokens.radius.control.saturating_add(2)),
             Stroke::new(tokens.stroke.focus, tokens.accent),
             StrokeKind::Outside,
@@ -357,7 +454,20 @@ fn painted_body(
     if enabled && response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
+    // M9c painted-bounds audit: every control body is on the record (no-op
+    // unless `SURAMAK_BOUNDS_AUDIT`/the test seam enabled it).
+    super::bounds::record(ui.ctx(), id, rect, tier_kind(tier));
     Painted { response, colors }
+}
+
+/// The audit's kind label for a tier.
+fn tier_kind(tier: Tier) -> &'static str {
+    match tier {
+        Tier::Primary => "primary",
+        Tier::Secondary => "secondary",
+        Tier::Tertiary => "tertiary",
+        Tier::Capsule => "capsule",
+    }
 }
 
 /// A painted labeled button (secondary/primary: label + padding; tertiary: a
@@ -399,6 +509,12 @@ pub fn button_sized(
     let galley =
         ui.painter()
             .layout_no_wrap(label.to_owned(), label_font(tier), painted.colors.text);
+    // M9c painted-bounds invariant: a fixed-size control's label must fit it.
+    debug_assert!(
+        rect.expand(0.01)
+            .contains_rect(Rect::from_center_size(rect.center(), galley.size())),
+        "label {label:?} overflows its {size:?} body"
+    );
     ui.painter().galley(
         rect.center() - galley.size() / 2.0,
         galley,
@@ -407,8 +523,104 @@ pub fn button_sized(
     painted.response
 }
 
+/// The capsule body's designed height (owner direction: ~28–30 pt).
+pub const CAPSULE_HEIGHT: f32 = 28.0;
+
+/// The designed size of a capsule labeled button: the label plus ≥
+/// `tokens.space.s` padding on each side, at the capsule height.
+pub fn capsule_button_size(ui: &Ui, tokens: &Tokens, label: &str) -> egui::Vec2 {
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        label_font(Tier::Capsule),
+        Color32::PLACEHOLDER,
+    );
+    vec2(
+        (galley.size().x + tokens.space.s * 2.0).max(CAPSULE_HEIGHT),
+        CAPSULE_HEIGHT,
+    )
+}
+
+/// The designed size of a capsule glyph button: the 16 pt glyph box plus ≥
+/// `tokens.space.s` padding on each side, at the capsule height.
+pub fn capsule_glyph_size(tokens: &Tokens) -> egui::Vec2 {
+    vec2(16.0 + tokens.space.s * 2.0, CAPSULE_HEIGHT)
+}
+
+/// A capsule labeled button — the title-line cluster's "real button" treatment
+/// (owner-directed): translucent body, hairline, capsule radius, hover/press at
+/// the fast token.
+pub fn capsule_button(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    id_salt: impl std::hash::Hash,
+    label: &str,
+    enabled: bool,
+) -> Response {
+    let size = capsule_button_size(ui, tokens, label);
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let id = ui.id().with(id_salt);
+    let painted = painted_body(ui, tokens, motion, id, rect, Tier::Capsule, enabled);
+    painted
+        .response
+        .widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, label));
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        label_font(Tier::Capsule),
+        painted.colors.text,
+    );
+    // Padding invariant: the label sits inside the body with ≥ space.s to spare.
+    debug_assert!(
+        (rect.width() - galley.size().x) / 2.0 >= tokens.space.s - 0.01
+            && rect
+                .expand(0.01)
+                .contains_rect(Rect::from_center_size(rect.center(), galley.size())),
+        "capsule label {label:?} does not fit its {size:?} body with padding"
+    );
+    ui.painter().galley(
+        rect.center() - galley.size() / 2.0,
+        galley,
+        painted.colors.text,
+    );
+    painted.response
+}
+
+/// A capsule glyph button (the title-line trash / confirm / cancel): the glyph
+/// centred in a capsule body with ≥ `tokens.space.s` padding on each side.
+pub fn capsule_glyph_button(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    id_salt: impl std::hash::Hash,
+    glyph: Glyph,
+    enabled: bool,
+    tooltip: &str,
+) -> Response {
+    let size = capsule_glyph_size(tokens);
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let id = ui.id().with(id_salt);
+    let painted = painted_body(ui, tokens, motion, id, rect, Tier::Capsule, enabled);
+    let glyph_rect = Rect::from_center_size(rect.center(), vec2(16.0, 16.0));
+    // `paint_glyph` asserts the ink fits `glyph_rect`; the padding invariant is
+    // asserted here (the glyph box inside the body with space.s to spare).
+    let ink = paint_glyph(ui.painter(), glyph_rect, glyph, painted.colors.text);
+    debug_assert!(
+        (rect.width() - ink.width()) / 2.0 >= tokens.space.s - 0.1,
+        "capsule glyph {glyph:?} has less than space.s padding in its {size:?} body"
+    );
+    painted
+        .response
+        .widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, tooltip));
+    painted.response.on_hover_text(tooltip)
+}
+
 /// A painted glyph control (tertiary by default; tooltip attached).
+///
+/// Part of the control vocabulary; the M9c capsule treatment took its last
+/// call site (the editor's title-line cluster), so it is kept for the
+/// surfaces that still want a bare tertiary glyph.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub fn glyph_button(
     ui: &mut Ui,
     tokens: &Tokens,
@@ -432,11 +644,11 @@ pub fn glyph_button(
     painted.response.on_hover_text(tooltip)
 }
 
-/// The label font for a tier (secondary/primary 13 pt; tertiary 12 pt).
+/// The label font for a tier (secondary/primary 13 pt; tertiary/capsule 12 pt).
 fn label_font(tier: Tier) -> FontId {
     match tier {
         Tier::Primary | Tier::Secondary => FontId::new(13.0, FontFamily::Proportional),
-        Tier::Tertiary => FontId::new(12.0, FontFamily::Proportional),
+        Tier::Tertiary | Tier::Capsule => FontId::new(12.0, FontFamily::Proportional),
     }
 }
 
@@ -445,10 +657,14 @@ fn label_size(ui: &Ui, tokens: &Tokens, label: &str, tier: Tier) -> egui::Vec2 {
     let galley =
         ui.painter()
             .layout_no_wrap(label.to_owned(), label_font(tier), Color32::PLACEHOLDER);
+    if tier == Tier::Capsule {
+        return capsule_button_size(ui, tokens, label);
+    }
     let (pad_x, pad_y) = match tier {
         Tier::Primary => (tokens.space.l, tokens.space.s),
         Tier::Secondary => (tokens.space.m, tokens.space.xs + 2.0),
         Tier::Tertiary => (tokens.space.s, tokens.space.xs),
+        Tier::Capsule => unreachable!("handled above"),
     };
     vec2(
         (galley.size().x + pad_x * 2.0).max(24.0),
@@ -489,20 +705,23 @@ pub fn glyph_label_button(
         ),
         vec2(glyph_w, glyph_w),
     );
-    paint_glyph(ui.painter(), glyph_rect, glyph, painted.colors.text);
+    let ink = paint_glyph(ui.painter(), glyph_rect, glyph, painted.colors.text);
     let galley = ui.painter().layout_no_wrap(
         label.to_owned(),
         FontId::new(12.0, FontFamily::Proportional),
         painted.colors.text,
     );
-    ui.painter().galley(
-        pos2(
-            glyph_rect.right() + tokens.space.xs,
-            rect.center().y - galley.size().y / 2.0,
-        ),
-        galley,
-        painted.colors.text,
+    let galley_pos = pos2(
+        glyph_rect.right() + tokens.space.xs,
+        rect.center().y - galley.size().y / 2.0,
     );
+    // M9c painted-bounds invariant: glyph ink + label stay inside the body.
+    debug_assert!(
+        rect.contains_rect(ink)
+            && rect.contains_rect(Rect::from_min_size(galley_pos, galley.size())),
+        "glyph+label control overflows its {size:?} body"
+    );
+    ui.painter().galley(galley_pos, galley, painted.colors.text);
     painted.response
 }
 
@@ -557,25 +776,24 @@ pub fn segmented<T: PartialEq + Clone>(
             });
             let hover = motion.factor(ui.ctx(), id.with("hover"), response.hovered(), motion::FAST);
             // The selected segment carries the accent tint; the rest are quiet.
-            let fill = if selected {
+            // The selection itself crossfades with the fast token (a snap under
+            // Reduce Motion) — a deliberate state change, not a teleport.
+            let selected_f = motion.factor(ui.ctx(), id.with("selected"), selected, motion::FAST);
+            let fill = motion::lerp_color(
+                motion::lerp_color(Color32::TRANSPARENT, tokens.surface_hover, hover),
                 motion::lerp_color(
                     tokens.accent_tint,
                     tokens.accent.gamma_multiply(0.55),
                     hover * 0.35,
-                )
-            } else {
-                motion::lerp_color(Color32::TRANSPARENT, tokens.surface_hover, hover)
-            };
-            let text = if selected {
-                tokens.ink
-            } else {
-                tokens.ink_soft
-            };
+                ),
+                selected_f,
+            );
+            let text = motion::lerp_color(tokens.ink_soft, tokens.ink, selected_f);
             ui.painter()
                 .rect_filled(rect, CornerRadius::same(tokens.radius.control), fill);
             if response.has_focus() {
                 ui.painter().rect_stroke(
-                    rect.expand(1.5),
+                    rect.expand(FOCUS_RING_EXPAND),
                     CornerRadius::same(tokens.radius.control.saturating_add(2)),
                     Stroke::new(tokens.stroke.focus, tokens.accent),
                     StrokeKind::Outside,
@@ -586,11 +804,18 @@ pub fn segmented<T: PartialEq + Clone>(
                 FontId::new(12.0, FontFamily::Proportional),
                 text,
             );
+            // M9c painted-bounds invariant: the segment label fits its segment.
+            debug_assert!(
+                rect.expand(0.01)
+                    .contains_rect(Rect::from_center_size(rect.center(), galley.size())),
+                "segment {label:?} overflows its {size:?} body"
+            );
             ui.painter()
                 .galley(rect.center() - galley.size() / 2.0, galley, text);
             if response.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
+            super::bounds::record(ui.ctx(), id, rect, "segment");
             if response.clicked() && !selected {
                 *current = value.clone();
                 changed = true;
@@ -636,6 +861,9 @@ pub fn transport(
         Stroke::new(tokens.stroke.hairline, colors.stroke),
         StrokeKind::Inside,
     );
+    // The capsule body is a painted shape of this control — on the audit's
+    // record alongside the two interactive halves.
+    super::bounds::record(ui.ctx(), id.with("body"), rect, "transport");
 
     let half = rect.width() / 2.0;
     let skip_rect = Rect::from_min_size(rect.min, vec2(half, rect.height()));
@@ -710,7 +938,12 @@ mod tests {
     fn every_tier_defines_every_state_with_distinct_deltas() {
         for theme in [AppTheme::Light, AppTheme::Dark] {
             let t = tokens(theme);
-            for tier in [Tier::Primary, Tier::Secondary, Tier::Tertiary] {
+            for tier in [
+                Tier::Primary,
+                Tier::Secondary,
+                Tier::Tertiary,
+                Tier::Capsule,
+            ] {
                 let rest = tier_colors(&t, tier, State::Rest);
                 let hover = tier_colors(&t, tier, State::Hover);
                 let active = tier_colors(&t, tier, State::Active);
@@ -745,6 +978,107 @@ mod tests {
                 tier_colors(&t, Tier::Secondary, State::Rest).fill,
                 t.control_fill
             );
+            // The capsule rests on the translucent control fill with a hairline
+            // — the pill's material family (owner direction).
+            assert_eq!(
+                tier_colors(&t, Tier::Capsule, State::Rest).fill,
+                t.control_fill
+            );
+            assert_eq!(
+                tier_colors(&t, Tier::Capsule, State::Rest).stroke,
+                t.hairline
+            );
+        }
+    }
+
+    /// The capsule body (owner direction, 2026-10-14): ~28–30 pt tall, a real
+    /// capsule radius, ≥ space.s padding around the glyph/label.
+    #[test]
+    fn capsule_bodies_are_padded_capsules_at_the_designed_height() {
+        let ctx = egui::Context::default();
+        let t = tokens(AppTheme::Light);
+        let motion = Motion::new(false);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 400.0))),
+            ..Default::default()
+        };
+        let mut rects = Vec::new();
+        let mut glyph_pads = Vec::new();
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    let label = capsule_button(ui, &t, &motion, "cap-label", "Polish", true);
+                    rects.push(label.rect);
+                    let glyph = capsule_glyph_button(
+                        ui,
+                        &t,
+                        &motion,
+                        "cap-glyph",
+                        Glyph::Trash,
+                        true,
+                        "Delete this transcript",
+                    );
+                    rects.push(glyph.rect);
+                    glyph_pads.push((
+                        glyph.rect.width(),
+                        glyph_bounds(
+                            Glyph::Trash,
+                            Rect::from_center_size(glyph.rect.center(), vec2(16.0, 16.0)),
+                        )
+                        .width(),
+                    ));
+                });
+        });
+        for rect in &rects {
+            assert!(
+                (28.0..=30.0).contains(&rect.height()),
+                "the capsule body is 28–30 pt tall: {rect:?}"
+            );
+        }
+        // Label padding: width = label + 2 × space.s.
+        let label_w = rects[0].width();
+        assert!(
+            label_w >= t.space.s * 2.0,
+            "the labeled capsule carries its padding: {label_w}"
+        );
+        // Glyph padding: (body − ink) / 2 ≥ space.s − the stroke's half-pixel.
+        let (body_w, ink_w) = glyph_pads[0];
+        assert!(
+            (body_w - ink_w) / 2.0 >= t.space.s - 0.1,
+            "the glyph capsule carries ≥ space.s padding: body {body_w}, ink {ink_w}"
+        );
+        // The radius is the capsule's half-height.
+        let radius = (rects[0].height() / 2.0).round() as u8;
+        assert_eq!(radius, 14, "28 pt tall → 14 pt capsule radius");
+    }
+
+    /// The painted-bounds invariant at the source: every glyph's ink fits the
+    /// rect a control allocates for it (26 pt tertiary, 16 pt capsule box).
+    #[test]
+    fn every_glyph_fits_its_control_rect() {
+        for glyph in [
+            Glyph::Play,
+            Glyph::Pause,
+            Glyph::SkipStart,
+            Glyph::Trash,
+            Glyph::Check,
+            Glyph::Cross,
+            Glyph::Stop,
+            Glyph::ChevronLeft,
+        ] {
+            // The tertiary glyph button's body and the capsule glyph box.
+            for side in [26.0_f32, 28.0, 16.0] {
+                let rect = Rect::from_center_size(pos2(100.0, 100.0), vec2(side, side));
+                let bounds = glyph_bounds(glyph, rect);
+                assert!(
+                    rect.expand(0.01).contains_rect(bounds),
+                    "{glyph:?} ink {bounds:?} must fit a {side} pt box"
+                );
+            }
+            // The pill's stop glyph draws in a 16 pt box.
+            let pill = Rect::from_center_size(pos2(0.0, 0.0), vec2(16.0, 16.0));
+            assert!(pill.contains_rect(glyph_bounds(Glyph::Stop, pill)));
         }
     }
 

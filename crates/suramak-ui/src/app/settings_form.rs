@@ -35,6 +35,29 @@ pub fn normalize_language_code(raw: &str) -> Result<String, String> {
     Ok(code.to_ascii_lowercase())
 }
 
+/// The one-shot "applied" confirm's total envelope (M9c): the pulse is exactly
+/// 0 after this long — a one-shot, never a loop.
+pub const APPLIED_PULSE_MS: u64 = 700;
+/// The confirm pulse's rise (the rest of the envelope is the calm fall).
+pub const APPLIED_PULSE_RISE_MS: u64 = 120;
+
+/// The "applied" confirm pulse's opacity for an age since the save landed:
+/// quick rise, calm fall, exactly 0 by [`APPLIED_PULSE_MS`] (and for anything
+/// older). Drawn around the Save control; under Reduce Motion the view skips
+/// it entirely (the status line carries the confirmation).
+pub fn confirm_pulse(age: std::time::Duration) -> f32 {
+    let t = age.as_millis() as f32;
+    let rise = APPLIED_PULSE_RISE_MS as f32;
+    let total = APPLIED_PULSE_MS as f32;
+    if t >= total {
+        return 0.0;
+    }
+    if t <= rise {
+        return (t / rise).clamp(0.0, 1.0);
+    }
+    1.0 - ((t - rise) / (total - rise)).clamp(0.0, 1.0)
+}
+
 /// Placeholder base URL shown (not persisted until typed).
 pub const DEFAULT_POLISH_BASE_URL: &str = "https://api.openai.com/v1";
 
@@ -103,6 +126,9 @@ pub struct SettingsForm {
     pub dirty: bool,
     /// Last save result (ok note / error), shown next to the buttons.
     pub status: Option<Result<String, String>>,
+    /// M9c: when the last successful save landed — the view plays the one-shot
+    /// "applied" confirm pulse around Save, then clears this.
+    pub applied_at: Option<std::time::Instant>,
 }
 
 impl SettingsForm {
@@ -144,6 +170,7 @@ impl SettingsForm {
             api_key: String::new(),
             dirty: false,
             status: None,
+            applied_at: None,
         }
     }
 
@@ -616,6 +643,29 @@ mod tests {
             api_key_supported(),
             cfg!(any(target_os = "macos", target_os = "windows"))
         );
+    }
+
+    #[test]
+    fn the_applied_confirm_pulse_rises_falls_and_ends() {
+        use std::time::Duration;
+        // 0 at the instant, full at the end of the rise…
+        assert_eq!(confirm_pulse(Duration::ZERO), 0.0);
+        assert_eq!(
+            confirm_pulse(Duration::from_millis(APPLIED_PULSE_RISE_MS)),
+            1.0
+        );
+        // …falling monotonically through the hold…
+        let a = confirm_pulse(Duration::from_millis(300));
+        let b = confirm_pulse(Duration::from_millis(500));
+        assert!(a > b && b > 0.0, "the fall is monotonic: {a} -> {b}");
+        // …and exactly 0 once the envelope elapsed (a one-shot, not a loop).
+        assert_eq!(confirm_pulse(Duration::from_millis(APPLIED_PULSE_MS)), 0.0);
+        assert_eq!(confirm_pulse(Duration::from_secs(30)), 0.0);
+        // A fresh form has no armed pulse; a successful save arms one.
+        let mut form = SettingsForm::from_settings(&Settings::default());
+        assert!(form.applied_at.is_none());
+        form.applied_at = Some(std::time::Instant::now());
+        assert!(form.applied_at.is_some());
     }
 
     // ---- M6: the multi-select source list -----------------------------------

@@ -46,6 +46,81 @@ pub const GUTTER_WIDTH: f32 = 72.0;
 /// The transcript body's measure as a fraction of the available row width
 /// (workorder §3: ~66–70 %).
 pub const BODY_MEASURE: f32 = 0.68;
+/// The deck's one bottom separator sits this far above the band's bottom edge.
+pub const DECK_SEPARATOR_OFFSET: f32 = 0.5;
+
+// ---- the header's explicit vertical rhythm (owner-directed fix 2) ----------
+//
+// The editor header below the deck is positioned ENTIRELY from these pixel
+// constants — never from a measured galley height and never from an
+// `add_space` after measured content. Root cause of the owner's macOS defect:
+// the block used to flow from the measured heights of the serif title and the
+// proportional captions, so under the real system fonts (New York / SF Pro)
+// the rows shifted a few pixels while the deck's separator sat at a fixed
+// offset — and the caption zone collided with the rule. Explicit rows make
+// that class impossible on every platform, whatever the fonts measure.
+
+/// The deck separator → title row gap.
+pub const HEADER_TITLE_GAP: f32 = 6.0;
+/// The title row's constant height (holds the 20 pt serif title and the
+/// capsule action cluster; nothing below depends on what it measures).
+pub const HEADER_TITLE_ROW: f32 = 32.0;
+/// The title row → caption block gap.
+pub const HEADER_CAPTION_GAP: f32 = 2.0;
+/// One caption row's constant height (meta / save state / status).
+pub const HEADER_CAPTION_ROW: f32 = 18.0;
+/// How many caption rows the block reserves (meta, save, status).
+pub const HEADER_CAPTION_ROWS: usize = 3;
+/// The title's right reserve for the action cluster (trash + Polish + Undo +
+/// the confirm step); a longer title truncates with an ellipsis instead of
+/// pushing the cluster or growing the row.
+pub const HEADER_CLUSTER_RESERVE: f32 = 280.0;
+
+/// The header zone's explicit geometry: the one rule's y, the title row and
+/// the caption block. Pure, unit-tested (the macOS-collision fix).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HeaderLayout {
+    /// The deck's bottom separator (the ONLY horizontal rule in the header).
+    pub separator_y: f32,
+    /// The title row (serif title + the capsule cluster).
+    pub title: Rect,
+    /// The caption block (3 constant rows: meta / save state / status).
+    pub captions: Rect,
+}
+
+/// Lays out the header zone below the deck from the constants above.
+pub fn header_layout(pane: Rect) -> HeaderLayout {
+    let separator_y = pane.top() + DECK_HEIGHT - DECK_SEPARATOR_OFFSET;
+    let title = Rect::from_min_size(
+        pos2(pane.left(), pane.top() + DECK_HEIGHT + HEADER_TITLE_GAP),
+        vec2(pane.width(), HEADER_TITLE_ROW),
+    );
+    let captions = Rect::from_min_size(
+        pos2(pane.left(), title.bottom() + HEADER_CAPTION_GAP),
+        vec2(
+            pane.width(),
+            HEADER_CAPTION_ROW * HEADER_CAPTION_ROWS as f32,
+        ),
+    );
+    HeaderLayout {
+        separator_y,
+        title,
+        captions,
+    }
+}
+
+/// One caption row's rect: stacked from the explicit row height, zero overlap
+/// (row `i + 1` starts exactly where row `i` ends).
+pub fn header_caption_rect(header: &HeaderLayout, row: usize) -> Rect {
+    let row = row.min(HEADER_CAPTION_ROWS - 1);
+    Rect::from_min_size(
+        pos2(
+            header.captions.left(),
+            header.captions.top() + HEADER_CAPTION_ROW * row as f32,
+        ),
+        vec2(header.captions.width(), HEADER_CAPTION_ROW),
+    )
+}
 
 /// The deck's final geometry — band + the three anchors, pure and testable.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -103,19 +178,21 @@ pub fn ui(
 ) {
     let pane = ui.max_rect();
     let deck = deck_layout(pane);
+    // The header's rhythm comes from the constants — never from the flow
+    // cursor's measured content (owner-directed fix 2; see `header_layout`).
+    let header = header_layout(pane);
 
     deck_band(ui, tokens, motion, state, effects, &deck);
 
     // The export sheet hangs from the deck's button (anchored card, no band).
-    if state.export.open {
-        export::sheet(ui.ctx(), tokens, motion, state, effects, deck.export);
-    }
+    // It draws itself only while open or mid-close (M9c: base enter / fast exit).
+    export::sheet(ui.ctx(), tokens, motion, state, effects, deck.export);
 
-    // ---- title line: serif title + the single quiet Polish action ----------
-    title_line(ui, tokens, motion, state, effects);
+    // ---- title line: serif title + the capsule action cluster --------------
+    title_line(ui, tokens, motion, state, effects, header.title);
 
-    // ---- meta / save / status captions (quiet, under the title) ------------
-    meta_captions(ui, tokens, state);
+    // ---- meta / save / status captions (constant rows under the title) -----
+    meta_captions(ui, tokens, motion, state, &header);
 
     // ---- polish actions (only when the state has something to say) ---------
     polish_actions(ui, tokens, motion, state, effects);
@@ -140,9 +217,11 @@ fn deck_band(
 ) {
     let painter = ui.painter().clone();
     painter.rect_filled(deck.band, CornerRadius::ZERO, tokens.panel);
+    // The header's ONE horizontal rule: the deck's bottom separator, full pane
+    // width, at the constant offset (`header_layout` uses the same constant).
     painter.hline(
         deck.band.x_range(),
-        deck.band.bottom() - 0.5,
+        deck.band.bottom() - DECK_SEPARATOR_OFFSET,
         Stroke::new(tokens.stroke.strong, tokens.hairline),
     );
 
@@ -366,51 +445,53 @@ fn waveform_ms_at(strip: Rect, x: f32, total_ms: u32) -> u32 {
     (t * total_ms as f32).round() as u32
 }
 
-/// The title line: serif title at the left, `Polish` (quiet) at the far right,
-/// with `Undo` beside it when a polish undo is pending.
+/// The title line: the serif title painted into a **constant-height row**
+/// (one-row ellipsis truncation — the row never measures the text) and, right
+/// aligned in the same row, the action cluster as capsule buttons
+/// (owner-directed fix 1, 2026-10-14: trash / Polish / Undo read as real
+/// buttons — translucent capsule bodies, ≥ space.s padding, ≥ space.s gaps).
 fn title_line(
     ui: &mut egui::Ui,
     tokens: &Tokens,
     motion: &Motion,
     state: &mut AppState,
     effects: &mut Vec<Effect>,
+    row: Rect,
 ) {
     let (title, can_polish) = match &state.editor {
         Some(editor) => (editor.transcript.title.clone(), state.can_polish()),
         None => ("No transcript open".to_string(), false),
     };
-    ui.add_space(tokens.space.m);
-    ui.horizontal(|ui| {
-        ui.add_space(PANE_PAD_X - 8.0);
-        ui.label(
-            egui::RichText::new(title)
-                .font(FontId::new(20.0, theme::serif_family()))
-                .color(tokens.ink),
-        );
+
+    // The title: a single truncated row, centred in the constant row rect.
+    let title_left = row.left() + PANE_PAD_X - 8.0;
+    let max_width = (row.width() - (PANE_PAD_X - 8.0) * 2.0 - HEADER_CLUSTER_RESERVE).max(120.0);
+    let galley = title_galley(ui, tokens, &title, max_width);
+    ui.painter().galley(
+        pos2(title_left, row.center().y - galley.size().y / 2.0),
+        galley,
+        tokens.ink,
+    );
+
+    // The action cluster: right-aligned, vertically centred, gaps at space.s.
+    ui.scope_builder(egui::UiBuilder::new().max_rect(row), |ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = tokens.space.s;
             ui.add_space(PANE_PAD_X - 8.0);
             let undo_available = state.polish_undo.is_some();
-            let polish = controls::button(
-                ui,
-                tokens,
-                motion,
-                "editor-polish",
-                "Polish",
-                Tier::Tertiary,
-                can_polish,
-            )
-            .on_hover_text("Tidy up the transcript text with the configured endpoint");
+            let polish =
+                controls::capsule_button(ui, tokens, motion, "editor-polish", "Polish", can_polish)
+                    .on_hover_text("Tidy up the transcript text with the configured endpoint");
             if polish.clicked() {
                 effects.extend(state.start_polish());
             }
             if undo_available {
-                let undo = controls::button(
+                let undo = controls::capsule_button(
                     ui,
                     tokens,
                     motion,
                     "editor-polish-undo",
                     "Undo",
-                    Tier::Tertiary,
                     true,
                 )
                 .on_hover_text("Undo the accepted polish");
@@ -418,9 +499,11 @@ fn title_line(
                     effects.extend(state.undo_polish());
                 }
             }
-            // The delete affordance (M4.5, restyled M9a): a painted trash glyph
-            // that turns into an in-place confirm step — acting where the user
-            // clicked, no OS dialog. The M4.5 emoji (🗑 ✔ ✖) is gone.
+            // The delete affordance (M4.5, M9c capsule treatment): a painted
+            // trash glyph that turns into an in-place confirm step — acting
+            // where the user clicked, no OS dialog. The confirm step wears the
+            // same capsule body (a trivially consistent tweak of the owner's
+            // direction; the M4.5 emoji set is long gone).
             let confirming = state
                 .editor
                 .as_ref()
@@ -429,23 +512,21 @@ fn title_line(
             if confirming {
                 // Right-to-left layout: the first added sits rightmost, so this
                 // reads "Delete? ✔ ✖" from left to right.
-                let cancel = controls::glyph_button(
+                let cancel = controls::capsule_glyph_button(
                     ui,
                     tokens,
                     motion,
                     "editor-delete-cancel",
                     controls::Glyph::Cross,
-                    Tier::Tertiary,
                     true,
                     "Keep this transcript",
                 );
-                let confirm = controls::glyph_button(
+                let confirm = controls::capsule_glyph_button(
                     ui,
                     tokens,
                     motion,
                     "editor-delete-confirm",
                     controls::Glyph::Check,
-                    Tier::Tertiary,
                     true,
                     "Delete this transcript",
                 );
@@ -466,13 +547,12 @@ fn title_line(
                     effects.extend(state.delete_open_transcript());
                 }
             } else if has_editor {
-                let trash = controls::glyph_button(
+                let trash = controls::capsule_glyph_button(
                     ui,
                     tokens,
                     motion,
                     "editor-delete",
                     controls::Glyph::Trash,
-                    Tier::Tertiary,
                     true,
                     "Delete this transcript",
                 );
@@ -486,16 +566,50 @@ fn title_line(
     });
 }
 
-/// The quiet caption block under the title: the transcript meta, the autosave
-/// state and the cross-view status line.
-fn meta_captions(ui: &mut egui::Ui, tokens: &Tokens, state: &AppState) {
+/// A one-row, ellipsis-truncated serif galley for the title — the title row's
+/// height is a constant, so a long title can never grow it or push the
+/// cluster (owner-directed fix 2).
+fn title_galley(
+    ui: &egui::Ui,
+    tokens: &Tokens,
+    text: &str,
+    max_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::single_section(
+        text.to_owned(),
+        egui::TextFormat {
+            font_id: FontId::new(20.0, theme::serif_family()),
+            color: tokens.ink,
+            ..Default::default()
+        },
+    );
+    job.wrap = egui::text::TextWrapping {
+        max_width,
+        max_rows: 1,
+        break_anywhere: false,
+        overflow_character: Some('…'),
+    };
+    ui.ctx().fonts_mut(|fonts| fonts.layout_job(job))
+}
+
+/// The quiet captions under the title — the transcript meta, the autosave
+/// state and the cross-view status line — each in its own **constant row**
+/// (explicit heights; a row never moves another). The status line fades in
+/// over base / out over fast (M9c).
+fn meta_captions(
+    ui: &mut egui::Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    state: &AppState,
+    header: &HeaderLayout,
+) {
     let (meta, save_state, failed) = match &state.editor {
         Some(editor) => (
             format!(
-                "{} · {} · {} segment(s) · {}",
-                editor.transcript.model,
+                "{} · {} · {} · {}",
+                super::model_manager::display_name(&editor.transcript.model),
                 editor.transcript.language.as_deref().unwrap_or("auto"),
-                editor.transcript.segments.len(),
+                super::count_noun(editor.transcript.segments.len(), "segment"),
                 editor.transcript.created_at.format("%d %b %Y %H:%M")
             ),
             editor.save_state().to_string(),
@@ -503,20 +617,46 @@ fn meta_captions(ui: &mut egui::Ui, tokens: &Tokens, state: &AppState) {
         ),
         None => (String::new(), String::new(), false),
     };
-    ui.horizontal(|ui| {
-        ui.add_space(PANE_PAD_X - 8.0);
-        ui.vertical(|ui| {
-            if !meta.is_empty() {
-                pane_caption(ui, &meta, tokens, false);
-            }
-            if !save_state.is_empty() {
-                pane_caption(ui, &save_state, tokens, failed);
-            }
-            if let Some(status) = &state.status {
-                pane_caption(ui, &status.text, tokens, status.error);
-            }
+    let rows = [
+        (meta, false),
+        (save_state, failed),
+        (
+            state
+                .status
+                .as_ref()
+                .map(|s| s.text.clone())
+                .unwrap_or_default(),
+            state.status.as_ref().is_some_and(|s| s.error),
+        ),
+    ];
+    for (index, (text, error)) in rows.into_iter().enumerate() {
+        let rect = header_caption_rect(header, index);
+        if index == 2 {
+            // The cross-view status line: fades in base / out fast, and the
+            // stale text lingers while it fades (views::status_caption).
+            let message = if text.is_empty() {
+                None
+            } else {
+                Some((text.as_str(), error))
+            };
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(PANE_PAD_X - 8.0);
+                    super::views::status_caption(ui, tokens, motion, "editor-status", message);
+                });
+            });
+            continue;
+        }
+        if text.is_empty() {
+            continue;
+        }
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+            ui.horizontal(|ui| {
+                ui.add_space(PANE_PAD_X - 8.0);
+                pane_caption(ui, &text, tokens, error);
+            });
         });
-    });
+    }
 }
 
 /// The polish action row: only drawn when the polish state has something to
@@ -565,7 +705,8 @@ fn polish_actions(
                 pane_caption(
                     ui,
                     &format!(
-                        "polishing {segments} segment(s) — the review opens here when the endpoint answers"
+                        "polishing {} — the review opens here when the endpoint answers",
+                        super::count_noun(segments, "segment")
                     ),
                     tokens,
                     false,
@@ -602,7 +743,8 @@ fn polish_actions(
                 pane_caption(
                     ui,
                     &format!(
-                        "reviewing {rows} segment(s) — original | tidied; Accept replaces the transcript text"
+                        "reviewing {} — original | tidied; Accept replaces the transcript text",
+                        super::count_noun(rows, "segment")
                     ),
                     tokens,
                     false,
@@ -851,8 +993,8 @@ fn polish_panel(ui: &mut egui::Ui, tokens: &Tokens, state: &AppState) {
                 ui.add_space(PANE_PAD_X - 8.0);
                 ui.label(
                     egui::RichText::new(format!(
-                        "polishing {} segment(s) with the configured endpoint…",
-                        run.originals.len()
+                        "polishing {} with the configured endpoint…",
+                        super::count_noun(run.originals.len(), "segment")
                     ))
                     .size(13.0)
                     .color(tokens.ink_soft),
@@ -1005,22 +1147,256 @@ mod tests {
         assert_eq!(waveform_ms_at(strip, bars.right() + 50.0, 18_000), 18_000);
     }
 
-    /// M9b a11y floor: a full editor frame with accesskit enabled must expose
-    /// every painted control as a node carrying its semantic label — this is
-    /// the tree VoiceOver / AT-SPI reads.
+    // ---- M9c: the header's explicit rhythm (owner-directed fix 2) -----------
+
+    /// The deck separator never renders within
+    /// `[title_row_top − 2, caption_block_bottom + 2]` — the exact band the
+    /// owner's macOS screenshot showed a rule inside.
     #[test]
-    fn the_editor_exposes_labelled_accesskit_nodes() {
+    fn the_header_separator_never_enters_the_title_or_caption_zone() {
+        for pane in [
+            demo_pane(),
+            Rect::from_min_size(pos2(207.0, 46.0), vec2(693.0, 554.0)),
+            Rect::from_min_size(pos2(10.0, 200.0), vec2(900.0, 700.0)),
+        ] {
+            let header = header_layout(pane);
+            let forbidden_top = header.title.top() - 2.0;
+            let forbidden_bottom = header.captions.bottom() + 2.0;
+            assert!(
+                header.separator_y <= forbidden_top,
+                "the separator ({}) must sit above the title row ({}): forbidden band {forbidden_top}..{forbidden_bottom}",
+                header.separator_y,
+                header.title.top()
+            );
+            assert!(
+                !(header.separator_y > forbidden_top && header.separator_y < forbidden_bottom),
+                "the separator must never render inside the title/caption zone"
+            );
+        }
+    }
+
+    /// Caption rows stack from the explicit row height: contiguous, zero
+    /// overlap, and the block is exactly `ROWS × ROW_HEIGHT` tall.
+    #[test]
+    fn caption_rows_stack_from_explicit_heights_with_zero_overlap() {
+        let header = header_layout(demo_pane());
+        for row in 0..HEADER_CAPTION_ROWS {
+            let rect = header_caption_rect(&header, row);
+            assert_eq!(rect.height(), HEADER_CAPTION_ROW, "row {row} height");
+            assert_eq!(rect.left(), header.captions.left());
+            assert_eq!(rect.width(), header.captions.width());
+            if row > 0 {
+                let previous = header_caption_rect(&header, row - 1);
+                assert_eq!(rect.top(), previous.bottom(), "row {row} is contiguous");
+                assert_eq!(
+                    rect.intersect(previous).area(),
+                    0.0,
+                    "row {row} must not overlap (shared edges are contiguous, not overlap)"
+                );
+            }
+        }
+        assert_eq!(
+            header.captions.height(),
+            HEADER_CAPTION_ROW * HEADER_CAPTION_ROWS as f32
+        );
+        // The block sits directly under the title row at the constant gap.
+        assert_eq!(
+            header.captions.top() - header.title.bottom(),
+            HEADER_CAPTION_GAP
+        );
+    }
+
+    /// The rhythm is pure geometry: identical offsets from the pane's top for
+    /// every pane position and width (nothing here measures text).
+    #[test]
+    fn the_header_rhythm_is_constant_across_panes() {
+        let a = header_layout(demo_pane());
+        let b = header_layout(Rect::from_min_size(pos2(10.0, 200.0), vec2(800.0, 600.0)));
+        assert_eq!(a.title.top() - demo_pane().top(), b.title.top() - 200.0);
+        assert_eq!(a.title.height(), HEADER_TITLE_ROW);
+        assert_eq!(
+            a.captions.top() - a.title.bottom(),
+            b.captions.top() - b.title.bottom()
+        );
+        assert_eq!(a.separator_y - demo_pane().top(), b.separator_y - 200.0);
+    }
+
+    /// The header-zone audit (owner-directed fix 2b): a real editor frame
+    /// paints exactly ONE full-pane-width horizontal rule in the header zone —
+    /// the deck's bottom separator, at its constant y.
+    #[test]
+    fn the_header_zone_has_exactly_one_full_width_rule() {
         let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        // The editor draws in the serif family (registered by `install_fonts`);
-        // a bare test context has no font families at all.
         crate::theme::install_fonts(&ctx);
         let tokens = crate::theme::tokens(crate::theme::AppTheme::Light);
         let motion = crate::motion::Motion::new(false);
+        let mut state = demo_state("header-rule");
+        let mut effects = Vec::new();
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    super::ui(ui, &tokens, &motion, &mut state, &mut effects);
+                });
+        });
 
+        let header = header_layout(screen);
+        let zone_bottom = header.captions.bottom() + 2.0;
+        let mut rules: Vec<Rect> = Vec::new();
+        for clipped in &output.shapes {
+            let bounds = clipped.shape.visual_bounding_rect();
+            if !bounds.is_finite() || bounds.is_negative() {
+                continue;
+            }
+            // Line-like (≤ 2 pt tall) and full-content-width (≥ 80 % pane).
+            let line_like = bounds.height() <= 2.0 && bounds.width() >= screen.width() * 0.8;
+            if line_like && bounds.center().y >= screen.top() && bounds.center().y <= zone_bottom {
+                rules.push(bounds);
+            }
+        }
+        assert_eq!(
+            rules.len(),
+            1,
+            "exactly one full-width rule may exist in the header zone: {rules:?}"
+        );
+        let rule = rules[0];
+        assert!(
+            (rule.center().y - header.separator_y).abs() <= 1.0,
+            "the one rule is the deck separator at its constant y ({} vs {})",
+            rule.center().y,
+            header.separator_y
+        );
+        assert!(
+            rule.center().y <= header.title.top() - 2.0,
+            "the one rule never enters the title/caption zone"
+        );
+    }
+
+    /// Owner-directed fix 1: the title-line cluster's painted geometry — the
+    /// trash and Polish capsules are separate bodies with ≥ space.s between
+    /// them, no two cluster controls overlap, nothing paints across the gap,
+    /// and every shape stays inside its control's rect (ring allowance only).
+    #[test]
+    fn the_title_line_cluster_has_a_real_gap_and_no_overlap() {
+        crate::app::bounds::set_enabled(true);
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let tokens = crate::theme::tokens(crate::theme::AppTheme::Light);
+        let motion = crate::motion::Motion::new(false);
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
+        let row = header_layout(screen).title;
+        let allow = controls::FOCUS_RING_EXPAND + tokens.stroke.focus;
+
+        let run = |state: &mut crate::app::AppState| -> Vec<crate::app::bounds::ControlRect> {
+            let mut effects = Vec::new();
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            let output = ctx.run(input, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        super::title_line(ui, &tokens, &motion, state, &mut effects, row);
+                    });
+            });
+            let records = crate::app::bounds::take(&ctx);
+            // Every painted shape either belongs to a cluster control (inside
+            // its rect + the ring allowance) or is the title (left of the
+            // cluster); nothing may span the trash ↔ Polish gap.
+            let mut cluster: Vec<Rect> = records.iter().map(|record| record.rect).collect();
+            cluster.sort_by(|a, b| a.left().partial_cmp(&b.left()).unwrap());
+            let trash = *cluster.first().expect("the trash capsule");
+            let polish = *cluster.last().expect("the Polish capsule");
+            for clipped in &output.shapes {
+                let bounds = clipped.shape.visual_bounding_rect();
+                if !bounds.is_finite() || bounds.is_negative() {
+                    continue;
+                }
+                let in_trash = bounds.intersects(trash.expand(0.01));
+                let in_polish = bounds.intersects(polish.expand(0.01));
+                assert!(
+                    !(in_trash && in_polish),
+                    "a shape spans the trash ↔ Polish gap: {bounds:?}"
+                );
+                if in_trash {
+                    assert!(
+                        trash.expand(allow).contains_rect(bounds),
+                        "trash shape escapes its body: {bounds:?}"
+                    );
+                }
+                if in_polish {
+                    assert!(
+                        polish.expand(allow).contains_rect(bounds),
+                        "Polish shape escapes its body: {bounds:?}"
+                    );
+                }
+                assert!(
+                    row.expand(allow).contains_rect(bounds),
+                    "title-line shape escapes the row: {bounds:?}"
+                );
+            }
+            records
+        };
+
+        // No undo: exactly the trash + Polish capsules.
+        let mut state = demo_state("titleline");
+        let records = run(&mut state);
+        let mut cluster: Vec<Rect> = records.iter().map(|record| record.rect).collect();
+        cluster.sort_by(|a, b| a.left().partial_cmp(&b.left()).unwrap());
+        assert_eq!(cluster.len(), 2, "trash + Polish: {cluster:?}");
+        let trash = cluster[0];
+        let polish = cluster[1];
+        let gap = polish.left() - trash.right();
+        assert!(
+            gap >= tokens.space.s - 0.01,
+            "the painted trash ↔ Polish gap ({gap} pt) must be ≥ space.s ({})",
+            tokens.space.s
+        );
+        assert!(!trash.intersects(polish), "the two bodies never overlap");
+        // Both capsules are real bodies at the designed height.
+        for rect in [trash, polish] {
+            assert!(
+                (28.0..=30.0).contains(&rect.height()),
+                "capsule height: {rect:?}"
+            );
+        }
+
+        // With a pending polish undo the cluster is trash + Undo + Polish —
+        // still pairwise non-overlapping, every gap ≥ space.s.
+        let mut undo_state = demo_state("titleline-undo");
+        undo_state.polish_undo = Some(super::super::polish::PolishUndo {
+            previous: vec![(0, "before".to_string())],
+            segments: 1,
+        });
+        let records = run(&mut undo_state);
+        let mut cluster: Vec<Rect> = records.iter().map(|record| record.rect).collect();
+        cluster.sort_by(|a, b| a.left().partial_cmp(&b.left()).unwrap());
+        assert_eq!(cluster.len(), 3, "trash + Undo + Polish: {cluster:?}");
+        for pair in cluster.windows(2) {
+            assert!(
+                !pair[0].intersects(pair[1]),
+                "cluster controls never overlap: {pair:?}"
+            );
+            let gap = pair[1].left() - pair[0].right();
+            assert!(
+                gap >= tokens.space.s - 0.01,
+                "cluster gap {gap} must be ≥ space.s"
+            );
+        }
+        crate::app::bounds::set_enabled(false);
+    }
+
+    /// The editor's a11y tree (M9b) — kept as the shared-state regression.
+    fn demo_state(tag: &str) -> crate::app::AppState {
         let dir = std::env::temp_dir().join(format!("suramak-a11y-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let wav = dir.join("a11y.wav");
+        let wav = dir.join(format!("{tag}.wav"));
         std::fs::write(&wav, b"RIFF....").expect("temp wav");
         let mut state = crate::app::AppState::new();
         state.on_transcript_loaded(suramak_core::transcript::Transcript::new(
@@ -1038,6 +1414,22 @@ mod tests {
                 text: "hello".to_string(),
             }],
         ));
+        state
+    }
+
+    /// M9b a11y floor: a full editor frame with accesskit enabled must expose
+    /// every painted control as a node carrying its semantic label — this is
+    /// the tree VoiceOver / AT-SPI reads.
+    #[test]
+    fn the_editor_exposes_labelled_accesskit_nodes() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        // The editor draws in the serif family (registered by `install_fonts`);
+        // a bare test context has no font families at all.
+        crate::theme::install_fonts(&ctx);
+        let tokens = crate::theme::tokens(crate::theme::AppTheme::Light);
+        let motion = crate::motion::Motion::new(false);
+        let mut state = demo_state("a11y-tree");
 
         let mut effects = Vec::new();
         let input = egui::RawInput {

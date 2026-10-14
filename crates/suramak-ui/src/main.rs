@@ -611,6 +611,17 @@ impl ApplicationHandler<AccessKitEnabler> for App {
                     if std::env::var_os("SURAMAK_SMOKE_RECORD").is_some() {
                         shell.app.seed_demo_recording();
                     }
+                    // M9c harness: seed the model-manager table with a
+                    // mid-flight download (state only — no network, no real
+                    // download) so the download state can be captured
+                    // headlessly. Smoke modes only.
+                    if std::env::var_os("SURAMAK_SMOKE_MODELS").is_some() {
+                        shell.app.model_manager.rows = runtime.model_rows();
+                        shell.app.model_manager.refresh_epoch = 1;
+                        shell.app.model_manager.begin_download("turbo-q5-0");
+                        shell.app.on_download_progress(180_000_000, 574_041_195);
+                        shell.app.route = app::Route::Models;
+                    }
                     if let Some(input) = smoke.job.clone() {
                         let effects = shell.app.begin_import(input);
                         runtime.apply(effects, &mut shell.app);

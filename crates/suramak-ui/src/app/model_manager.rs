@@ -126,6 +126,73 @@ pub struct ModelManager {
     pub download: DownloadState,
     /// Last action result (Ok note / Err message), shown under the table.
     pub status: Option<Result<String, String>>,
+    /// M9c motion: the smoothed download-bar position (chunked progress
+    /// reports ease into one continuous move — no jitter).
+    pub progress_ease: ProgressEase,
+    /// M9c motion: bumped on every table load; rows play their base-token
+    /// arrival once per epoch (the re-check / delete / download-done
+    /// transition is seen, not teleported).
+    pub refresh_epoch: u64,
+}
+
+/// The download bar's smoothing (M9c): each frame the shown value approaches
+/// the reported fraction by a bounded step; it converges exactly, so the
+/// animation ends (and never jitters between two chunk reports).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ProgressEase {
+    shown: f32,
+}
+
+impl ProgressEase {
+    /// The smoothing's time constant: the bar covers ~63 % of a jump in this
+    /// time. Sized above the download poll cadence (150 ms) so each chunk
+    /// report moves the bar by a visible fraction instead of snapping.
+    pub const TAU: f32 = 0.30;
+    /// Settle threshold: within this the value snaps to the target (the
+    /// animation ENDS — no perpetual sub-pixel motion).
+    pub const EPSILON: f32 = 0.002;
+
+    /// The current displayed fraction (0..=1).
+    pub fn shown(&self) -> f32 {
+        self.shown
+    }
+
+    /// Approaches `target` over `dt` seconds; `reduce` (Reduce Motion) snaps.
+    /// Monotonic per target; the value lands exactly on the target.
+    pub fn approach(&mut self, target: f32, dt: f32, reduce: bool) -> f32 {
+        let target = target.clamp(0.0, 1.0);
+        if reduce || dt <= 0.0 {
+            self.shown = target;
+            return self.shown;
+        }
+        let delta = target - self.shown;
+        if delta.abs() <= Self::EPSILON {
+            self.shown = target;
+            return self.shown;
+        }
+        // Linear-in-time approach: never overshoots, never oscillates.
+        let step = delta * (dt / Self::TAU).min(1.0);
+        self.shown += step;
+        if (target - self.shown).abs() <= Self::EPSILON {
+            self.shown = target;
+        }
+        self.shown
+    }
+}
+
+/// The human display name for a model id (M9c copy sweep — no quant-suffix
+/// strings on screen). Unknown ids (a custom path, `auto`) pass through
+/// unchanged; the raw id stays visible as the model manager's detail line.
+pub fn display_name(id: &str) -> String {
+    match id.trim() {
+        "tiny" => "Tiny (fastest)".to_string(),
+        "base" => "Base (legacy)".to_string(),
+        "small" => "Small (fast)".to_string(),
+        "turbo-q5-0" => "Large v3 Turbo (balanced)".to_string(),
+        "turbo-q8-0" => "Large v3 Turbo (high quality)".to_string(),
+        "turbo" => "Large v3 Turbo (full precision)".to_string(),
+        other => other.to_string(),
+    }
 }
 
 impl ModelManager {
@@ -142,8 +209,17 @@ impl ModelManager {
             bytes_done: 0,
             bytes_total: total,
         };
+        // A fresh download restarts the smoothed bar at the bottom.
+        self.progress_ease = ProgressEase::default();
         self.status = None;
         true
+    }
+
+    /// M9c: a fresh table arrived — rows play their arrival once (the epoch
+    /// makes each refresh a deliberate transition).
+    pub fn on_rows_loaded(&mut self, rows: Vec<ModelRow>) {
+        self.rows = rows;
+        self.refresh_epoch = self.refresh_epoch.wrapping_add(1);
     }
 
     /// Progress report from the runtime.
@@ -164,14 +240,20 @@ impl ModelManager {
         match &result {
             Ok(()) => {
                 self.download = DownloadState::Done { id: id.to_string() };
-                self.status = Some(Ok(format!("{id} downloaded and sha256-verified")));
+                self.status = Some(Ok(format!(
+                    "{} downloaded and sha256-verified",
+                    display_name(id)
+                )));
             }
             Err(err) => {
                 self.download = DownloadState::Failed {
                     id: id.to_string(),
                     message: err.clone(),
                 };
-                self.status = Some(Err(format!("download of {id} failed: {err}")));
+                self.status = Some(Err(format!(
+                    "download of {} failed: {err}",
+                    display_name(id)
+                )));
             }
         }
     }
@@ -512,5 +594,84 @@ mod tests {
         assert_eq!(human_size(500), "500 B");
         assert_eq!(human_size(77_691_713), "77.7 MB");
         assert_eq!(human_size(1_624_555_275), "1.6 GB");
+    }
+
+    // ---- M9c: display names + smoothed progress ------------------------------
+
+    #[test]
+    fn every_manifest_model_has_a_human_display_name() {
+        for info in models::MODELS {
+            let name = display_name(info.id);
+            assert_ne!(name, info.id, "{} must have a human label", info.id);
+            assert!(!name.is_empty());
+            // No quant-suffix / raw-id strings on screen (brief principle 7).
+            for leak in ["q5", "q8", "ggml", "_0", "-q"] {
+                assert!(
+                    !name.contains(leak),
+                    "{name:?} leaks the raw quant suffix {leak:?}"
+                );
+            }
+        }
+        // The owner's example maps exactly.
+        assert_eq!(display_name("turbo-q5-0"), "Large v3 Turbo (balanced)");
+        assert_eq!(display_name("turbo-q8-0"), "Large v3 Turbo (high quality)");
+        assert_eq!(display_name("small"), "Small (fast)");
+        // Unknown ids (custom paths, `auto`) pass through untouched.
+        assert_eq!(display_name("auto"), "auto");
+        assert_eq!(display_name("/models/custom.bin"), "/models/custom.bin");
+        assert_eq!(display_name(" turbo-q5-0 "), "Large v3 Turbo (balanced)");
+    }
+
+    #[test]
+    fn progress_ease_is_monotonic_settles_and_snaps_under_reduce_motion() {
+        let mut ease = ProgressEase::default();
+        assert_eq!(ease.shown(), 0.0);
+
+        // Approaching 0.5 in small steps: monotonic, bounded, never overshoots,
+        // and it settles exactly (the ease ENDS).
+        let mut last = 0.0;
+        for _ in 0..600 {
+            let value = ease.approach(0.5, 1.0 / 60.0, false);
+            assert!(value >= last && value <= 0.5 + f32::EPSILON, "{value}");
+            last = value;
+        }
+        assert_eq!(ease.shown(), 0.5, "the ease ends exactly on the target");
+
+        // A chunked report mid-flight does not jitter: the value keeps moving
+        // toward the new target without a jump backwards, and one download
+        // cadence frame (150 ms) moves a visible fraction of the gap.
+        let before = ease.shown();
+        let after = ease.approach(0.7, 0.150, false);
+        assert!(
+            after > before + 0.05 && after <= 0.7,
+            "a poll moves the bar visibly: {before} -> {after}"
+        );
+
+        // Reduce Motion: a snap.
+        let mut reduced = ProgressEase::default();
+        assert_eq!(reduced.approach(0.42, 1.0 / 60.0, true), 0.42);
+        assert_eq!(reduced.approach(0.9, 1.0 / 60.0, true), 0.9);
+        // Out-of-range targets clamp.
+        assert_eq!(reduced.approach(2.0, 1.0 / 60.0, true), 1.0);
+        assert_eq!(reduced.approach(-1.0, 1.0 / 60.0, true), 0.0);
+    }
+
+    #[test]
+    fn a_refresh_bumps_the_epoch_so_rows_replay_their_arrival() {
+        let mut manager = ModelManager::default();
+        assert_eq!(manager.refresh_epoch, 0);
+        manager.on_rows_loaded(Vec::new());
+        manager.on_rows_loaded(Vec::new());
+        assert_eq!(
+            manager.refresh_epoch, 2,
+            "every load is a new arrival epoch"
+        );
+        // A fresh download restarts the smoothed bar.
+        let mut ease = ProgressEase::default();
+        ease.approach(0.8, 1.0, true);
+        assert_eq!(ease.shown(), 0.8);
+        manager.progress_ease = ease;
+        assert!(manager.begin_download("tiny"));
+        assert_eq!(manager.progress_ease.shown(), 0.0);
     }
 }

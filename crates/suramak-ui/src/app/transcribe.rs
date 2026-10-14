@@ -25,7 +25,7 @@ pub fn ui(
     let left = rect.left() + PANE_PAD_X;
     let right = rect.right() - PANE_PAD_X;
 
-    let (file_name, pct, model, requested, planned, warnings, failure) = match &state.job {
+    let (file_name, pct, model, planned, warnings, failure) = match &state.job {
         Job::Running(run) => (
             run.input
                 .file_name()
@@ -33,7 +33,6 @@ pub fn ui(
                 .unwrap_or_else(|| run.input.display().to_string()),
             run.pct,
             run.model.clone(),
-            run.requested_engine.clone(),
             run.planned_engine.clone(),
             run.warnings.clone(),
             None,
@@ -46,11 +45,10 @@ pub fn ui(
             0,
             None,
             None,
-            None,
             Vec::new(),
             Some(message.clone()),
         ),
-        Job::Idle => ("—".to_string(), 0, None, None, None, Vec::new(), None),
+        Job::Idle => ("—".to_string(), 0, None, None, Vec::new(), None),
     };
 
     ui.horizontal(|ui| {
@@ -93,9 +91,11 @@ pub fn ui(
         FontId::new(12.0, FontFamily::Monospace),
         tokens.ink,
     );
-    let engine_line = match (&requested, &planned) {
-        (Some(requested), Some(planned)) => format!("engine: {requested} → planned {planned}"),
-        _ => "engine: resolving…".to_string(),
+    // The engine line in plain words (M9c copy sweep: no `planned`, human
+    // engine names). While the plan resolves it says so.
+    let engine_line = match &planned {
+        Some(planned) => format!("engine: {}", super::engine_display(planned)),
+        _ => "engine: choosing…".to_string(),
     };
     painter.text(
         pos2(bar.left(), bar.bottom() + 14.0),
@@ -108,7 +108,7 @@ pub fn ui(
         painter.text(
             pos2(bar.right(), bar.bottom() + 14.0),
             Align2::RIGHT_TOP,
-            format!("model: {model}"),
+            format!("model: {}", super::model_manager::display_name(model)),
             FontId::new(11.5, FontFamily::Monospace),
             tokens.ink_soft,
         );
@@ -134,7 +134,27 @@ pub fn ui(
                 .max_rect(Rect::from_min_size(pos2(left, y), vec2(right - left, 24.0))),
             |ui| {
                 ui.horizontal(|ui| {
-                    pane_caption(ui, message, tokens, true);
+                    // The failure line fades in base / out fast (M9c status
+                    // discipline) — called every frame so a retry clears it.
+                    super::views::status_caption(
+                        ui,
+                        tokens,
+                        motion,
+                        "transcribe-failure",
+                        Some((message.as_str(), true)),
+                    );
+                });
+            },
+        );
+    } else {
+        // Keep the fade id registered while the job runs (so a failure that
+        // lands later animates in, and a cleared one animates out).
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(Rect::from_min_size(pos2(left, y), vec2(right - left, 24.0))),
+            |ui| {
+                ui.horizontal(|ui| {
+                    super::views::status_caption(ui, tokens, motion, "transcribe-failure", None);
                 });
             },
         );

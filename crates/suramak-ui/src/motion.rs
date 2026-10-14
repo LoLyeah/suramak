@@ -56,6 +56,19 @@ impl Motion {
         ctx.animate_bool_with_time_and_easing(id, on, self.duration(token), ease_out)
     }
 
+    /// A directional 0..=1 factor with **different enter and exit durations**
+    /// (the brief's "exits faster than enters": enter base 180 / exit fast 120
+    /// for the export sheet and status lines).
+    ///
+    /// Built on the same animation manager as [`Motion::factor`]: on a mid-flight
+    /// flip the value retargets from its *current* position at the new
+    /// direction's rate — it never queues and never snaps back. Under Reduce
+    /// Motion both durations are 0, so the flip is a snap either way.
+    pub fn fade(&self, ctx: &egui::Context, id: Id, on: bool, enter: f32, exit: f32) -> f32 {
+        let duration = self.duration(if on { enter } else { exit });
+        ctx.animate_bool_with_time_and_easing(id, on, duration, ease_out)
+    }
+
     /// A one-shot 0..=1 arrival factor: call with a FRESH `id` per arrival
     /// (e.g. one per new transcript line). The first frame renders at 0, then
     /// the factor eases to 1 over the token — and stops. Under Reduce Motion
@@ -118,6 +131,12 @@ pub fn arrival_progress(age: std::time::Duration, token: f32) -> f32 {
         return 1.0;
     }
     ease_out(age.as_secs_f32() / token)
+}
+
+/// A token (seconds) as a [`std::time::Duration`] — the seam for state that
+/// timestamps its animations (list arrivals, the settings confirm).
+pub fn token_duration(token: f32) -> std::time::Duration {
+    std::time::Duration::from_secs_f32(token.max(0.0))
 }
 
 #[cfg(test)]
@@ -277,5 +296,81 @@ mod tests {
         assert!(mid > 0.5 && mid < 1.0, "mid-flight: {mid}");
         assert_eq!(arrival_progress(Duration::from_millis(180), BASE), 1.0);
         assert_eq!(arrival_progress(Duration::from_secs(10), BASE), 1.0);
+    }
+
+    #[test]
+    fn directional_fades_honour_enter_and_exit_durations() {
+        let ctx = egui::Context::default();
+        let motion = Motion::new(false);
+        let id = Id::new("test-fade-direction");
+        // Register while off (the frame before the first open).
+        assert_eq!(
+            run_frame(&ctx, 0.0, |ctx| motion.fade(ctx, id, false, BASE, FAST)),
+            0.0
+        );
+        // Opening animates over the ENTER token: still in flight at 130 ms.
+        let opened = run_frame(&ctx, 0.130, |ctx| motion.fade(ctx, id, true, BASE, FAST));
+        assert!(
+            opened > 0.0 && opened < 1.0,
+            "the enter still runs at 130 ms of the base token: {opened}"
+        );
+        // Settled open.
+        assert_eq!(
+            run_frame(&ctx, 1.0, |ctx| motion.fade(ctx, id, true, BASE, FAST)),
+            1.0
+        );
+        // Closing runs over the EXIT token: fully gone once 120 ms elapsed.
+        let closing = run_frame(&ctx, 1.050, |ctx| motion.fade(ctx, id, false, BASE, FAST));
+        assert!(closing > 0.0 && closing < 1.0, "closing: {closing}");
+        assert_eq!(
+            run_frame(&ctx, 1.180, |ctx| motion.fade(ctx, id, false, BASE, FAST)),
+            0.0,
+            "the fast exit has ended 130 ms after the flip"
+        );
+        // Reduce Motion: both directions snap.
+        let reduced = Motion::new(true);
+        let snap = Id::new("test-fade-reduce");
+        assert_eq!(
+            run_frame(&ctx, 2.0, |ctx| reduced.fade(ctx, snap, false, BASE, FAST)),
+            0.0
+        );
+        assert_eq!(
+            run_frame(&ctx, 2.001, |ctx| reduced.fade(ctx, snap, true, BASE, FAST)),
+            1.0
+        );
+        assert_eq!(
+            run_frame(&ctx, 2.002, |ctx| reduced
+                .fade(ctx, snap, false, BASE, FAST)),
+            0.0
+        );
+    }
+
+    #[test]
+    fn interruptions_retarget_from_the_current_value() {
+        // The brief's interruption discipline: a flip mid-flight continues from
+        // where the value is — it never queues a second animation and never
+        // snaps back to 0 (or 1) before the new direction runs.
+        let ctx = egui::Context::default();
+        let motion = Motion::new(false);
+        let id = Id::new("test-interrupt");
+        assert_eq!(
+            run_frame(&ctx, 0.0, |ctx| motion.factor(ctx, id, false, SLOW)),
+            0.0
+        );
+        // Climb part-way into the slow entrance…
+        let mid = run_frame(&ctx, 0.150, |ctx| motion.factor(ctx, id, true, SLOW));
+        assert!(mid > 0.0 && mid < 1.0, "in flight: {mid}");
+        // …then flip back: the next frame moves down from the current value —
+        // strictly below the mid-flight value, strictly above 0.
+        let retargeted = run_frame(&ctx, 0.166, |ctx| motion.factor(ctx, id, false, SLOW));
+        assert!(
+            retargeted < mid && retargeted > 0.0,
+            "retargets from the current value ({mid} -> {retargeted})"
+        );
+        // And the new direction ends exactly at its target.
+        assert_eq!(
+            run_frame(&ctx, 5.0, |ctx| motion.factor(ctx, id, false, SLOW)),
+            0.0
+        );
     }
 }

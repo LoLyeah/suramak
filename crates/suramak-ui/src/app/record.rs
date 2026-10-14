@@ -72,7 +72,9 @@ pub fn ui(
         RecordState::Failed { message } => {
             let message = message.clone();
             pane_title(ui, "Recording failed", tokens);
-            pane_caption(ui, &message, tokens, true);
+            // An error state: its text fades in on arrival (base; a snap under
+            // Reduce Motion).
+            super::views::arriving_caption(ui, tokens, motion, "record-failed", &message, true);
             ui.add_space(16.0);
             ui.horizontal(|ui| {
                 ui.add_space(PANE_PAD_X - 8.0);
@@ -129,13 +131,35 @@ fn recording_body(
         ui.add_space(PANE_PAD_X - 8.0);
         ui.vertical(|ui| {
             pane_title(ui, title, tokens);
+            // The caption crossfades from the arming line to the live-sources
+            // line the moment the runtime reports them (base token; a snap
+            // under Reduce Motion) — the recording lifecycle's arming → live
+            // transition, seen rather than teleported. Both lines paint into
+            // the same preallocated row: the text measure never shifts.
+            let (caption_row, _) = ui.allocate_exact_size(
+                vec2(ui.available_width().max(120.0), 18.0),
+                egui::Sense::hover(),
+            );
+            let device_f = motion.factor(
+                ui.ctx(),
+                egui::Id::new("suramak-record-device"),
+                device.is_some(),
+                motion::BASE,
+            );
             let caption = match device {
                 Some(device) => {
                     format!("recording from {device} — transcribed on this machine, never uploaded")
                 }
                 None => "starting capture…".to_string(),
             };
-            pane_caption(ui, &caption, tokens, false);
+            let alpha = if device.is_some() { device_f } else { 1.0 };
+            ui.painter().text(
+                caption_row.left_center(),
+                Align2::LEFT_CENTER,
+                caption,
+                FontId::new(12.0, FontFamily::Proportional),
+                tokens.ink_soft.gamma_multiply(alpha),
+            );
         });
     });
 
@@ -284,15 +308,9 @@ fn recording_body(
                 stop_clicked = true;
             }
             ui.add_space(10.0);
-            pane_caption(
-                ui,
-                &format!(
-                    "current recording: {} of the last {RECORD_WAVEFORM_BARS} meter samples",
-                    waveform.len()
-                ),
-                tokens,
-                false,
-            );
+            // The meter line in plain words (M9c copy sweep: the old
+            // "N of the last 96 meter samples" telemetry string is gone).
+            pane_caption(ui, "the meter shows the last 10 seconds", tokens, false);
         });
     });
     if stop_clicked {
@@ -301,19 +319,22 @@ fn recording_body(
 
     // Source-resolution warnings ("device not found — using the default") must be
     // visible while recording (Addendum A: fall back with a *visible* warning).
-    if let Some(status) = &state.status {
-        ui.scope_builder(
-            egui::UiBuilder::new().max_rect(Rect::from_min_size(
-                pos2(left, controls_top + 38.0),
-                vec2(right - left, 20.0),
-            )),
-            |ui| {
-                ui.horizontal(|ui| {
-                    pane_caption(ui, &status.text, tokens, status.error);
-                });
-            },
-        );
-    }
+    // M9c: the line fades in base / out fast (called every frame, also empty).
+    ui.scope_builder(
+        egui::UiBuilder::new().max_rect(Rect::from_min_size(
+            pos2(left, controls_top + 38.0),
+            vec2(right - left, 20.0),
+        )),
+        |ui| {
+            ui.horizontal(|ui| {
+                let message = state
+                    .status
+                    .as_ref()
+                    .map(|status| (status.text.as_str(), status.error));
+                super::views::status_caption(ui, tokens, motion, "record-status", message);
+            });
+        },
+    );
 
     // ---- live provisional transcript (M7) ------------------------------------
     draw_provisional(
@@ -375,7 +396,8 @@ fn draw_provisional(
             pos2(card.left() + 18.0, card.top() + 24.0),
             Align2::LEFT_TOP,
             format!(
-                "{skipped} window(s) skipped to keep up — live updates may lag; the final pass is unaffected"
+                "{} skipped to keep up — live updates may lag; the final pass is unaffected",
+                super::count_noun(skipped as usize, "window")
             ),
             FontId::new(11.0, FontFamily::Proportional),
             tokens.ink_soft,
@@ -395,12 +417,25 @@ fn draw_provisional(
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 if provisional.is_empty() {
+                    // The stopping state's hint fades in (base token; a snap
+                    // under Reduce Motion) — the finishing hand-off is seen.
+                    let hint_f = motion.factor(
+                        ui.ctx(),
+                        egui::Id::new("suramak-record-hint"),
+                        stopping,
+                        motion::BASE,
+                    );
                     let hint = if stopping {
                         "finishing the recording — the final pass starts next"
                     } else {
                         "words appear here while you speak"
                     };
-                    ui.label(egui::RichText::new(hint).size(12.0).color(tokens.ink_soft));
+                    let alpha = if stopping { hint_f } else { 1.0 };
+                    ui.label(
+                        egui::RichText::new(hint)
+                            .size(12.0)
+                            .color(tokens.ink_soft.gamma_multiply(alpha)),
+                    );
                     return;
                 }
                 let wrap = ui.available_width().max(80.0);

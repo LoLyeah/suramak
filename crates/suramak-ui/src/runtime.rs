@@ -189,6 +189,15 @@ impl Runtime {
         settings_form::SettingsForm::from_settings(&self.settings)
     }
 
+    /// The model-manager table for the current models dir + default id.
+    ///
+    /// Used by the normal `Effect::RefreshModels` path and by the M9c smoke
+    /// harness (`SURAMAK_SMOKE_MODELS`), which seeds a mid-download state for
+    /// the headless screenshot — it never starts a real download.
+    pub fn model_rows(&self) -> Vec<model_manager::ModelRow> {
+        model_manager::rows(&self.models_dir, &self.settings.asr.model_id)
+    }
+
     /// Live rolling RMS of the capture session (`None` when not recording);
     /// M6: the loudest of the live sources (see `MultiRecorder::rms`).
     pub fn capture_rms(&self) -> Option<f32> {
@@ -1099,7 +1108,7 @@ impl LiveCapture {
         if skipped != skipped_before {
             tracing::info!(
                 skipped,
-                "live: backlog — the previous decode was still running; window(s) skipped and merged into the next"
+                "live: backlog — the previous decode was still running; the skipped window merged into the next"
             );
         }
     }

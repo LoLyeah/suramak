@@ -29,6 +29,7 @@ use self::model_manager::{ModelManager, ModelRow};
 use self::polish::{PolishState, PolishUndo};
 use self::settings_form::SettingsForm;
 
+pub mod bounds;
 pub mod controls;
 pub mod editor;
 pub mod export;
@@ -158,13 +159,16 @@ pub fn recording_file_stem(title: &str) -> String {
         .collect()
 }
 
-/// `mm:ss.t` elapsed clock for the record view (`00:07.3`; hours fold into mm).
+/// The **elapsed hh:mm:ss** clock for recordings (M9c copy sweep: the one
+/// sanctioned recording time format — the record view's timer and the floating
+/// pill both use it; the old `mm:ss.t` / `mm:ss` variants are gone). Hours
+/// never fold into minutes here: a 70-minute recording reads `01:10:00`.
 pub fn format_elapsed(elapsed: Duration) -> String {
     let total_secs = elapsed.as_secs();
-    let tenths = elapsed.subsec_millis() / 100;
-    let minutes = total_secs / 60;
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
     let seconds = total_secs % 60;
-    format!("{minutes:02}:{seconds:02}.{tenths}")
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
 /// `mm:ss.mmm` transport readout for the deck (`01:02.480`; hours fold into
@@ -175,6 +179,28 @@ pub fn format_transport(ms: u32) -> String {
     let seconds = (ms % 60_000) / 1000;
     let millis = ms % 1000;
     format!("{minutes:02}:{seconds:02}.{millis:03}")
+}
+
+/// `1 segment` / `5 segments` — the pluralization rule for every count the UI
+/// shows (M9c copy sweep: no `N item(s)` strings).
+pub fn count_noun(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
+}
+
+/// A human label for an engine id (`cpu` → `CPU`, `coreml` → `Core ML`) —
+/// the plain-words rule for the transcribe card and the outcome line. Unknown
+/// strings pass through unchanged.
+pub fn engine_display(name: &str) -> String {
+    match name {
+        "cpu" => "CPU".to_string(),
+        "metal" => "Metal".to_string(),
+        "coreml" => "Core ML".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// Lifecycle of the in-app transcription job.
@@ -218,6 +244,54 @@ pub struct LibraryState {
     /// Index into `items` of the selected row.
     pub selected: Option<usize>,
     pub error: Option<String>,
+    /// M9c list motion: set once the first list has been drawn. Insert
+    /// arrivals are stamped only for rows that appear *after* it, so the
+    /// first frame's list renders statically (only changes animate).
+    pub loaded_once: bool,
+    /// Insert ease (base token): `(transcript id, first-seen instant)` for rows
+    /// that appeared after the first load — the row fades + rises once.
+    pub arrivals: Vec<(Uuid, Instant)>,
+    /// Remove ease (base token): rows that just left the list (delete or a
+    /// refresh that dropped them), kept with their old index so the list can
+    /// shrink their height and fade them out where they were.
+    pub leaving: Vec<LeavingRow>,
+}
+
+/// One row that is leaving a list (M9c remove ease).
+#[derive(Debug, Clone)]
+pub struct LeavingRow {
+    pub item: Transcript,
+    /// The row's index in the list *before* it left (its draw position).
+    pub index: usize,
+    /// When it left; the fade + height collapse runs for the base token.
+    pub at: Instant,
+}
+
+impl LibraryState {
+    /// The insert ease's progress for a row (0..=1), when it is still arriving.
+    /// `None` → draw at 1 (no arrival). The caller passes the base token
+    /// duration ([`crate::motion::arrival_progress`] semantics).
+    pub fn row_arrival(&self, id: Uuid, now: Instant, token: f32) -> Option<f32> {
+        let at = self
+            .arrivals
+            .iter()
+            .find(|(arrival_id, _)| *arrival_id == id)
+            .map(|(_, at)| *at)?;
+        Some(crate::motion::arrival_progress(
+            now.saturating_duration_since(at),
+            token,
+        ))
+    }
+
+    /// Prunes settled insert arrivals and finished remove-ease rows. Called by
+    /// the list views each frame (and on refresh); both animations END — once
+    /// the token elapsed, the bookkeeping is dropped and nothing repaints.
+    pub fn prune_motion(&mut self, now: Instant, token: Duration) {
+        self.arrivals
+            .retain(|(_, at)| now.saturating_duration_since(*at) < token);
+        self.leaving
+            .retain(|row| now.saturating_duration_since(row.at) < token);
+    }
 }
 
 /// Open transcript in the editor.
@@ -1008,7 +1082,9 @@ impl AppState {
 
     /// Runtime: fresh table rows.
     pub fn on_models_loaded(&mut self, rows: Vec<ModelRow>) {
-        self.model_manager.rows = rows;
+        // M9c: the refresh bumps the table's epoch, so every row plays its
+        // base-token arrival once (the re-check/delete state transition).
+        self.model_manager.on_rows_loaded(rows);
     }
 
     /// Download pressed for `id`.
@@ -1041,11 +1117,15 @@ impl AppState {
         id: &str,
         result: Result<Vec<String>, String>,
     ) -> Vec<Effect> {
+        let name = model_manager::display_name(id);
         self.model_manager.status = Some(match result {
             Ok(removed) if removed.is_empty() => {
-                Ok(format!("{id} is not installed — nothing to remove"))
+                Ok(format!("{name} is not installed — nothing to remove"))
             }
-            Ok(removed) => Ok(format!("{id}: removed {} file(s)", removed.len())),
+            Ok(removed) => Ok(format!(
+                "{name}: removed {}",
+                count_noun(removed.len(), "file")
+            )),
             Err(err) => Err(err),
         });
         vec![Effect::RefreshModels]
@@ -1059,7 +1139,10 @@ impl AppState {
     /// Set-default executed → status + refresh (the default marker follows).
     pub fn on_default_set(&mut self, id: &str, result: Result<(), String>) -> Vec<Effect> {
         self.model_manager.status = Some(match result {
-            Ok(()) => Ok(format!("{id} is now the default model")),
+            Ok(()) => Ok(format!(
+                "{} is now the default model",
+                model_manager::display_name(id)
+            )),
             Err(err) => Err(err),
         });
         vec![Effect::RefreshModels]
@@ -1100,6 +1183,11 @@ impl AppState {
     /// Save result from the runtime.
     pub fn on_settings_saved(&mut self, result: Result<String, String>) {
         self.settings_form.dirty = result.is_err();
+        if result.is_ok() {
+            // M9c: a successful save arms the one-shot "applied" confirm pulse
+            // (drawn by the settings view around Save; it ends and clears).
+            self.settings_form.applied_at = Some(Instant::now());
+        }
         self.settings_form.status = Some(result);
     }
 
@@ -1202,7 +1290,7 @@ impl AppState {
                 }
                 self.job = Job::Idle;
                 self.last_engine = Some(engine_used);
-                let mut status = format!("engine: {}", engine_used.as_str());
+                let mut status = format!("engine: {}", engine_display(engine_used.as_str()));
                 if !warnings.is_empty() {
                     status.push_str(&format!(" — {}", warnings.join("; ")));
                 }
@@ -1271,7 +1359,40 @@ impl AppState {
     }
 
     /// Library list refreshed from the store.
+    ///
+    /// M9c list motion: rows that appear *after* the first load get an arrival
+    /// (insert ease — the row fades + rises once, base token); rows a
+    /// successful refresh drops are kept as [`LeavingRow`]s (remove ease — the
+    /// list shrinks their height and fades them out where they were). The
+    /// first load renders statically; a refresh that errored animates nothing.
     pub fn on_library_loaded(&mut self, items: Vec<Transcript>, error: Option<String>) {
+        let now = Instant::now();
+        if self.library.loaded_once && error.is_none() {
+            let previous: Vec<Uuid> = self.library.items.iter().map(|item| item.id).collect();
+            let live: Vec<Uuid> = items.iter().map(|item| item.id).collect();
+            for (index, item) in self.library.items.iter().enumerate() {
+                if !live.contains(&item.id) {
+                    self.library.leaving.push(LeavingRow {
+                        item: item.clone(),
+                        index,
+                        at: now,
+                    });
+                }
+            }
+            for item in &items {
+                if !previous.contains(&item.id) {
+                    self.library.arrivals.push((item.id, now));
+                }
+            }
+            // A row that came back (a refresh raced a delete) is not leaving.
+            self.library
+                .leaving
+                .retain(|row| !live.contains(&row.item.id));
+        }
+        self.library.loaded_once = true;
+        self.library
+            .prune_motion(now, crate::motion::token_duration(crate::motion::BASE));
+
         let mut selected = self
             .library
             .selected
@@ -1684,7 +1805,7 @@ mod tests {
         assert_eq!(state.last_insert.as_ref().unwrap().error, None);
         let status = state.status.as_ref().unwrap();
         assert!(
-            status.text.starts_with("engine: cpu — saved to library:"),
+            status.text.starts_with("engine: CPU — saved to library:"),
             "unexpected status: {}",
             status.text
         );
@@ -2101,7 +2222,7 @@ mod tests {
                 assert_eq!(rec.waveform, vec![0.4, 0.6]);
                 assert!((rec.rms - 0.6).abs() < 1e-6);
                 assert_eq!(rec.elapsed, Duration::from_millis(7_300));
-                assert_eq!(format_elapsed(rec.elapsed), "00:07.3");
+                assert_eq!(format_elapsed(rec.elapsed), "00:00:07");
             }
             other => panic!("expected a recording, got {other:?}"),
         }
@@ -2132,7 +2253,7 @@ mod tests {
             recording_file_stem("Recording 2026-10-13 14:05:33"),
             "Recording 2026-10-13 14-05-33"
         );
-        assert_eq!(format_elapsed(Duration::from_millis(62_040)), "01:02.0");
+        assert_eq!(format_elapsed(Duration::from_millis(62_040)), "00:01:02");
     }
 
     #[test]
@@ -2374,14 +2495,15 @@ mod tests {
             other => panic!("expected a recording, got {other:?}"),
         }
 
-        // The elapsed clock ticks on the app tick while recording.
+        // The elapsed clock ticks on the app tick while recording; the pill
+        // shows the same sanctioned hh:mm:ss format as the record view (M9c).
         state.tick(t0 + Duration::from_millis(7_300));
         match &state.record {
             RecordState::Recording(recording) => {
                 assert_eq!(
-                    suramak_playback::format_mmss(recording.elapsed.as_millis() as u32),
-                    "00:07",
-                    "the pill shows the live mm:ss clock"
+                    format_elapsed(recording.elapsed),
+                    "00:00:07",
+                    "the pill shows the live elapsed clock"
                 );
             }
             other => panic!("expected a recording, got {other:?}"),
@@ -2436,7 +2558,7 @@ mod tests {
 
     #[test]
     fn the_recording_clock_keeps_the_event_loop_pumping() {
-        // The pill's mm:ss clock is driven by the frame tick, so the busy
+        // The pill's elapsed clock is driven by the frame tick, so the busy
         // predicate must hold from the moment the control starts a session
         // until the runtime has taken the recording over (the M8 playback rule).
         let mut state = recording_state();
@@ -2598,7 +2720,7 @@ mod tests {
             .unwrap()
             .as_ref()
             .unwrap()
-            .contains("1 file(s)"));
+            .contains("removed 1 file"));
 
         // Set default → effect; the marker refresh follows.
         let effects = state.set_default_model("tiny");
@@ -3195,6 +3317,186 @@ mod tests {
         assert_eq!(format_transport(62_480), "01:02.480");
         // Hours fold into minutes — one format, never a third clock style.
         assert_eq!(format_transport(3_661_007), "61:01.007");
+    }
+
+    // ---- M9c: copy sweep — the two time formats, counts, engine names --------
+
+    /// Exactly TWO sanctioned time formats exist (brief §3): recordings show
+    /// elapsed hh:mm:ss, the transport mm:ss.mmm — and the old variants
+    /// (`mm:ss.t` tenths, bare `mm:ss`) are rejected by shape.
+    #[test]
+    fn the_two_sanctioned_time_formats_are_the_only_clocks() {
+        // Elapsed: hh:mm:ss — two colons, no dot, hours never fold into minutes.
+        assert_eq!(format_elapsed(Duration::ZERO), "00:00:00");
+        assert_eq!(format_elapsed(Duration::from_millis(7_300)), "00:00:07");
+        assert_eq!(format_elapsed(Duration::from_millis(62_040)), "00:01:02");
+        assert_eq!(format_elapsed(Duration::from_millis(3_723_456)), "01:02:03");
+        assert_eq!(format_elapsed(Duration::from_millis(4_200_000)), "01:10:00");
+        for elapsed in [
+            Duration::ZERO,
+            Duration::from_millis(7_300),
+            Duration::from_millis(62_040),
+            Duration::from_millis(3_723_456),
+        ] {
+            let text = format_elapsed(elapsed);
+            assert!(
+                !text.contains('.') && text.matches(':').count() == 2,
+                "elapsed {text:?} must be hh:mm:ss (the mm:ss.t variant is gone)"
+            );
+        }
+        // Transport: mm:ss.mmm — one colon, exactly three fractional digits,
+        // never an hours field (the old `mm:ss` readout is rejected by shape).
+        for ms in [0u32, 1_234, 62_480, 3_661_007] {
+            let text = format_transport(ms);
+            let (whole, frac) = text.split_once('.').expect("a millisecond dot");
+            assert_eq!(frac.len(), 3, "transport {text:?} has three millis digits");
+            assert_eq!(whole.matches(':').count(), 1, "transport {text:?} is mm:ss");
+        }
+        // The old shapes do not come out of either function.
+        assert_ne!(format_elapsed(Duration::from_millis(7_300)), "00:07.3");
+        assert_ne!(format_transport(7_000), "00:07");
+    }
+
+    #[test]
+    fn counts_are_pluralized_never_bracketed() {
+        assert_eq!(count_noun(0, "segment"), "0 segments");
+        assert_eq!(count_noun(1, "segment"), "1 segment");
+        assert_eq!(count_noun(5, "segment"), "5 segments");
+        assert_eq!(count_noun(1, "file"), "1 file");
+        assert_eq!(count_noun(2, "window"), "2 windows");
+        assert_eq!(count_noun(1, "window"), "1 window");
+        assert_eq!(count_noun(3, "device"), "3 devices");
+        // The bracketed shape is gone everywhere this helper is used.
+        for count in [0usize, 1, 2, 96] {
+            for noun in ["segment", "file", "window", "device"] {
+                let text = count_noun(count, noun);
+                assert!(!text.contains("(s)"), "no (s) suffix in {text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn engine_ids_render_as_human_names() {
+        assert_eq!(engine_display("cpu"), "CPU");
+        assert_eq!(engine_display("metal"), "Metal");
+        assert_eq!(engine_display("coreml"), "Core ML");
+        // Unknown strings pass through untouched.
+        assert_eq!(engine_display("auto"), "auto");
+        assert_eq!(engine_display(""), "");
+    }
+
+    // ---- M9c: list motion (insert / remove ease) -----------------------------
+
+    #[test]
+    fn the_first_library_load_is_static_then_inserts_and_removals_animate() {
+        let mut state = AppState::new();
+        let first = transcript("first.wav");
+        let second = transcript("second.wav");
+
+        // The first load renders statically: no arrivals, nothing leaving.
+        state.on_library_loaded(vec![first.clone(), second.clone()], None);
+        assert!(state.library.loaded_once);
+        assert!(
+            state.library.arrivals.is_empty(),
+            "no arrival on first load"
+        );
+        assert!(state.library.leaving.is_empty());
+
+        // An insert (a saved job / a new recording) gets exactly one arrival.
+        let third = transcript("third.wav");
+        state.on_library_loaded(vec![third.clone(), first.clone(), second.clone()], None);
+        assert_eq!(state.library.arrivals.len(), 1, "only the new row arrives");
+        assert_eq!(state.library.arrivals[0].0, third.id);
+        let progress = state
+            .library
+            .row_arrival(third.id, Instant::now(), crate::motion::BASE);
+        assert!(progress.is_some(), "the new row is mid-arrival");
+        assert!(
+            state
+                .library
+                .row_arrival(first.id, Instant::now(), crate::motion::BASE)
+                .is_none(),
+            "an existing row never replays its arrival"
+        );
+
+        // A removal (delete) keeps the row as a leaving ghost at its old index.
+        // (third's insert arrival from the previous load may still be in
+        // flight — the token has not elapsed — but no NEW arrival is stamped.)
+        state.on_library_loaded(vec![third.clone(), first.clone()], None);
+        assert_eq!(state.library.leaving.len(), 1);
+        assert_eq!(state.library.leaving[0].item.id, second.id);
+        assert_eq!(state.library.leaving[0].index, 2, "its old draw position");
+        assert_eq!(
+            state.library.arrivals.len(),
+            1,
+            "still only third's insert arrival"
+        );
+        assert_eq!(state.library.arrivals[0].0, third.id);
+
+        // Once the token elapsed, the bookkeeping is pruned (animations end).
+        let later = Instant::now() + Duration::from_millis(500);
+        state
+            .library
+            .prune_motion(later, Duration::from_millis(180));
+        assert!(state.library.leaving.is_empty());
+        assert!(state.library.arrivals.is_empty());
+    }
+
+    #[test]
+    fn a_refresh_that_errored_animates_nothing() {
+        let mut state = AppState::new();
+        state.on_library_loaded(vec![transcript("kept.wav")], None);
+        state.on_library_loaded(Vec::new(), Some("database is locked".into()));
+        assert!(
+            state.library.leaving.is_empty(),
+            "an errored refresh must not animate rows away"
+        );
+        assert!(state.library.arrivals.is_empty());
+    }
+
+    #[test]
+    fn list_slots_merge_leaving_rows_at_their_old_positions() {
+        use crate::app::library::{list_slots, ListSlot};
+        let mut state = AppState::new();
+        // The same transcript objects across loads (same ids — a refresh that
+        // returns new ids would be an insert + a removal, which is correct).
+        let a = transcript("a.wav");
+        let b = transcript("b.wav");
+        let c = transcript("c.wav");
+        state.on_library_loaded(vec![a.clone(), b.clone(), c.clone()], None);
+        // Delete b: the new list is [a, c]; b leaves at index 1.
+        state.on_library_loaded(vec![a.clone(), c.clone()], None);
+        assert_eq!(state.library.leaving.len(), 1);
+        assert!(state.library.arrivals.is_empty(), "no new rows");
+        let slots = list_slots(&state.library, None);
+        // a(0) → b-leaving(1) → c(1): the ghost keeps its slot while the live
+        // row that took the index follows it, so c slides up as b collapses.
+        assert_eq!(slots.len(), 3);
+        assert_eq!(slots[0], ListSlot::Live(0));
+        assert_eq!(slots[1], ListSlot::Leaving(0));
+        assert_eq!(slots[2], ListSlot::Live(1));
+        // The home recents cap applies to live rows and to ghosts that were
+        // visible within it: cap 2 keeps the ghost (old index 1 < 2), cap 1
+        // drops it (it lived beyond the visible rows).
+        assert_eq!(list_slots(&state.library, Some(2)).len(), 3);
+        assert_eq!(list_slots(&state.library, Some(1)).len(), 1);
+    }
+
+    // ---- M9c: settings confirm ----------------------------------------------
+
+    #[test]
+    fn a_successful_settings_save_arms_the_applied_confirm() {
+        let mut state = AppState::new();
+        assert!(state.settings_form.applied_at.is_none());
+        state.on_settings_saved(Ok("settings saved".to_string()));
+        assert!(
+            state.settings_form.applied_at.is_some(),
+            "Ok arms the one-shot confirm pulse"
+        );
+        // A failed save never arms it (the error line is the message).
+        let mut failed = AppState::new();
+        failed.on_settings_saved(Err("disk full".to_string()));
+        assert!(failed.settings_form.applied_at.is_none());
     }
 
     #[test]

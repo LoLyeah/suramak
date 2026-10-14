@@ -184,8 +184,8 @@ impl AppState {
                 if !aligned {
                     self.polish = PolishState::Failed {
                         message: format!(
-                            "polish reply does not line up with the {} sent segment(s): got {}",
-                            run.originals.len(),
+                            "polish reply does not line up with the {} sent: got {}",
+                            super::count_noun(run.originals.len(), "segment"),
                             polished.len()
                         ),
                     };
@@ -245,7 +245,10 @@ impl AppState {
         let segments = updates.len();
         self.polish_undo = Some(PolishUndo { previous, segments });
         self.set_status(
-            format!("polish accepted — {segments} segment(s) updated (Undo available)"),
+            format!(
+                "polish accepted — {} updated (Undo available)",
+                super::count_noun(segments, "segment")
+            ),
             false,
         );
         vec![Effect::SaveEdits { updates }]

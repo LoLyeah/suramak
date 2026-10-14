@@ -104,6 +104,27 @@ pub fn ui(
                 Tier::Primary,
                 true,
             );
+            // M9c "applied" confirm: a subtle one-shot pulse around Save after a
+            // successful save (quick rise, calm fall, ends — then the timestamp
+            // is cleared). Reduce Motion skips it: the status line confirms.
+            let now = std::time::Instant::now();
+            if let Some(applied_at) = state.settings_form.applied_at {
+                let age = now.saturating_duration_since(applied_at);
+                if age.as_millis() as u64 >= settings_form::APPLIED_PULSE_MS {
+                    state.settings_form.applied_at = None;
+                } else if !state.reduce_motion {
+                    let pulse = settings_form::confirm_pulse(age);
+                    let ring = save
+                        .rect
+                        .expand(controls::FOCUS_RING_EXPAND + (1.0 - pulse) * 3.0);
+                    ui.painter().rect_stroke(
+                        ring,
+                        egui::CornerRadius::same(tokens.radius.control.saturating_add(2)),
+                        egui::Stroke::new(tokens.stroke.focus, tokens.accent.gamma_multiply(pulse)),
+                        egui::StrokeKind::Outside,
+                    );
+                }
+            }
             if save.clicked() {
                 effects.extend(state.save_settings());
             }
@@ -123,11 +144,16 @@ pub fn ui(
         });
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            if let Some(status) = &state.settings_form.status {
-                match status {
-                    Ok(note) => pane_caption(ui, note, tokens, false),
-                    Err(err) => pane_caption(ui, err, tokens, true),
-                }
+            let message = state
+                .settings_form
+                .status
+                .as_ref()
+                .map(|status| match status {
+                    Ok(note) => (note.as_str(), false),
+                    Err(err) => (err.as_str(), true),
+                });
+            if message.is_some() {
+                super::views::status_caption(ui, tokens, motion, "settings-status", message);
             } else if dirty {
                 pane_caption(ui, "unsaved changes — press Save", tokens, false);
             }
@@ -167,16 +193,17 @@ fn transcription_section(
     });
     *y += ROW_H;
 
-    // Default model.
+    // Default model. M9c copy sweep: the combobox shows the human display
+    // names; the raw id stays the value that persists.
     label(ui, tokens, left, *y, "Default model");
     let current = form.model_id.clone();
     let mut chosen = current.clone();
     inside(ui, left, right, *y, |ui| {
         egui::ComboBox::from_id_salt("suramak-default-model")
-            .selected_text(chosen.clone())
+            .selected_text(super::model_manager::display_name(&current))
             .show_ui(ui, |ui| {
-                for option in model_options(&current) {
-                    ui.selectable_value(&mut chosen, option.clone(), option);
+                for (value, display) in model_options(&current) {
+                    ui.selectable_value(&mut chosen, value.clone(), display);
                 }
             });
         if !core_models::MODELS.iter().any(|m| m.id == current) && current != "auto" {
@@ -356,7 +383,7 @@ fn audio_source_section(
     inside(ui, left, right, *y, |ui| {
         pane_caption(
             ui,
-            "pick one or more — everything ticked is recorded together into one 16 kHz recording",
+            "pick one or more — everything ticked is recorded together into one file",
             tokens,
             false,
         );
@@ -471,8 +498,8 @@ fn audio_source_section(
                     pane_caption(
                         ui,
                         &format!(
-                            "{} input device(s) enumerated (virtual loopback devices like BlackHole appear here)",
-                            devices.len()
+                            "{} enumerated (virtual loopback devices like BlackHole appear here)",
+                            super::count_noun(devices.len(), "input device")
                         ),
                         tokens,
                         false,
@@ -718,13 +745,18 @@ fn polish_section(
     dirty
 }
 
-/// Model dropdown options: `auto` + every manifest id (+ a custom value if the
-/// settings carry one).
-fn model_options(current: &str) -> Vec<String> {
-    let mut options = vec!["auto".to_string()];
-    options.extend(core_models::MODELS.iter().map(|m| m.id.to_string()));
-    if !options.iter().any(|option| option == current) {
-        options.insert(1, current.to_string());
+/// Model dropdown options as `(value, display label)` pairs: `auto` + every
+/// manifest id (human-labelled) + a custom value if the settings carry one.
+fn model_options(current: &str) -> Vec<(String, String)> {
+    let mut options: Vec<(String, String)> =
+        vec![("auto".to_string(), "Auto (best installed)".to_string())];
+    options.extend(
+        core_models::MODELS
+            .iter()
+            .map(|m| (m.id.to_string(), super::model_manager::display_name(m.id))),
+    );
+    if !options.iter().any(|(value, _)| value == current) {
+        options.insert(1, (current.to_string(), current.to_string()));
     }
     options
 }

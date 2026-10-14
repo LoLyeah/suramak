@@ -169,14 +169,6 @@ pub fn ui(
         },
     );
 
-    if let Some(error) = &state.home.error {
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.add_space(PANE_PAD_X - 8.0);
-            pane_caption(ui, error, tokens, true);
-        });
-    }
-
     // ---- navigation (M3: models + settings live here) -----------------------
     let nav_top = row_top + 34.0;
     ui.scope_builder(
@@ -214,20 +206,25 @@ pub fn ui(
         },
     );
 
-    // Cross-view status line (e.g. the record-dot note on builds without capture).
-    if let Some(status) = &state.status {
-        ui.scope_builder(
-            egui::UiBuilder::new().max_rect(Rect::from_min_size(
-                pos2(left, nav_top + 30.0),
-                vec2(right - left, 20.0),
-            )),
-            |ui| {
-                ui.horizontal(|ui| {
-                    pane_caption(ui, &status.text, tokens, status.error);
-                });
-            },
-        );
-    }
+    // One message slot (M9c): the import error takes priority over the
+    // cross-view status; both fade in base / out fast. The old flow-positioned
+    // error collided with the nav row on every error — one fixed slot.
+    ui.scope_builder(
+        egui::UiBuilder::new().max_rect(Rect::from_min_size(
+            pos2(left, nav_top + 30.0),
+            vec2(right - left, 20.0),
+        )),
+        |ui| {
+            ui.horizontal(|ui| {
+                let message = match (&state.home.error, &state.status) {
+                    (Some(err), _) => Some((err.as_str(), true)),
+                    (None, Some(status)) => Some((status.text.as_str(), status.error)),
+                    (None, None) => None,
+                };
+                super::views::status_caption(ui, tokens, motion, "home-status", message);
+            });
+        },
+    );
 
     // ---- recent recordings --------------------------------------------------
     let list_top = row_top + 82.0;
@@ -240,33 +237,80 @@ pub fn ui(
             ui.vertical(|ui| {
                 super::views::section_title(ui, "Recent recordings", tokens);
                 ui.add_space(6.0);
-                if let Some(error) = &state.library.error {
-                    pane_caption(ui, error, tokens, true);
-                } else if state.library.items.is_empty() {
-                    pane_caption(
+                let error = state.library.error.clone();
+                let empty = state.library.items.is_empty() && state.library.leaving.is_empty();
+                if let Some(error) = &error {
+                    // An error state: fades in on arrival (base; a snap under
+                    // Reduce Motion).
+                    super::views::arriving_caption(
                         ui,
-                        "Nothing yet — your transcriptions will appear here.",
                         tokens,
+                        motion,
+                        "home-library-error",
+                        error,
+                        true,
+                    );
+                } else if empty {
+                    super::views::arriving_caption(
+                        ui,
+                        tokens,
+                        motion,
+                        "home-empty",
+                        "Nothing yet — your transcriptions will appear here.",
                         false,
                     );
                 } else {
+                    // M9c list motion: insert ease (arrival) + remove ease
+                    // (leaving rows collapse in place), same as the sidebar.
+                    let now = std::time::Instant::now();
+                    state
+                        .library
+                        .prune_motion(now, motion::token_duration(motion::BASE));
+                    let slots = super::library::list_slots(&state.library, Some(6));
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            for index in 0..state.library.items.len().min(6) {
-                                let (title, meta) = {
-                                    let item = &state.library.items[index];
-                                    (
-                                        item.title.clone(),
-                                        format!(
+                            for slot in slots {
+                                match slot {
+                                    super::library::ListSlot::Live(index) => {
+                                        let (id, title, meta) = {
+                                            let item = &state.library.items[index];
+                                            (
+                                                item.id,
+                                                item.title.clone(),
+                                                format!(
+                                                    "{} · {}",
+                                                    item.created_at.format("%d %b %Y %H:%M"),
+                                                    super::model_manager::display_name(&item.model)
+                                                ),
+                                            )
+                                        };
+                                        let arrival = state
+                                            .library
+                                            .row_arrival(id, now, motion::BASE)
+                                            .unwrap_or(1.0);
+                                        if recording_row(
+                                            ui, tokens, motion, index, &title, &meta, arrival,
+                                        ) {
+                                            effects.extend(state.select_library(index));
+                                        }
+                                    }
+                                    super::library::ListSlot::Leaving(leaving_index) => {
+                                        let row = &state.library.leaving[leaving_index];
+                                        let title = row.item.title.clone();
+                                        let meta = format!(
                                             "{} · {}",
-                                            item.created_at.format("%d %b %Y %H:%M"),
-                                            item.model
-                                        ),
-                                    )
-                                };
-                                if recording_row(ui, tokens, motion, index, &title, &meta) {
-                                    effects.extend(state.select_library(index));
+                                            row.item.created_at.format("%d %b %Y %H:%M"),
+                                            super::model_manager::display_name(&row.item.model)
+                                        );
+                                        let progress = motion::arrival_progress(
+                                            now.saturating_duration_since(row.at),
+                                            motion::BASE,
+                                        );
+                                        super::library::leaving_row(
+                                            ui, tokens, &title, &meta, progress,
+                                        );
+                                    }
                                 }
                             }
                         });
@@ -276,7 +320,8 @@ pub fn ui(
     );
 }
 
-/// One clickable recording row (title + meta). Returns true when clicked.
+/// One clickable recording row (title + meta): `arrival` fades + rises the row
+/// on an insert (1.0 = settled). Returns true when clicked.
 pub fn recording_row(
     ui: &mut egui::Ui,
     tokens: &Tokens,
@@ -284,6 +329,7 @@ pub fn recording_row(
     index: usize,
     title: &str,
     meta: &str,
+    arrival: f32,
 ) -> bool {
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), 40.0), egui::Sense::click());
@@ -314,19 +360,20 @@ pub fn recording_row(
             motion::tint_over(egui::Color32::TRANSPARENT, tokens.surface_hover, hover),
         );
     }
+    let rise = motion::rise(arrival, 3.0);
     painter.text(
-        pos2(rect.left() + 10.0, rect.top() + 5.0),
+        pos2(rect.left() + 10.0, rect.top() + 5.0 + rise),
         Align2::LEFT_TOP,
         title,
         FontId::new(13.0, FontFamily::Proportional),
-        tokens.ink,
+        tokens.ink.gamma_multiply(arrival),
     );
     painter.text(
-        pos2(rect.left() + 10.0, rect.top() + 22.0),
+        pos2(rect.left() + 10.0, rect.top() + 22.0 + rise),
         Align2::LEFT_TOP,
         meta,
         FontId::new(11.0, FontFamily::Proportional),
-        tokens.ink_soft,
+        tokens.ink_soft.gamma_multiply(arrival),
     );
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);

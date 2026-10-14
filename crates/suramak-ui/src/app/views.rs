@@ -323,12 +323,14 @@ fn float_control(
                 );
             }
             if record_alpha > 0.01 {
-                // Stop affordance + the live clock (mm:ss).
+                // Stop affordance + the live clock. M9c: the pill's clock is the
+                // sanctioned **elapsed hh:mm:ss** recording format — the same
+                // clock the record view's timer shows (the old mm:ss is gone).
                 let elapsed = match &state.record {
                     super::RecordState::Recording(rec) => rec.elapsed,
                     _ => std::time::Duration::ZERO,
                 };
-                let clock = suramak_playback::format_mmss(elapsed.as_millis() as u32);
+                let clock = super::format_elapsed(elapsed);
                 let galley = painter.layout_no_wrap(
                     clock,
                     FontId::new(19.0, FontFamily::Monospace),
@@ -392,6 +394,104 @@ pub fn pane_caption(ui: &mut egui::Ui, text: &str, tokens: &Tokens, error: bool)
             .color(color)
             .family(FontFamily::Proportional),
     );
+}
+
+/// A status / inline message with the brief's fade discipline (M9c): fades in
+/// over the base token, out over the fast token. The stale text is kept while
+/// it fades out — an immediate-mode label cannot fade once it stops being
+/// drawn — then dropped. Never blocks input (it is a label, not a control);
+/// the app has no hover-pausable dismiss timer to honor (noted in the report).
+///
+/// Call it **every frame** (with `None` when there is no message) so the fade
+/// id is registered while empty and the appearance animates.
+pub fn status_caption(
+    ui: &mut egui::Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    id_salt: impl std::hash::Hash,
+    message: Option<(&str, bool)>,
+) {
+    let ctx = ui.ctx();
+    let base_id = ui.id().with(id_salt);
+    let fade_id = base_id.with("status-fade");
+    let text_id = base_id.with("status-text");
+    let fade = motion.fade(ctx, fade_id, message.is_some(), motion::BASE, motion::FAST);
+    if let Some((text, error)) = message {
+        ctx.data_mut(|data| data.insert_temp(text_id, (text.to_owned(), error)));
+    }
+    if fade <= 0.01 {
+        return;
+    }
+    let stored = ctx.data_mut(|data| data.get_temp::<(String, bool)>(text_id));
+    if let Some((text, error)) = stored {
+        let color = if error {
+            tokens.record_red
+        } else {
+            tokens.ink_soft
+        };
+        ui.label(
+            egui::RichText::new(text)
+                .size(12.0)
+                .color(color.gamma_multiply(fade))
+                .family(FontFamily::Proportional),
+        );
+    }
+}
+
+/// A one-shot fade-in for an empty / first-run / error state's text (base
+/// token; a snap under Reduce Motion). The id is per state, so the caption
+/// eases in the first time the state appears and stays settled — nothing loops.
+pub fn arriving_caption(
+    ui: &mut egui::Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    id_salt: impl std::hash::Hash,
+    text: &str,
+    error: bool,
+) {
+    let fade = motion.arrive(
+        ui.ctx(),
+        egui::Id::new(("suramak-arrive", id_salt)),
+        motion::BASE,
+    );
+    let color = if error {
+        tokens.record_red
+    } else {
+        tokens.ink_soft
+    };
+    ui.label(
+        egui::RichText::new(text)
+            .size(12.0)
+            .color(color.gamma_multiply(fade))
+            .family(FontFamily::Proportional),
+    );
+}
+
+/// A one-row, ellipsis-truncated galley for a fixed-width slot (the editor
+/// title row, the model-manager name column): the slot's geometry never
+/// depends on what the text measures (owner-directed fix 2).
+pub fn truncated_galley(
+    ui: &egui::Ui,
+    text: &str,
+    font: egui::FontId,
+    color: egui::Color32,
+    max_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::single_section(
+        text.to_owned(),
+        egui::TextFormat {
+            font_id: font,
+            color,
+            ..Default::default()
+        },
+    );
+    job.wrap = egui::text::TextWrapping {
+        max_width,
+        max_rows: 1,
+        break_anywhere: false,
+        overflow_character: Some('…'),
+    };
+    ui.ctx().fonts_mut(|fonts| fonts.layout_job(job))
 }
 
 /// Section heading inside a card (serif, 20 px).
