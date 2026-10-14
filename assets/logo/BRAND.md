@@ -1,7 +1,8 @@
 # Suramak brand
 
-The mark: **"Speak to Text"** (picked 2026-10-13) — a system-style squircle tile
-whose cutouts run waveform → text rules: speech becoming text.
+The mark: **"Speak to Text (A3 — Bars + Live Record Dot)"** (updated 2026-10-14) — a
+system-style squircle tile whose cutouts run 3 vertical waveform bars → 3 horizontal
+text rules + an inline signal-red record dot at the end of the third line.
 
 ## Palette (flat master)
 

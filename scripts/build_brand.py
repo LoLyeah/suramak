@@ -79,10 +79,12 @@ def wcag_ratio(a, b):
 
 def split_mark(svg_text):
     d = re.search(r'd="([^"]+)"', svg_text).group(1)
-    parts = re.findall(r"M[^M]+", d)
-    if len(parts) != 7:
-        sys.exit(f"concept geometry changed: expected 7 subpaths, got {len(parts)}")
-    tile, bars, rules = parts[0], " ".join(parts[1:4]), " ".join(parts[4:7])
+    parts = [p.strip() for p in re.findall(r"M[^M]+", d)]
+    if len(parts) != 8:
+        sys.exit(f"concept geometry changed: expected 8 subpaths (tile + 3 bars + 3 rules + dot), got {len(parts)}")
+    tile = parts[0]
+    bars = " ".join(parts[1:4] + [parts[7]])  # 3 vertical voice bars + inline record dot
+    rules = " ".join(parts[4:7])              # 3 horizontal text rules
     return tile, bars, rules
 
 
@@ -268,7 +270,12 @@ def verify():
     def bl(x, y):
         return ((x - 128) * k + 128) / 256, ((y - 128) * k + 128) / 256
 
-    pts = [(*bl(200, 41), INK), (*bl(52, 128), SIGNAL), (*bl(191, 98), PAPER)]
+    pts = [
+        (*bl(200, 41), INK),
+        (*bl(53, 128), SIGNAL),
+        (*bl(177, 89), PAPER),
+        (*bl(203, 167), SIGNAL),
+    ]
     probe(os.path.join(base, "icon_512x512@2x.png"), pts)
     probe(os.path.join(ICONS, "linux", "suramak-512.png"), pts)
     print("verify: dimensions + colour probes OK")
