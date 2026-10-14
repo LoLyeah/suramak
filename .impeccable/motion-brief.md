@@ -1,6 +1,6 @@
 # Motion brief — Suramak
 
-Shaped per impeccable `shape` (v4.4.0), 2026-10-14. Status: **draft — two owner questions pending** (bottom). Once confirmed, this is the standing motion contract: each future milestone implements its part; each surface gets an `impeccable animate` review at polish time.
+Shaped per impeccable `shape` (v4.4.0), 2026-10-14. Status: **confirmed by owner 2026-10-14** (decisions in §7). This is the standing motion contract: each future milestone implements its part; each surface gets an `impeccable animate` review at polish time.
 
 ## 1. Job and audience
 
@@ -52,10 +52,10 @@ Suramak is used in **Operate** mode: people record, read, edit, export. Motion's
 - Enter/exit: exits faster than enters (exit fast 120, enter base 180).
 - The pill floats above everything: it persists across routes; only its state morphs.
 
-## 7. Constraints and open decisions
+## 7. Constraints and decided details
 
 - Implementation: extend `motion.rs`; every workorder from M9b on carries a **Motion** section mapping its states to L1/L2/L3.
 - Gates: `impeccable animate` review per surface at polish time; the finish review walks §5.
-- **Open (owner)**:
-  - **Q1 — delight appetite in the record view**: recommend *subtle living dot + level meter only* (no waveform breathing, no ambient pulses). Confirm or add.
-  - **Q2 — pill spring**: recommend *gentle press spring, no bounce*. Confirm or redirect.
+- **Owner decisions (confirmed 2026-10-14)**:
+  - **Record view delight — subtle.** A living dot + the real level meter only. No breathing/pulsing waveform, no ambient pulses.
+  - **Pill press — gentle spring, no bounce.**
