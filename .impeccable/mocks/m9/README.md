@@ -9,4 +9,4 @@ Three compositions of the remade editor (M9 UI remake), LIGHT appearance, same w
   - `B-instrument.png` ← `B-instrument.prompt.txt` (emphasis-retry pass)
   - `C-deck.png` ← `C-deck.prompt.txt` (first pass)
 - Known comp-artifact class: micro-text noise (a leaked "19px"/"15px" here, a garbled word there) — placeholder noise, judge composition, not copy. The floating Record pill, the single-surface system, and the light glass are the load-bearing elements; text/behavior are implementation responsibilities.
-- Owner decision pending: composition pick (A / B / C / a stated mix) + appearance (follow-system vs pinned). Winner becomes the build target; mark the chosen file once picked.
+- Owner decision (2026-10-14): **CHOSEN: `C-deck.png`** — composition C; appearance follows the macOS light/dark automatically, with a Settings option to force Light or Dark (default: System). The chosen comp is the build target; the other two stay for reference.

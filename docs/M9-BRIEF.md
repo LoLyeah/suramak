@@ -34,11 +34,11 @@ Craft overhaul *inside* the settled world (C-system, "OS citizen"). The glass ma
 
 Common to all three: light appearance (appearance decision pending), one surface system, the pill bottom-center, real content.
 
-## Open decisions (owner)
+## Decisions (owner, 2026-10-14)
 
-1. **Composition**: A, B, C, or a stated mix ("C's deck + A's reading column" etc.).
-2. **Appearance**: follow the system (author the ladder in light + dark) — recommended, it is what a Tahoe OS-citizen does — vs pinned light vs pinned dark.
-3. Anything the comps dropped that must stay.
+1. **Composition: C — Deck** (one integrated control deck under the titlebar: transport + waveform + readout + Export in one band; transcript as clean rows below). Build target: `.impeccable/mocks/m9/C-deck.png`.
+2. **Appearance: follow the macOS light/dark automatically**, with a Settings option to force Light or Dark (default: System).
+3. Nothing beyond the protect list must be restored from before the remake.
 
 ## Build plan (post-pick)
 
