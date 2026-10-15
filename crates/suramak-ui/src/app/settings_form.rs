@@ -101,6 +101,10 @@ pub fn order_sources(sources: &mut [RecordSource]) {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsForm {
     pub engine: EngineSetting,
+    /// M10A: "Fast engine (experimental)" — persisted as `settings.asr.fast_engine`,
+    /// **OFF by default**. On: covered languages route to Parakeet when installed;
+    /// Indonesian and everything else stay Whisper.
+    pub fast_engine: bool,
     pub model_id: String,
     /// Language selector (`auto`/`en`/`id`, or a custom code from an older file).
     pub language: String,
@@ -150,6 +154,7 @@ impl SettingsForm {
         order_sources(&mut sources);
         Self {
             engine: settings.asr.engine,
+            fast_engine: settings.asr.fast_engine,
             model_id: settings.asr.model_id.clone(),
             language,
             language_custom,
@@ -282,6 +287,7 @@ impl SettingsForm {
     /// apps) refuses, the previous list stays.
     pub fn apply(&self, settings: &mut Settings) {
         settings.asr.engine = self.engine;
+        settings.asr.fast_engine = self.fast_engine;
         settings.asr.model_id = self.model_id.trim().to_string();
         if let Ok(code) = self.validated_language() {
             settings.asr.language = lang_mode(&code);
@@ -395,6 +401,7 @@ mod tests {
     fn form_defaults_match_core_defaults() {
         let form = SettingsForm::from_settings(&Settings::default());
         assert_eq!(form.engine, EngineSetting::Auto);
+        assert!(!form.fast_engine, "the fast engine starts OFF");
         assert_eq!(form.model_id, "turbo-q5-0");
         assert_eq!(form.language, "auto");
         assert!(!form.keep_audio);
@@ -403,6 +410,38 @@ mod tests {
         assert!(form.polish_base_url.is_empty() && form.polish_model.is_empty());
         assert!(form.api_key.is_empty(), "the key field always starts empty");
         assert!(!form.dirty);
+    }
+
+    // ---- M10A: the fast-engine toggle ---------------------------------------
+
+    #[test]
+    fn fast_engine_toggle_roundtrips_form_settings_file_and_back() {
+        let mut settings = Settings::default();
+        let mut form = SettingsForm::from_settings(&settings);
+        assert!(!form.fast_engine);
+
+        form.fast_engine = true;
+        form.apply(&mut settings);
+        assert!(settings.asr.fast_engine);
+
+        let path = temp_path("fast-engine");
+        settings.save(&path).expect("save");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("fast_engine = true"),
+            "unexpected TOML: {text}"
+        );
+        let reloaded = Settings::load(&path).expect("reload");
+        assert!(reloaded.asr.fast_engine);
+        let form2 = SettingsForm::from_settings(&reloaded);
+        assert!(form2.fast_engine, "the form follows the file");
+
+        // …and back off (the observable value follows the toggle both ways).
+        form.fast_engine = false;
+        form.apply(&mut settings);
+        settings.save(&path).expect("save");
+        assert!(!Settings::load(&path).unwrap().asr.fast_engine);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     // ---- M9a: appearance (live apply) ---------------------------------------

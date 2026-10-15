@@ -230,6 +230,42 @@ The shell has been rebuilt (M9 slice 1). The editor now reads as **one** surface
   end-to-end — Save and Reset are reachable and clear of the Record pill; the Models
   list keeps its columns apart (no mashed headers) and you can scroll to the end.
 
+## 28. The fast engine — Parakeet (M10A, experimental)
+
+Parakeet is **opt-in twice**: this app build must carry the `parakeet` cargo feature,
+and the model must be installed. The default build has neither, and nothing about
+today's routing changes until you turn the toggle on.
+
+- **Build with it** (the macOS build does not ship it yet): from the repo root,
+  `cargo build --release -p suramak-cli --features parakeet` (and
+  `cargo build --release -p suramak-ui --features parakeet` for the app). The first
+  build downloads the prebuilt sherpa-onnx libraries once and caches them.
+  Note (packaging): the build script copies the sherpa-onnx shared libraries next
+  to the built binary; if the binary cannot find them at launch, run it with
+  `DYLD_LIBRARY_PATH=<target>/release` on macOS (`LD_LIBRARY_PATH=…` on Linux)
+  until the app-bundle packaging lands (M10B follow-up — the dylibs go into
+  `Contents/Frameworks` with an `@loader_path` rpath).
+- **Install the model**: `./target/release/suramak-cli models download parakeet`
+  (~670 MB, four sha256-verified files; `models list` shows it as `parakeet`).
+  `suramak-cli doctor` prints a `parakeet (fast engine, experimental)` block —
+  expect `model: installed … layout ok` and the 25-language coverage line.
+- **Turn it on**: Settings → **Fast engine** → tick `(experimental) — Parakeet for
+  covered languages` → Save. (Off by default; `settings.toml` gains
+  `fast_engine = true`.)
+- **English**: transcribe `en.wav` (or any English clip). Expected: the engine line
+  says `engine: parakeet (fast)`. Time it against the same clip on `--engine coreml`
+  (whisper) — that is the comparison that matters on your Mac; the VPS numbers
+  (CPU-only) are in `docs/reports/M10a.md` and are not ANE numbers.
+- **Indonesian stays whisper**: with the toggle ON, transcribe `id.wav` with
+  language `id` — the engine line must say `engine: Core ML` / `Metal` / `CPU`
+  (never parakeet). Auto-detect also stays whisper by design.
+- **When it can't run**: with the toggle ON but the model not installed (or a build
+  without the feature), the job still runs — on whisper — and the status line shows
+  `fast engine requested but … — using …`.
+- **Install size note**: the Parakeet model adds ~670 MB under the models dir (plus
+  the one-time sherpa-onnx native libraries in the build cache). `models remove
+  parakeet` deletes it.
+
 ## Report
 
 Anything that deviates from an expected result, with: what you did, what happened, what you expected.

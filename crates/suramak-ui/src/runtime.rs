@@ -641,7 +641,14 @@ impl Runtime {
             LangMode::Auto => None,
             LangMode::Fixed(code) => Some(code.as_str()),
         };
-        let plan = suramak_asr::resolve_for(&model_path, self.settings.asr.engine, language);
+        let plan = suramak_asr::resolve_for(
+            &model_path,
+            self.settings.asr.engine,
+            // M10A: live transcription stays whisper by design — the fast engine
+            // never runs on the live window scheduler.
+            false,
+            language,
+        );
         let decoder = live::LiveDecoder::spawn(
             live::LiveDecodeSettings {
                 model_path,
@@ -1025,7 +1032,12 @@ impl Runtime {
             LangMode::Auto => None,
             LangMode::Fixed(code) => Some(code.as_str()),
         };
-        let plan = suramak_asr::resolve_for(&model_path, self.settings.asr.engine, language);
+        let plan = suramak_asr::resolve_for(
+            &model_path,
+            self.settings.asr.engine,
+            self.settings.asr.fast_engine,
+            language,
+        );
         let model_id = suramak_asr::model_id_from_path(&model_path);
         state.job_planned(
             &model_id,
@@ -1045,6 +1057,7 @@ impl Runtime {
             lang,
             initial_prompt: self.settings.asr.initial_prompt.clone(),
             engine: self.settings.asr.engine,
+            fast_engine: self.settings.asr.fast_engine,
             cancel: cancel.clone(),
         };
         if let Err(err) = self.bridge.submit(job) {
@@ -1489,6 +1502,7 @@ mod tests {
             lang: LangMode::Auto,
             initial_prompt: None,
             engine: EngineSetting::Auto,
+            fast_engine: false,
             cancel: CancelToken::new(),
         }
     }

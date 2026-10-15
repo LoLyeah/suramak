@@ -118,6 +118,147 @@ pub const ENCODER_REQUIRED_FILES: &[&str] = &[
     "weights/weight.bin",
 ];
 
+// ---------------------------------------------------------------------------
+// M10A: the Parakeet fast engine (sherpa-onnx / NeMo TDT 0.6B v3 int8)
+// ---------------------------------------------------------------------------
+
+/// One pinned file of a Parakeet model directory.
+///
+/// Parakeet models are a *directory* of ONNX artifacts (encoder/decoder/joiner +
+/// tokens), not a single ggml file, so each file carries its own size + sha256 pin.
+#[derive(Debug, Clone, Copy)]
+pub struct ParakeetFile {
+    /// File name inside the model directory (and in the upstream repository).
+    pub name: &'static str,
+    /// Size in bytes (pinned alongside the sha256).
+    pub size_bytes: u64,
+    /// sha256 of the file.
+    pub sha256: &'static str,
+}
+
+/// A Parakeet (sherpa-onnx offline transducer) model: a directory of pinned
+/// artifacts under the models dir.
+#[derive(Debug, Clone, Copy)]
+pub struct ParakeetModelInfo {
+    /// Manifest id used by `models download|remove` and the settings toggle.
+    pub id: &'static str,
+    /// Directory name under the models dir (the upstream release layout name).
+    pub dir_name: &'static str,
+    /// HuggingFace repository + revision base URL (`…/resolve/main/`).
+    pub hf_base_url: &'static str,
+    /// Mirror base URL selected via `SURAMAK_HF_MIRROR` (same paths).
+    pub mirror_base_url: &'static str,
+    /// The pinned files (all of them are required for an install).
+    pub files: &'static [ParakeetFile],
+    /// Primary language subtags the model covers (upstream: 25 European languages).
+    /// **Indonesian is deliberately absent** — the routing invariant lives in
+    /// `suramak-asr::engine` and is tested there.
+    pub languages: &'static [&'static str],
+    pub role: &'static str,
+}
+
+/// HuggingFace base URL for the sherpa-onnx Parakeet TDT v3 int8 export (the
+/// `csukuangfj` mirror of the k2-fsa release artifacts, which ships the *same*
+/// files individually — pinned per file below).
+pub const PARAKEET_HF_BASE_URL: &str =
+    "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/main/";
+
+/// Mirror base URL selected via `SURAMAK_HF_MIRROR` (same paths).
+pub const PARAKEET_HF_MIRROR_BASE_URL: &str =
+    "https://hf-mirror.com/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/main/";
+
+/// The one Parakeet model (M10A). Sizes + sha256 taken from the real downloaded
+/// artifacts (see `docs/MODEL-PINS.md` and `scripts/pin-model-hashes.sh`).
+pub const PARAKEET: ParakeetModelInfo = ParakeetModelInfo {
+    id: "parakeet",
+    dir_name: "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
+    hf_base_url: PARAKEET_HF_BASE_URL,
+    mirror_base_url: PARAKEET_HF_MIRROR_BASE_URL,
+    files: &[
+        ParakeetFile {
+            name: "encoder.int8.onnx",
+            size_bytes: 652_184_281,
+            sha256: "acfc2b4456377e15d04f0243af540b7fe7c992f8d898d751cf134c3a55fd2247",
+        },
+        ParakeetFile {
+            name: "decoder.int8.onnx",
+            size_bytes: 11_845_275,
+            sha256: "179e50c43d1a9de79c8a24149a2f9bac6eb5981823f2a2ed88d655b24248db4e",
+        },
+        ParakeetFile {
+            name: "joiner.int8.onnx",
+            size_bytes: 6_355_277,
+            sha256: "3164c13fc2821009440d20fcb5fdc78bff28b4db2f8d0f0b329101719c0948b3",
+        },
+        ParakeetFile {
+            name: "tokens.txt",
+            size_bytes: 93_939,
+            sha256: "d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d",
+        },
+    ],
+    languages: &[
+        "bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr", "de", "el", "hu", "it", "lv", "lt",
+        "mt", "pl", "pt", "ro", "sk", "sl", "es", "sv", "ru", "uk",
+    ],
+    role: "fast engine (experimental)",
+};
+
+/// Every file an installed Parakeet directory must contain (layout check).
+pub const PARAKEET_REQUIRED_FILES: &[&str] = &[
+    "encoder.int8.onnx",
+    "decoder.int8.onnx",
+    "joiner.int8.onnx",
+    "tokens.txt",
+];
+
+/// Looks up the Parakeet model by manifest id (`parakeet`).
+pub fn find_parakeet(id: &str) -> Option<&'static ParakeetModelInfo> {
+    if id == PARAKEET.id {
+        Some(&PARAKEET)
+    } else {
+        None
+    }
+}
+
+/// The Parakeet model directory under `models_dir`.
+pub fn parakeet_dir(models_dir: &Path) -> PathBuf {
+    models_dir.join(PARAKEET.dir_name)
+}
+
+/// Whether the Parakeet model directory is installed with every required file.
+pub fn parakeet_installed(models_dir: &Path) -> bool {
+    crate::download::dir_ready(&parakeet_dir(models_dir), PARAKEET_REQUIRED_FILES)
+}
+
+/// Download URL for one Parakeet file, respecting `SURAMAK_HF_MIRROR`.
+pub fn parakeet_file_url(info: &ParakeetModelInfo, name: &str) -> String {
+    let base = if std::env::var("SURAMAK_HF_MIRROR").is_ok() {
+        info.mirror_base_url
+    } else {
+        info.hf_base_url
+    };
+    format!("{base}{name}")
+}
+
+/// Whether the Parakeet model covers `code` (a primary language subtag like `en`
+/// or a regional code like `pt-BR`).
+///
+/// Normalizes to the primary subtag, lowercased. **Indonesian (`id`) is always
+/// `false`** — the hard guard behind "Indonesian never routes to Parakeet"
+/// (docs/ENGINES.md); the list itself must also never contain `id`.
+pub fn parakeet_covers(code: &str) -> bool {
+    let primary = code
+        .trim()
+        .split(['-', '_'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if primary == "id" {
+        return false;
+    }
+    PARAKEET.languages.contains(&primary.as_str())
+}
+
 /// Looks up a model by id.
 pub fn find_model(id: &str) -> Option<&'static ModelInfo> {
     MODELS.iter().find(|m| m.id == id)
@@ -282,5 +423,119 @@ mod tests {
             encoder_url(&enc),
             format!("{HF_BASE_URL}ggml-tiny-encoder.mlmodelc.zip")
         );
+    }
+
+    // ---- M10A: the Parakeet manifest ---------------------------------------
+
+    #[test]
+    fn parakeet_pins_are_well_formed_and_cover_the_layout() {
+        assert_eq!(PARAKEET.id, "parakeet");
+        assert_eq!(
+            PARAKEET.dir_name,
+            "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
+        );
+        assert!(PARAKEET.role.contains("fast"), "role: {}", PARAKEET.role);
+        // Every required file is a pinned file (the layout check cannot drift
+        // from the download set).
+        let pinned: Vec<&str> = PARAKEET.files.iter().map(|f| f.name).collect();
+        for required in PARAKEET_REQUIRED_FILES {
+            assert!(
+                pinned.contains(required),
+                "{required} is required but not pinned"
+            );
+        }
+        assert_eq!(PARAKEET.files.len(), PARAKEET_REQUIRED_FILES.len());
+        for file in PARAKEET.files {
+            assert!(file.size_bytes > 0, "{}: size", file.name);
+            assert_eq!(file.sha256.len(), 64, "{}: sha256", file.name);
+            assert!(
+                file.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+                "{}: sha256 must be hex",
+                file.name
+            );
+        }
+    }
+
+    #[test]
+    fn parakeet_urls_use_the_hf_base_and_carry_every_pinned_file() {
+        for file in PARAKEET.files {
+            assert_eq!(
+                parakeet_file_url(&PARAKEET, file.name),
+                format!("{PARAKEET_HF_BASE_URL}{}", file.name)
+            );
+        }
+        assert_eq!(
+            parakeet_file_url(&PARAKEET, "encoder.int8.onnx"),
+            "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/\
+             resolve/main/encoder.int8.onnx"
+        );
+    }
+
+    #[test]
+    fn parakeet_coverage_has_25_languages_and_never_indonesian() {
+        // Upstream: 25 European languages (no Indonesian — the M10A invariant).
+        assert_eq!(PARAKEET.languages.len(), 25);
+        assert!(
+            !PARAKEET.languages.contains(&"id"),
+            "the Parakeet coverage list must never contain `id`"
+        );
+        for covered in ["en", "de", "fr", "es", "pt", "uk", "bg"] {
+            assert!(parakeet_covers(covered), "{covered} must be covered");
+        }
+        // The hard guard: `id` is false no matter what the list says.
+        assert!(!parakeet_covers("id"));
+        assert!(!parakeet_covers("ID"));
+        assert!(!parakeet_covers("id-ID"));
+        // Regional codes resolve to their primary subtag.
+        assert!(parakeet_covers("pt-BR"));
+        assert!(parakeet_covers("en-US"));
+        assert!(parakeet_covers(" EN "));
+        // Uncovered languages (and empty input) are false.
+        for uncovered in ["", "ja", "ko", "zh", "ar", "jv", "xx"] {
+            assert!(
+                !parakeet_covers(uncovered),
+                "{uncovered:?} must not be covered"
+            );
+        }
+    }
+
+    #[test]
+    fn parakeet_install_detection_requires_every_file() {
+        let dir = std::env::temp_dir().join(format!("suramak-parakeet-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(!parakeet_installed(&dir), "nothing installed yet");
+        let model_dir = parakeet_dir(&dir);
+        std::fs::create_dir_all(&model_dir).unwrap();
+        for (i, file) in PARAKEET.files.iter().enumerate() {
+            std::fs::write(model_dir.join(file.name), b"x").unwrap();
+            let complete = i + 1 == PARAKEET.files.len();
+            assert_eq!(
+                parakeet_installed(&dir),
+                complete,
+                "with {} of {} files the install must be {}",
+                i + 1,
+                PARAKEET.files.len(),
+                if complete { "detected" } else { "incomplete" }
+            );
+        }
+        // A directory named like the model file is not an install (dir_ready
+        // checks files, so a stray directory cannot masquerade).
+        std::fs::remove_dir_all(&model_dir).unwrap();
+        std::fs::create_dir_all(model_dir.join("tokens.txt")).unwrap();
+        for file in PARAKEET.files.iter().filter(|f| f.name != "tokens.txt") {
+            std::fs::write(model_dir.join(file.name), b"x").unwrap();
+        }
+        assert!(!parakeet_installed(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_parakeet_accepts_only_the_manifest_id() {
+        assert_eq!(find_parakeet("parakeet").unwrap().id, "parakeet");
+        for unknown in ["tiny", "parakeet-tdt-0.6b-v3", ""] {
+            assert!(find_parakeet(unknown).is_none(), "{unknown:?}");
+        }
     }
 }

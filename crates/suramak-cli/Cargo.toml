@@ -22,3 +22,6 @@ serde_json = { workspace = true }
 [features]
 # Forwards to suramak-asr's microphone-capture feature (used by `devices`).
 capture = ["suramak-asr/capture"]
+# M10A: the Parakeet fast engine (forwards to suramak-asr's `parakeet` feature).
+# OFF by default; `transcribe --fast` / `settings.asr.fast_engine` drive it.
+parakeet = ["suramak-asr/parakeet"]

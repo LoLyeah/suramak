@@ -26,10 +26,28 @@ capture-test = ["capture"]
 # targets below (see `[target.'cfg(target_os = "macos")'.dependencies]`), and available
 # on every target so the CI cross-check can compile it explicitly.
 coreml = ["whisper-rs/coreml"]
+# M10A: the Parakeet fast engine (sherpa-rs / sherpa-onnx, Rust-native ONNX Runtime).
+# OFF by default: builds without the feature are exactly as before (the engine is
+# never routed to; `parakeet::compiled()` is false). `sherpa-rs/sys` exposes the raw
+# C API, which the module uses for the token timestamps the safe wrapper drops.
+parakeet = ["dep:sherpa-rs", "sherpa-rs/sys"]
 
 [dependencies.cpal]
 version = "0.15.3"
 optional = true
+
+# M10A: Rust bindings to sherpa-onnx (prebuilt native libraries via
+# `download-binaries`; no cmake build of sherpa-onnx itself). The prebuilt
+# libraries are fetched once at build time and cached under the user cache dir;
+# on Linux the linked shared libraries are copied next to the test/binary in the
+# cargo target dir, so runs need `LD_LIBRARY_PATH=<target>/<profile>` (documented
+# in docs/ENGINES.md). macOS: the prebuilt universal2 libraries carry the Core ML
+# execution provider; the module passes `provider=coreml` there.
+[dependencies.sherpa-rs]
+version = "0.6.8"
+optional = true
+default-features = false
+features = ["download-binaries"]
 
 [dependencies.suramak-taps]
 # macOS system-audio taps; no-op stubs elsewhere (pure Rust).

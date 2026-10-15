@@ -4,6 +4,9 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased]
 
+### Added
+- **Parakeet fast engine — opt-in (M10A)**: a "Fast engine (experimental)" toggle (Settings → Transcription; default OFF) and a `--fast` CLI flag route **covered languages** (the 25 European languages of Parakeet TDT 0.6B v3 int8) through **sherpa-onnx** — Rust-native ONNX with the Core ML execution provider on macOS — behind a `parakeet` cargo feature the release builds do not enable yet. **Indonesian never routes to Parakeet** (a hard invariant asserted across the routing matrix and end-to-end); auto-detect and uncovered languages stay whisper; a covered language without the model installed warns and falls back, never fails. The model (4 files, ~670 MB, per-file sha256 pins) installs with `suramak-cli models download parakeet`; `doctor` reports build/model/coverage/setting; the editor and CLI name what ran (`parakeet (fast)`). VPS-measured (CPU-only, the 9 s English fixture): 4.2× realtime vs whisper-tiny's 3.4×; model load ~6 s (cached per worker). Apple-silicon/ANE timing is owner-verify. Report: `docs/reports/M10a.md`
+
 ## [0.1.1] - 2026-10-15
 
 ### Added

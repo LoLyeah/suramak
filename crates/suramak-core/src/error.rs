@@ -33,6 +33,11 @@ pub enum SuramakError {
     #[error("zip error: {0}")]
     Zip(String),
 
+    /// A multi-file download (M10A: the Parakeet model directory) did not end
+    /// with the expected layout on disk.
+    #[error("download error: {0}")]
+    Download(String),
+
     #[error("Model not found: {0}")]
     ModelNotFound(String),
 

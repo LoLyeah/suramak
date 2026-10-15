@@ -157,14 +157,14 @@ fn engine_resolution_uses_availability_not_the_platform_guess() {
     assert!(!avail.encoder_installed);
     if !cfg!(target_os = "macos") {
         assert_eq!(
-            resolve_for(missing, EngineSetting::Auto, None).engine,
+            resolve_for(missing, EngineSetting::Auto, false, None).engine,
             EngineId::Cpu
         );
         assert_eq!(
-            resolve_for(missing, EngineSetting::CoreML, None).engine,
+            resolve_for(missing, EngineSetting::CoreML, false, None).engine,
             EngineId::Cpu
         );
-        assert!(resolve_for(missing, EngineSetting::CoreML, None)
+        assert!(resolve_for(missing, EngineSetting::CoreML, false, None)
             .warning
             .is_some());
     }
@@ -194,6 +194,7 @@ fn worker_reports_missing_model_as_error_event() {
             lang: LangMode::Fixed("en".to_string()),
             initial_prompt: None,
             engine: EngineSetting::Auto,
+            fast_engine: false,
             cancel: CancelToken::new(),
         })
         .expect("submit job");
@@ -227,7 +228,7 @@ fn e2e_en_fixture_contains_fox() {
     let Some(model_path) = tiny_model_or_skip() else {
         return;
     };
-    let plan = resolve_for(&model_path, EngineSetting::Auto, Some("en"));
+    let plan = resolve_for(&model_path, EngineSetting::Auto, false, Some("en"));
     let mut cache = ContextCache::new();
     let ctx = cache
         .get_or_load(&model_path, plan.engine.use_gpu())
@@ -275,7 +276,7 @@ fn e2e_id_fixture_has_non_empty_segment() {
     let Some(model_path) = tiny_model_or_skip() else {
         return;
     };
-    let plan = resolve_for(&model_path, EngineSetting::Auto, Some("id"));
+    let plan = resolve_for(&model_path, EngineSetting::Auto, false, Some("id"));
     let mut cache = ContextCache::new();
     let ctx = cache
         .get_or_load(&model_path, plan.engine.use_gpu())
@@ -326,7 +327,7 @@ fn e2e_video_fixture_matches_the_source_mp3_words() {
         return;
     };
 
-    let plan = resolve_for(&model_path, EngineSetting::Auto, Some("en"));
+    let plan = resolve_for(&model_path, EngineSetting::Auto, false, Some("en"));
     let mut cache = ContextCache::new();
     let ctx = cache
         .get_or_load(&model_path, plan.engine.use_gpu())
@@ -416,7 +417,7 @@ fn e2e_live_partials_then_the_final_pass_replaces_them() {
     let buffer = suramak_core::decode::decode_file(&fixture("en.wav")).expect("decode en.wav");
     let samples = suramak_core::resample::to_16khz_mono(&buffer).expect("resample");
     let lang = LangMode::Fixed("en".to_string());
-    let plan = resolve_for(&model_path, EngineSetting::Auto, Some("en"));
+    let plan = resolve_for(&model_path, EngineSetting::Auto, false, Some("en"));
     let mut cache = ContextCache::new();
     let ctx = cache
         .get_or_load(&model_path, plan.engine.use_gpu())
@@ -583,7 +584,7 @@ fn e2e_coreml_encoder_engaged_macos() {
         whisper::system_info()
     );
 
-    let plan = resolve_for(&model_path, EngineSetting::CoreML, Some("en"));
+    let plan = resolve_for(&model_path, EngineSetting::CoreML, false, Some("en"));
     assert_eq!(
         plan.engine,
         EngineId::CoreML,
@@ -634,7 +635,7 @@ fn e2e_cancel_mid_run_stops_cleanly_and_the_engine_stays_healthy() {
     let Some(model_path) = tiny_model_or_skip() else {
         return;
     };
-    let plan = resolve_for(&model_path, EngineSetting::Auto, Some("en"));
+    let plan = resolve_for(&model_path, EngineSetting::Auto, false, Some("en"));
     let mut cache = ContextCache::new();
     let ctx = cache
         .get_or_load(&model_path, plan.engine.use_gpu())

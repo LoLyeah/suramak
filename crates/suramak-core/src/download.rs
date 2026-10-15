@@ -164,6 +164,74 @@ pub fn dir_ready(dir: &Path, required: &[&str]) -> bool {
     dir.is_dir() && required.iter().all(|f| dir.join(f).is_file())
 }
 
+/// Downloads a set of pinned files into `dest_dir` (M10A: the Parakeet model is a
+/// directory of artifacts, not one archive).
+///
+/// 1. short-circuits when `dest_dir` already contains every file in `required`
+///    (each present file is size- and sha256-verified — a corrupted install fails
+///    loudly instead of being trusted);
+/// 2. downloads each missing file with resume + sha256 verification
+///    ([`download`]) from `url_for(name)`;
+/// 3. re-checks the layout ([`dir_ready`]) before claiming success.
+pub fn download_files(
+    dest_dir: &Path,
+    files: &[(&str, u64, &str)],
+    url_for: impl Fn(&str) -> String,
+    required: &[&str],
+) -> Result<(), SuramakError> {
+    if dir_ready(dest_dir, required) {
+        for (name, size, sha256) in files {
+            let path = dest_dir.join(name);
+            check_size(&path, *size)?;
+            verify_sha256(&path, sha256)?;
+        }
+        info!("already installed: {}", dest_dir.display());
+        return Ok(());
+    }
+    std::fs::create_dir_all(dest_dir)?;
+    for (name, size, sha256) in files {
+        let dest = dest_dir.join(name);
+        if dest.exists() {
+            // A file from an earlier interrupted run: verify before trusting it.
+            check_size(&dest, *size)?;
+            verify_sha256(&dest, sha256)?;
+            continue;
+        }
+        let url = url_for(name);
+        debug!("downloading {name} from {url}");
+        download(&url, &dest, sha256)?;
+        // Re-verify the final file (post-rename) so the claim is airtight.
+        check_size(&dest, *size)?;
+        verify_sha256(&dest, sha256)?;
+    }
+    if !dir_ready(dest_dir, required) {
+        let missing: Vec<&str> = required
+            .iter()
+            .filter(|f| !dest_dir.join(f).is_file())
+            .copied()
+            .collect();
+        return Err(SuramakError::Download(format!(
+            "downloaded into {} but required files are missing ({})",
+            dest_dir.display(),
+            missing.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// The pinned size check — a cheap pre-filter ahead of the sha256 (and the clear
+/// error for a truncated file).
+fn check_size(path: &Path, expected: u64) -> Result<(), SuramakError> {
+    let actual = std::fs::metadata(path)?.len();
+    if actual != expected {
+        return Err(SuramakError::Download(format!(
+            "{}: expected {expected} bytes, found {actual} — delete it and retry",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Extracts `zip_path` into `dest_dir` (created/replaced).
 ///
 /// The official encoder packages wrap their contents in a single top-level directory;

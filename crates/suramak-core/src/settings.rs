@@ -50,6 +50,11 @@ pub struct AsrSettings {
     /// Acceleration tier; missing in older settings files → `Auto`.
     #[serde(default)]
     pub engine: EngineSetting,
+    /// M10A: the "Fast engine (experimental)" toggle (Parakeet TDT v3 via
+    /// sherpa-onnx for covered languages). **OFF by default**; missing in older
+    /// settings files → `false`, which keeps today's routing exactly.
+    #[serde(default)]
+    pub fast_engine: bool,
 }
 
 /// LLM polish settings.
@@ -244,6 +249,7 @@ impl Default for Settings {
                 initial_prompt: None,
                 translate_to_english: false,
                 engine: EngineSetting::Auto,
+                fast_engine: false,
             },
             polish: None,
             storage: StorageSettings { keep_audio: false },
@@ -326,6 +332,43 @@ font_scale = 1.0
         assert_eq!(settings.asr.engine, EngineSetting::Auto);
         assert_eq!(EngineSetting::default(), EngineSetting::Auto);
         assert_eq!(EngineSetting::CoreML.as_str(), "coreml");
+    }
+
+    // ---- M10A: the fast-engine toggle ---------------------------------------
+
+    #[test]
+    fn fast_engine_roundtrips_and_defaults_to_off() {
+        for fast in [false, true] {
+            let mut settings = Settings::default();
+            settings.asr.fast_engine = fast;
+            let text = toml::to_string_pretty(&settings).expect("serialize settings");
+            assert!(
+                text.contains(&format!("fast_engine = {fast}")),
+                "unexpected TOML: {text}"
+            );
+            let back: Settings = toml::from_str(&text).expect("deserialize settings");
+            assert_eq!(back.asr.fast_engine, fast);
+        }
+        // The built-in default is OFF (existing builds behave identically).
+        assert!(!Settings::default().asr.fast_engine);
+        // A settings file written before M10A has no `fast_engine` key.
+        let text = r#"
+[asr]
+model_id = "tiny"
+language = "auto"
+translate_to_english = false
+engine = "coreml"
+
+[storage]
+keep_audio = false
+
+[ui]
+glass = "auto"
+font_scale = 1.0
+"#;
+        let settings: Settings = toml::from_str(text).expect("M9-era settings must load");
+        assert!(!settings.asr.fast_engine, "missing key → OFF");
+        assert_eq!(settings.asr.engine, EngineSetting::CoreML);
     }
 
     #[test]

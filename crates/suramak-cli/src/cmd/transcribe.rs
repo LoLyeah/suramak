@@ -66,6 +66,12 @@ pub struct TranscribeArgs {
     #[arg(long, value_enum)]
     pub engine: Option<EngineArg>,
 
+    /// Enable the experimental fast engine (Parakeet TDT v3 via sherpa-onnx) for
+    /// this run — covered languages only; Indonesian always stays on whisper.
+    /// Overrides `settings.asr.fast_engine` (which defaults to OFF).
+    #[arg(long)]
+    pub fast: bool,
+
     /// Initial prompt forwarded to whisper (helps brand words and names)
     #[arg(long)]
     pub initial_prompt: Option<String>,
@@ -101,6 +107,9 @@ pub fn run(args: TranscribeArgs) -> Result<()> {
         .engine
         .map(EngineSetting::from)
         .unwrap_or(settings.asr.engine);
+    // M10A: `--fast` forces the fast engine on for this run; otherwise the
+    // settings toggle (default OFF) decides.
+    let fast_engine = args.fast || settings.asr.fast_engine;
     std::fs::create_dir_all(&args.out_dir)
         .with_context(|| format!("cannot create output dir {}", args.out_dir.display()))?;
 
@@ -110,7 +119,7 @@ pub fn run(args: TranscribeArgs) -> Result<()> {
         LangMode::Auto => None,
         LangMode::Fixed(code) => Some(code.as_str()),
     };
-    let plan = resolve_for(&model_path, engine, language);
+    let plan = resolve_for(&model_path, engine, fast_engine, language);
     if let Some(warning) = &plan.warning {
         eprintln!("warning: {warning}");
     }
@@ -128,6 +137,7 @@ pub fn run(args: TranscribeArgs) -> Result<()> {
         lang,
         initial_prompt: args.initial_prompt,
         engine,
+        fast_engine,
         // M9e: the CLI never cancels — a fresh, uncancelled token.
         cancel: suramak_asr::CancelToken::new(),
     })?;

@@ -396,3 +396,226 @@ fn download_zip_requires_the_pinned_files() {
         "unexpected error: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// M10A: multi-file pinned downloads (the Parakeet model directory)
+// ---------------------------------------------------------------------------
+
+/// Mock HTTP server serving several files by path (up to `max_requests`).
+fn spawn_multi_file_server(
+    files: Vec<(String, Vec<u8>)>,
+    max_requests: usize,
+) -> std::net::SocketAddr {
+    use std::collections::HashMap;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let table: HashMap<String, Vec<u8>> = files.into_iter().collect();
+    thread::spawn(move || {
+        for _ in 0..max_requests {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let req = read_request(&mut stream);
+            let path = req
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or_default()
+                .to_string();
+            match table.get(&path) {
+                Some(body) => send_response(&mut stream, "200 OK", body),
+                None => send_response(&mut stream, "404 Not Found", b"not found"),
+            }
+        }
+    });
+    addr
+}
+
+const PARAKEET_TEST_FILES: &[(&str, &str)] = &[
+    ("encoder.int8.onnx", "encoder-bytes"),
+    ("decoder.int8.onnx", "decoder-bytes"),
+    ("joiner.int8.onnx", "joiner-bytes"),
+    ("tokens.txt", "token-bytes"),
+];
+
+#[test]
+fn download_files_fetches_every_pinned_file_and_is_idempotent() {
+    let bodies: Vec<(String, Vec<u8>)> = PARAKEET_TEST_FILES
+        .iter()
+        .map(|(name, body)| (format!("/{name}"), body.as_bytes().to_vec()))
+        .collect();
+    let addr = spawn_multi_file_server(bodies, 8);
+
+    let pins: Vec<(&str, u64, String)> = PARAKEET_TEST_FILES
+        .iter()
+        .map(|(name, body)| (*name, body.len() as u64, sha256_of(body.as_bytes())))
+        .collect();
+    let pins: Vec<(&str, u64, &str)> = pins
+        .iter()
+        .map(|(name, size, hash)| (*name, *size, hash.as_str()))
+        .collect();
+    let required: Vec<&str> = PARAKEET_TEST_FILES.iter().map(|(name, _)| *name).collect();
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("parakeet");
+    suramak_core::download::download_files(
+        &dest,
+        &pins,
+        |name| format!("http://{addr}/{name}"),
+        &required,
+    )
+    .unwrap();
+
+    for (name, body) in PARAKEET_TEST_FILES {
+        assert_eq!(std::fs::read(dest.join(name)).unwrap(), body.as_bytes());
+    }
+    // No `.part` files are left behind.
+    let leftovers: Vec<String> = std::fs::read_dir(&dest)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".part"))
+        .collect();
+    assert!(leftovers.is_empty(), "leftover part files: {leftovers:?}");
+
+    // Idempotent: a second call verifies what is on disk and never contacts the
+    // server (the closure would panic if it were called).
+    suramak_core::download::download_files(
+        &dest,
+        &pins,
+        |name| panic!("must not download {name} again"),
+        &required,
+    )
+    .unwrap();
+}
+
+#[test]
+fn download_files_rejects_a_checksum_mismatch() {
+    let bodies: Vec<(String, Vec<u8>)> = PARAKEET_TEST_FILES
+        .iter()
+        .map(|(name, body)| (format!("/{name}"), body.as_bytes().to_vec()))
+        .collect();
+    let addr = spawn_multi_file_server(bodies, 8);
+
+    let good: Vec<(&str, u64, String)> = PARAKEET_TEST_FILES
+        .iter()
+        .map(|(name, body)| (*name, body.len() as u64, sha256_of(body.as_bytes())))
+        .collect();
+    // The first file's pin is wrong on purpose.
+    let mut pins: Vec<(&str, u64, &str)> = good
+        .iter()
+        .map(|(name, size, hash)| (*name, *size, hash.as_str()))
+        .collect();
+    pins[0].2 = "0000000000000000000000000000000000000000000000000000000000000000";
+    let required: Vec<&str> = PARAKEET_TEST_FILES.iter().map(|(name, _)| *name).collect();
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("parakeet");
+    let err = suramak_core::download::download_files(
+        &dest,
+        &pins,
+        |name| format!("http://{addr}/{name}"),
+        &required,
+    )
+    .expect_err("a checksum mismatch must fail the install");
+    assert!(
+        err.to_string().contains("Checksum mismatch"),
+        "unexpected error: {err}"
+    );
+    // The mismatching file never lands under its final name.
+    assert!(!dest.join("encoder.int8.onnx").exists());
+}
+
+#[test]
+fn download_files_verifies_a_corrupted_existing_install() {
+    // A complete-looking directory whose bytes do not match the pins must be
+    // rejected (a corrupted install is never trusted).
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("parakeet");
+    std::fs::create_dir_all(&dest).unwrap();
+    let mut pins: Vec<(&str, u64, String)> = Vec::new();
+    for (name, body) in PARAKEET_TEST_FILES {
+        // Same size, wrong bytes → the sha256 (not the size) is what catches it.
+        std::fs::write(dest.join(name), vec![b'x'; body.len()]).unwrap();
+        pins.push((name, body.len() as u64, sha256_of(body.as_bytes())));
+    }
+    let pins: Vec<(&str, u64, &str)> = pins
+        .iter()
+        .map(|(name, size, hash)| (*name, *size, hash.as_str()))
+        .collect();
+    let required: Vec<&str> = PARAKEET_TEST_FILES.iter().map(|(name, _)| *name).collect();
+
+    let err = suramak_core::download::download_files(
+        &dest,
+        &pins,
+        |name| panic!("must not download {name} — the directory looks complete"),
+        &required,
+    )
+    .expect_err("corrupted bytes must fail verification");
+    assert!(
+        err.to_string().contains("Checksum mismatch"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn download_files_rejects_a_truncated_existing_file_by_size() {
+    // A truncated file (wrong size) fails the cheap size pre-check with a clear
+    // message, before any hashing.
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("parakeet");
+    std::fs::create_dir_all(&dest).unwrap();
+    let mut pins: Vec<(&str, u64, String)> = Vec::new();
+    for (i, (name, body)) in PARAKEET_TEST_FILES.iter().enumerate() {
+        // The last file is truncated; the rest are fine (so the layout is ready
+        // and the idempotent path runs).
+        let bytes = if i + 1 == PARAKEET_TEST_FILES.len() {
+            &body.as_bytes()[..body.len() - 1]
+        } else {
+            body.as_bytes()
+        };
+        std::fs::write(dest.join(name), bytes).unwrap();
+        pins.push((name, body.len() as u64, sha256_of(body.as_bytes())));
+    }
+    let pins: Vec<(&str, u64, &str)> = pins
+        .iter()
+        .map(|(name, size, hash)| (*name, *size, hash.as_str()))
+        .collect();
+    let required: Vec<&str> = PARAKEET_TEST_FILES.iter().map(|(name, _)| *name).collect();
+
+    let err = suramak_core::download::download_files(
+        &dest,
+        &pins,
+        |name| panic!("must not download {name}"),
+        &required,
+    )
+    .expect_err("a truncated file must fail the size check");
+    assert!(
+        err.to_string().contains("expected") && err.to_string().contains("bytes"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn download_files_requires_the_whole_layout() {
+    // Only one file is pinned; the layout check demands two → the download
+    // succeeds but the install is refused with the missing name.
+    let body = b"only-one".to_vec();
+    let addr = spawn_multi_file_server(vec![("/one.bin".to_string(), body.clone())], 4);
+    let hash = sha256_of(&body);
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("parakeet");
+    let err = suramak_core::download::download_files(
+        &dest,
+        &[("one.bin", body.len() as u64, hash.as_str())],
+        |name| format!("http://{addr}/{name}"),
+        &["one.bin", "two.bin"],
+    )
+    .expect_err("an incomplete layout must fail");
+    assert!(
+        err.to_string().contains("required files are missing")
+            && err.to_string().contains("two.bin"),
+        "unexpected error: {err}"
+    );
+}

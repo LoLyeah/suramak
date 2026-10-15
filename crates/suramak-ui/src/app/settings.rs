@@ -224,6 +224,28 @@ fn transcription_section(ui: &mut egui::Ui, tokens: &Tokens, form: &mut Settings
         }
     });
 
+    // M10A: the fast engine (experimental) — one toggle, OFF by default.
+    row(ui, tokens, "Fast engine", |ui| {
+        if ui
+            .checkbox(
+                &mut form.fast_engine,
+                "(experimental) — Parakeet for covered languages",
+            )
+            .changed()
+        {
+            dirty = true;
+        }
+    });
+    row_caption(
+        ui,
+        tokens,
+        "Off by default. When on, English and the other 24 European languages Parakeet \
+         TDT v3 covers run on the Parakeet fast engine when it is installed \
+         (`suramak-cli models download parakeet`); Indonesian and every other language \
+         stay on whisper. The engine line names what actually ran.",
+        false,
+    );
+
     // Default model. M9c copy sweep: the combobox shows the human display
     // names; the raw id stays the value that persists.
     row(ui, tokens, "Default model", |ui| {

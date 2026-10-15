@@ -1,9 +1,14 @@
 //! The transcription pipeline: decode (core) → resample to 16 kHz mono (core) →
-//! whisper → core [`Transcript`].
+//! engine → core [`Transcript`].
+//!
+//! Two engines share this shape (docs/ENGINES.md): the whisper path
+//! ([`transcribe_file`]) and the M10A Parakeet fast path
+//! ([`transcribe_file_parakeet`]). Both decode and resample identically and both
+//! report the engine that actually ran.
 //!
 //! M9e (P2-2): the pipeline carries the job's cooperative [`CancelToken`] and
 //! checks it at every stage boundary — before the decode, after the decode,
-//! after the resample and after whisper (where the abort callback has already
+//! after the resample and after the engine (where the abort callback has already
 //! stopped the run between chunks). A cancellation returns
 //! [`AsrError::Cancelled`] and drops the partial work; the audio decode itself
 //! (core's path) is untouched — the token is observed between its stages.
@@ -11,7 +16,7 @@
 use std::path::Path;
 
 use suramak_core::settings::LangMode;
-use suramak_core::transcript::{Source, Transcript};
+use suramak_core::transcript::{Segment, Source, Transcript};
 use suramak_core::{decode, resample};
 use whisper_rs::WhisperContext;
 
@@ -54,7 +59,7 @@ pub struct PipelineOutcome {
 /// The cooperative check point at a pipeline stage boundary (M9e, P2-2):
 /// `Err(Cancelled)` when the token is set. Pure, so the rule is pinned without
 /// a model; the pipeline calls it before the decode, after the decode, after
-/// the resample and after whisper.
+/// the resample and after the engine.
 pub fn stage_check(cancel: &CancelToken) -> Result<(), AsrError> {
     if cancel.is_cancelled() {
         Err(AsrError::Cancelled)
@@ -63,7 +68,45 @@ pub fn stage_check(cancel: &CancelToken) -> Result<(), AsrError> {
     }
 }
 
-/// Runs the full pipeline on an audio file and returns a library-ready transcript.
+/// Decode + resample to 16 kHz mono with the stage-boundary checks — the shared
+/// front half of every engine path.
+fn prepare_samples(input: &Path, cancel: &CancelToken) -> Result<Vec<f32>, AsrError> {
+    stage_check(cancel)?;
+    let buffer = decode::decode_file(input)?;
+    stage_check(cancel)?;
+    let samples = resample::to_16khz_mono(&buffer)?;
+    stage_check(cancel)?;
+    Ok(samples)
+}
+
+/// Builds the library-ready transcript for `input`.
+fn transcript_for(
+    input: &Path,
+    model_id: String,
+    lang: &LangMode,
+    segments: Vec<Segment>,
+) -> Transcript {
+    let title = input
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("transcript")
+        .to_string();
+    let language = match lang {
+        LangMode::Auto => None,
+        LangMode::Fixed(code) => Some(code.clone()),
+    };
+    Transcript::new(
+        title.clone(),
+        Source::File { name: title },
+        model_id,
+        language,
+        Some(input.to_path_buf()),
+        segments,
+    )
+}
+
+/// Runs the full whisper pipeline on an audio file and returns a library-ready
+/// transcript.
 ///
 /// Progress (0–100) comes from whisper's own progress callback; decode and resample
 /// are fast for typical files and do not report progress.
@@ -84,11 +127,7 @@ pub fn transcribe_file(
     cancel: &CancelToken,
     on_progress: impl FnMut(u8),
 ) -> Result<PipelineOutcome, AsrError> {
-    stage_check(cancel)?;
-    let buffer = decode::decode_file(input)?;
-    stage_check(cancel)?;
-    let samples = resample::to_16khz_mono(&buffer)?;
-    stage_check(cancel)?;
+    let samples = prepare_samples(input, cancel)?;
     let outcome = whisper::transcribe(
         ctx,
         model_path,
@@ -101,28 +140,48 @@ pub fn transcribe_file(
         on_progress,
     )?;
     stage_check(cancel)?;
-
-    let title = input
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("transcript")
-        .to_string();
-    let language = match lang {
-        LangMode::Auto => None,
-        LangMode::Fixed(code) => Some(code.clone()),
-    };
-    let transcript = Transcript::new(
-        title.clone(),
-        Source::File { name: title },
-        model_id_from_path(model_path),
-        language,
-        Some(input.to_path_buf()),
-        outcome.segments,
-    );
     Ok(PipelineOutcome {
-        transcript,
+        transcript: transcript_for(
+            input,
+            model_id_from_path(model_path),
+            lang,
+            outcome.segments,
+        ),
         engine_used: outcome.engine_used,
         warnings: outcome.warnings,
+    })
+}
+
+/// Runs the M10A Parakeet fast pipeline on an audio file.
+///
+/// Same decode → resample front half as [`transcribe_file`]; the engine decodes
+/// the whole clip in one sherpa-onnx call. sherpa-onnx reports no progress, so
+/// `on_progress` receives two honest milestones: 50 when the audio is ready and
+/// 100 when the decode finished. A cancelled job returns
+/// [`AsrError::Cancelled`] and no partial transcript.
+pub fn transcribe_file_parakeet(
+    recognizer: &mut crate::parakeet::ParakeetRecognizer,
+    input: &Path,
+    lang: &LangMode,
+    plan: &crate::engine::EngineDecision,
+    cancel: &CancelToken,
+    mut on_progress: impl FnMut(u8),
+) -> Result<PipelineOutcome, AsrError> {
+    let mut warnings = Vec::new();
+    if let Some(warning) = &plan.warning {
+        warnings.push(warning.clone());
+    }
+    let samples = prepare_samples(input, cancel)?;
+    on_progress(50);
+    let result = recognizer.transcribe(&samples, 16_000)?;
+    stage_check(cancel)?;
+    on_progress(100);
+    let audio_ms = samples.len() as i64 * 1000 / 16_000;
+    let segments = crate::parakeet::segments_from_result(&result, audio_ms);
+    Ok(PipelineOutcome {
+        transcript: transcript_for(input, crate::parakeet::MODEL_ID.to_string(), lang, segments),
+        engine_used: EngineId::Parakeet,
+        warnings,
     })
 }
 
@@ -139,6 +198,18 @@ mod tests {
         assert!(stage_check(&token).is_ok());
         token.cancel();
         match stage_check(&token) {
+            Err(AsrError::Cancelled) => {}
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+    }
+
+    /// The engine paths share `prepare_samples`: a cancelled token returns
+    /// `Cancelled` before the (here missing) input file is even touched.
+    #[test]
+    fn a_cancelled_token_stops_the_pipeline_before_decoding() {
+        let token = CancelToken::new();
+        token.cancel();
+        match prepare_samples(Path::new("/nonexistent/en.wav"), &token) {
             Err(AsrError::Cancelled) => {}
             other => panic!("expected Cancelled, got {other:?}"),
         }

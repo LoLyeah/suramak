@@ -30,6 +30,10 @@ pub struct Job {
     /// Requested engine; absent in older callers → `Auto`.
     #[serde(default)]
     pub engine: EngineSetting,
+    /// M10A: the "Fast engine (experimental)" setting; absent in older callers →
+    /// OFF (today's routing exactly).
+    #[serde(default)]
+    pub fast_engine: bool,
     /// M9e (P2-2): the cooperative cancel token for this job. The submitter
     /// keeps a clone and sets it; the worker/pipeline observe it at stage
     /// boundaries. Not serialized (a token is a live process handle; the CLI
@@ -128,6 +132,8 @@ fn run_worker(jobs: Receiver<Job>, events: Sender<WorkerEvent>) {
     whisper_rs::install_logging_hooks();
 
     let mut cache = ContextCache::new();
+    // M10A: the Parakeet recognizer cache (empty and unused without the feature).
+    let mut parakeet_cache = crate::parakeet::ParakeetCache::new();
     while let Ok(job) = jobs.recv() {
         let job_id = job.id;
         let _ = events.send(WorkerEvent::Progress { job_id, pct: 0 });
@@ -141,38 +147,55 @@ fn run_worker(jobs: Receiver<Job>, events: Sender<WorkerEvent>) {
             continue;
         }
 
-        // Engine selection is a pure function of (setting, language, availability).
+        // Engine selection is a pure function of
+        // (setting, fast engine, language, availability).
         let language = match &job.lang {
             LangMode::Auto => None,
             LangMode::Fixed(code) => Some(code.as_str()),
         };
-        let plan = engine::resolve_for(&job.model_path, job.engine, language);
-
-        let ctx = match cache.get_or_load(&job.model_path, plan.engine.use_gpu()) {
-            Ok(ctx) => ctx,
-            Err(err) => {
-                let _ = events.send(WorkerEvent::Error {
-                    job_id,
-                    message: err.to_string(),
-                });
-                continue;
-            }
-        };
+        let plan = engine::resolve_for(&job.model_path, job.engine, job.fast_engine, language);
 
         let progress_events = events.clone();
-        let result = pipeline::transcribe_file(
-            ctx,
-            &job.input,
-            &job.model_path,
-            &job.lang,
-            job.initial_prompt.as_deref(),
-            whisper::default_threads(),
-            &plan,
-            &job.cancel,
-            move |pct| {
-                let _ = progress_events.send(WorkerEvent::Progress { job_id, pct });
-            },
-        );
+        let mut on_progress = move |pct| {
+            let _ = progress_events.send(WorkerEvent::Progress { job_id, pct });
+        };
+
+        // M10A: the fast engine runs through sherpa-onnx — no whisper context.
+        // The whisper tiers keep the exact flow below.
+        let result = if plan.engine == EngineId::Parakeet {
+            let models_dir = job.model_path.parent().unwrap_or(std::path::Path::new("."));
+            let model_dir = suramak_core::models::parakeet_dir(models_dir);
+            match parakeet_cache.get_or_load(
+                &model_dir,
+                whisper::default_threads(),
+                crate::parakeet::provider(),
+            ) {
+                Ok(recognizer) => pipeline::transcribe_file_parakeet(
+                    recognizer,
+                    &job.input,
+                    &job.lang,
+                    &plan,
+                    &job.cancel,
+                    &mut on_progress,
+                ),
+                Err(err) => Err(err),
+            }
+        } else {
+            match cache.get_or_load(&job.model_path, plan.engine.use_gpu()) {
+                Ok(ctx) => pipeline::transcribe_file(
+                    ctx,
+                    &job.input,
+                    &job.model_path,
+                    &job.lang,
+                    job.initial_prompt.as_deref(),
+                    whisper::default_threads(),
+                    &plan,
+                    &job.cancel,
+                    &mut on_progress,
+                ),
+                Err(err) => Err(err),
+            }
+        };
 
         match result {
             Ok(outcome) => {
@@ -216,6 +239,7 @@ mod tests {
             lang: LangMode::Auto,
             initial_prompt: None,
             engine: EngineSetting::Auto,
+            fast_engine: false,
             cancel,
         }
     }

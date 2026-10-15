@@ -8,7 +8,8 @@ Status: 2026-10. This is the decision record for acceleration/engine work; the m
 |---|---|---|---|---|---|
 | whisper.cpp (current) | CPU / Metal GPU | good | ✅ | ✅ (whisper-rs) | core family |
 | **whisper.cpp + Core ML encoder** | **Neural Engine (ANE)** | ~2–3× faster than CPU; the fast Whisper path | ✅ | ✅ (whisper-rs `coreml` feature) | **implemented in M1.5** |
-| Parakeet TDT v2/v3 (FluidAudio CoreML / MLX) | ANE / GPU | fastest overall (~110–300× realtime) | ❌ (25 European langs) | ❌ (Swift/Python) | not primary; no `id` |
+| Parakeet TDT v2/v3 (FluidAudio CoreML / MLX) | ANE / GPU | fastest overall (~110–300× realtime) | ❌ (25 European langs) | ❌ (Swift/Python) | parked (Swift shim); **sherpa-rs path implemented in M10A** |
+| **Parakeet TDT v3 int8 via sherpa-onnx (sherpa-rs)** | CPU everywhere; **Core ML EP on macOS** | fast (CPU-verified on the VPS; ANE numbers = owner-verify) | ❌ (25 European langs) | ✅ (Rust + prebuilt ONNX Runtime) | **implemented in M10A** (opt-in) |
 | Apple SpeechAnalyzer / SpeechTranscriber (macOS 26) | ANE | very fast, long-form tuned | ❌ (10 langs as of 26.6) | ❌ (Swift-only API) | revisit if Apple adds `id` |
 | WhisperKit (Argmax) | ANE via CoreML | excellent (2.2% WER turbo, streaming) | ✅ | ❌ (Swift; needs a Swift shim) | defer; same silicon path as our CoreML option |
 | ANEForge (whisper.cpp backend) | direct ANE (private APIs) | ~2× faster than CoreML encoder | ✅ | partial (pip package + dylib) | research watch-list |
@@ -54,6 +55,97 @@ Facts confirmed against the vendored whisper.cpp (whisper-rs-sys 0.15.0) at impl
 - whisper-rs-sys builds whisper.cpp with `WHISPER_COREML_ALLOW_FALLBACK=1`, so a package that fails to load degrades to the ggml encoder instead of aborting — the app reports the engine that actually ran and never fails hard.
 - `whisper_coreml_init` uses `MLComputeUnitsAll` (CPU/GPU/ANE): Core ML engagement is testable on any Mac (VM included); the ANE speed-up itself is Apple-Silicon-only.
 - Engagement is detected from whisper.cpp's own log lines ("Core ML model loaded" / "failed to load Core ML model from …") captured through a `whisper_log_set` callback — the library's own statement of what it did, not a guess.
+
+## Status (M10A — the Parakeet fast engine, implemented opt-in)
+
+Phase 2 is implemented as an **opt-in** engine (`docs/WORKORDER-M10A.md`): the
+`parakeet` cargo feature (default OFF) **and** the model installed **and** the
+Settings "Fast engine (experimental)" toggle ON. Without all three, routing is
+exactly the pre-M10A behaviour (builds without the feature link no sherpa code at
+all).
+
+What it is:
+
+- NVIDIA **Parakeet TDT 0.6B v3 int8** (`sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8`,
+  4 pinned files, 670 609 772 bytes) through **sherpa-rs 0.6.8** (sherpa-onnx
+  1.12.9 — Rust-native ONNX Runtime; prebuilt native libraries fetched once at
+  build time and cached under `~/.cache/sherpa-rs`).
+- Execution provider: `cpu` everywhere; `coreml` on macOS builds (the prebuilt
+  macOS libraries carry the Core ML EP; sherpa-onnx logs and falls back to CPU per
+  node, and the module retries on `cpu` if a Core ML session cannot be created at
+  all — the engine stays Parakeet either way).
+- Routing (pure function, `suramak-asr::engine::resolve_engine(setting, fast,
+  language, availability)`): the fast engine applies only while the whisper
+  `engine` setting is `Auto`; only a **forced, covered** language (25 EU
+  languages, pinned in `models::PARAKEET.languages`) routes to Parakeet;
+  **Indonesian never** (hard guard + the routing-matrix tests); language
+  auto-detect and everything else stay Whisper.
+- Result mapping: sherpa-onnx decodes the whole clip in one pass and returns
+  **token-level timestamps** (seconds) — there are no whisper-style segment
+  boundaries. Segments are reconstructed by splitting the token stream at pauses
+  ≥ 0.5 s; a punctuation token that would start a split folds back into the
+  sentence it terminates. If a model ever returns no timestamps, the whole result
+  maps to one segment spanning the audio (the honest fallback). The transcript
+  records `model: parakeet`; the engine line shows `parakeet (fast)`.
+- `engine_used` reporting matches the whisper tiers: the result carries the engine
+  that actually ran, and a request that cannot be honoured falls back to Whisper
+  with a warning (`fast engine requested but … — using …`) — never a hard failure.
+
+Measured on the VPS (Linux, 2 cores, **CPU provider — not ANE numbers**),
+`fixtures/audio/en.wav` (9.00 s), release build:
+
+| engine | model load | decode + resample | realtime | text |
+|---|---|---|---|---|
+| parakeet (TDT v3 int8, cpu) | 6.37 s | 2.16 s | 4.2× | "The quick brown fox jumps over the lazy dog. Surimat keeps every recording on this machine and never sends audio to the cloud." |
+| whisper tiny (cpu) | 0.10 s | 2.62 s | 3.4× | "The quick brown fox jumps over the lazy dog. Surramat keeps every recording on this machine and never sends audio to the cloud." |
+
+Word-overlap against the known fixture text: **0.96** (the brand word is misheard
+by both engines on this clip). So on this 2-core VPS the Parakeet decode is
+~1.2× faster than whisper tiny end-to-end, while its model load is ~60× slower
+(652 MB of ONNX). On Apple silicon the Core ML EP should change that picture —
+that is **owner-verify**; no ANE numbers are claimed here.
+
+Verified from Linux (this tree):
+
+- The real end-to-end (`cargo test -p suramak-asr --release --features parakeet
+  --test parakeet -- --ignored`): download → per-file sha256 verify → load →
+  transcribe → approximate text match (table above); the routing test pins
+  `en → parakeet` and `id → never`, against the real install.
+- Routing-matrix unit tests (language × installed × setting, incl. the Indonesian
+  invariant over the whole availability matrix); model-manager tests (pins,
+  per-file sha256 + size, layout, idempotency, corruption rejection); `doctor`
+  prints the engine block (build / provider / model + layout / coverage /
+  setting).
+- `cargo check -p suramak-ui --target aarch64-apple-darwin` cannot pass from
+  Linux (pre-existing: `ring`, rusqlite-bundled and whisper-rs-sys need an Apple
+  C toolchain — M1.5 deviation 10; the exact failure is in
+  `docs/reports/M10a.md`). Instead: `cargo tree -e features --target
+  aarch64-apple-darwin` resolves `sherpa-rs` + `sherpa-rs-sys` (with the `sys`
+  feature) for the darwin target, and a throwaway probe crate
+  (`build/probe-darwin` — the same sherpa feature set and a trimmed copy of the
+  module's C-API calls) compile-checks for `aarch64-apple-darwin` from Linux.
+
+Boundaries (honest):
+
+- macOS **Core ML EP engagement and ANE speed are owner-verify** (no Apple
+  hardware on the VPS); the darwin code path is compile-checked only.
+- On Linux the linked sherpa-onnx shared libraries are copied next to the
+  binary by the sherpa-rs build script; runs need
+  `LD_LIBRARY_PATH=<target>/<profile>` (`…/deps` for test binaries). Packaging
+  the dylibs into the macOS app bundle (`Contents/Frameworks` + an
+  `@loader_path` rpath) is a follow-up for the Mac build (M10B / owner).
+- sherpa-rs' `static` feature (self-contained binaries) is available but requires
+  `RUSTFLAGS="-C relocation-model=dynamic-no-pic"` on Linux x86_64; not used here.
+- `live` transcription stays whisper by design; the fast engine runs on file jobs
+  only. The UI Models screen does not list the Parakeet model (install/remove via
+  `suramak-cli models download|remove parakeet`); the Settings toggle is the only
+  UI addition.
+- Quality note: 25 European languages (no Indonesian); the acceptance is a
+  text-match, **not** a WER benchmark — no quality claims beyond the overlap
+  figure above.
+- The bake-off note (sherpa-rs vs FluidAudio) stays open pending real Mac ANE
+  numbers: sherpa-rs was chosen for the Rust-native constraint, FluidAudio
+  remains the parked Swift-shim fallback.
 
 ## Mac manual check (ANE)
 
@@ -111,8 +203,9 @@ Notes:
 
 Verdict: **different engines per language is the right end state** — it is where the mature apps converge (MacWhisper ships Whisper and Parakeet side by side). Phase it:
 
-- **Architecture now (M1.5)**: engine selection is a pure function of `(language, installed engines, platform availability)` → engine id. Adding an engine is a new variant + a routing rule, never a reshape of call sites. The result always records the engine that actually ran.
+- **Architecture now (M1.5)**: engine selection is a pure function of `(setting, fast engine, language, installed engines, platform availability)` → engine id. Adding an engine is a new variant + a routing rule, never a reshape of call sites. The result always records the engine that actually ran.
 - **Phase 1 (M1.5, now)**: Whisper engines — CPU / Metal / CoreML-ANE. Covers English **and** Indonesian with the big speed unlock.
-- **Phase 2 (after the app works, post-M2)**: add **Parakeet TDT** as the English/EU fast path (~an order of magnitude faster than Whisper on ANE; TDT v2 English-only 1.69% WER; TDT v3 = 25 EU languages at ~5.4% English WER). Two candidate integrations, decide by bake-off: **sherpa-rs** (Rust-native, ONNX Runtime + CoreML EP — no Swift bridge) vs **FluidAudio** (Swift, best measured ANE numbers, needs a small Swift shim). Default routing once present: English → Parakeet if installed, else Whisper-ANE; Indonesian → Whisper-ANE; everything else → Whisper.
+- **Phase 2 (M10A, implemented opt-in)**: **Parakeet TDT v3 int8** as the English/EU fast path, through **sherpa-rs** (Rust-native ONNX Runtime + the Core ML execution provider on macOS — no Swift bridge). Decision record: **sherpa-rs chosen** for the Rust-native constraint; **FluidAudio stays parked** as the Swift-shim fallback should real Mac ANE numbers ever disappoint (the bake-off note stays open pending those numbers — owner-verify). Routing (see “Status (M10A — implemented)” below): with the “Fast engine (experimental)” setting ON, covered languages → Parakeet if installed, else Whisper; **Indonesian → Whisper, always**; everything else → Whisper.
+- **Phase 3 (M10B, next)**: Apple SpeechTranscriber — the default path for its covered languages on macOS once it is proven (owner pass with measured numbers). Spike first: the Rust `speech` crate wrapper (docs.rs/speech, analyzer/SpeechTranscriber, macOS 26+) before any Swift shim.
 - **Watch list**: Apple SpeechTranscriber (add when it gains `id`, or for ja/ko/zh coverage), ANEForge, Parakeet multilingual expansion.
 - Every added engine carries: model-asset download/verify, `doctor` reporting, a per-language quality note, and its own acceptance run. One engine at a time.

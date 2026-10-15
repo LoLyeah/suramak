@@ -200,6 +200,8 @@ pub fn engine_display(name: &str) -> String {
         "cpu" => "CPU".to_string(),
         "metal" => "Metal".to_string(),
         "coreml" => "Core ML".to_string(),
+        // M10A: the fast engine names itself in the engine line (owner copy).
+        "parakeet" => "parakeet (fast)".to_string(),
         other => other.to_string(),
     }
 }
@@ -3566,6 +3568,8 @@ mod tests {
         assert_eq!(engine_display("cpu"), "CPU");
         assert_eq!(engine_display("metal"), "Metal");
         assert_eq!(engine_display("coreml"), "Core ML");
+        // M10A: the fast engine names itself exactly as the owner copy asks.
+        assert_eq!(engine_display("parakeet"), "parakeet (fast)");
         // Unknown strings pass through untouched.
         assert_eq!(engine_display("auto"), "auto");
         assert_eq!(engine_display(""), "");

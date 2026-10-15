@@ -1,11 +1,13 @@
 //! `doctor` — prints data dir, db path, models dir (with installed models), settings
 //! path and the engine stack (compiled backends, Core ML availability, encoder
-//! pairing); creates missing directories; always exits 0 on success.
+//! pairing, and the M10A Parakeet fast engine); creates missing directories; always
+//! exits 0 on success.
 
 use anyhow::{Context, Result};
 use suramak_asr::{coreml_compiled, metal_compiled, system_info};
 use suramak_core::models;
 use suramak_core::paths;
+use suramak_core::settings::Settings;
 
 use crate::cmd::human_size;
 
@@ -91,7 +93,8 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-/// The engine stack: compiled whisper.cpp backends, the Core ML tier and encoder pairing.
+/// The engine stack: compiled whisper.cpp backends, the Core ML tier, encoder
+/// pairing, and the M10A Parakeet fast engine (compiled in / installed / coverage).
 fn print_engines(models_dir: &std::path::Path) {
     let macos = cfg!(target_os = "macos");
     println!("engines:");
@@ -190,4 +193,82 @@ fn print_engines(models_dir: &std::path::Path) {
             println!("    - {orphan}: unpaired (no installed model looks for this directory)");
         }
     }
+
+    print_parakeet(models_dir);
+}
+
+/// M10A: the Parakeet fast engine — compiled in? model installed + layout ok?
+/// language coverage; and whether the settings toggle is on.
+fn print_parakeet(models_dir: &std::path::Path) {
+    let info = &models::PARAKEET;
+    let dir = models::parakeet_dir(models_dir);
+    let installed = models::parakeet_installed(models_dir);
+    let total: u64 = info.files.iter().map(|f| f.size_bytes).sum();
+    let compiled = suramak_asr::parakeet::compiled();
+
+    println!("  parakeet (fast engine, experimental):");
+    println!(
+        "    build:      {}",
+        if compiled {
+            "compiled in (sherpa-onnx linked; `parakeet` feature on)".to_string()
+        } else {
+            "not compiled into this build (feature `parakeet` is off — rebuild with it to use the fast engine)"
+                .to_string()
+        }
+    );
+    println!(
+        "    provider:   {}",
+        if cfg!(target_os = "macos") {
+            "coreml (Core ML execution provider on Apple silicon; sherpa-onnx falls back to cpu when a node cannot run there)"
+        } else {
+            "cpu"
+        }
+    );
+    if installed {
+        println!(
+            "    model:      installed at {} ({} files, {}, layout ok)",
+            dir.display(),
+            info.files.len(),
+            human_size(total)
+        );
+    } else if dir.exists() {
+        let present = info
+            .files
+            .iter()
+            .filter(|f| dir.join(f.name).is_file())
+            .count();
+        println!(
+            "    model:      PARTIAL at {} ({} of {} files) — run `suramak-cli models download parakeet`",
+            dir.display(),
+            present,
+            info.files.len()
+        );
+    } else {
+        println!(
+            "    model:      not installed — run `suramak-cli models download parakeet` ({}, {} files)",
+            human_size(total),
+            info.files.len()
+        );
+    }
+    println!(
+        "    coverage:   {} languages ({})",
+        info.languages.len(),
+        info.languages.join(", ")
+    );
+    println!("    invariant:  Indonesian (id) never routes to Parakeet — whisper only");
+
+    let fast_setting = paths::settings_path()
+        .ok()
+        .and_then(|path| Settings::load(&path).ok())
+        .map(|settings| settings.asr.fast_engine)
+        .unwrap_or(false);
+    println!(
+        "    setting:    fast_engine = {} ({})",
+        fast_setting,
+        if fast_setting {
+            "covered languages use Parakeet when installed; everything else stays whisper"
+        } else {
+            "OFF (default) — today's whisper routing for every language"
+        }
+    );
 }

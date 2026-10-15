@@ -76,6 +76,18 @@ pub enum AsrError {
     /// whisper context is untouched.
     #[error("transcription cancelled")]
     Cancelled,
+
+    /// M10A: the Parakeet engine failed (model load, sherpa-onnx session or
+    /// decode). The whisper path is unaffected.
+    #[error("parakeet engine error: {0}")]
+    Parakeet(String),
+
+    /// M10A: this build has no `parakeet` feature, so the fast engine cannot run
+    /// (routing never selects it — this is the honest refusal).
+    #[error(
+        "the parakeet engine is not available in this build (compile with feature `parakeet`)"
+    )]
+    ParakeetUnsupported,
 }
 
 /// Decode thread count suggestion: physical parallelism, clamped to 2..=8.

@@ -37,3 +37,8 @@ suramak-asr = { path = "../suramak-asr", features = ["capture"] }
 # Single-instance guard (flock on the data-dir lock file, `src/instance.rs`).
 # Unix-only; the Windows port will need its own mechanism (no-op stub for now).
 libc = "0.2"
+
+[features]
+# M10A: the Parakeet fast engine (forwards to suramak-asr's `parakeet` feature).
+# OFF by default; the Settings "Fast engine (experimental)" toggle drives it.
+parakeet = ["suramak-asr/parakeet"]

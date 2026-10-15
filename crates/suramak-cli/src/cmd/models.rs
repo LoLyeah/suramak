@@ -4,6 +4,12 @@
 //! (`ggml-<model>-encoder.mlmodelc.zip`), sha256-verifies it and extracts it next to the
 //! model file as `<model-stem>-encoder.mlmodelc` — the exact directory whisper.cpp looks
 //! for. See `docs/ENGINES.md`.
+//!
+//! M10A: the id `parakeet` is the Parakeet TDT v3 int8 fast-engine model — a
+//! *directory* of pinned ONNX artifacts (encoder/decoder/joiner + tokens), each
+//! downloaded with resume + sha256 verification into
+//! `<models-dir>/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/` and layout-checked.
+//! `download parakeet` / `remove parakeet` work like the whisper ids.
 
 use std::path::{Path, PathBuf};
 
@@ -20,7 +26,7 @@ pub enum ModelsCmd {
     List,
     /// Download a model from HuggingFace and verify its pinned sha256
     Download {
-        /// Model id: tiny, base, small, turbo-q5-0, turbo-q8-0, turbo
+        /// Model id: tiny, base, small, turbo-q5-0, turbo-q8-0, turbo, parakeet
         id: String,
         /// Also download + extract the official Core ML encoder package (ANE tier)
         #[arg(long)]
@@ -28,7 +34,7 @@ pub enum ModelsCmd {
     },
     /// Delete an installed model file (and its Core ML encoder package when unshared)
     Remove {
-        /// Model id: tiny, base, small, turbo-q5-0, turbo-q8-0, turbo
+        /// Model id: tiny, base, small, turbo-q5-0, turbo-q8-0, turbo, parakeet
         id: String,
     },
 }
@@ -76,10 +82,42 @@ fn list() -> Result<()> {
     println!(
         "encoder packages: `models download <id> --encoder` (shared by the three turbo decoders)"
     );
+
+    // M10A: the Parakeet fast engine (a directory of pinned files, not one file).
+    let parakeet = &models::PARAKEET;
+    let parakeet_dir = models::parakeet_dir(&dir);
+    let parakeet_size: u64 = parakeet.files.iter().map(|f| f.size_bytes).sum();
+    let parakeet_state = if models::parakeet_installed(&dir) {
+        "yes"
+    } else if parakeet_dir.exists() {
+        "partial"
+    } else {
+        "-"
+    };
+    println!(
+        "{:<12} {:>10}  {:<10} {:<12} {}",
+        parakeet.id,
+        human_size(parakeet_size),
+        parakeet_state,
+        "n/a",
+        parakeet.role
+    );
+    println!(
+        "  parakeet: {} pinned files into {} (languages: {})",
+        parakeet.files.len(),
+        parakeet.dir_name,
+        parakeet.languages.join(", ")
+    );
     Ok(())
 }
 
 fn download_model(id: &str, with_encoder: bool) -> Result<()> {
+    if models::find_parakeet(id).is_some() {
+        if with_encoder {
+            println!("{id}: `--encoder` applies to whisper models only (ignored)");
+        }
+        return download_parakeet();
+    }
     let info = find_model(id)?;
     paths::ensure_dirs()?;
     let models_dir = paths::models_dir()?;
@@ -115,6 +153,71 @@ fn download_model(id: &str, with_encoder: bool) -> Result<()> {
     if with_encoder {
         download_encoder(info, &models_dir)?;
     }
+    Ok(())
+}
+
+/// Downloads the Parakeet model directory (M10A): every pinned file with resume +
+/// sha256 verification, then the layout check. Idempotent.
+fn download_parakeet() -> Result<()> {
+    let info = &models::PARAKEET;
+    paths::ensure_dirs()?;
+    let models_dir = paths::models_dir()?;
+    let dest = models::parakeet_dir(&models_dir);
+    let total: u64 = info.files.iter().map(|f| f.size_bytes).sum();
+
+    if models::parakeet_installed(&models_dir) {
+        // Verify the installed bytes against the pins before claiming success.
+        for file in info.files {
+            download::verify_sha256(&dest.join(file.name), file.sha256).with_context(|| {
+                format!(
+                    "installed file {} failed sha256 verification — remove the directory and retry",
+                    dest.join(file.name).display()
+                )
+            })?;
+        }
+        println!(
+            "parakeet already installed ({} files, sha256 verified): {}",
+            info.files.len(),
+            dest.display()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "downloading parakeet ({} files, {})",
+        info.files.len(),
+        human_size(total)
+    );
+    println!("  to   {}", dest.display());
+    let pins: Vec<(&str, u64, &str)> = info
+        .files
+        .iter()
+        .map(|f| (f.name, f.size_bytes, f.sha256))
+        .collect();
+    download::download_files(
+        &dest,
+        &pins,
+        |name| models::parakeet_file_url(info, name),
+        models::PARAKEET_REQUIRED_FILES,
+    )?;
+    // Re-check the layout so the success claim below is airtight.
+    if !models::parakeet_installed(&models_dir) {
+        anyhow::bail!(
+            "downloaded into {} but the Parakeet layout is incomplete",
+            dest.display()
+        );
+    }
+    println!(
+        "parakeet downloaded, {} files sha256 verified ({}), installed at {}",
+        info.files.len(),
+        human_size(total),
+        dest.display()
+    );
+    println!(
+        "  covers {} languages ({}) — Indonesian stays on whisper",
+        info.languages.len(),
+        info.languages.join(", ")
+    );
     Ok(())
 }
 
@@ -171,6 +274,9 @@ fn download_encoder(info: &'static models::ModelInfo, models_dir: &Path) -> Resu
 }
 
 fn remove(id: &str) -> Result<()> {
+    if models::find_parakeet(id).is_some() {
+        return remove_parakeet();
+    }
     let info = find_model(id)?;
     let models_dir = paths::models_dir()?;
     let dest = models_dir.join(info.hf_file);
@@ -215,6 +321,19 @@ fn remove_encoder_if_unshared(info: &'static models::ModelInfo, models_dir: &Pat
             dir.display(),
             shared_by.join(", ")
         );
+        return Ok(());
+    }
+    std::fs::remove_dir_all(&dir).with_context(|| format!("cannot remove {}", dir.display()))?;
+    println!("removed {}", dir.display());
+    Ok(())
+}
+
+/// Removes the Parakeet model directory (M10A).
+fn remove_parakeet() -> Result<()> {
+    let models_dir = paths::models_dir()?;
+    let dir = models::parakeet_dir(&models_dir);
+    if !dir.exists() {
+        println!("parakeet is not installed ({})", dir.display());
         return Ok(());
     }
     std::fs::remove_dir_all(&dir).with_context(|| format!("cannot remove {}", dir.display()))?;
