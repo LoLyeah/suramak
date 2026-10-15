@@ -21,6 +21,7 @@ symphonia = { workspace = true }
 symphonia-adapter-libopus = { workspace = true }
 rubato = { workspace = true }
 hound = { workspace = true }
+base64 = { workspace = true }
 # Reads the official Core ML encoder packages (`.mlmodelc.zip`). Pure-Rust: default
 # features are off (they would pull C-compiled bzip2/zstd/lzma) and only the deflate
 # read path is enabled; flate2's backend is zlib-rs, a pure-Rust zlib (no C toolchain).

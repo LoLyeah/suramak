@@ -698,7 +698,7 @@ fn polish_actions(
     enum Bar {
         Idle { show_setup_note: bool },
         Running { segments: usize },
-        Review { rows: usize },
+        Review { rows: usize, notes: Option<String> },
         Failed { can: bool, message: String },
     }
     let bar = match &state.polish {
@@ -710,6 +710,7 @@ fn polish_actions(
         },
         PolishState::Review(review) => Bar::Review {
             rows: review.rows.len(),
+            notes: review.notes_line(),
         },
         PolishState::Failed { message } => Bar::Failed {
             can: state.can_polish(),
@@ -739,7 +740,7 @@ fn polish_actions(
                 );
             });
         }
-        Bar::Review { rows } => {
+        Bar::Review { rows, notes } => {
             ui.horizontal(|ui| {
                 ui.add_space(PANE_PAD_X - 8.0);
                 let accept = controls::button(
@@ -766,15 +767,18 @@ fn polish_actions(
                 if discard.clicked() {
                     state.discard_polish();
                 }
-                pane_caption(
-                    ui,
-                    &format!(
-                        "reviewing {} — original | tidied; Accept replaces the transcript text",
-                        super::count_noun(rows, "segment")
-                    ),
-                    tokens,
-                    false,
+                // M11: the run's degradation notes (missing recording,
+                // rejected audio) ride the same caption as every polish
+                // message.
+                let mut caption = format!(
+                    "reviewing {} — original | tidied; Accept replaces the transcript text",
+                    super::count_noun(rows, "segment")
                 );
+                if let Some(notes) = &notes {
+                    caption.push_str(" · ");
+                    caption.push_str(notes);
+                }
+                pane_caption(ui, &caption, tokens, false);
             });
         }
         Bar::Failed { can, message } => {

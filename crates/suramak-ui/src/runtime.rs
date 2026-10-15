@@ -35,11 +35,11 @@ use suramak_asr::mix;
 use suramak_asr::worker::{Job, Worker, WorkerEvent};
 use suramak_core::models as core_models;
 use suramak_core::paths;
-use suramak_core::polish::{OpenAiCompat, PolishBackend};
+use suramak_core::polish::{OpenAiCompat, PolishBackend, PolishOutcome};
 use suramak_core::resample;
 use suramak_core::settings::{LangMode, PolishSettings, RecordSource, Settings};
 use suramak_core::store::Store;
-use suramak_core::transcript::{Segment, Transcript};
+use suramak_core::transcript::Transcript;
 use suramak_playback::{
     peaks, Command as PlaybackCommand, Engine, Peaks, Status as PlaybackStatus,
 };
@@ -114,9 +114,10 @@ struct PolishJob {
 }
 
 /// Shared slot for a background polish outcome: `None` while running, `Some`
-/// exactly once when the call finished (Ok = validated segments, Err = the raw
-/// backend/reply error shown to the user).
-type PolishSlot = Arc<Mutex<Option<Result<Vec<Segment>, String>>>>;
+/// exactly once when the call finished (Ok = the validated outcome — segments
+/// plus any M11 degradation notes — Err = the raw backend/reply error shown to
+/// the user).
+type PolishSlot = Arc<Mutex<Option<Result<PolishOutcome, String>>>>;
 
 /// A live playback engine and the file it was opened for (M8). The engine's
 /// thread owns the cpal stream; the runtime only sends it commands.
@@ -187,7 +188,7 @@ impl Runtime {
 
     /// Outcome of the background polish run, if one finished since the last
     /// poll. Terminal-once, like [`Runtime::download_status`].
-    pub fn polish_status(&mut self) -> Option<Result<Vec<Segment>, String>> {
+    pub fn polish_status(&mut self) -> Option<Result<PolishOutcome, String>> {
         let job = self.polish.as_ref()?;
         let result = job.result.lock().ok().and_then(|guard| guard.clone());
         if result.is_some() {
@@ -537,11 +538,21 @@ impl Runtime {
     /// UI thread). The result lands in a mutex slot that [`Runtime::polish_status`]
     /// polls; the thread also requests a repaint when it finishes, like the
     /// bridge does for worker events.
+    ///
+    /// M11: the audio-aware toggle is resolved here ([`polish::polish_audio_request`])
+    /// — off keeps the request byte-identical to the pre-M11 one; on sends the
+    /// recording (or degrades to text-only + a note when it is missing).
     fn start_polish(&mut self, transcript: Transcript) -> Result<(), String> {
         if self.polish.is_some() {
             return Err("a polish run is already in progress".to_string());
         }
         let config = polish::polish_config(&self.settings, key_present())?;
+        let send_audio = self
+            .settings
+            .polish
+            .as_ref()
+            .is_some_and(|polish| polish.send_audio);
+        let audio = polish::polish_audio_request(&self.settings, &transcript);
         let segments = transcript.segments;
         let result: PolishSlot = Arc::new(Mutex::new(None));
         let outcome = Arc::clone(&result);
@@ -550,24 +561,30 @@ impl Runtime {
             endpoint = %config.base_url,
             model = %config.model,
             segments = segments.len(),
+            audio_aware = send_audio,
             "polish: starting the background run"
         );
         let spawned = thread::Builder::new()
             .name("suramak-polish".to_string())
             .spawn(move || {
-                let run = (|| -> Result<Vec<Segment>, String> {
+                let run = (|| -> Result<PolishOutcome, String> {
                     let backend = OpenAiCompat::new().map_err(|err| err.to_string())?;
                     let cfg = PolishSettings {
                         base_url: config.base_url,
                         model: config.model,
+                        send_audio,
                     };
                     backend
-                        .polish(&segments, &cfg)
+                        .polish_with_audio(&segments, &cfg, audio)
                         .map_err(|err| error_chain(&err))
                 })();
                 match &run {
-                    Ok(segments) => {
-                        tracing::info!(segments = segments.len(), "polish: reply validated")
+                    Ok(outcome) => {
+                        tracing::info!(
+                            segments = outcome.segments.len(),
+                            notes = outcome.notes.len(),
+                            "polish: reply validated"
+                        )
                     }
                     Err(err) => tracing::warn!(error = %err, "polish: run failed"),
                 }

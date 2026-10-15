@@ -4,6 +4,9 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased]
 
+### Added
+- **Audio-aware polish (M11, owner-requested)**: the optional LLM polish gained a second data point — the **recording** — behind a new Settings toggle, **"Send the recording too (audio-aware polish)"** (default OFF; `settings.polish.send_audio`). When on and a recording is available, the recording is sent as OpenAI-compatible **`input_audio`** content parts (base64 WAV — the 16 kHz mono PCM16 recordings need **no encoder**; imported files are decoded + resampled through the pipeline's own path), **chunked at segment boundaries into ≤ 4 MB (~2 min) raw chunks** — one request per chunk, the corrected outputs concatenated in order. The ladder degrades, never fails hard: a **missing recording** is text-only + a note; an endpoint that **rejects the audio (4xx)** gets **one automatic text-only retry** + a note naming the status and the endpoint's reason; the notes surface with the review like every polish message. With the toggle **off**, the request is **byte-identical** to the pre-M11 text-only one (pinned by tests at the builder level and on the wire). The privacy copy (Settings caption, README, USER_SMOKE §31) states that the recording itself is uploaded when the toggle is on — it stays the app's one opt-in upload path. Tests: exact request shape, chunker coverage/order/segment-alignment/caps, and mock-endpoint runs (audio part shape + coverage + 400 fallback + OFF-identical) — no real endpoints anywhere. Report: `docs/reports/M11.md`
+
 ## [0.2.0] - 2026-10-15
 
 ### Added

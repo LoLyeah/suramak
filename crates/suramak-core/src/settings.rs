@@ -63,6 +63,12 @@ pub struct PolishSettings {
     /// OpenAI-compatible API base URL.
     pub base_url: String,
     pub model: String,
+    /// M11: "Send the recording too (audio-aware polish)" — **OFF by
+    /// default**; missing in older settings files → `false`, which keeps the
+    /// text-only request exactly as it was. When on, the recording itself is
+    /// uploaded to the configured endpoint alongside the transcript.
+    #[serde(default)]
+    pub send_audio: bool,
 }
 
 /// Storage settings.
@@ -369,6 +375,51 @@ font_scale = 1.0
         let settings: Settings = toml::from_str(text).expect("M9-era settings must load");
         assert!(!settings.asr.fast_engine, "missing key → OFF");
         assert_eq!(settings.asr.engine, EngineSetting::CoreML);
+    }
+
+    // ---- M11: the audio-aware polish toggle ---------------------------------
+
+    #[test]
+    fn polish_send_audio_roundtrips_and_defaults_to_off() {
+        for send in [false, true] {
+            let settings = Settings {
+                polish: Some(PolishSettings {
+                    base_url: "http://localhost:11434/v1".to_string(),
+                    model: "m".to_string(),
+                    send_audio: send,
+                }),
+                ..Settings::default()
+            };
+            let text = toml::to_string_pretty(&settings).expect("serialize settings");
+            assert!(
+                text.contains(&format!("send_audio = {send}")),
+                "unexpected TOML: {text}"
+            );
+            let back: Settings = toml::from_str(&text).expect("deserialize settings");
+            assert_eq!(back.polish.unwrap().send_audio, send);
+        }
+        // A settings file written before M11 has no `send_audio` key → OFF.
+        let text = r#"
+[asr]
+model_id = "tiny"
+language = "auto"
+translate_to_english = false
+
+[polish]
+base_url = "http://localhost:11434/v1"
+model = "llama3"
+
+[storage]
+keep_audio = false
+
+[ui]
+glass = "auto"
+font_scale = 1.0
+"#;
+        let settings: Settings = toml::from_str(text).expect("M10-era settings must load");
+        let polish = settings.polish.expect("polish section");
+        assert!(!polish.send_audio, "missing key → OFF");
+        assert_eq!(polish.model, "llama3");
     }
 
     #[test]

@@ -51,6 +51,8 @@ pub fn run(args: PolishArgs) -> Result<()> {
     let cfg = PolishSettings {
         base_url: base_url.clone(),
         model: model.clone(),
+        // M11 is an in-app option; the CLI polish stays text-only.
+        send_audio: false,
     };
     let backend = OpenAiCompat::new()?;
 

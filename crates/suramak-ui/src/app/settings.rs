@@ -663,6 +663,30 @@ fn polish_section(ui: &mut egui::Ui, tokens: &Tokens, form: &mut SettingsForm) -
         }
     });
 
+    // M11: the audio-aware toggle — one control, OFF by default, with the
+    // privacy copy (the recording itself uploads when this is on).
+    row(ui, tokens, "Send audio", |ui| {
+        if ui
+            .checkbox(
+                &mut form.polish_send_audio,
+                "Send the recording too (audio-aware polish)",
+            )
+            .changed()
+        {
+            dirty = true;
+        }
+    });
+    row_caption(
+        ui,
+        tokens,
+        "Off by default. When on, the recording itself is uploaded to the endpoint you \
+         configured, alongside the transcript, so corrections resolve names, homophones and \
+         jargon against what was actually said. Needs an audio-capable model (e.g. the \
+         gpt-audio class, Gemini, Voxtral); an endpoint that rejects the audio falls back to \
+         text-only with a note.",
+        false,
+    );
+
     row(ui, tokens, "API key", |ui| {
         if settings_form::api_key_supported() {
             let response = ui.add_sized(

@@ -46,3 +46,10 @@ parakeet = ["suramak-asr/parakeet"]
 # feature). OFF by default; macOS 26+ builds only (the `speech` crate is a Swift
 # bridge). The Settings "Fast engine (experimental)" toggle drives it.
 speech-transcriber = ["suramak-asr/speech-transcriber"]
+
+[dev-dependencies]
+# M11: the UI polish tests decode the `input_audio` base64 payload back to the
+# WAV bytes and parse the recorded request bodies to verify what goes on the
+# wire (production encoding lives in core).
+base64 = { workspace = true }
+serde_json = { workspace = true }

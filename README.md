@@ -15,13 +15,13 @@ Local-first transcription app. Fully native, written in Rust. **macOS first; Win
 - Any whisper language code: `auto` / `en` / `id` presets plus a free-text **Custom…** entry in Settings (loose validation, keeps the last good value).
 - Delete a transcript from the library: a trash button in the editor header with an inline confirm (segments go with it).
 - Export Markdown / TXT / JSON (+ SRT / VTT) — take it to any LLM you like.
-- Optional in-app "polish" via your own OpenAI-compatible endpoint — review side-by-side, accept/undo/discard; the app works fully without it.
-- No telemetry. Network only for model downloads and opt-in polish.
+- Optional in-app "polish" via your own OpenAI-compatible endpoint — review side-by-side, accept/undo/discard; the app works fully without it. **Audio-aware polish (M11)**: an opt-in toggle (default OFF) that sends the recording itself alongside the transcript — OpenAI-compatible `input_audio` content parts (base64 WAV, no encoder), chunked at segment boundaries into ≤ 4 MB (~2 min) chunks, the corrected outputs concatenated in order — so corrections resolve names, homophones and jargon against what was actually said. Needs an audio-capable model (`gpt-audio` class, Gemini, Voxtral); a missing recording falls back to text-only with a note, and an endpoint that rejects the audio gets one automatic text-only retry with a note naming the reason. Off = byte-identical to the pre-M11 text-only request.
+- No telemetry. Network only for model downloads and opt-in polish (the recording uploads only when you turn audio-aware polish on).
 - Liquid Glass on macOS 26+ (fallback for older); DWM Mica/Acrylic backdrop on Windows (compile-checked; runtime unverified).
 
 ## Status
 
-- ✅ `suramak-core` — types, storage (sqlite), export, model download w/ sha256, decode, resample, polish client — fully tested
+- ✅ `suramak-core` — types, storage (sqlite), export, model download w/ sha256, decode, resample, polish client (incl. the M11 audio-aware request builder + segment-aligned chunker) — fully tested
 - ✅ `suramak-asr` — whisper-rs pipeline + worker thread (record-then-transcribe), verified end-to-end; multi-source mixing engine (M6) compiled and tested on every platform; live partials (M7) — pure windowing/backlog scheduler + bounded queue + provisional merging on every platform, decode on its own thread through the same whisper path
 - ✅ `suramak-cli` — `models` / `transcribe` / `export` / `library` / `polish` / `doctor`
 - ✅ engine tiers — CPU / Metal / Core ML-ANE (`--engine`, `doctor` reports the stack; M1.5)

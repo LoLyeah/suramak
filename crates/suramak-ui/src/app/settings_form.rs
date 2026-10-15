@@ -123,6 +123,10 @@ pub struct SettingsForm {
     pub sources: Vec<RecordSource>,
     pub polish_base_url: String,
     pub polish_model: String,
+    /// M11: "Send the recording too (audio-aware polish)" — persisted as
+    /// `settings.polish.send_audio`, **OFF by default**. On: the recording
+    /// itself is uploaded to the configured endpoint alongside the transcript.
+    pub polish_send_audio: bool,
     /// Transient API-key input; **never** written to settings.toml (macOS/Windows
     /// keychain only).
     pub api_key: String,
@@ -172,6 +176,10 @@ impl SettingsForm {
                 .as_ref()
                 .map(|polish| polish.model.clone())
                 .unwrap_or_default(),
+            polish_send_audio: settings
+                .polish
+                .as_ref()
+                .is_some_and(|polish| polish.send_audio),
             api_key: String::new(),
             dirty: false,
             status: None,
@@ -311,6 +319,7 @@ impl SettingsForm {
             Some(PolishSettings {
                 base_url: base.to_string(),
                 model: model.to_string(),
+                send_audio: self.polish_send_audio,
             })
         };
     }
@@ -352,6 +361,7 @@ mod tests {
         settings.polish = Some(PolishSettings {
             base_url: "http://localhost:11434/v1".to_string(),
             model: "llama3".to_string(),
+            send_audio: false,
         });
         settings.ui.glass = GlassMode::Never;
 
@@ -408,6 +418,7 @@ mod tests {
         assert_eq!(form.appearance, Appearance::System);
         assert_eq!(form.sources, vec![RecordSource::Default]);
         assert!(form.polish_base_url.is_empty() && form.polish_model.is_empty());
+        assert!(!form.polish_send_audio, "audio-aware polish starts OFF");
         assert!(form.api_key.is_empty(), "the key field always starts empty");
         assert!(!form.dirty);
     }
@@ -441,6 +452,45 @@ mod tests {
         form.apply(&mut settings);
         settings.save(&path).expect("save");
         assert!(!Settings::load(&path).unwrap().asr.fast_engine);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    // ---- M11: the audio-aware polish toggle ---------------------------------
+
+    #[test]
+    fn polish_send_audio_toggle_roundtrips_form_settings_file_and_back() {
+        let mut settings = Settings {
+            polish: Some(PolishSettings {
+                base_url: "http://localhost:11434/v1".to_string(),
+                model: "llama3".to_string(),
+                send_audio: false,
+            }),
+            ..Settings::default()
+        };
+        let mut form = SettingsForm::from_settings(&settings);
+        assert!(!form.polish_send_audio, "the toggle starts OFF");
+
+        form.polish_send_audio = true;
+        form.apply(&mut settings);
+        assert!(settings.polish.as_ref().unwrap().send_audio);
+
+        let path = temp_path("polish-send-audio");
+        settings.save(&path).expect("save");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("send_audio = true"),
+            "unexpected TOML: {text}"
+        );
+        let reloaded = Settings::load(&path).expect("reload");
+        assert!(reloaded.polish.as_ref().unwrap().send_audio);
+        let form2 = SettingsForm::from_settings(&reloaded);
+        assert!(form2.polish_send_audio, "the form follows the file");
+
+        // …and back off (the observable value follows the toggle both ways).
+        form.polish_send_audio = false;
+        form.apply(&mut settings);
+        settings.save(&path).expect("save");
+        assert!(!Settings::load(&path).unwrap().polish.unwrap().send_audio);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
@@ -528,6 +578,7 @@ mod tests {
             polish: Some(PolishSettings {
                 base_url: "http://x/v1".to_string(),
                 model: "m".to_string(),
+                send_audio: false,
             }),
             ..Settings::default()
         };

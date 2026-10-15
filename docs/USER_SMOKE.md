@@ -342,6 +342,41 @@ toggle; this is the default build.
   libopus is compiled into the binary (BSD-licensed; the adapter is
   MIT/Apache-2.0).
 
+## 31. Audio-aware polish — the recording as a second data point (M11)
+
+Off by default. When on, **the recording itself is uploaded** to the endpoint
+you configured — the app's only path that sends audio anywhere, and it exists
+only while this toggle is on. The point: corrections resolve names, homophones
+and jargon against what was actually said (whisper stays the engine; the LLM
+cross-checks the text against the audio).
+
+- Settings → Polish (LLM tidy-up) → tick **Send the recording too (audio-aware
+  polish)** → Save. Expected: `settings.toml` gains `send_audio = true` under
+  `[polish]` (and the caption right there says the recording uploads).
+- Use an **audio-capable model** for the next step (the `gpt-audio` class,
+  Gemini, Voxtral); a text-only model like `gpt-4o-mini` will reject the audio
+  part — that is the fallback item below, not a failure.
+- Open a transcript **whose recording is still on disk** (a kept recording, or
+  an imported file) → **Polish**. Expected: the same `original | tidied` review
+  as item 7 — plus, if you can see the endpoint's logs, one request per ~2 min
+  chunk carrying an `input_audio` part (base64 WAV) with the transcript text.
+- **Text-only model → the fallback note**: with the toggle on and a model that
+  does not accept audio, the run must still succeed: the review opens with the
+  tidied text and a note in the polish line like
+  `the endpoint rejected the recording (HTTP 400: …) — retried without it`.
+  Put the endpoint + status in Report.
+- **Missing recording**: open a transcript recorded with **Keep recordings
+  off** → **Polish** (toggle on). Expected: a normal text-only review with
+  `the recording was not sent — keep audio was off, or the file is gone; …`
+  in the polish line — never a failure.
+- **OFF stays today's behavior**: untick the toggle → Save → **Polish**.
+  Expected: exactly item 7 (text-only; no note about the recording).
+- Long recordings (over ~2 minutes) are split into ~2-minute chunks **at
+  segment boundaries** and sent as several requests; the review is unchanged
+  (the corrected segments arrive in order). Nothing to configure.
+- Privacy check: with the toggle **off**, nothing about the recording leaves
+  the machine (the request is the pre-M11 text-only one, byte for byte).
+
 ## Report
 
 Anything that deviates from an expected result, with: what you did, what happened, what you expected.

@@ -44,6 +44,10 @@ symphonia = { version = "0.5.4", features = ["aac", "flac", "isomp4", "mkv", "mp
 symphonia-adapter-libopus = "0.2"
 rubato = { version = "0.16", features = ["fft_resampler"] }
 hound = "3.5"
+# M11: base64 for the audio-aware polish `input_audio` content parts (the WAV
+# bytes go on the wire base64'd, per the OpenAI-compatible shape). Already in
+# the lock via reqwest's transitive graph; pinned here directly.
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 pollster = "0.4"
 egui = { version = "0.33", features = ["accesskit"] }

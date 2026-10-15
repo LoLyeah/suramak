@@ -10,13 +10,19 @@
 //! background thread (never the ASR worker) and reports the outcome back through
 //! [`AppState::on_polish_done`]. The view lives in `app::editor`.
 //!
+//! M11: [`polish_audio_request`] resolves the audio-aware toggle against the
+//! open transcript (off → text-only; on with a recording → the recording; on
+//! without → text-only + a note). Core's graceful ladder's notes ride the
+//! outcome and are shown with the review, like every polish message.
+//!
 //! Failure rule (documented + tested): when the reply does not validate — it
 //! drops or merges segments, swaps ids, sends empty text, is not JSON, or the
 //! endpoint errors — the **whole run fails**, the transcript is left exactly as
 //! it was and the raw backend/reply error is shown. There is no partial apply.
 
+use suramak_core::polish::{AudioRequest, PolishOutcome};
 use suramak_core::settings::Settings;
-use suramak_core::transcript::Segment;
+use suramak_core::transcript::Transcript;
 
 use super::{AppState, Effect};
 
@@ -69,6 +75,41 @@ or set SURAMAK_OPENAI_API_KEY on Linux"
     })
 }
 
+/// M11: the note when audio-aware polish is on but the transcript has no audio
+/// path at all (e.g. a transcript made by another tool).
+pub const AUDIO_NOT_ATTACHED_NOTE: &str =
+    "the recording was not sent — no audio is attached to this transcript; the text was polished on its own";
+
+/// M11: the note when audio-aware polish is on but the recording's file is
+/// gone (keep-audio off, or a moved/deleted import).
+pub const AUDIO_FILE_GONE_NOTE: &str =
+    "the recording was not sent — keep audio was off, or the file is gone; the text was polished on its own";
+
+/// M11: what a polish run should do about the recording — the toggle
+/// (`settings.polish.send_audio`) resolved against the open transcript.
+///
+/// `Off` keeps the request byte-identical to the pre-M11 one. The toggle on
+/// with a recording that exists sends it; a missing file degrades to
+/// text-only + a note, never an error.
+pub fn polish_audio_request(settings: &Settings, transcript: &Transcript) -> AudioRequest {
+    let send_audio = settings
+        .polish
+        .as_ref()
+        .is_some_and(|polish| polish.send_audio);
+    if !send_audio {
+        return AudioRequest::Off;
+    }
+    match transcript.audio_path.as_deref() {
+        Some(path) if path.is_file() => AudioRequest::Recording(path.to_path_buf()),
+        Some(_) => AudioRequest::Unavailable {
+            note: AUDIO_FILE_GONE_NOTE.to_string(),
+        },
+        None => AudioRequest::Unavailable {
+            note: AUDIO_NOT_ATTACHED_NOTE.to_string(),
+        },
+    }
+}
+
 /// Lifecycle of the in-app polish run.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PolishState {
@@ -113,6 +154,20 @@ pub struct PolishRow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PolishReview {
     pub rows: Vec<PolishRow>,
+    /// M11: graceful-degradation notes from the run (empty on a plain
+    /// success) — shown with the review like every polish message.
+    pub notes: Vec<String>,
+}
+
+impl PolishReview {
+    /// The notes as one caption line (`None` when there are none).
+    pub fn notes_line(&self) -> Option<String> {
+        if self.notes.is_empty() {
+            None
+        } else {
+            Some(self.notes.join(" · "))
+        }
+    }
 }
 
 /// One-step undo of an accepted polish: the buffer texts from before Accept.
@@ -161,8 +216,9 @@ impl AppState {
     }
 
     /// The runtime finished the call: a validated reply opens the review, any
-    /// failure keeps the transcript untouched and shows the raw error.
-    pub fn on_polish_done(&mut self, result: Result<Vec<Segment>, String>) -> Vec<Effect> {
+    /// failure keeps the transcript untouched and shows the raw error. M11:
+    /// the outcome's degradation notes ride into the review.
+    pub fn on_polish_done(&mut self, result: Result<PolishOutcome, String>) -> Vec<Effect> {
         if !self.polish.is_running() {
             // A stray result (no run in flight) — nothing to attach it to.
             return Vec::new();
@@ -172,7 +228,11 @@ impl AppState {
             return Vec::new();
         };
         match result {
-            Ok(polished) => {
+            Ok(outcome) => {
+                let PolishOutcome {
+                    segments: polished,
+                    notes,
+                } = outcome;
                 // Core's `parse_and_validate` already rejects count/id/empty-text
                 // mismatches; re-check the alignment here so a stray caller can
                 // never pair polished text with the wrong segment.
@@ -201,7 +261,7 @@ impl AppState {
                         polished: segment.text.clone(),
                     })
                     .collect();
-                self.polish = PolishState::Review(PolishReview { rows });
+                self.polish = PolishState::Review(PolishReview { rows, notes });
             }
             Err(message) => {
                 self.polish = PolishState::Failed { message };
@@ -297,15 +357,17 @@ impl AppState {
 mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::path::Path;
-    use std::sync::Mutex;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    use base64::Engine as _;
 
     use suramak_core::paths;
     use suramak_core::settings::{PolishSettings, Settings};
     use suramak_core::store::Store;
-    use suramak_core::transcript::{Source, Transcript};
+    use suramak_core::transcript::{Segment, Source, Transcript};
 
     use super::*;
     use crate::app::Route;
@@ -347,6 +409,7 @@ mod tests {
             polish: Some(PolishSettings {
                 base_url: base_url.to_string(),
                 model: model.to_string(),
+                send_audio: false,
             }),
             ..Settings::default()
         }
@@ -363,6 +426,7 @@ mod tests {
             polish: Some(PolishSettings {
                 base_url: "   ".to_string(),
                 model: "m".to_string(),
+                send_audio: false,
             }),
             ..Settings::default()
         };
@@ -474,7 +538,7 @@ mod tests {
         let mut state = state_with_editor(true);
         state.start_polish();
         let swapped = vec![segment(1, "Hello world."), segment(0, "This is a test.")];
-        state.on_polish_done(Ok(swapped));
+        state.on_polish_done(Ok(PolishOutcome::plain(swapped)));
         match &state.polish {
             PolishState::Failed { message } => {
                 assert!(message.contains("line up"), "unexpected: {message}")
@@ -486,7 +550,9 @@ mod tests {
     #[test]
     fn stray_results_and_accept_without_a_review_are_noops() {
         let mut state = state_with_editor(true);
-        assert!(state.on_polish_done(Ok(vec![])).is_empty());
+        assert!(state
+            .on_polish_done(Ok(PolishOutcome::plain(vec![])))
+            .is_empty());
         assert_eq!(state.polish, PolishState::Idle);
         assert!(state.accept_polish().is_empty());
         assert!(state.undo_polish().is_empty());
@@ -499,7 +565,9 @@ mod tests {
         let mut state = state_with_editor(true);
         state.start_polish();
         let polished = vec![segment(0, "Hello world."), segment(1, "This is a test.")];
-        assert!(state.on_polish_done(Ok(polished)).is_empty());
+        assert!(state
+            .on_polish_done(Ok(PolishOutcome::plain(polished)))
+            .is_empty());
         match &state.polish {
             PolishState::Review(review) => {
                 assert_eq!(review.rows.len(), 2);
@@ -543,10 +611,10 @@ mod tests {
     fn undo_restores_the_previous_text_and_persists_it_once() {
         let mut state = state_with_editor(true);
         state.start_polish();
-        state.on_polish_done(Ok(vec![
+        state.on_polish_done(Ok(PolishOutcome::plain(vec![
             segment(0, "Hello world."),
             segment(1, "This is a test."),
-        ]));
+        ])));
         state.accept_polish();
         state.on_edits_saved(Instant::now(), Ok(()));
 
@@ -578,10 +646,10 @@ mod tests {
     fn accept_with_no_text_change_skips_the_save_and_the_undo() {
         let mut state = state_with_editor(true);
         state.start_polish();
-        state.on_polish_done(Ok(vec![
+        state.on_polish_done(Ok(PolishOutcome::plain(vec![
             segment(0, "helo wrold"),
             segment(1, "this iz a tset"),
-        ]));
+        ])));
         assert!(state.accept_polish().is_empty(), "nothing to persist");
         assert!(state.polish_undo.is_none());
         assert!(!state.editor.as_ref().unwrap().dirty);
@@ -597,10 +665,10 @@ mod tests {
     fn discard_keeps_the_transcript_untouched() {
         let mut state = state_with_editor(true);
         state.start_polish();
-        state.on_polish_done(Ok(vec![
+        state.on_polish_done(Ok(PolishOutcome::plain(vec![
             segment(0, "Hello world."),
             segment(1, "This is a test."),
-        ]));
+        ])));
         state.discard_polish();
         assert_eq!(state.polish, PolishState::Idle);
         let editor = state.editor.as_ref().unwrap();
@@ -617,10 +685,10 @@ mod tests {
     fn opening_another_transcript_drops_a_pending_review() {
         let mut state = state_with_editor(true);
         state.start_polish();
-        state.on_polish_done(Ok(vec![
+        state.on_polish_done(Ok(PolishOutcome::plain(vec![
             segment(0, "Hello world."),
             segment(1, "This is a test."),
-        ]));
+        ])));
         assert!(state.polish.is_reviewing());
 
         state.on_transcript_loaded(transcript("other.wav"));
@@ -639,9 +707,41 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn read_request(stream: &mut TcpStream) -> String {
-        let mut buf = [0u8; 8192];
-        let n = stream.read(&mut buf).unwrap_or(0);
-        String::from_utf8_lossy(&buf[..n]).to_string()
+        // Reads the full request — headers + the Content-Length body (M11's
+        // audio requests carry megabytes of base64).
+        let mut data: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 16 * 1024];
+        let mut expected: Option<(usize, usize)> = None;
+        loop {
+            if expected.is_none() {
+                if let Some(pos) = find_bytes(&data, b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&data[..pos]).to_ascii_lowercase();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("content-length:")
+                                .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    expected = Some((pos + 4, length));
+                }
+            }
+            if let Some((body_at, length)) = expected {
+                if data.len() >= body_at + length {
+                    break;
+                }
+            }
+            let n = stream.read(&mut buf).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            data.extend_from_slice(&buf[..n]);
+        }
+        String::from_utf8_lossy(&data).to_string()
+    }
+
+    fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
     }
 
     fn respond(stream: &mut TcpStream, status: &str, body: &str) {
@@ -698,6 +798,98 @@ mod tests {
         )
     }
 
+    /// Spawns a mock endpoint that serves `expected` connections with a
+    /// scripted handler (request index + raw request → (status, body)) and
+    /// records every raw request it saw (M11: the audio tests need the index
+    /// and the full body).
+    fn spawn_scripted_mock<F>(expected: usize, handler: F) -> (String, Arc<Mutex<Vec<String>>>)
+    where
+        F: Fn(usize, &str) -> (String, String) + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        thread::spawn(move || {
+            for index in 0..expected {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let request = read_request(&mut stream);
+                let (status, body) = handler(index, &request);
+                record.lock().unwrap().push(request);
+                respond(&mut stream, &status, &body);
+            }
+        });
+        (format!("http://{addr}/v1"), seen)
+    }
+
+    /// The raw request body (after the header block) as JSON.
+    fn request_body(request: &str) -> serde_json::Value {
+        let at = find_bytes(request.as_bytes(), b"\r\n\r\n").expect("headers") + 4;
+        serde_json::from_str(request[at..].trim_end()).expect("JSON body")
+    }
+
+    /// The ids of the request payload — works for the text-only string content
+    /// and the M11 content-part array alike.
+    fn payload_ids(body: &serde_json::Value) -> Vec<u32> {
+        let content = &body["messages"][1]["content"];
+        let text = match content {
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Array(parts) => parts
+                .iter()
+                .find_map(|part| {
+                    if part["type"] == "text" {
+                        part["text"].as_str()
+                    } else {
+                        None
+                    }
+                })
+                .expect("a text part")
+                .to_string(),
+            other => panic!("unexpected user content: {other}"),
+        };
+        let payload: serde_json::Value = serde_json::from_str(&text).expect("payload JSON");
+        payload["segments"]
+            .as_array()
+            .expect("segments array")
+            .iter()
+            .map(|segment| segment["id"].as_u64().expect("id") as u32)
+            .collect()
+    }
+
+    /// The `input_audio` part of the user message, if any: (base64, format).
+    fn audio_part(content: &serde_json::Value) -> Option<(String, String)> {
+        let parts = content.as_array()?;
+        let part = parts.iter().find(|part| part["type"] == "input_audio")?;
+        Some((
+            part["input_audio"]["data"].as_str()?.to_string(),
+            part["input_audio"]["format"].as_str()?.to_string(),
+        ))
+    }
+
+    /// A valid reply for the given segment ids.
+    fn reply_for(ids: &[u32]) -> String {
+        let segments: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| serde_json::json!({ "id": id, "text": format!("Polished {id}.") }))
+            .collect();
+        chat_body(&serde_json::json!({ "segments": segments }).to_string())
+    }
+
+    /// A 16 kHz mono PCM16 WAV of `frames` silent samples — a recording, as
+    /// the app writes them (`decode::write_wav_i16`).
+    fn wav16k(tag: &str, frames: usize) -> (PathBuf, Vec<u8>) {
+        let path = std::env::temp_dir().join(format!(
+            "suramak-ui-polish-{tag}-{}-{frames}.wav",
+            std::process::id()
+        ));
+        suramak_core::decode::write_wav_i16(&path, &vec![0.0f32; frames], 16_000, 1)
+            .expect("write wav");
+        let bytes = std::fs::read(&path).expect("read wav");
+        (path, bytes)
+    }
+
     /// Runs `f` with a fresh `XDG_DATA_HOME` and a test API key, then restores
     /// the environment. Serialized on `ENV_LOCK` (all mock tests take it).
     fn with_polish_env<T>(tag: &str, f: impl FnOnce(&Path) -> T) -> T {
@@ -727,15 +919,20 @@ mod tests {
     /// Writes `settings.toml` (polish pointed at `base_url`) under the temp
     /// data dir and returns the loaded settings path.
     fn write_settings(base_url: &str) {
+        write_settings_send_audio(base_url, false);
+    }
+
+    /// The M11 variant: the audio-aware toggle persisted as given.
+    fn write_settings_send_audio(base_url: &str, send_audio: bool) {
         let path = paths::settings_path().expect("settings path");
         std::fs::create_dir_all(path.parent().unwrap()).expect("data dir");
-        settings_with_polish(base_url, "mock-model")
-            .save(&path)
-            .expect("save settings");
+        let mut settings = settings_with_polish(base_url, "mock-model");
+        settings.polish.as_mut().unwrap().send_audio = send_audio;
+        settings.save(&path).expect("save settings");
     }
 
     /// Polls the runtime until the polish run reports its terminal outcome.
-    fn wait_for_polish(runtime: &mut Runtime) -> Result<Vec<Segment>, String> {
+    fn wait_for_polish(runtime: &mut Runtime) -> Result<PolishOutcome, String> {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(result) = runtime.polish_status() {
@@ -933,6 +1130,250 @@ mod tests {
                 }
                 other => panic!("expected a failure, got {other:?}"),
             }
+        });
+    }
+
+    // ---- M11: audio-aware polish --------------------------------------------
+
+    #[test]
+    fn polish_audio_request_resolves_the_toggle_against_the_transcript() {
+        let dir = std::env::temp_dir().join(format!("suramak-ui-audio-req-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (wav, _bytes) = wav16k("resolve", 1_000);
+        let mut transcript = transcript("audio-aware.wav");
+        transcript.audio_path = Some(wav.clone());
+
+        // Off (the default) — even with a recording present — and no polish
+        // section at all.
+        let settings = settings_with_polish("http://localhost:9/v1", "m");
+        assert_eq!(
+            polish_audio_request(&settings, &transcript),
+            AudioRequest::Off
+        );
+        assert_eq!(
+            polish_audio_request(&Settings::default(), &transcript),
+            AudioRequest::Off
+        );
+
+        // On + the recording exists → the recording itself.
+        let mut on = settings.clone();
+        on.polish.as_mut().unwrap().send_audio = true;
+        assert_eq!(
+            polish_audio_request(&on, &transcript),
+            AudioRequest::Recording(wav.clone())
+        );
+
+        // On + the file is gone → text-only + the keep-audio/file-gone note.
+        transcript.audio_path = Some(dir.join("gone.wav"));
+        match polish_audio_request(&on, &transcript) {
+            AudioRequest::Unavailable { note } => assert_eq!(note, AUDIO_FILE_GONE_NOTE),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+
+        // On + no audio attached at all → text-only + the no-audio note.
+        transcript.audio_path = None;
+        match polish_audio_request(&on, &transcript) {
+            AudioRequest::Unavailable { note } => assert_eq!(note, AUDIO_NOT_ATTACHED_NOTE),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+
+        std::fs::remove_file(&wav).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn degradation_notes_surface_with_the_review() {
+        let mut state = state_with_editor(true);
+        state.start_polish();
+        let notes = vec![
+            "the endpoint rejected the recording (HTTP 400: nope) — retried without it".to_string(),
+        ];
+        state.on_polish_done(Ok(PolishOutcome {
+            segments: vec![segment(0, "Hello world."), segment(1, "This is a test.")],
+            notes: notes.clone(),
+        }));
+        match &state.polish {
+            PolishState::Review(review) => {
+                assert_eq!(review.notes, notes, "the notes ride the review");
+                assert_eq!(review.notes_line().as_deref(), Some(notes[0].as_str()));
+            }
+            other => panic!("expected a review, got {other:?}"),
+        }
+        // Accept still works with notes attached.
+        assert!(matches!(
+            state.accept_polish().as_slice(),
+            [Effect::SaveEdits { .. }]
+        ));
+
+        // A plain outcome carries no notes.
+        let mut state = state_with_editor(true);
+        state.start_polish();
+        state.on_polish_done(Ok(PolishOutcome::plain(vec![
+            segment(0, "Hello world."),
+            segment(1, "This is a test."),
+        ])));
+        match &state.polish {
+            PolishState::Review(review) => assert!(review.notes_line().is_none()),
+            other => panic!("expected a review, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn audio_aware_polish_sends_the_recording_through_the_runtime() {
+        let (url, seen) = spawn_scripted_mock(1, |_index, request| {
+            let ids = payload_ids(&request_body(request));
+            ("200 OK".to_string(), reply_for(&ids))
+        });
+        with_polish_env("audio-aware", |_root| {
+            write_settings_send_audio(&url, true);
+            let mut runtime = Runtime::new(egui::Context::default());
+            assert!(runtime.polish_configured());
+
+            let (wav, bytes) = wav16k("runtime", 32_000);
+            let mut state = AppState::new();
+            state.polish_configured = true;
+            let mut transcript = transcript("audio-aware.wav");
+            transcript.audio_path = Some(wav.clone());
+            Store::open(&paths::db_path().unwrap())
+                .unwrap()
+                .insert_transcript(&transcript)
+                .unwrap();
+            state.on_transcript_loaded(transcript);
+
+            runtime.apply(state.start_polish(), &mut state);
+            let outcome = wait_for_polish(&mut runtime).expect("the run succeeds");
+            assert!(outcome.notes.is_empty(), "a clean audio run has no notes");
+            state.on_polish_done(Ok(outcome));
+            match &state.polish {
+                PolishState::Review(review) => {
+                    assert_eq!(review.rows[0].polished, "Polished 0.");
+                    assert_eq!(review.rows[1].polished, "Polished 1.");
+                    assert!(review.notes_line().is_none());
+                }
+                other => panic!("expected a review, got {other:?}"),
+            }
+
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "one request for a single-chunk recording");
+            let body = request_body(&seen[0]);
+            let (data, format) =
+                audio_part(&body["messages"][1]["content"]).expect("the recording is on the wire");
+            assert_eq!(format, "wav");
+            // The payload is the recording's own WAV bytes, base64'd as-is.
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .expect("base64"),
+                bytes,
+                "the chunk is the recording's exact bytes"
+            );
+            assert_eq!(payload_ids(&body), vec![0, 1]);
+
+            std::fs::remove_file(&wav).ok();
+        });
+    }
+
+    #[test]
+    fn a_rejected_recording_retries_text_only_and_notes_it_in_the_review() {
+        let (url, seen) = spawn_scripted_mock(2, |index, request| {
+            if index == 0 {
+                (
+                    "400 Bad Request".to_string(),
+                    r#"{"error":{"message":"audio unsupported"}}"#.to_string(),
+                )
+            } else {
+                let ids = payload_ids(&request_body(request));
+                ("200 OK".to_string(), reply_for(&ids))
+            }
+        });
+        with_polish_env("audio-400", |_root| {
+            write_settings_send_audio(&url, true);
+            let mut runtime = Runtime::new(egui::Context::default());
+
+            let (wav, _bytes) = wav16k("rejected", 32_000);
+            let mut state = AppState::new();
+            state.polish_configured = true;
+            let mut transcript = transcript("rejected.wav");
+            transcript.audio_path = Some(wav.clone());
+            Store::open(&paths::db_path().unwrap())
+                .unwrap()
+                .insert_transcript(&transcript)
+                .unwrap();
+            state.on_transcript_loaded(transcript);
+
+            runtime.apply(state.start_polish(), &mut state);
+            let outcome = wait_for_polish(&mut runtime).expect("the ladder retries text-only");
+            assert_eq!(outcome.notes.len(), 1);
+            let note = &outcome.notes[0];
+            assert!(note.contains("HTTP 400"), "names the status: {note}");
+            assert!(note.contains("retried without"), "names the retry: {note}");
+            assert_eq!(outcome.segments[1].text, "Polished 1.");
+
+            state.on_polish_done(Ok(outcome));
+            match &state.polish {
+                PolishState::Review(review) => {
+                    assert!(review
+                        .notes_line()
+                        .expect("the note is shown")
+                        .contains("HTTP 400"));
+                    assert_eq!(review.rows[1].polished, "Polished 1.");
+                }
+                other => panic!("expected a review, got {other:?}"),
+            }
+
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 2, "the audio attempt + the text-only retry");
+            assert!(
+                audio_part(&request_body(&seen[0])["messages"][1]["content"]).is_some(),
+                "the first attempt carries the recording"
+            );
+            assert!(
+                audio_part(&request_body(&seen[1])["messages"][1]["content"]).is_none(),
+                "the retry is text-only"
+            );
+
+            std::fs::remove_file(&wav).ok();
+        });
+    }
+
+    #[test]
+    fn a_gone_recording_degrades_to_text_only_with_the_note_in_the_review() {
+        let (url, seen) = spawn_scripted_mock(1, |_index, request| {
+            let ids = payload_ids(&request_body(request));
+            ("200 OK".to_string(), reply_for(&ids))
+        });
+        with_polish_env("audio-gone", |root| {
+            write_settings_send_audio(&url, true);
+            let mut runtime = Runtime::new(egui::Context::default());
+
+            let mut state = AppState::new();
+            state.polish_configured = true;
+            let mut transcript = transcript("gone.wav");
+            transcript.audio_path = Some(root.join("recordings").join("gone.wav"));
+            Store::open(&paths::db_path().unwrap())
+                .unwrap()
+                .insert_transcript(&transcript)
+                .unwrap();
+            state.on_transcript_loaded(transcript);
+
+            runtime.apply(state.start_polish(), &mut state);
+            let outcome = wait_for_polish(&mut runtime).expect("the run succeeds text-only");
+            assert_eq!(outcome.notes, vec![AUDIO_FILE_GONE_NOTE.to_string()]);
+            state.on_polish_done(Ok(outcome));
+            match &state.polish {
+                PolishState::Review(review) => {
+                    let line = review.notes_line().expect("the note is shown");
+                    assert!(line.contains("keep audio was off"), "unexpected: {line}");
+                }
+                other => panic!("expected a review, got {other:?}"),
+            }
+
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert!(
+                audio_part(&request_body(&seen[0])["messages"][1]["content"]).is_none(),
+                "no recording was sent"
+            );
         });
     }
 }
