@@ -153,7 +153,7 @@ fn engine_resolution_uses_availability_not_the_platform_guess() {
     // A path with no encoder package installed: Core ML is only ever planned when the
     // encoder directory exists, so on a non-macOS build this must resolve to CPU.
     let missing = Path::new("/nonexistent/models/ggml-tiny.bin");
-    let avail = EngineAvailability::current(missing);
+    let avail = EngineAvailability::current(missing, None);
     assert!(!avail.encoder_installed);
     if !cfg!(target_os = "macos") {
         assert_eq!(

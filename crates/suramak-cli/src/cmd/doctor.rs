@@ -195,6 +195,29 @@ fn print_engines(models_dir: &std::path::Path) {
     }
 
     print_parakeet(models_dir);
+    print_speech_transcriber();
+}
+
+/// The "Fast engine (experimental)" setting (OFF when settings are missing).
+fn fast_engine_setting() -> bool {
+    paths::settings_path()
+        .ok()
+        .and_then(|path| Settings::load(&path).ok())
+        .map(|settings| settings.asr.fast_engine)
+        .unwrap_or(false)
+}
+
+/// The configured default language code (for the SpeechTranscriber asset probe;
+/// `auto` falls back to `en`).
+fn default_language_code() -> String {
+    paths::settings_path()
+        .ok()
+        .and_then(|path| Settings::load(&path).ok())
+        .map(|settings| match settings.asr.language {
+            suramak_core::settings::LangMode::Fixed(code) => code,
+            suramak_core::settings::LangMode::Auto => "en".to_string(),
+        })
+        .unwrap_or_else(|| "en".to_string())
 }
 
 /// M10A: the Parakeet fast engine — compiled in? model installed + layout ok?
@@ -257,16 +280,111 @@ fn print_parakeet(models_dir: &std::path::Path) {
     );
     println!("    invariant:  Indonesian (id) never routes to Parakeet — whisper only");
 
-    let fast_setting = paths::settings_path()
-        .ok()
-        .and_then(|path| Settings::load(&path).ok())
-        .map(|settings| settings.asr.fast_engine)
-        .unwrap_or(false);
+    let fast_setting = fast_engine_setting();
     println!(
         "    setting:    fast_engine = {} ({})",
         fast_setting,
         if fast_setting {
             "covered languages use Parakeet when installed; everything else stays whisper"
+        } else {
+            "OFF (default) — today's whisper routing for every language"
+        }
+    );
+}
+
+/// M10B: Apple SpeechTranscriber — the macOS fast path. Build / OS availability /
+/// locales / authorization / the locale asset / the routing order. The assets are
+/// **OS-managed**: there are deliberately no `models` entries (nothing is pinned,
+/// downloaded or hosted by this app — the system ships and auto-updates them).
+fn print_speech_transcriber() {
+    use suramak_asr::speech_transcriber as st;
+
+    let macos = cfg!(target_os = "macos");
+    let compiled = st::compiled();
+    let probed = macos && compiled;
+
+    println!("  speech-transcriber (fast engine, experimental):");
+    println!(
+        "    build:      {}",
+        if !macos {
+            "not available on this platform (Apple SpeechTranscriber is macOS-only; \
+             the `speech` crate is a Swift bridge)"
+                .to_string()
+        } else if !compiled {
+            "not compiled into this build (feature `speech-transcriber` is off — \
+             rebuild with it on macOS 26+)"
+                .to_string()
+        } else {
+            "compiled in (feature `speech-transcriber` on; `speech` crate / Swift bridge linked)"
+                .to_string()
+        }
+    );
+    if probed {
+        println!(
+            "    os:         {}",
+            if st::os_available() {
+                "macOS 26+ SpeechTranscriber available".to_string()
+            } else {
+                "unavailable on this macOS version (needs macOS 26+)".to_string()
+            }
+        );
+        if let Some(auth) = st::authorization() {
+            println!("    auth:       {}", auth.label());
+        }
+    } else {
+        println!(
+            "    os:         not probed ({})",
+            if macos { "feature off" } else { "macOS-only" }
+        );
+    }
+    match st::supported_locales() {
+        Ok(locales) => println!(
+            "    locales:    {} supported by this OS ({})",
+            locales.len(),
+            locales.join(", ")
+        ),
+        Err(_) if !probed => println!(
+            "    locales:    not probed ({})",
+            if macos { "feature off" } else { "macOS-only" }
+        ),
+        Err(err) => println!("    locales:    unavailable ({err})"),
+    }
+    println!(
+        "    coverage:   {} languages pinned ({})",
+        models::SPEECH_TRANSCRIBER_LANGUAGES.len(),
+        models::SPEECH_TRANSCRIBER_LANGUAGES.join(", ")
+    );
+    println!("    invariant:  Indonesian (id) never routes to SpeechTranscriber — whisper only");
+
+    let language = default_language_code();
+    match st::asset_status(&language) {
+        Ok(state) => println!(
+            "    asset:      {} (locale for `{language}`)",
+            state.label()
+        ),
+        Err(_) if !probed => println!(
+            "    asset:      not probed ({})",
+            if macos { "feature off" } else { "macOS-only" }
+        ),
+        Err(err) => println!("    asset:      unavailable ({err})"),
+    }
+    println!(
+        "    assets:     OS-managed — no `models` entries (macOS ships and auto-updates \
+         the locale models via AssetInventory; nothing is pinned or downloaded here)"
+    );
+    println!(
+        "    routing:    Fast engine ON + Auto: macOS + covered + available → \
+         speech-transcriber, else parakeet, else whisper (the warning names the \
+         blocker); explicit coreml/metal/cpu stays whisper"
+    );
+
+    let fast_setting = fast_engine_setting();
+    println!(
+        "    setting:    fast_engine = {} ({})",
+        fast_setting,
+        if fast_setting {
+            "covered languages use the fast engines in order (macOS: SpeechTranscriber → \
+             Parakeet → Whisper); everything else stays whisper"
         } else {
             "OFF (default) — today's whisper routing for every language"
         }

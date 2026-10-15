@@ -259,6 +259,45 @@ pub fn parakeet_covers(code: &str) -> bool {
     PARAKEET.languages.contains(&primary.as_str())
 }
 
+// ---------------------------------------------------------------------------
+// M10B: Apple SpeechTranscriber (macOS 26+) — coverage only, no model files
+// ---------------------------------------------------------------------------
+
+/// Primary language subtags Apple's SpeechTranscriber covers (10 languages / 30
+/// locales as of macOS 26.6: English, Spanish, French, German, Italian,
+/// Portuguese, Japanese, Korean, Chinese, Cantonese).
+///
+/// This is a **static mirror of the OS's own list** and nothing else: the assets
+/// are **OS-managed** (the system ships and auto-updates the locale models via
+/// `AssetInventory`), so there are deliberately **no `MODELS`/manifest entries,
+/// no pins and no downloads** for this engine — `docs/ENGINES.md` records why.
+/// The runtime check through the `speech` crate is authoritative for
+/// availability; this list pins what routing may consider and carries the
+/// Indonesian hard guard. **Indonesian is deliberately absent** — and must stay
+/// absent.
+pub const SPEECH_TRANSCRIBER_LANGUAGES: &[&str] =
+    &["en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh", "yue"];
+
+/// Whether Apple's SpeechTranscriber covers `code` (a primary language subtag
+/// like `en` or a regional code like `pt-BR`).
+///
+/// Normalizes to the primary subtag, lowercased. **Indonesian (`id`) is always
+/// `false`** — the hard guard behind "Indonesian never routes to
+/// SpeechTranscriber" (docs/ENGINES.md); the list itself must also never
+/// contain `id`.
+pub fn speech_transcriber_covers(code: &str) -> bool {
+    let primary = code
+        .trim()
+        .split(['-', '_'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if primary == "id" {
+        return false;
+    }
+    SPEECH_TRANSCRIBER_LANGUAGES.contains(&primary.as_str())
+}
+
 /// Looks up a model by id.
 pub fn find_model(id: &str) -> Option<&'static ModelInfo> {
     MODELS.iter().find(|m| m.id == id)
@@ -536,6 +575,41 @@ mod tests {
         assert_eq!(find_parakeet("parakeet").unwrap().id, "parakeet");
         for unknown in ["tiny", "parakeet-tdt-0.6b-v3", ""] {
             assert!(find_parakeet(unknown).is_none(), "{unknown:?}");
+        }
+    }
+
+    // ---- M10B: Apple SpeechTranscriber coverage ------------------------------
+
+    #[test]
+    fn speech_transcriber_coverage_has_10_languages_and_never_indonesian() {
+        // macOS 26.6: 10 languages (no Indonesian — the M10B invariant).
+        assert_eq!(SPEECH_TRANSCRIBER_LANGUAGES.len(), 10);
+        assert!(
+            !SPEECH_TRANSCRIBER_LANGUAGES.contains(&"id"),
+            "the SpeechTranscriber coverage list must never contain `id`"
+        );
+        for covered in ["en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh", "yue"] {
+            assert!(
+                speech_transcriber_covers(covered),
+                "{covered} must be covered"
+            );
+        }
+        // The hard guard: `id` is false no matter what the list says.
+        assert!(!speech_transcriber_covers("id"));
+        assert!(!speech_transcriber_covers("ID"));
+        assert!(!speech_transcriber_covers("id-ID"));
+        // Regional codes resolve to their primary subtag.
+        assert!(speech_transcriber_covers("pt-BR"));
+        assert!(speech_transcriber_covers("en-US"));
+        assert!(speech_transcriber_covers("zh-Hans"));
+        assert!(speech_transcriber_covers(" EN "));
+        // Uncovered languages (and empty input) are false — incl. Parakeet-only
+        // languages (the two fast engines cover different sets).
+        for uncovered in ["", "ar", "jv", "xx", "uk", "pl", "sv"] {
+            assert!(
+                !speech_transcriber_covers(uncovered),
+                "{uncovered:?} must not be covered"
+            );
         }
     }
 }

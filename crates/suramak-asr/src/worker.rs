@@ -124,6 +124,16 @@ impl Drop for Worker {
     }
 }
 
+/// M10B: the warning for a SpeechTranscriber→Whisper degradation (pure; pinned
+/// by a test). `err` carries the actionable reason (authorization, asset
+/// install, analyzer failure); the fallback names the engine that ran instead.
+fn speech_transcriber_degradation(err: &AsrError, fallback: EngineId) -> String {
+    format!(
+        "SpeechTranscriber could not run ({err}) — falling back to whisper ({})",
+        fallback.as_str()
+    )
+}
+
 fn run_worker(jobs: Receiver<Job>, events: Sender<WorkerEvent>) {
     // Route whisper.cpp/GGML C-level logs into whisper-rs's hooks. With neither the
     // `log_backend` nor `tracing_backend` feature enabled this silences the C-level
@@ -161,8 +171,52 @@ fn run_worker(jobs: Receiver<Job>, events: Sender<WorkerEvent>) {
         };
 
         // M10A: the fast engine runs through sherpa-onnx — no whisper context.
-        // The whisper tiers keep the exact flow below.
-        let result = if plan.engine == EngineId::Parakeet {
+        // M10B: the macOS fast path (Apple SpeechTranscriber) degrades to
+        // Whisper on any failure — never a hard failure. The whisper tiers keep
+        // the exact flow below.
+        let result = if plan.engine == EngineId::SpeechTranscriber {
+            match pipeline::transcribe_file_speech_transcriber(
+                &job.input,
+                &job.lang,
+                &plan,
+                &job.cancel,
+                &mut on_progress,
+            ) {
+                // M9e: a cancellation is terminal, not a failure — no degrade.
+                Err(AsrError::Cancelled) => Err(AsrError::Cancelled),
+                Err(err) => {
+                    let fallback_plan =
+                        engine::resolve_for(&job.model_path, job.engine, false, language);
+                    let fallback = fallback_plan.engine;
+                    tracing::warn!(
+                        job_id,
+                        "speech-transcriber failed ({err}); degrading to whisper ({})",
+                        fallback.as_str()
+                    );
+                    match cache.get_or_load(&job.model_path, fallback.use_gpu()) {
+                        Ok(ctx) => pipeline::transcribe_file(
+                            ctx,
+                            &job.input,
+                            &job.model_path,
+                            &job.lang,
+                            job.initial_prompt.as_deref(),
+                            whisper::default_threads(),
+                            &fallback_plan,
+                            &job.cancel,
+                            &mut on_progress,
+                        )
+                        .map(|mut outcome| {
+                            outcome
+                                .warnings
+                                .insert(0, speech_transcriber_degradation(&err, fallback));
+                            outcome
+                        }),
+                        Err(load_err) => Err(load_err),
+                    }
+                }
+                Ok(outcome) => Ok(outcome),
+            }
+        } else if plan.engine == EngineId::Parakeet {
             let models_dir = job.model_path.parent().unwrap_or(std::path::Path::new("."));
             let model_dir = suramak_core::models::parakeet_dir(models_dir);
             match parakeet_cache.get_or_load(
@@ -308,5 +362,34 @@ mod tests {
             }
         }
         assert!(cancelled, "the queued cancellation must be observed");
+    }
+
+    /// M10B: the SpeechTranscriber→Whisper degradation warning names the reason
+    /// and the engine that ran instead (pure; the worker inserts it as the
+    /// first warning of the degraded outcome).
+    #[test]
+    fn the_speech_transcriber_degradation_warning_is_actionable() {
+        let err = AsrError::SpeechTranscriber(
+            "speech recognition is not authorized (Denied) — allow Suramak under \
+             System Settings → Privacy & Security → Speech Recognition"
+                .to_string(),
+        );
+        let warning = speech_transcriber_degradation(&err, EngineId::CoreML);
+        assert!(
+            warning.contains("SpeechTranscriber could not run"),
+            "unexpected: {warning}"
+        );
+        assert!(warning.contains("not authorized"), "unexpected: {warning}");
+        assert!(
+            warning.contains("falling back to whisper (coreml)"),
+            "unexpected: {warning}"
+        );
+        // The refusal variant (stub builds) is equally honest.
+        let warning =
+            speech_transcriber_degradation(&AsrError::SpeechTranscriberUnsupported, EngineId::Cpu);
+        assert!(
+            warning.contains("feature `speech-transcriber`"),
+            "unexpected: {warning}"
+        );
     }
 }

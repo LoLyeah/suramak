@@ -88,6 +88,22 @@ pub enum AsrError {
         "the parakeet engine is not available in this build (compile with feature `parakeet`)"
     )]
     ParakeetUnsupported,
+
+    /// M10B: the Apple SpeechTranscriber engine failed (locale resolution, the
+    /// authorization gate, the OS asset install, or the analyzer run itself).
+    /// The whisper path is unaffected — the worker degrades to it with this
+    /// message as the warning.
+    #[error("speech-transcriber engine error: {0}")]
+    SpeechTranscriber(String),
+
+    /// M10B: this build has no macOS SpeechTranscriber (feature
+    /// `speech-transcriber` off, or not a macOS target — the `speech` crate is a
+    /// Swift bridge). Routing never selects it; this is the honest refusal.
+    #[error(
+        "the speech-transcriber engine is not available in this build \
+         (compile with feature `speech-transcriber` on macOS)"
+    )]
+    SpeechTranscriberUnsupported,
 }
 
 /// Decode thread count suggestion: physical parallelism, clamped to 2..=8.
@@ -284,7 +300,9 @@ fn create_state_for_plan(
     plan: &EngineDecision,
     warnings: &mut Vec<String>,
 ) -> Result<(WhisperState, EngineId), AsrError> {
-    let fallback = EngineAvailability::current(model_path).best_without_coreml();
+    // The fallback engine only depends on the platform/build (macos + metal),
+    // not on any language — the SpeechTranscriber probe is irrelevant here.
+    let fallback = EngineAvailability::current(model_path, None).best_without_coreml();
 
     if plan.engine == EngineId::CoreML {
         return match create_state_probed(ctx) {

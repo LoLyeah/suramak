@@ -266,6 +266,57 @@ today's routing changes until you turn the toggle on.
   the one-time sherpa-onnx native libraries in the build cache). `models remove
   parakeet` deletes it.
 
+## 29. The macOS fast path — Apple SpeechTranscriber (M10B, experimental)
+
+SpeechTranscriber is **opt-in** the same way as Parakeet: the app build must carry
+the `speech-transcriber` cargo feature (macOS only — the `speech` crate builds a
+Swift bridge), and the Settings toggle must be on. It needs **macOS 26+** and one
+of its 10 covered languages (`en, es, fr, de, it, pt, ja, ko, zh, yue` —
+**Indonesian is never covered**). Its models are **managed by macOS** (nothing to
+install or pin; the system ships and updates them), so there are no `models`
+entries for it — `doctor` reports the state instead.
+
+- **Build with it** (the macOS build does not ship it yet; needs Xcode/Swift —
+  the crate compiles its Swift bridge with `swift build` on first build): from the
+  repo root, `cargo build --release -p suramak-cli --features speech-transcriber`
+  (and `cargo build --release -p suramak-ui --features speech-transcriber` for the
+  app). First build takes a few minutes (the bridge compiles once).
+- **Check `doctor`**: `./target/release/suramak-cli doctor` — expect a
+  `speech-transcriber (fast engine, experimental)` block with
+  `build: compiled in …`, `os: macOS 26+ SpeechTranscriber available`,
+  `auth: …`, `locales: N supported by this OS (…)`, the 10-language coverage line
+  and `asset: …` for your default language.
+- **Turn it on**: Settings → **Fast engine** → tick
+  `(experimental) — fast engines for covered languages` → Save. On macOS 26+ the
+  order is `SpeechTranscriber → Parakeet → Whisper`.
+- **First run**: transcribe `en.wav` (or any English clip). Expected: a one-time
+  macOS prompt — “Suramak would like to access speech recognition” class → click
+  **Allow** (if it never appears, check System Settings → Privacy & Security →
+  Speech Recognition; a denial still transcribes — on whisper — with an
+  actionable warning). The first run may also download the locale model
+  (OS-managed; a few tens of MB, once) and may be slower than later runs.
+  Expected engine line: **`engine: speech-transcriber (fast)`**.
+- **The measured comparison (this gates the later auto-default flip)**: on the
+  **same clip**, time `--engine coreml` (whisper on the ANE encoder) vs the fast
+  path (`--fast`), e.g.
+  `time ./target/release/suramak-cli transcribe fixtures/audio/en.wav --model small --lang en --engine coreml --formats json --out-dir build/out` vs
+  `time ./target/release/suramak-cli transcribe fixtures/audio/en.wav --model small --lang en --fast --formats json --out-dir build/out`
+  — record both wall times, the engine lines, and compare the texts (a couple of
+  runs each; note the first-run Core ML compile and the first-run asset download
+  separately). **These numbers decide whether SpeechTranscriber becomes the
+  auto-default for its covered languages** — put them in the Report.
+- **Indonesian stays whisper**: with the toggle ON, transcribe `id.wav` with
+  language `id` — the engine line must say `engine: Core ML` / `Metal` / `CPU`
+  (never `speech-transcriber`). Auto-detect also stays whisper by design.
+- **A covered language the OS lacks** (e.g. a locale your Mac does not list in
+  doctor): the job still runs — on Parakeet if installed, else whisper — and the
+  status line shows `fast engine requested but … — using …` naming the blocker.
+- **When it can't run**: no macOS 26, feature not compiled, or authorization
+  denied → the job still runs on whisper with an actionable warning; nothing
+  fails hard.
+- **Note (packaging)**: the `speech` Swift bridge links Apple frameworks only —
+  no dylibs to copy; unlike Parakeet there is nothing to bundle for this engine.
+
 ## Report
 
 Anything that deviates from an expected result, with: what you did, what happened, what you expected.

@@ -225,11 +225,12 @@ fn transcription_section(ui: &mut egui::Ui, tokens: &Tokens, form: &mut Settings
     });
 
     // M10A: the fast engine (experimental) — one toggle, OFF by default.
+    // M10B: the same toggle now drives the engine order per platform.
     row(ui, tokens, "Fast engine", |ui| {
         if ui
             .checkbox(
                 &mut form.fast_engine,
-                "(experimental) — Parakeet for covered languages",
+                "(experimental) — fast engines for covered languages",
             )
             .changed()
         {
@@ -239,10 +240,12 @@ fn transcription_section(ui: &mut egui::Ui, tokens: &Tokens, form: &mut Settings
     row_caption(
         ui,
         tokens,
-        "Off by default. When on, English and the other 24 European languages Parakeet \
-         TDT v3 covers run on the Parakeet fast engine when it is installed \
-         (`suramak-cli models download parakeet`); Indonesian and every other language \
-         stay on whisper. The engine line names what actually ran.",
+        "Off by default. When on, covered languages use the fast engines in order — \
+         on macOS 26+: SpeechTranscriber → Parakeet → Whisper; elsewhere: \
+         Parakeet → Whisper (covered languages only; Indonesian always Whisper). \
+         Parakeet needs its model installed (`suramak-cli models download parakeet`); \
+         SpeechTranscriber's models are managed by macOS. The engine line names what \
+         actually ran.",
         false,
     );
 

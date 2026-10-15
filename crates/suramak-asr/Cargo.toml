@@ -31,6 +31,12 @@ coreml = ["whisper-rs/coreml"]
 # never routed to; `parakeet::compiled()` is false). `sherpa-rs/sys` exposes the raw
 # C API, which the module uses for the token timestamps the safe wrapper drops.
 parakeet = ["dep:sherpa-rs", "sherpa-rs/sys"]
+# M10B: Apple's on-device SpeechTranscriber (the macOS 26+ SpeechAnalyzer pipeline)
+# via the Rust `speech` crate (a Swift bridge — macOS builds only). OFF by default:
+# without the feature (or off-macOS) the module is an honest refusal stub with the
+# same API shape, so routing can never select the engine and every refusal test
+# runs on Linux (`speech_transcriber::compiled()` is false there).
+speech-transcriber = ["dep:speech"]
 
 [dependencies.cpal]
 version = "0.15.3"
@@ -59,3 +65,6 @@ optional = true
 # package is what makes whisper.cpp fast on Apple Silicon. `WHISPER_COREML_ALLOW_FALLBACK`
 # is set by whisper-rs-sys, so a broken/missing encoder never breaks a run.
 whisper-rs = { workspace = true, features = ["metal", "coreml"] }
+# M10B: Apple SpeechTranscriber (macOS 26+) — the `speech-transcriber` feature turns
+# this on; the module is macOS-gated (`cfg(all(feature, target_os))`).
+speech = { version = "0.8", optional = true }

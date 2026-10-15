@@ -1,10 +1,11 @@
 //! The transcription pipeline: decode (core) → resample to 16 kHz mono (core) →
 //! engine → core [`Transcript`].
 //!
-//! Two engines share this shape (docs/ENGINES.md): the whisper path
-//! ([`transcribe_file`]) and the M10A Parakeet fast path
-//! ([`transcribe_file_parakeet`]). Both decode and resample identically and both
-//! report the engine that actually ran.
+//! Three engines share this shape (docs/ENGINES.md): the whisper path
+//! ([`transcribe_file`]), the M10A Parakeet fast path
+//! ([`transcribe_file_parakeet`]) and the M10B Apple SpeechTranscriber macOS fast
+//! path ([`transcribe_file_speech_transcriber`]). All decode and resample
+//! identically and all report the engine that actually ran.
 //!
 //! M9e (P2-2): the pipeline carries the job's cooperative [`CancelToken`] and
 //! checks it at every stage boundary — before the decode, after the decode,
@@ -185,6 +186,60 @@ pub fn transcribe_file_parakeet(
     })
 }
 
+/// Runs the M10B Apple SpeechTranscriber fast pipeline on an audio file
+/// (macOS 26+ builds with the `speech-transcriber` feature; the stub refuses
+/// honestly everywhere else, so routing never reaches it off-macOS).
+///
+/// Same decode → resample front half as [`transcribe_file`]: the analyzer itself
+/// reads the file (whole-file `transcribe_in_path`), so the prepared samples are
+/// what makes the clip duration available for clamping segment times and keep
+/// the uniform cancel/progress shape. Two honest progress milestones: 50 when
+/// the audio is ready, 100 when the analyzer finished (the crate reports none;
+/// the first run may also sit in the one-time authorization prompt and the OS
+/// asset download before the analyzer starts). A cancelled job returns
+/// [`AsrError::Cancelled`]; any other failure is the caller's cue to degrade to
+/// Whisper (the worker does that — never a hard failure).
+pub fn transcribe_file_speech_transcriber(
+    input: &Path,
+    lang: &LangMode,
+    plan: &crate::engine::EngineDecision,
+    cancel: &CancelToken,
+    mut on_progress: impl FnMut(u8),
+) -> Result<PipelineOutcome, AsrError> {
+    let mut warnings = Vec::new();
+    if let Some(warning) = &plan.warning {
+        warnings.push(warning.clone());
+    }
+    let samples = prepare_samples(input, cancel)?;
+    on_progress(50);
+    let code = match lang {
+        LangMode::Fixed(code) => code.clone(),
+        // Routing never selects this engine for auto-detect (an Indonesian clip
+        // could otherwise reach it); this is the honest refusal if it ever did.
+        LangMode::Auto => {
+            return Err(AsrError::SpeechTranscriber(
+                "SpeechTranscriber needs a forced language (auto-detect stays whisper)".to_string(),
+            ))
+        }
+    };
+    let engine = crate::speech_transcriber::SpeechTranscriberEngine::for_language(&code)?;
+    let results = engine.transcribe(input)?;
+    stage_check(cancel)?;
+    on_progress(100);
+    let audio_ms = samples.len() as i64 * 1000 / 16_000;
+    let segments = crate::speech_transcriber::segments_from_results(&results, audio_ms);
+    Ok(PipelineOutcome {
+        transcript: transcript_for(
+            input,
+            crate::speech_transcriber::MODEL_ID.to_string(),
+            lang,
+            segments,
+        ),
+        engine_used: EngineId::SpeechTranscriber,
+        warnings,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,5 +268,85 @@ mod tests {
             Err(AsrError::Cancelled) => {}
             other => panic!("expected Cancelled, got {other:?}"),
         }
+    }
+
+    /// M10B: the SpeechTranscriber path shares the same front half — a cancelled
+    /// token returns `Cancelled` before the (here missing) input is touched.
+    #[test]
+    fn a_cancelled_token_stops_the_speech_transcriber_pipeline_before_decoding() {
+        let token = CancelToken::new();
+        token.cancel();
+        let plan = crate::engine::EngineDecision {
+            engine: EngineId::SpeechTranscriber,
+            warning: None,
+        };
+        match transcribe_file_speech_transcriber(
+            Path::new("/nonexistent/en.wav"),
+            &LangMode::Fixed("en".to_string()),
+            &plan,
+            &token,
+            |_| {},
+        ) {
+            Err(AsrError::Cancelled) => {}
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+    }
+
+    /// The committed English fixture (decodable on every platform).
+    fn en_fixture() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/audio/en.wav")
+    }
+
+    /// M10B (the Linux surface): auto-detect is refused by the engine itself —
+    /// routing never plans SpeechTranscriber for it, and the refusal is the
+    /// honest reason (a None language could be Indonesian).
+    #[test]
+    fn speech_transcriber_refuses_auto_detect_after_the_shared_front_half() {
+        let plan = crate::engine::EngineDecision {
+            engine: EngineId::SpeechTranscriber,
+            warning: None,
+        };
+        let err = transcribe_file_speech_transcriber(
+            &en_fixture(),
+            &LangMode::Auto,
+            &plan,
+            &CancelToken::new(),
+            |_| {},
+        )
+        .expect_err("auto-detect must be refused");
+        match err {
+            AsrError::SpeechTranscriber(message) => {
+                assert!(message.contains("forced language"), "unexpected: {message}")
+            }
+            other => panic!("expected SpeechTranscriber, got {other:?}"),
+        }
+    }
+
+    /// M10B (the stub path, Linux): with a real decodable file the stub engine
+    /// refuses with `SpeechTranscriberUnsupported` after the shared front half —
+    /// which the worker turns into the Whisper degradation on a Mac. Skipped on
+    /// a macOS + feature build, where the real engine would run instead
+    /// (owner/CI territory).
+    #[test]
+    fn the_stub_speech_transcriber_pipeline_refuses_after_the_shared_front_half() {
+        if cfg!(all(feature = "speech-transcriber", target_os = "macos")) {
+            return;
+        }
+        let plan = crate::engine::EngineDecision {
+            engine: EngineId::SpeechTranscriber,
+            warning: Some("fast engine requested but x — using cpu".to_string()),
+        };
+        let err = transcribe_file_speech_transcriber(
+            &en_fixture(),
+            &LangMode::Fixed("en".to_string()),
+            &plan,
+            &CancelToken::new(),
+            |_| {},
+        )
+        .expect_err("the stub must refuse");
+        assert!(
+            matches!(err, AsrError::SpeechTranscriberUnsupported),
+            "unexpected: {err:?}"
+        );
     }
 }

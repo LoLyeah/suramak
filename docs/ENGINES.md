@@ -10,7 +10,7 @@ Status: 2026-10. This is the decision record for acceleration/engine work; the m
 | **whisper.cpp + Core ML encoder** | **Neural Engine (ANE)** | ~2–3× faster than CPU; the fast Whisper path | ✅ | ✅ (whisper-rs `coreml` feature) | **implemented in M1.5** |
 | Parakeet TDT v2/v3 (FluidAudio CoreML / MLX) | ANE / GPU | fastest overall (~110–300× realtime) | ❌ (25 European langs) | ❌ (Swift/Python) | parked (Swift shim); **sherpa-rs path implemented in M10A** |
 | **Parakeet TDT v3 int8 via sherpa-onnx (sherpa-rs)** | CPU everywhere; **Core ML EP on macOS** | fast (CPU-verified on the VPS; ANE numbers = owner-verify) | ❌ (25 European langs) | ✅ (Rust + prebuilt ONNX Runtime) | **implemented in M10A** (opt-in) |
-| Apple SpeechAnalyzer / SpeechTranscriber (macOS 26) | ANE | very fast, long-form tuned | ❌ (10 langs as of 26.6) | ❌ (Swift-only API) | revisit if Apple adds `id` |
+| Apple SpeechAnalyzer / SpeechTranscriber (macOS 26) | ANE | very fast, long-form tuned | ❌ (10 langs as of 26.6) | ✅ via the Rust `speech` crate (Swift bridge; macOS-only build) | **implemented in M10B** (opt-in; the macOS fast path) |
 | WhisperKit (Argmax) | ANE via CoreML | excellent (2.2% WER turbo, streaming) | ✅ | ❌ (Swift; needs a Swift shim) | defer; same silicon path as our CoreML option |
 | ANEForge (whisper.cpp backend) | direct ANE (private APIs) | ~2× faster than CoreML encoder | ✅ | partial (pip package + dylib) | research watch-list |
 | MLX / faster-whisper / Python stacks | GPU/CPU | varies | ✅ | ❌ | excluded (native constraint) |
@@ -29,7 +29,7 @@ Key facts:
   - Model manager downloads, sha256-verifies and extracts `<model>-encoder.mlmodelc` packages next to their ggml files (renamed to match the selected model's stem).
   - Engine selection is explicit and honest: `--engine auto|coreml|metal|cpu` (settings field `engine`, default `auto` = coreml → metal → cpu); the result records which engine actually ran; `doctor` reports the acceleration stack and encoder pairing.
   - Auto-fallback: if CoreML/ANE init fails, retry without it and surface a warning (never a hard failure).
-- **Deferred engines** (documented, not built): Apple SpeechTranscriber shim (no `id`, Swift-only), Parakeet/FluidAudio (no `id`), WhisperKit shim, ANEForge (private APIs).
+- **Deferred engines** (documented, not built): Parakeet/FluidAudio (no `id`; the sherpa-rs path shipped in M10A, FluidAudio stays parked), WhisperKit shim, ANEForge (private APIs). **Apple SpeechTranscriber** (no `id`, Swift-only API) shipped opt-in in M10B via the Rust `speech` crate — see “Status (M10B)” below; the auto-default flip is deferred to the owner's measured pass.
 - Re-check this table each macOS release; Apple adding Indonesian to SpeechTranscriber is the trigger to revisit the native-Apple engine.
 
 ## Implementation notes
@@ -147,6 +147,90 @@ Boundaries (honest):
   numbers: sherpa-rs was chosen for the Rust-native constraint, FluidAudio
   remains the parked Swift-shim fallback.
 
+## Status (M10B — Apple SpeechTranscriber, implemented opt-in)
+
+Phase 3 is implemented as an **opt-in** engine (`docs/WORKORDER-M10B.md`): the
+`speech-transcriber` cargo feature (default OFF; **macOS-only** — the `speech`
+crate carries a Swift bridge) **and** macOS 26+ with the locale available
+**and** the Settings “Fast engine (experimental)” toggle ON. Without any of
+those, routing is exactly the pre-M10B behaviour (builds without the feature
+link no `speech` code at all; off-macOS the module is an honest refusal stub).
+
+What it is:
+
+- Apple's on-device **SpeechTranscriber** (the macOS 26+ SpeechAnalyzer
+  pipeline) through the Rust **`speech` crate** (v0.8.x — `analyzer::
+  SpeechTranscriber` + `asset_inventory::AssetInventory`), *not* a hand-written
+  Swift shim. Whole-file input only (`transcribe_in_path`), which matches our
+  one-clip-per-job shape.
+- **Assets are OS-managed**: the locale model ships with the system, lives
+  outside the app, and auto-updates. There are **no `models` entries, no
+  `MODEL-PINS` rows and no downloads** for this engine — the app asks
+  `AssetInventory` for the state, attempts the crate's wrapped installation
+  request when the locale asset is missing, and `doctor` reports the state.
+- **Authorization**: the crate's Swift bridge gates the analyzer path on
+  `SFSpeechRecognizer.authorizationStatus() == .authorized`, so the engine
+  ensures authorization first — a one-time system prompt (the bundle carries
+  `NSSpeechRecognitionUsageDescription` for it). A denial is an honest,
+  actionable degradation, never a dead end.
+- Routing (pure function, `suramak-asr::engine::resolve_engine(setting, fast,
+  language, availability)`): the fast engines apply only while the whisper
+  `engine` setting is `Auto`; on macOS, a **covered** language with
+  SpeechTranscriber available (OS probe + locale check) routes to
+  **SpeechTranscriber**; else the M10A Parakeet check; else Whisper with a
+  warning naming the blocker(s). **Indonesian never** (hard guard + matrix
+  tests); **never off-macOS**; language auto-detect and everything else stay
+  Whisper; an explicit `coreml`/`metal`/`cpu` still means “whisper on that
+  backend”.
+- Result mapping (honest, three tiers): time-stamped spans from the
+  time-indexed preset → segments split at pauses ≥ 0.5 s (the Parakeet rule);
+  else the result's own audio time range → one segment; else one whole-clip
+  segment. Volatile results are dropped whenever a final result exists.
+  The transcript records `model: speech-transcriber`; the engine line shows
+  `speech-transcriber (fast)`.
+- Degradation: any failure (locale, authorization, asset install, analyzer) is
+  a warning — the worker re-runs the job on Whisper and the engine line names
+  what actually ran. `engine_used` always reports the engine that ran.
+
+Coverage (pinned in `suramak_core::models::SPEECH_TRANSCRIBER_LANGUAGES`, a
+static mirror of the OS list — macOS 26.6: 10 languages / 30 locales):
+`en, es, fr, de, it, pt, ja, ko, zh, yue` — **no Indonesian**.
+
+Verified from Linux (this tree):
+
+- The full routing matrix incl. SpeechTranscriber: ST beats Parakeet on macOS
+  when both are available; ST never off-macOS; ST never for `id`; ST blocked →
+  Parakeet → Whisper with the blocker(s) named; feature-off builds identical.
+- The refusal stub (`cargo test -p suramak-asr --features speech-transcriber` on
+  Linux): the module exists with the same API shape, `compiled()` is false and
+  every entry point refuses honestly; the pure result→`Segment` mapping is
+  unit-tested with synthetic spans (splitting, punctuation fold, range
+  fallback, whole-clip fallback, clamping, volatile-drop).
+- `doctor` prints the `speech-transcriber (fast engine, experimental)` block
+  (build / OS / auth / locales / pinned coverage / asset / routing).
+- The CI change: the macOS job gains a bounded
+  `cargo build -p suramak-asr --features speech-transcriber` step (validates the
+  Swift bridge on a real Mac); the Linux job gains the stub check + tests.
+
+Boundaries (honest):
+
+- **Every SpeechTranscriber runtime behavior is owner-verify**: the module
+  cannot execute on Linux (the `speech` crate's `swift build` bridge cannot
+  compile there) and `cargo check --target aarch64-apple-darwin` cannot build it
+  either (no Swift toolchain on the VPS — the pre-existing darwin C-dependency
+  failures apply). The macOS CI feature build + the owner's Mac are its real
+  validation. The module was written against the crate's published API
+  (docs.rs 0.8.7) and sources, every call defended, and labeled accordingly.
+- **No speed/quality numbers are claimed** — the measured Core ML-whisper vs
+  SpeechTranscriber comparison on the same clip is the owner's pass
+  (USER_SMOKE §29); **those numbers gate the auto-default flip**.
+- `live` transcription stays whisper by design; the fast engines run on file
+  jobs only.
+- The analyzer runs are not cancellable mid-call (the crate exposes no
+  progress/cancel hooks on the file path): cancellation is observed at the
+  stage boundaries around the engine call, and the two honest progress
+  milestones are 50/100.
+
 ## Mac manual check (ANE)
 
 ```bash
@@ -206,6 +290,6 @@ Verdict: **different engines per language is the right end state** — it is whe
 - **Architecture now (M1.5)**: engine selection is a pure function of `(setting, fast engine, language, installed engines, platform availability)` → engine id. Adding an engine is a new variant + a routing rule, never a reshape of call sites. The result always records the engine that actually ran.
 - **Phase 1 (M1.5, now)**: Whisper engines — CPU / Metal / CoreML-ANE. Covers English **and** Indonesian with the big speed unlock.
 - **Phase 2 (M10A, implemented opt-in)**: **Parakeet TDT v3 int8** as the English/EU fast path, through **sherpa-rs** (Rust-native ONNX Runtime + the Core ML execution provider on macOS — no Swift bridge). Decision record: **sherpa-rs chosen** for the Rust-native constraint; **FluidAudio stays parked** as the Swift-shim fallback should real Mac ANE numbers ever disappoint (the bake-off note stays open pending those numbers — owner-verify). Routing (see “Status (M10A — implemented)” below): with the “Fast engine (experimental)” setting ON, covered languages → Parakeet if installed, else Whisper; **Indonesian → Whisper, always**; everything else → Whisper.
-- **Phase 3 (M10B, next)**: Apple SpeechTranscriber — the default path for its covered languages on macOS once it is proven (owner pass with measured numbers). Spike first: the Rust `speech` crate wrapper (docs.rs/speech, analyzer/SpeechTranscriber, macOS 26+) before any Swift shim.
+- **Phase 3 (M10B, implemented opt-in)**: Apple SpeechTranscriber — the macOS fast path via the Rust `speech` crate (spiked first, per the M10A follow-up note). Routing: with the “Fast engine (experimental)” setting ON and `Auto`, covered languages on macOS 26+ route **SpeechTranscriber → Parakeet → Whisper** (the warning names the blocker); **Indonesian → Whisper, always**. The **auto-default flip** (SpeechTranscriber as the default path for its covered languages) is deferred to a follow-up tree **after the owner's measured pass** — see §Status (M10B).
 - **Watch list**: Apple SpeechTranscriber (add when it gains `id`, or for ja/ko/zh coverage), ANEForge, Parakeet multilingual expansion.
 - Every added engine carries: model-asset download/verify, `doctor` reporting, a per-language quality note, and its own acceptance run. One engine at a time.

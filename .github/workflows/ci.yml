@@ -63,6 +63,15 @@ jobs:
       - name: Cross-check suramak-taps (aarch64-apple-darwin)
         run: cargo check -p suramak-taps --target aarch64-apple-darwin
 
+      # M10B: the SpeechTranscriber refusal-stub path. With the feature on but
+      # off-macOS the module is an honest stub (the `speech` crate is macOS-only
+      # and is never built here) — its tests run on Linux; the real engine is the
+      # macos job below / the owner's Mac.
+      - name: SpeechTranscriber feature — check + tests (refusal stub, Linux)
+        run: |
+          cargo check -p suramak-asr --features speech-transcriber
+          cargo test -p suramak-asr --features speech-transcriber
+
       # `cargo check --target aarch64-apple-darwin` is only meaningful for pure-Rust
       # crates: `suramak-asr` pulls C dependencies (ring via rustls, whisper-rs-sys) that
       # need an Apple C toolchain (no osxcross on this runner). The darwin *build* of the
@@ -135,6 +144,12 @@ jobs:
 
       - name: Build workspace (release, Metal)
         run: cargo build --release --workspace
+
+      # M10B: compile the `speech-transcriber` feature on a real Mac — the
+      # `speech` crate's Swift bridge (`swift build` via its build.rs) is the one
+      # piece Linux cannot compile. Bounded: one debug build of the asr crate.
+      - name: Build suramak-asr with the SpeechTranscriber feature (Swift bridge)
+        run: cargo build -p suramak-asr --features speech-transcriber
 
       - name: Restore tiny model cache
         uses: actions/cache@v4
