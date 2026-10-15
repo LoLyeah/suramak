@@ -18,7 +18,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binaries
-        run: cargo build --release -p suramak-ui -p suramak-cli
+        # M10B: SpeechTranscriber is compiled into the macOS artifact (behind
+        # the default-OFF "Fast engine" setting). Swift bridge = Xcode on the
+        # runner; no extra runtime dylibs (the Speech framework is OS-side).
+        run: cargo build --release -p suramak-ui -p suramak-cli --features suramak-ui/speech-transcriber,suramak-cli/speech-transcriber
 
       - name: Bundle + ad-hoc sign (includes the generated app icon)
         run: ./scripts/make-app.sh
