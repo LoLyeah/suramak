@@ -18,6 +18,10 @@
 //! the second comparison with a message; `SURAMAK_REQUIRE_SAMPLE=1` turns that skip into
 //! a failure (used for the M5 acceptance run).
 //!
+//! `e2e_opus_fixtures_transcribe_the_fox_sentence` (M10C) transcribes the three committed
+//! Opus fixtures — webm, mkv and a raw Ogg-Opus `.opus` voice note — natively through the
+//! same pipeline and asserts the known sentence; same gating as the other whisper e2e.
+//!
 //! `e2e_coreml_encoder_engaged_macos` additionally needs macOS + the tiny Core ML
 //! encoder package; `SURAMAK_REQUIRE_COREML=1` turns its skips into failures (used by
 //! the macOS CI job).
@@ -393,6 +397,56 @@ fn e2e_video_fixture_matches_the_source_mp3_words() {
     );
     if !cfg!(target_os = "macos") {
         assert_eq!(video.engine_used, EngineId::Cpu);
+    }
+}
+
+/// M10C end-to-end: the three Opus shapes — webm, mkv and a raw Ogg-Opus
+/// `.opus` voice note — must decode **natively** (libopus in the decode path;
+/// no ffmpeg anywhere) and transcribe to the known sentence through the
+/// identical pipeline as audio imports.
+///
+/// The tiny model mishears the brand word on this clip ("Surramat"), so the
+/// assertion is the fox sentence — the fragment the fixtures were built around.
+#[test]
+#[ignore = "release-only e2e: debug whisper is ~50x too slow (run with --release -- --ignored)"]
+fn e2e_opus_fixtures_transcribe_the_fox_sentence() {
+    let _serial = e2e_serial();
+    let Some(model_path) = tiny_model_or_skip() else {
+        return;
+    };
+    let plan = resolve_for(&model_path, EngineSetting::Auto, false, Some("en"));
+    let mut cache = ContextCache::new();
+    let ctx = cache
+        .get_or_load(&model_path, plan.engine.use_gpu())
+        .expect("load tiny model");
+
+    for name in [
+        "sample-en-opus.webm",
+        "sample-en-opus.mkv",
+        "sample-en-opus.opus",
+    ] {
+        let path = video_fixture(name);
+        let outcome = transcribe_file(
+            ctx,
+            &path,
+            &model_path,
+            &LangMode::Fixed("en".to_string()),
+            None,
+            whisper::default_threads(),
+            &plan,
+            &CancelToken::new(),
+            |_| {},
+        )
+        .unwrap_or_else(|err| panic!("transcribe {}: {err}", path.display()));
+        let text = words(&outcome.transcript);
+        eprintln!("{name}: {text}");
+        assert!(
+            text.contains("the quick brown fox jumps over the lazy dog"),
+            "{name}: unexpected transcript: {text}"
+        );
+        if !cfg!(target_os = "macos") {
+            assert_eq!(outcome.engine_used, EngineId::Cpu);
+        }
     }
 }
 

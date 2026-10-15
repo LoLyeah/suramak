@@ -248,9 +248,9 @@ What to expect:
 - Then benchmark the tiers on the same file — `--engine coreml` vs `--engine metal` vs `--engine cpu` (`time …`) — and check `engine:` on stderr; Activity Monitor's GPU History / `powermetrics` show the ANE/GPU activity.
 - If a macOS/chip combination regresses on ANE init (the whisper.cpp #3702 class), the run still succeeds: the CLI prints `engine: metal`/`cpu` plus a warning — no hard failure.
 
-## Container support — the decode path (M5)
+## Container support — the decode path (M5; Opus in M10C)
 
-Status: 2026-10-14, test-verified on Linux from the committed fixtures in
+Status: 2026-10-15, test-verified on Linux from the committed fixtures in
 `fixtures/video/` (real ffmpeg files built from the TTS speech sample; exact
 commands in `fixtures/video/manifest.tsv`). Import decodes the **first audio
 track** of a file and ignores video streams; every container below rides the
@@ -263,21 +263,40 @@ identical pipeline (decode → resample → whisper) as audio imports.
 | mov | aac | ✅ (M5) | — |
 | m4v | aac | ✅ (M5) | — |
 | mkv | aac | ✅ (M5) | — |
-| mkv | opus | ❌ | `cannot decode clip.mkv: the audio codec (Opus) is not supported — convert it first, for example: ffmpeg -i "clip.mkv" "clip.mp4"` |
-| webm (not an offered import extension) | opus | ❌ | same message with the file's own name |
+| mkv / webm | opus | ✅ (M10C) | — |
+| ogg (`.opus` voice note) | opus | ✅ (M10C) | — |
+| m4a | alac | ❌ | `cannot decode clip.m4a: the audio codec (ALAC) is not supported — convert it first, for example: ffmpeg -i "clip.m4a" "clip.mp4"` |
 | anything else (wma, aiff, …) | — | ❌ (no reader in this build) | `cannot decode clip.wma: this file's format is not supported — convert it first, for example: ffmpeg -i "clip.wma" "clip.mp4"` |
 
 Notes:
 
-- Decoding is pure-Rust **symphonia** — no ffmpeg dependency and nothing
-  bundled. The `ffmpeg` line in the errors is a user-facing conversion recipe.
+- Decoding is **in-process Rust** — no ffmpeg dependency and nothing
+  bundled as a binary. The `ffmpeg` line in the errors is a user-facing
+  conversion recipe for the leftovers.
 - Readers enabled: `isomp4` (mp4/m4a/mov/m4v), `mkv` (matroska/webm), `wav`,
   `ogg`, plus the existing audio codecs; `mkv` was already active through
   symphonia's default features and is now pinned explicitly in the workspace
   manifest (no new crates).
+- **Opus (M10C)**: symphonia 0.5 has no first-party Opus decoder, so the
+  community adapter **`symphonia-adapter-libopus` 0.2.x** (MIT OR Apache-2.0)
+  supplies one and its `OpusDecoder` is registered in the single decode path
+  (`suramak-core/src/decode.rs` builds the codec registry; symphonia's
+  `opus` feature does not exist in 0.5.5 — it is a no-op placeholder upstream).
+  The adapter's default `bundled` feature **compiles libopus (BSD) from source
+  into the binary via `cc`** — the whisper.cpp-class bundled-C pattern, no
+  runtime library, nothing shipped separately. Opus ships in the **default
+  build** (not feature-gated); measured release-binary delta: **+225,496 B
+  (+0.225 MB, +1.46 %)** on the Linux CLI (`docs/reports/M10c.md`).
+- **Opus rates (measured)**: the WebM/MKV fixtures declare `SamplingFrequency =
+  16000` in their Matroska audio element (ffmpeg wrote the source rate), so
+  libopus decodes them at 16 kHz; a raw Ogg-Opus `.opus` declares 48 kHz per the
+  Ogg-Opus mapping and decodes at 48 kHz. Both are the container's declared rate
+  and both resample to the pipeline's 16 kHz. The Ogg-Opus reader was already
+  enabled — only the decoder was missing.
 - `aiff` is listed in the file picker but has no reader enabled in this build
-  (pre-existing); such files now fail with the actionable conversion error
-  instead of a raw decoder message.
+  (pre-existing); such files fail with the actionable conversion error instead
+  of a raw decoder message. ALAC-in-m4a demuxes but has no decoder (the `alac`
+  feature is not enabled) — same actionable error, pinned by a test.
 - The **ffmpeg-sidecar** integration (decode anything by shelling out to a
   bundled ffmpeg) remains the documented future escape hatch — see
   `docs/PLAN-NOTES.md`; it is deliberately not implemented and nothing is ever

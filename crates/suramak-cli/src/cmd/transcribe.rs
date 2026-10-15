@@ -49,8 +49,8 @@ impl From<EngineArg> for EngineSetting {
 
 #[derive(Args)]
 pub struct TranscribeArgs {
-    /// Input file: audio (wav, mp3, flac, ogg/vorbis, m4a) or video
-    /// (mp4, mov, m4v, mkv — the audio track is transcribed)
+    /// Input file: audio (wav, mp3, flac, ogg/vorbis, m4a, opus) or video
+    /// (mp4, mov, m4v, mkv, webm — the audio track is transcribed)
     pub input: PathBuf,
 
     /// Model: manifest id (tiny, base, small, turbo-q5-0, turbo-q8-0, turbo) or a .bin path

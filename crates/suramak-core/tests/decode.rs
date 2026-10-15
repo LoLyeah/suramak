@@ -1,15 +1,20 @@
-//! Decode-path tests for the M5 container matrix.
+//! Decode-path tests for the M5 container matrix and the M10C Opus decoder.
 //!
 //! Every fixture in `fixtures/video/` is a real ffmpeg file (see
 //! `fixtures/video/manifest.tsv` for the exact commands) carrying the same 9 s
-//! speech track plus a testsrc video stream. The matrix these tests pin:
+//! speech track plus a testsrc video stream — the raw `.opus` fixture is the
+//! webm's Opus stream copied out of its container (Ogg-Opus; the Ogg-Opus
+//! mapping declares 48 kHz, while the webm/mkv fixtures declare 16 kHz in their
+//! Matroska audio element). The matrix these tests pin:
 //!
 //! | container      | audio codec | result                          |
 //! |----------------|-------------|---------------------------------|
 //! | mp4 / mov / m4v| aac         | decoded (audio track, video ignored) |
 //! | mkv            | aac         | decoded                         |
-//! | mkv            | opus        | `UnsupportedFormat` with a conversion hint |
-//! | webm           | opus        | `UnsupportedFormat` with a conversion hint |
+//! | mkv            | opus        | decoded (M10C — libopus adapter) |
+//! | webm           | opus        | decoded (M10C — libopus adapter) |
+//! | ogg (.opus)    | opus        | decoded (M10C — libopus adapter) |
+//! | m4a            | alac        | `UnsupportedFormat` with a conversion hint |
 
 use std::path::PathBuf;
 
@@ -22,16 +27,23 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-/// The speech every fixture was built from is 9.0 s of 16 kHz mono audio.
+/// The speech every fixture was built from is 9.0 s of mono audio.
 const EXPECTED_SECONDS: f64 = 9.0;
 
-/// Decodes `name` and asserts it carries real 16 kHz mono speech: the right
-/// rate, roughly the source length (AAC adds priming/padding), non-silent.
-fn assert_speech_track(name: &str) {
+/// Decodes `name` and asserts it carries real mono speech at `rate`: the right
+/// rate, roughly the source length (codecs add priming/padding), non-silent.
+fn assert_speech_track_at(name: &str, rate: u32) {
     let buffer = decode_file(&fixture(name)).unwrap_or_else(|err| panic!("{name}: {err}"));
-    assert_eq!(buffer.rate, 16_000, "{name}: sample rate");
-    assert_eq!(buffer.channels, 1, "{name}: channels");
     let seconds = buffer.samples.len() as f64 / f64::from(buffer.rate) / f64::from(buffer.channels);
+    // Visible with `--nocapture` — the decoded shape the report cites.
+    eprintln!(
+        "{name}: rate {}, {} ch, {seconds:.4} s, {} samples",
+        buffer.rate,
+        buffer.channels,
+        buffer.samples.len()
+    );
+    assert_eq!(buffer.rate, rate, "{name}: sample rate");
+    assert_eq!(buffer.channels, 1, "{name}: channels");
     assert!(
         (seconds - EXPECTED_SECONDS).abs() < 0.2,
         "{name}: expected ~{EXPECTED_SECONDS} s of audio, got {seconds:.3} s"
@@ -41,6 +53,15 @@ fn assert_speech_track(name: &str) {
         .iter()
         .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
     assert!(peak > 0.05, "{name}: audio is silent (peak {peak})");
+}
+
+/// The AAC fixtures carry the source's 16 kHz rate (ffmpeg encoded them at the
+/// input rate). The mkv/webm Opus fixtures declare 16 kHz in their Matroska
+/// audio element (`SamplingFrequency` — verified in the file bytes; ffmpeg wrote
+/// the source rate there), so libopus decodes at 16 kHz; a raw Ogg-Opus file
+/// declares 48 kHz per the Ogg-Opus mapping.
+fn assert_speech_track(name: &str) {
+    assert_speech_track_at(name, 16_000);
 }
 
 /// Asserts `name` fails with the actionable error and returns its message.
@@ -75,21 +96,34 @@ fn mkv_aac_decodes_its_audio_track() {
 }
 
 #[test]
-fn webm_opus_is_rejected_with_a_conversion_hint() {
-    let message = assert_actionable_unsupported("sample-en-opus.webm");
-    assert!(message.contains("sample-en-opus.webm"), "{message}");
-    assert!(message.contains("Opus"), "{message}");
-    assert!(
-        message.contains(r#"ffmpeg -i "sample-en-opus.webm" "sample-en-opus.mp4""#),
-        "{message}"
-    );
+fn webm_opus_decodes_its_audio_track() {
+    // M10C: used to be the rejection test — the libopus adapter decodes it now.
+    assert_speech_track_at("sample-en-opus.webm", 16_000);
 }
 
 #[test]
-fn mkv_opus_is_rejected_with_a_conversion_hint() {
-    let message = assert_actionable_unsupported("sample-en-opus.mkv");
-    assert!(message.contains("Opus"), "{message}");
-    assert!(message.contains("ffmpeg -i"), "{message}");
+fn mkv_opus_decodes_its_audio_track() {
+    assert_speech_track_at("sample-en-opus.mkv", 16_000);
+}
+
+#[test]
+fn raw_opus_voice_note_decodes_its_audio_track() {
+    // The WhatsApp/Discord voice-message shape: a raw Ogg-Opus `.opus` file.
+    assert_speech_track_at("sample-en-opus.opus", 48_000);
+}
+
+#[test]
+fn m4a_alac_is_rejected_with_a_conversion_hint() {
+    // A genuinely unsupported codec: the isomp4 reader demuxes the ALAC track
+    // (codec params filled from the `alac` atom) but this build has no ALAC
+    // decoder — the recipe must still be handed to the user.
+    let message = assert_actionable_unsupported("sample-en-alac.m4a");
+    assert!(message.contains("sample-en-alac.m4a"), "{message}");
+    assert!(message.contains("ALAC"), "{message}");
+    assert!(
+        message.contains(r#"ffmpeg -i "sample-en-alac.m4a" "sample-en-alac.mp4""#),
+        "{message}"
+    );
 }
 
 #[test]

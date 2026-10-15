@@ -317,6 +317,31 @@ entries for it — `doctor` reports the state instead.
 - **Note (packaging)**: the `speech` Swift bridge links Apple frameworks only —
   no dylibs to copy; unlike Parakeet there is nothing to bundle for this engine.
 
+## 30. Native Opus import — WebM and `.opus` voice notes (M10C)
+
+Opus files now import and transcribe **natively**: the libopus decoder is
+compiled into the app at build time (bundled BSD C, the whisper.cpp pattern) —
+there is **no ffmpeg anywhere in the flow** and none to install. Nothing to
+toggle; this is the default build.
+
+- **A WebM file**: import any `.webm` (e.g. a browser/screen recording) — the
+  import dialog now lists `webm` alongside `mp4/mov/m4v/mkv`, and drag-and-drop
+  or the path field work as before. Expect: a normal library row and transcript,
+  no "convert it first" hint.
+- **A real voice note**: export a voice message off your phone and import it —
+  WhatsApp "Export chat" media (`.opus`) or Discord (`.opus`) directly; Telegram
+  voice notes are the same Ogg-Opus container under a `.oga` name (drag-and-drop
+  ignores extensions, so they import as-is). Expect a normal transcript.
+- **No ffmpeg anywhere (the acceptance question)**: the app never shells out —
+  the decoder is in-process. If you want to check on your Mac: `which ffmpeg`
+  (a "not found" is expected and fine) — every step above must work regardless.
+- **Still a recipe, by design**: a genuinely unsupported leftover (`.wma`,
+  `.aiff`, ALAC-in-m4a) keeps the actionable `ffmpeg -i …` conversion error —
+  that remains the documented escape hatch, never bundled.
+- **Packaging note**: nothing extra to install or copy into the app bundle —
+  libopus is compiled into the binary (BSD-licensed; the adapter is
+  MIT/Apache-2.0).
+
 ## Report
 
 Anything that deviates from an expected result, with: what you did, what happened, what you expected.

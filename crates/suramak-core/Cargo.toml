@@ -17,6 +17,8 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
 symphonia = { workspace = true }
+# M10C: Opus decoding (webm/opus, mkv-opus, raw Ogg-Opus) — bundled libopus via cc.
+symphonia-adapter-libopus = { workspace = true }
 rubato = { workspace = true }
 hound = { workspace = true }
 # Reads the official Core ML encoder packages (`.mlmodelc.zip`). Pure-Rust: default

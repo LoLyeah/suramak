@@ -1,10 +1,12 @@
 use std::io::Cursor;
+use std::sync::LazyLock;
 use symphonia::core::audio::{AudioBufferRef, Signal};
-use symphonia::core::codecs::{CodecType, DecoderOptions};
+use symphonia::core::codecs::{CodecRegistry, CodecType, DecoderOptions};
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
+use symphonia_adapter_libopus::OpusDecoder;
 
 use crate::SuramakError;
 
@@ -68,7 +70,9 @@ impl InputLabel {
 }
 
 /// Human name for a codec that demuxes but has no decoder in this build
-/// (Opus in WebM/MKV is the case users actually hit).
+/// (ALAC in an m4a is the case users actually hit; Opus decodes natively since
+/// M10C, so it no longer reaches this map in the default build — kept because
+/// this is a name table, not a support list).
 fn codec_name(codec: CodecType) -> Option<&'static str> {
     use symphonia::core::codecs as c;
     Some(match codec {
@@ -83,12 +87,32 @@ fn codec_name(codec: CodecType) -> Option<&'static str> {
     })
 }
 
+/// The decode path's codec registry: symphonia's default set plus the libopus
+/// adapter's Opus decoder (M10C).
+///
+/// symphonia 0.5 has no first-party Opus decoder, so webm/opus, mkv-opus and
+/// raw Ogg-Opus (`.opus` voice notes) used to demux and then fail with the
+/// conversion recipe. `OpusDecoder` registers for `CODEC_TYPE_OPUS`; the
+/// adapter bundles libopus (compiled from source via `cc` — no runtime
+/// library, nothing shipped separately). Built once per process; the registry
+/// is read-only afterwards.
+fn codec_registry() -> &'static CodecRegistry {
+    static REGISTRY: LazyLock<CodecRegistry> = LazyLock::new(|| {
+        let mut registry = CodecRegistry::new();
+        symphonia::default::register_enabled_codecs(&mut registry);
+        registry.register_all::<OpusDecoder>();
+        registry
+    });
+    &REGISTRY
+}
+
 /// Decodes audio from a file path into interleaved f32 samples.
 ///
 /// Container support (M5): wav, mp3, flac, ogg/vorbis, m4a, mp4, mov, m4v and
 /// mkv — a video file's first audio track is decoded and its video streams are
-/// ignored. Anything else fails with [`SuramakError::UnsupportedFormat`], whose
-/// message names a working conversion.
+/// ignored. Opus decodes natively since M10C (webm, mkv, raw Ogg-Opus `.opus`
+/// voice notes). Anything else fails with [`SuramakError::UnsupportedFormat`],
+/// whose message names a working conversion.
 pub fn decode_file(path: &std::path::Path) -> Result<AudioBuffer, SuramakError> {
     let file = std::fs::File::open(path)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -154,10 +178,11 @@ fn decode_stream(
         .ok_or(SuramakError::NoAudioData)?;
 
     let track_id = track.id;
-    let mut decoder = match symphonia::default::get_codecs().make(&track.codec_params, &dec_opts) {
+    let mut decoder = match codec_registry().make(&track.codec_params, &dec_opts) {
         Ok(decoder) => decoder,
         // The container demuxed, but there is no decoder for its audio codec
-        // (e.g. Opus in WebM/MKV) — actionable, same as the probe case.
+        // (e.g. ALAC in an m4a; Opus decoded natively since M10C) —
+        // actionable, same as the probe case.
         Err(symphonia::core::errors::Error::Unsupported(_)) => {
             return Err(label.unsupported_codec(track.codec_params.codec));
         }

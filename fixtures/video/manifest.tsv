@@ -4,6 +4,11 @@
 # from the repo root with ffmpeg n9.0.1; regeneration matches in content, not
 # bytes (mp4/mov embed creation timestamps, matroska a random SegmentUID).
 #
+# M10C adds two rows: the raw Ogg-Opus fixture (the webm's Opus stream copied out
+# of its container — the WhatsApp/Discord voice-note shape) and the ALAC m4a that
+# keeps the unsupported-codec error path pinned (built with ffmpeg 8.0.1 on the
+# dev VPS; the opus rows above decode natively since M10C).
+#
 # Source speech: "The quick brown fox jumps over the lazy dog. Suramak keeps
 # every recording on this machine and never sends audio to the cloud."
 #
@@ -12,5 +17,7 @@ sample-en.mp4	mp4 (h264 + aac)	supported	ffmpeg -y -f lavfi -i testsrc=size=160x
 sample-en.mov	mov (h264 + aac)	supported	ffmpeg -y -f lavfi -i testsrc=size=160x120:rate=5 -i build/share/suramak-sample-en.mp3 -map 0:v -map 1:a -c:v libx264 -preset veryslow -crf 51 -c:a aac -b:a 64k -movflags +faststart -shortest -f mov fixtures/video/sample-en.mov
 sample-en.m4v	m4v (mp4 container; h264 + aac)	supported	ffmpeg -y -f lavfi -i testsrc=size=160x120:rate=5 -i build/share/suramak-sample-en.mp3 -map 0:v -map 1:a -c:v libx264 -preset veryslow -crf 51 -c:a aac -b:a 64k -movflags +faststart -shortest -f mp4 fixtures/video/sample-en.m4v
 sample-en.mkv	mkv (h264 + aac)	supported	ffmpeg -y -f lavfi -i testsrc=size=160x120:rate=5 -i build/share/suramak-sample-en.mp3 -map 0:v -map 1:a -c:v libx264 -preset veryslow -crf 51 -c:a aac -b:a 64k -shortest -f matroska fixtures/video/sample-en.mkv
-sample-en-opus.mkv	mkv (h264 + opus)	unsupported (error path)	ffmpeg -y -f lavfi -i testsrc=size=160x120:rate=5 -i build/share/suramak-sample-en.mp3 -map 0:v -map 1:a -c:v libx264 -preset veryslow -crf 51 -c:a libopus -b:a 24k -shortest -f matroska fixtures/video/sample-en-opus.mkv
-sample-en-opus.webm	webm (vp9 + opus)	unsupported (error path)	ffmpeg -y -f lavfi -i testsrc=size=160x120:rate=5 -i build/share/suramak-sample-en.mp3 -map 0:v -map 1:a -c:v libvpx-vp9 -deadline best -cpu-used 2 -crf 50 -b:v 0 -c:a libopus -b:a 24k -shortest -f webm fixtures/video/sample-en-opus.webm
+sample-en-opus.mkv	mkv (h264 + opus)	supported (M10C — native opus decode)	ffmpeg -y -f lavfi -i testsrc=size=160x120:rate=5 -i build/share/suramak-sample-en.mp3 -map 0:v -map 1:a -c:v libx264 -preset veryslow -crf 51 -c:a libopus -b:a 24k -shortest -f matroska fixtures/video/sample-en-opus.mkv
+sample-en-opus.webm	webm (vp9 + opus)	supported (M10C — native opus decode)	ffmpeg -y -f lavfi -i testsrc=size=160x120:rate=5 -i build/share/suramak-sample-en.mp3 -map 0:v -map 1:a -c:v libvpx-vp9 -deadline best -cpu-used 2 -crf 50 -b:v 0 -c:a libopus -b:a 24k -shortest -f webm fixtures/video/sample-en-opus.webm
+sample-en-opus.opus	ogg (opus; the webm's audio stream copied out of its container)	raw voice-note path (M10C)	ffmpeg -y -i fixtures/video/sample-en-opus.webm -c:a copy fixtures/video/sample-en-opus.opus
+sample-en-alac.m4a	m4a (alac)	unsupported codec (M10C error path)	ffmpeg -y -i build/share/suramak-sample-en.mp3 -c:a alac fixtures/video/sample-en-alac.m4a

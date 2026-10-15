@@ -34,6 +34,14 @@ sha2 = "0.10"
 # inside mkv). `mkv` was already pulled in by symphonia's default features; it is
 # listed explicitly so the intended reader set is pinned, not implied.
 symphonia = { version = "0.5.4", features = ["aac", "flac", "isomp4", "mkv", "mp3", "vorbis", "wav"] }
+# M10C: the Opus decoder symphonia 0.5 ships no first-party crate for (webm/opus,
+# mkv-opus and raw Ogg-Opus voice notes). The adapter targets symphonia 0.5 — stay
+# on the 0.2.x line (0.3.x targets symphonia 0.6). Default feature `bundled`
+# compiles libopus (BSD) from source via `cc` — the whisper.cpp-class bundled-C
+# pattern: no runtime library, nothing shipped separately. Do NOT enable
+# symphonia's `opus` feature — 0.5.5 has no such feature (the upstream name is a
+# no-op placeholder); this adapter is the decoder.
+symphonia-adapter-libopus = "0.2"
 rubato = { version = "0.16", features = ["fft_resampler"] }
 hound = "3.5"
 clap = { version = "4", features = ["derive"] }

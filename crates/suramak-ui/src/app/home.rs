@@ -29,7 +29,8 @@ fn pick_media_file() -> Option<PathBuf> {
         .add_filter(
             "Audio or video",
             &[
-                "wav", "mp3", "m4a", "flac", "ogg", "aiff", "mp4", "mov", "m4v", "mkv",
+                "wav", "mp3", "m4a", "flac", "ogg", "aiff", "mp4", "mov", "m4v", "mkv", "webm",
+                "opus",
             ],
         )
         .pick_file()
