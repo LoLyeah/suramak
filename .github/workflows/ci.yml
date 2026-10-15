@@ -123,6 +123,11 @@ jobs:
       # real app under xvfb. SURAMAK_SMOKE_SECS is the watchdog (exit 1 + no
       # file when the job has not completed by then).
       - name: UI scripted smoke job (in-app pipeline → sqlite library)
+        env:
+          # CI-smoke diagnostics (branch ci/smoke-diagnostics): verbose app logs
+          # + crash backtraces to pinpoint the SIGILL / hang on the runners.
+          RUST_LOG: debug
+          RUST_BACKTRACE: "1"
         run: |
           rm -f build/smoke_job_ok.txt
           SURAMAK_SMOKE_SECS=120 SURAMAK_SMOKE_JOB=fixtures/audio/en.wav xvfb-run -a cargo run -p suramak-ui
@@ -191,6 +196,10 @@ jobs:
       # M2: the scripted in-app job on the real (Metal/Core ML) build — import →
       # transcribe → sqlite library → DB assertion → SMOKE-JOB-OK.
       - name: UI scripted smoke job (in-app pipeline → sqlite library)
+        env:
+          # CI-smoke diagnostics (branch ci/smoke-diagnostics): verbose app logs
+          # to pinpoint where the runner hangs.
+          RUST_LOG: debug
         run: |
           rm -f build/smoke_job_ok.txt
           SURAMAK_SMOKE_SECS=120 SURAMAK_SMOKE_JOB=fixtures/audio/en.wav ./dist/Suramak.app/Contents/MacOS/suramak &
