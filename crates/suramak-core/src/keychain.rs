@@ -11,6 +11,15 @@ pub fn get_api_key() -> Result<String, SuramakError> {
         }
     }
 
+    // Smoke harnesses must never reach the OS keychain. On a headless macOS CI
+    // runner the keychain access prompt can never be answered, so the read
+    // blocks forever and the app looks hung (the M2 scripted smoke: last log
+    // line `get password from entry`, then silence until the 150 s kill).
+    // In smoke mode polish simply reads as "not configured".
+    if in_smoke_mode() {
+        return Err(SuramakError::ApiKeyNotSet);
+    }
+
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         let entry = keyring::Entry::new("Suramak", "polish")
@@ -47,5 +56,33 @@ pub fn set_api_key(key: &str) -> Result<(), SuramakError> {
         Err(SuramakError::Keychain(
             "keychain not available on Linux; set SURAMAK_OPENAI_API_KEY instead".to_string(),
         ))
+    }
+}
+
+/// Whether any smoke-harness variable is set (`SURAMAK_SMOKE_*`).
+///
+/// Smoke runs (CI + the Xvfb suites) must stay keychain-free — see
+/// [`get_api_key`].
+fn in_smoke_mode() -> bool {
+    std::env::vars_os().any(|(name, _)| is_smoke_var(&name.to_string_lossy()))
+}
+
+/// Pure prefix check behind [`in_smoke_mode`] (tested without touching env).
+fn is_smoke_var(name: &str) -> bool {
+    name.starts_with("SURAMAK_SMOKE")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_smoke_var;
+
+    #[test]
+    fn the_smoke_var_family_is_recognised() {
+        assert!(is_smoke_var("SURAMAK_SMOKE_SECS"));
+        assert!(is_smoke_var("SURAMAK_SMOKE_JOB"));
+        assert!(is_smoke_var("SURAMAK_SMOKE_MODELS"));
+        assert!(is_smoke_var("SURAMAK_SMOKE_QUIT_ANSWER"));
+        assert!(!is_smoke_var("SURAMAK_OPENAI_API_KEY"));
+        assert!(!is_smoke_var("HOME"));
     }
 }
