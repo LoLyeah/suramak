@@ -18,7 +18,7 @@ M13 ships a sideloadable, signed **arm64 Android APK** of Suramak. It reuses the
   - scoped storage;
   - resumable, checksummed model downloads.
 
-Distribution starts as a GitHub Release APK. F-Droid comes next. Play is deferred.
+Distribution is **GitHub Releases only for now** (owner, 2026-10-16); any other channel is a later decision.
 
 Guiding decisions:
 
@@ -90,6 +90,7 @@ This is technically "A with the JVM glue that every Android app needs." It is no
   - Whisper's Vulkan backend is excluded: driver variance across Android GPUs is too wide for v1.
 - **Model guidance changes on phones.** The model manager shows device-appropriate recommendations: `base` and `small` quantized as defaults, with `large-v3-turbo` quantized listed as "slow, high quality."
   - Indonesian users are steered away from `tiny`.
+  - **Supported floor: arm64 with 4 GB RAM** (owner, 2026-10-16). Below the floor the larger models are refused with a clear message; 4–6 GB devices default to the smaller pinned model.
   - Pins and sha256 entries reuse the existing manifest.
 - **sherpa-onnx / Parakeet: No-Go for v1.**
   - Dylib bundling is not yet solved even on desktop.
@@ -225,7 +226,7 @@ Each slice is one workorder. The ordering front-loads the two existential risks:
 
 ### M13g — Touch Deck
 
-- **Goal:** the real product UI in compact profile. Library, transcript editor, playback-synced segments, exports, settings, and polish (if retained, §9).
+- **Goal:** the real product UI in compact profile. Library, transcript editor, playback-synced segments, exports, settings, and polish (§9 — retained).
 - **Deliverables:**
   - The `suramak-ui` components/shell split.
   - Compact layout set.
@@ -233,6 +234,7 @@ Each slice is one workorder. The ordering front-loads the two existential risks:
   - Fling scrolling: verify egui's touch momentum, and implement it in the Deck motion layer if it is insufficient.
   - Frosted treatment reused from Linux.
   - Export via `ACTION_CREATE_DOCUMENT` for md, txt, json, srt and vtt.
+  - **Quit action** (owner-requested, 2026-10-16): stops any running job with the standard cancel semantics, stops the foreground service, and exits the app — reachable from Settings.
   - The phone-viewport screenshot suite (`tests/ui-compact/`) added to CI as gating.
 - **Verified by:** new compact goldens; existing desktop suites stay green (proves the split did not regress desktop); owner motion video review.
 - **Risks:** desktop regressions from the split; accessibility (§8).
@@ -438,7 +440,7 @@ scripts/android/build.sh   # cargo ndk -t arm64-v8a [-t x86_64] -o android/app/s
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| Inference too slow or too hot on mid-range arm64 | High | High | Default to the smaller pinned model on devices with < 6 GB RAM. Expose chunked progress. Measure early with the M13d bench on a real device before UI work commits to the UX |
+| Inference too slow or too hot on mid-range arm64 | High | High | Default to the smaller pinned model on 4–6 GB devices (4 GB arm64 is the supported floor — §9). Expose chunked progress. Measure early with the M13d bench on a real device before UI work commits to the UX |
 | OEM battery managers kill the foreground service | Medium | High | Persist chunk progress so a killed job resumes from the last completed chunk. Surface a one-time "battery optimisation" hint linking to system settings. Do not request `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` in v1 |
 | egui touch/IME ergonomics fall short of user expectations | Medium | Medium | Keep text editing minimal in v1 (rename, search). Phone goldens plus a manual IME pass on Gboard and Samsung Keyboard. Native Kotlin fallback is kept only for the file picker and share sheet |
 | NDK / `cargo-ndk` / Gradle version drift breaks CI | Medium | Medium | Pin NDK, AGP and Gradle versions. Renovate PRs for them run the full emulator smoke before merge |
@@ -449,13 +451,13 @@ scripts/android/build.sh   # cargo ndk -t arm64-v8a [-t x86_64] -o android/app/s
 
 ---
 
-## 9. Open questions for the owner
+## 9. Decided (owner, 2026-10-16)
 
-1. **Auto Backup of the sqlite library.** Include it, so transcripts survive a phone migration but land in Google's backup, or exclude it so everything stays on-device? This plan currently assumes *exclude* until decided.
-2. **Distribution channel for v1.** Play Store (needs a privacy policy, data-safety form and target-SDK churn), GitHub-release APKs only, or both? This affects signing and the M13h scope.
-3. **Minimum supported device.** Is 4 GB RAM / arm64 the floor, or should we refuse to offer the larger model below a hardware threshold rather than just defaulting away from it?
-4. **Background transcription.** Is a foreground service with a persistent notification acceptable for long files, or should v1 require the app to stay in the foreground?
-5. **Polish on mobile.** Ship opt-in polish in v1 at all, or defer it to keep the network surface down to model downloads only?
+1. **Auto Backup: include the sqlite library.** Transcripts survive a phone migration; the privacy copy states that the library rides Android Auto Backup (Google servers). v1 keeps the default on; the documentation names how to exclude it.
+2. **Distribution for v1: GitHub Releases only** (sideloaded APK). F-Droid/Play stay later decisions; the M13h work is scoped to the GitHub path.
+3. **Minimum supported device: arm64 with 4 GB RAM.** That is the floor — larger models are refused below it with a clear message (4–6 GB devices default small).
+4. **Background transcription: yes, via the foreground service + persistent notification — with a Quit action.** The app exposes an explicit quit/stop affordance (Settings) that cancels running work with the standard semantics, stops the service, and exits.
+5. **Polish on mobile: yes, opt-in.** The toggle ships in v1; the recording-upload path stays behind its own explicit opt-in and the existing privacy copy.
 
 ---
 

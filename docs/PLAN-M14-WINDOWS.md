@@ -15,7 +15,7 @@ M14 makes Windows a real target, not a compile-checked stub. The shared crates `
 - **Single instance:** a named mutex, replacing `flock`.
 - **Notifications:** native toasts.
 
-CI produces a `windows-x86_64` zip on every tag.
+CI produces a signed per-user installer plus a portable zip on every tag.
 
 Guiding decisions:
 
@@ -28,11 +28,10 @@ Guiding decisions:
 
 Non-goals for v1:
 - In-app updater
-- Code signing
-- Installer (MSI, MSIX, winget)
+- MSI/MSIX/winget packaging (v1 ships our own per-user installer + portable zip)
 - ARM64 Windows
 - System-audio capture
-- GPU-accelerated whisper on Windows
+- GPU-accelerated whisper on Windows (Vulkan/CUDA is its own follow-up milestone — owner, 2026-10-16)
 - File-type associations
 
 ---
@@ -49,7 +48,7 @@ Non-goals for v1:
 |---|---|---|
 | ≥ 22621 (Win11 22H2+) | **Acrylic** backdrop for the main window | `DWMWA_SYSTEMBACKDROP_TYPE = DWMSBT_TRANSIENTWINDOW`; `DwmExtendFrameIntoClientArea(-1 margins)`; `DWMWA_USE_IMMERSIVE_DARK_MODE`; `DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND` |
 | 22000–22620 (Win11 21H2) | **No backdrop**; opaque Deck surface | dark mode + rounded corners only |
-| Win10 (any) | **No backdrop**; opaque Deck surface | dark mode attribute (20, falling back to 19 on pre-20H1); square corners (OS default) |
+| Windows 10 | **Not supported** — the milestone is Windows 11-only (owner, 2026-10-16); no material work | — |
 | "Transparency effects" off in Settings, or high contrast | Opaque Deck surface, live-switched | listen for `WM_SETTINGCHANGE` / `WM_DWMCOMPOSITIONCHANGED` |
 
 Why Acrylic (`TRANSIENTWINDOW`) and not Mica (`MAINWINDOW`):
@@ -253,7 +252,7 @@ Each slice is one workorder, lands as Conventional Commits with a CHANGELOG `Unr
 ### M14g — CI GUI smoke and release artifact
 
 - **Goal:** D4 smoke attempt; Windows in `release.yml`.
-- **Deliverables:** a WARP smoke step in the `windows` job; `release.yml` Windows job producing the zip (see Packaging); SHA256 alongside; README download section.
+- **Deliverables:** a WARP smoke step in the `windows` job; `release.yml` Windows job producing the **installer + portable zip + SHA256SUMS** (see Packaging), including the installer tooling choice and the SignPath signing step once the certificate is available; README download section.
 - **Verified by:** a dry-run tag on a fork or prerelease tag produces the zip; the owner downloads it from the Release page and runs it cold.
 - **Risks:** WARP smoke flakiness, handled per D4's honest fallback.
 
@@ -311,14 +310,15 @@ The Windows changes are additive and fenced: every new code path sits behind `#[
 
 ## Packaging & release
 
-- [ ] **Target**: `x86_64-pc-windows-msvc` only. ARM64 Windows is out of scope for this milestone; it runs the x64 build under emulation, and that is acceptable for now.
+- [ ] **Target**: `x86_64-pc-windows-msvc` only, **Windows 11 only** (owner, 2026-10-16). ARM64 Windows is out of scope; the x64 build under emulation is acceptable for now.
 - [ ] **Toolchain**: MSVC on the **pinned** Windows runner chosen in D4 (never `windows-latest`). whisper.cpp builds through its existing CMake path; libopus builds statically through the same `cc`/CMake route macOS uses, and no system DLLs are expected.
 - [ ] **CPU baseline**: build whisper.cpp with AVX2 enabled and rely on its runtime dispatch for anything higher. If AVX2 is absent, show a startup diagnostic. The app must not crash silently.
-- [ ] **v1 artifact: a portable zip** (`suramak-<version>-windows-x86_64.zip`) with the GUI exe, the CLI exe, and a short `README.txt` (SmartScreen note + data locations), plus `SHA256SUMS`. Release CI produces it from a single tag. **No installer and no code signing in v1** (both are non-goals; an earlier draft of this section proposed more — this text is the scope of record).
-- [ ] **Models**: not bundled. The zip stays small; the existing model manager downloads on first run with sha256 pins and resume. Models live under `%LOCALAPPDATA%\Suramak\models`.
-- [ ] **Updates**: none in-app (Sparkle stays macOS-only). The release page links to the new zip; upgrading = replace the folder — data under `%LOCALAPPDATA%\Suramak` is untouched.
-- [ ] **Deferred (own future decisions, not v1)**: a per-user installer (Start Menu shortcut + HKCU uninstall entry), Authenticode signing (OV/EV or Azure Trusted Signing) to quiet SmartScreen, MSIX/winget/Microsoft Store. If signing lands later, expect SmartScreen reputation warnings for the first releases regardless; document, never work around.
-- [ ] **Uninstall story (v1)**: delete the app folder; `%LOCALAPPDATA%\Suramak` (library, models, settings) stays unless the user removes it — documented in `docs/windows.md`.
+- [ ] **Installer (in v1 — owner, 2026-10-16)**: a per-user install into `%LOCALAPPDATA%\Programs\Suramak` needing no admin rights — Start Menu shortcut, HKCU uninstall entry. The uninstaller leaves the user library, settings and models in place, with an opt-in "also remove my data" checkbox. Tooling (Inno Setup vs NSIS) is chosen in M14g.
+- [ ] **Portable zip (still produced)**: `suramak-<version>-windows-x86_64.zip` with the GUI exe + CLI exe + a short `README.txt`, plus `SHA256SUMS` covering both artifacts.
+- [ ] **Code signing — the free route** (owner, 2026-10-16): apply to the **SignPath Foundation** free Authenticode program for open-source projects (Suramak is GPL-3.0 OSS). If accepted, sign the exe + installer in CI from the first public build. Fallback if ineligible: ship unsigned with the SmartScreen "More info → Run anyway" steps documented in the release notes and `docs/windows.md`. Expect reputation warnings for early releases either way; document, never work around.
+- [ ] **Models**: not bundled. The installer stays small; the existing model manager downloads on first run with sha256 pins and resume. Models live under `%LOCALAPPDATA%\Suramak\models`.
+- [ ] **Updates**: none in-app (Sparkle stays macOS-only). The release page links to the new installer; running a newer installer over an existing install upgrades in place and preserves `%LOCALAPPDATA%\Suramak` data.
+- [ ] **Deferred (own future decisions)**: MSIX/winget/Microsoft Store, and GPU acceleration (its own follow-up milestone per the non-goals).
 
 ## Testing
 
@@ -338,7 +338,7 @@ The Windows changes are additive and fenced: every new code path sits behind `#[
   - privacy setting "Let desktop apps access your microphone" turned off;
   - no input device present;
   - device in use exclusively by another app.
-- [ ] **Manual smoke matrix**: Windows 10 22H2 and Windows 11 23H2/24H2, on one AVX2 machine and one low-end laptop. On each, run the full flow: fresh install, first-run model download, transcription, export, reveal-in-folder, completion notification, taskbar progress, then upgrade-install and uninstall.
+- [ ] **Manual smoke matrix**: Windows 11 23H2/24H2 (21H2 best-effort), on one AVX2 machine and one low-end laptop. On each, run the full flow: fresh install, first-run model download, transcription, export, reveal-in-folder, completion notification, taskbar progress, then upgrade-install and uninstall.
 - [ ] **Scaling**: confirm the Deck layout and motion at 100%, 150%, and 200% display scaling, and when a window is dragged across monitors with different scaling. The manifest declares per-monitor DPI awareness (v2).
 - [ ] **Keyboard**: walk every documented shortcut with Ctrl in place of Cmd. Confirm none of the remapped shortcuts collides with a system binding (Alt+F4, Win-key combos, Ctrl+Esc).
 
@@ -348,20 +348,20 @@ The Windows changes are additive and fenced: every new code path sits behind `#[
 |---|---|---|
 | whisper.cpp performance on Windows is noticeably worse than on Apple Silicon, so jobs feel slow | High | Default to a smaller model on Windows. Show the estimated duration before starting a job. Treat GPU backends as a follow-up, not a blocker. |
 | MSVC build breaks for whisper.cpp or libopus on toolchain updates | Medium | Pin the VS Build Tools version in CI. Cache build outputs. Run the `cargo check` gate on every PR so breakage surfaces early. |
-| SmartScreen and antivirus false positives on the unsigned or new-reputation binary | High | Authenticode-sign from the first public build. Submit the binary to Microsoft for analysis. Ship the portable zip so testers have a fallback. |
+| SmartScreen and antivirus false positives on a new-reputation binary | High | Sign via the free SignPath Foundation OSS program from the first public build (fallback: documented unsigned path); submit the binary to Microsoft for analysis; ship the portable zip so testers have a fallback. |
 | Antivirus quarantines model downloads or `.part` resume files | Medium | Keep resume files under `%LOCALAPPDATA%\Suramak\models`. Verify the sha256 after every resume. Surface a named "file was removed during download" error rather than a generic failure. |
 | OneDrive or roaming profiles corrupt the sqlite database through sync | Medium | Keep the library in `%LOCALAPPDATA%`, which does not roam. Detect a library folder that sits inside an OneDrive-synced path and warn the user. |
 | A Bluetooth hands-free profile drops capture to 8/16 kHz mono and quality degrades silently | Medium | The existing resampler already handles the rate change. Add a capture-quality diagnostic that names the device format. |
 | `#[cfg(windows)]` creep into shared crates erodes the seam | Medium | Enforce the seam rules above in review. Add a CI grep that fails if `cfg(windows)` appears in the engine, routing, model manager, or exports crates. |
 | Notification APIs require an AppUserModelID; the portable zip has no shortcut registration | High | Register the per-user AUMID (HKCU) on first toast; if registration or toast creation fails, degrade to `FlashWindowEx` and log the reason (never fatal, never silent). |
 
-## Open questions for the owner
+## Decided (owner, 2026-10-16)
 
-1. **Minimum OS**: do we support Windows 10 until its consumer end of support, or ship Windows 11-only? Dropping Windows 10 removes one test target and simplifies notifications.
-2. **Code-signing certificate**: should we use an OV/EV certificate, or Azure Trusted Signing? This choice drives both cost and how quickly SmartScreen warnings go away.
-3. **Distribution**: is a GitHub Releases installer enough for this milestone, or do we also want the Microsoft Store or winget?
-4. **GPU acceleration**: is CPU-only whisper acceptable for the first Windows release, with Vulkan or CUDA as an explicit follow-up milestone?
-5. **Default model on Windows**: do we ship a smaller default than macOS, accepting lower accuracy for Indonesian, or keep parity and accept slower jobs?
+1. **Minimum OS: Windows 11 only.** The Win10 row is dropped; testing exercises 23H2/24H2 (21H2 best-effort).
+2. **Code signing: the free certificate route** — attempt SignPath Foundation (free Authenticode for open-source); if ineligible, ship unsigned with documented SmartScreen steps. No paid certificate this milestone.
+3. **Distribution: GitHub Releases** — the installer + portable zip attached to each release. Store/winget stay deferred.
+4. **GPU acceleration: yes — as its own follow-up milestone** (Vulkan first, CUDA later), not in v1.
+5. **Default model: a smaller Windows default is accepted** — with the model selectable in Settings for higher quality; Indonesian users are steered to the quality tier with a clear note.
 
 ## Suggested first slice to dispatch
 
