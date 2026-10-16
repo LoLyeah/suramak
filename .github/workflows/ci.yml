@@ -215,7 +215,14 @@ jobs:
           SURAMAK_SMOKE_SECS=120 SURAMAK_SMOKE_JOB=fixtures/audio/en.wav ./dist/Suramak.app/Contents/MacOS/suramak &
           PID=$!
           for i in $(seq 1 30); do kill -0 $PID 2>/dev/null || break; sleep 5; done
-          kill -9 $PID 2>/dev/null || true
+          if kill -0 $PID 2>/dev/null; then
+            echo "smoke job app still alive after 150s — capturing a hang sample (M12 CI forensics)"
+            sample $PID 2 -file build/mac-smoke-hang.txt 2>&1 | tail -3 || true
+            echo "===== hang sample (top of all threads, first 120 lines) ====="
+            head -120 build/mac-smoke-hang.txt 2>/dev/null || true
+            echo "===== end hang sample ====="
+            kill -9 $PID 2>/dev/null || true
+          fi
           wait $PID 2>/dev/null; echo "smoke job app exit=$?"
           test -f build/smoke_job_ok.txt && echo SMOKE-JOB-OK
           ./target/release/suramak-cli library list | grep -q "en.wav" && echo LIBRARY-OK
