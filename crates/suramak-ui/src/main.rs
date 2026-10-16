@@ -76,6 +76,30 @@ impl From<egui_winit::accesskit_winit::Event> for AccessKitEnabler {
     }
 }
 
+/// The winit user-event payload: [`AccessKitEnabler`]'s events (the `egui-winit`
+/// wiring pattern) plus the **asynchronous repaint wake**.
+///
+/// The repaint wake must be async: egui's repaint callback runs while the
+/// context lock is held, so a synchronous hop to the main thread from the
+/// bridge thread deadlocks against a main thread already waiting for that lock
+/// (the macOS CI stack sample caught the cycle: `redraw_or_log →
+/// take_egui_input → lock_shared_slow` on main, `run_bridge → request_repaint →
+/// dispatch_sync(main)` on the bridge thread). `EventLoopProxy::send_event`
+/// never blocks; the loop turns `Repaint` into a redraw on the main thread.
+#[derive(Debug)]
+pub enum UserEvent {
+    /// M9b: an AccessKit platform event for the egui state.
+    AccessKit(AccessKitEnabler),
+    /// M12: a repaint requested from another thread (worker/bridge).
+    Repaint,
+}
+
+impl From<egui_winit::accesskit_winit::Event> for UserEvent {
+    fn from(event: egui_winit::accesskit_winit::Event) -> Self {
+        Self::AccessKit(AccessKitEnabler(event))
+    }
+}
+
 /// Written on a successful plain smoke run (repo-root relative, like the acceptance block).
 const SMOKE_FILE: &str = "build/smoke_ok.txt";
 /// Written on a successful scripted job run.
@@ -101,7 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     acquire_instance_lock(smoke.is_none());
     // M9b: the user-event channel carries AccessKit's action requests back into
     // the loop (the proxy is handed to the shell's adapter at startup).
-    let event_loop = EventLoop::<AccessKitEnabler>::with_user_event().build()?;
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let mut app = App::new(smoke, Some(event_loop.create_proxy()));
     // Every quit flavor ends in `App::exiting` (winit dispatches `LoopExiting`
     // on the way out), which tears down and hard-exits — see `App::quit`. For
@@ -217,7 +241,7 @@ struct App {
     shutdown_done: bool,
     /// The AccessKit user-event proxy, handed to the shell when it starts
     /// (M9b: `Shell::new` creates the platform adapter before the window shows).
-    accesskit_proxy: Option<EventLoopProxy<AccessKitEnabler>>,
+    accesskit_proxy: Option<EventLoopProxy<UserEvent>>,
     /// The next scheduled cadence repaint (M9b). Set while the state asks for an
     /// interval (recording / playing / download / autosave due), cleared when it
     /// does not; a wake that finds the deadline passed repaints and re-arms.
@@ -236,10 +260,7 @@ struct App {
 }
 
 impl App {
-    fn new(
-        smoke: Option<Smoke>,
-        accesskit_proxy: Option<EventLoopProxy<AccessKitEnabler>>,
-    ) -> Self {
+    fn new(smoke: Option<Smoke>, accesskit_proxy: Option<EventLoopProxy<UserEvent>>) -> Self {
         // M9e smoke harness: a scripted answer for the quit confirm, only when
         // a smoke mode is active (same discipline as SURAMAK_SMOKE_RECORD).
         let smoke_quit_answer = if smoke.is_some() {
@@ -754,7 +775,7 @@ fn assert_stored(outcome: &app::SaveOutcome) -> Result<usize, String> {
     Ok(stored.segments.len())
 }
 
-impl ApplicationHandler<AccessKitEnabler> for App {
+impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.shell.is_some() {
             return;
@@ -927,18 +948,27 @@ impl ApplicationHandler<AccessKitEnabler> for App {
     }
 
     /// M9b: AccessKit's platform adapter posts its events through the winit
-    /// user-event channel (the `AccessKitEnabler` proxy `Shell::new` handed to
-    /// it). Action requests — a screen reader "pressing" a node — go back into
-    /// the egui state, which turns them into `Event::AccessKitActionRequest`s
-    /// for the next pass; the initial-tree request just needs a frame.
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AccessKitEnabler) {
+    /// user-event channel (the `EventLoopProxy<UserEvent>` `Shell::new` handed
+    /// to it). `Repaint` wakes the loop for an off-thread repaint request (the
+    /// main-thread-only redraw happens here — see [`UserEvent`]); AccessKit
+    /// action requests — a screen reader "pressing" a node — go back into the
+    /// egui state, which turns them into `Event::AccessKitActionRequest`s for
+    /// the next pass; the initial-tree request just needs a frame.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         let Some(shell) = self.shell.as_mut() else {
             return;
         };
-        if event.0.window_id != shell.window.id() {
+        let enabler = match event {
+            UserEvent::Repaint => {
+                shell.window.request_redraw();
+                return;
+            }
+            UserEvent::AccessKit(enabler) => enabler,
+        };
+        if enabler.0.window_id != shell.window.id() {
             return;
         }
-        match event.0.window_event {
+        match enabler.0.window_event {
             egui_winit::accesskit_winit::WindowEvent::ActionRequested(request) => {
                 shell.egui_state.on_accesskit_action_request(request);
                 shell.window.request_redraw();

@@ -21,7 +21,7 @@ use winit::window::{Window, WindowAttributes};
 use crate::app::{self, AppState, RecordState};
 use crate::framestats::FrameStats;
 use crate::theme::{self, AppTheme};
-use crate::AccessKitEnabler;
+use crate::UserEvent;
 
 const WINDOW_TITLE: &str = "Suramak";
 const INITIAL_SIZE: LogicalSize<f64> = LogicalSize::new(1280.0, 800.0);
@@ -117,7 +117,7 @@ impl Shell {
     pub fn new(
         event_loop: &ActiveEventLoop,
         egui_ctx: &egui::Context,
-        accesskit_proxy: Option<EventLoopProxy<AccessKitEnabler>>,
+        accesskit_proxy: Option<EventLoopProxy<UserEvent>>,
     ) -> Result<Self, String> {
         let attributes: WindowAttributes = Window::default_attributes()
             .with_title(WINDOW_TITLE)
@@ -193,8 +193,12 @@ impl Shell {
         // arrive through the winit user event (`App::user_event`) and the tree
         // updates ride `handle_platform_output` below. On Linux the same wiring
         // is active (AT-SPI); it degrades silently on a headless machine.
+        // The repaint wake below reuses this proxy (cloned — `EventLoopProxy`
+        // is cheap and cloneable; `App` always supplies one, `None` survives
+        // only in unit tests).
+        let repaint_proxy = accesskit_proxy.clone();
         if let Some(proxy) = accesskit_proxy {
-            egui_state.init_accesskit::<AccessKitEnabler>(event_loop, window.as_ref(), proxy);
+            egui_state.init_accesskit::<UserEvent>(event_loop, window.as_ref(), proxy);
             tracing::info!("accesskit adapter initialised");
         }
         window.set_visible(true);
@@ -206,14 +210,27 @@ impl Shell {
 
         // Wake the winit loop for egui-side repaint requests (worker events
         // arrive on the bridge thread and call `Context::request_repaint`).
-        {
-            let window = window.clone();
-            egui_ctx.set_request_repaint_callback(move |info| {
+        // M12: the wake is ASYNCHRONOUS — `EventLoopProxy::send_event` never
+        // blocks. Calling `window.request_redraw()` directly from off-main
+        // went through a synchronous main-thread dispatch while egui's context
+        // lock was held, deadlocking the macOS CI smoke against a main thread
+        // waiting for that lock (see `UserEvent` for the captured stack).
+        // `None` (unit tests only) keeps the direct call — the callback never
+        // fires off-thread there.
+        match repaint_proxy {
+            Some(proxy) => egui_ctx.set_request_repaint_callback(move |info| {
                 // `debug`: every egui-side repaint request with its delay — the
                 // frame-stats seam's companion when tracing why a frame came.
                 tracing::debug!(delay = ?info.delay, "egui repaint requested");
-                window.request_redraw();
-            });
+                let _ = proxy.send_event(UserEvent::Repaint);
+            }),
+            None => {
+                let window = window.clone();
+                egui_ctx.set_request_repaint_callback(move |info| {
+                    tracing::debug!(delay = ?info.delay, "egui repaint requested");
+                    window.request_redraw();
+                });
+            }
         }
 
         let glass = apply_glass(&window);

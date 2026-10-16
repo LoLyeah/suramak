@@ -4,6 +4,9 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased]
 
+### Fixed
+- **UI: the macOS cross-thread repaint deadlock is gone** — off-thread (worker/bridge) repaint wakes now go through winit's user-event channel (`EventLoopProxy::send_event`) instead of a synchronous main-thread dispatch made while egui's context lock was held; a CI stack sample caught the cycle on the runner (`take_egui_input → lock_shared_slow` on main vs `request_repaint → dispatch_sync(main)` on the bridge). Also unblocks the macOS CI smoke run.
+
 ## [0.3.0] - 2026-10-16
 
 ### Added
