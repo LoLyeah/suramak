@@ -19,12 +19,17 @@
 # Runs on macOS and Linux (the archive is extracted, never executed).
 set -euo pipefail
 cd "$(dirname "$0")/.."
+ROOT="$(pwd)"
 
 SPARKLE_VERSION="2.9.6"
 SPARKLE_URL="https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz"
 SPARKLE_SHA256="52bf9e88cdd972fc0c81501377a880e90d47031bd8ca5462488f843e2609e192"
 
-DEST="build/sparkle/${SPARKLE_VERSION}"
+# Absolute on purpose: this value is handed to cargo as SPARKLE_FRAMEWORK_PATH
+# and read by sparkle-updater's build script, whose CWD is the crate's source
+# directory (not the repo root) — a relative path fails that check with
+# "must point to a directory containing Sparkle.framework".
+DEST="${ROOT}/build/sparkle/${SPARKLE_VERSION}"
 ARCHIVE="${DEST}/Sparkle-${SPARKLE_VERSION}.tar.xz"
 MARKER="${DEST}/.verified-${SPARKLE_SHA256}"
 

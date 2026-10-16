@@ -21,7 +21,9 @@ FEATURES="${SURAMAK_FEATURES:-}"
 # The `updates` feature needs the framework on disk at build time.
 SPARKLE_DIR=""
 if [[ ",${FEATURES}," == *",updates,"* ]]; then
-  SPARKLE_DIR="$(scripts/fetch-sparkle.sh)"
+  # Absolutize even if the fetch script's output ever becomes relative again:
+  # the value feeds a build script whose CWD is the crate's source dir.
+  SPARKLE_DIR="$(cd "$(scripts/fetch-sparkle.sh)" && pwd)"
   export SPARKLE_FRAMEWORK_PATH="$SPARKLE_DIR"
 fi
 
