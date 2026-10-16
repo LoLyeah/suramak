@@ -19,9 +19,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.2.0</string>
+	<string>0.3.0</string>
 	<key>CFBundleVersion</key>
-	<string>0.2.0</string>
+	<string>0.3.0</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.productivity</string>
 	<key>LSMinimumSystemVersion</key>
@@ -36,17 +36,8 @@
 	<string>Suramak can use Apple's on-device SpeechTranscriber (the macOS 26 fast path) to transcribe your recordings. Recognition runs entirely on this Mac; audio never leaves the machine.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
-	<!-- M12: in-app updates (Sparkle 2, macOS-only, behind the `updates` cargo
-	     feature). The feed is the newest GitHub release's appcast.xml asset,
-	     generated + EdDSA-signed by the release pipeline (scripts/make-appcast.sh). -->
 	<key>SUFeedURL</key>
 	<string>https://github.com/LoLyeah/suramak/releases/latest/download/appcast.xml</string>
-	<!-- M12 PLACEHOLDER — this is NOT a real key and matches no signature.
-	     Base64-decoded it is the ASCII marker "SURAMAK-PLACEHOLDER-ED25519-KEY!"
-	     (32 bytes, so Sparkle accepts its shape and the updater still starts).
-	     The owner replaces it, once, with the public key printed by Sparkle's
-	     ./bin/generate_keys — the exact steps are in docs/reports/M12.md
-	     ("Owner key setup") and README §Updates. Never commit a private key. -->
 	<key>SUPublicEDKey</key>
 	<string>U1VSQU1BSy1QTEFDRUhPTERFUi1FRDI1NTE5LUtFWSE=</string>
 </dict>
