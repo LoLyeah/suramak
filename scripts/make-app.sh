@@ -1,13 +1,35 @@
 #!/usr/bin/env bash
 # Builds dist/Suramak.app from the release binaries and ad-hoc codesigns it (PLAN §7).
 # macOS only. Proper Developer ID signing is post-MVP (PLAN §8.6).
+#
+# M12: SURAMAK_FEATURES (comma list, default empty) selects the cargo features
+# for the suramak-ui build. When the list contains `updates`, the pinned
+# Sparkle distribution is fetched through scripts/fetch-sparkle.sh (never a
+# bare download), the build links Sparkle.framework (SPARKLE_FRAMEWORK_PATH,
+# which the crate's build script requires) and the framework is embedded into
+# Contents/Frameworks before the existing ad-hoc signing — `--deep` signs the
+# nested code (the framework, its Autoupdate/Updater.app helpers and the two
+# XPC services). The @executable_path/../Frameworks rpath is a link-time
+# argument (crates/suramak-ui/build.rs), so nothing here patches the binary.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 APP="dist/Suramak.app"
 BIN="target/release/suramak"
+FEATURES="${SURAMAK_FEATURES:-}"
 
-cargo build --release -p suramak-ui
+# The `updates` feature needs the framework on disk at build time.
+SPARKLE_DIR=""
+if [[ ",${FEATURES}," == *",updates,"* ]]; then
+  SPARKLE_DIR="$(scripts/fetch-sparkle.sh)"
+  export SPARKLE_FRAMEWORK_PATH="$SPARKLE_DIR"
+fi
+
+if [[ -n "$FEATURES" ]]; then
+  cargo build --release -p suramak-ui --features "$FEATURES"
+else
+  cargo build --release -p suramak-ui
+fi
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -35,7 +57,18 @@ if [[ -f target/release/suramak-cli ]]; then
   cp target/release/suramak-cli "$APP/Contents/MacOS/suramak-cli"
 fi
 
+# M12: embed the pinned Sparkle framework (the `updates` feature). `ditto`
+# preserves the framework's symlinks — following them would break its code
+# signature. Contents/Frameworks + the build-time @executable_path/../Frameworks
+# rpath are the bundling contract from the crate's README / Sparkle's guide.
+if [[ -n "$SPARKLE_DIR" ]]; then
+  mkdir -p "$APP/Contents/Frameworks"
+  ditto "$SPARKLE_DIR/Sparkle.framework" "$APP/Contents/Frameworks/Sparkle.framework"
+fi
+
 # Ad-hoc signature: stable per binary; the user may re-see the mic prompt after a rebuild.
+# M12: `--deep` signs nested code first — including the embedded Sparkle.framework
+# and its helpers/XPC services when the `updates` feature is on.
 codesign --force --deep --sign - "$APP"
 codesign --verify --verbose=2 "$APP"
 

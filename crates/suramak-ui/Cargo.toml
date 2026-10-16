@@ -33,6 +33,17 @@ rfd = "0.15"
 # desktop platforms only — Linux keeps a capture-free build (no ALSA runtime).
 suramak-asr = { path = "../suramak-asr", features = ["capture"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# M12: the in-app updater's dependencies — the `updates` feature turns them on.
+# `sparkle-updater` 0.1.0 is objc2 bindings for Sparkle 2.9.6 (its build script
+# needs SPARKLE_FRAMEWORK_PATH; `scripts/fetch-sparkle.sh` fetches the pinned
+# distribution). objc2 + objc2-app-kit are for the one piece the crate does not
+# wrap: the "Check for Updates…" app-menu item (src/updates.rs, `imp`).
+sparkle-updater = { version = "0.1.0", optional = true }
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true, features = ["NSObject", "NSString"] }
+objc2-app-kit = { version = "0.3", optional = true, features = ["NSApplication", "NSMenu", "NSMenuItem"] }
+
 [target.'cfg(unix)'.dependencies]
 # Single-instance guard (flock on the data-dir lock file, `src/instance.rs`).
 # Unix-only; the Windows port will need its own mechanism (no-op stub for now).
@@ -46,6 +57,13 @@ parakeet = ["suramak-asr/parakeet"]
 # feature). OFF by default; macOS 26+ builds only (the `speech` crate is a Swift
 # bridge). The Settings "Fast engine (experimental)" toggle drives it.
 speech-transcriber = ["suramak-asr/speech-transcriber"]
+# M12: in-app updates (Sparkle 2). OFF by default; macOS builds only. The build
+# needs the pinned Sparkle distribution on disk (SPARKLE_FRAMEWORK_PATH —
+# `scripts/fetch-sparkle.sh`), and the packaged app must embed Sparkle.framework
+# + sign it (`scripts/make-app.sh` does both when SURAMAK_FEATURES contains
+# `updates`). The "Automatic updates" setting and the "Check for Updates…" menu
+# item are driven by src/updates.rs; without the feature the module is a stub.
+updates = ["dep:sparkle-updater", "dep:objc2", "dep:objc2-foundation", "dep:objc2-app-kit"]
 
 [dev-dependencies]
 # M11: the UI polish tests decode the `input_audio` base64 payload back to the
@@ -53,3 +71,6 @@ speech-transcriber = ["suramak-asr/speech-transcriber"]
 # wire (production encoding lives in core).
 base64 = { workspace = true }
 serde_json = { workspace = true }
+# M12: the packaging test verifies the cached Sparkle archive against the
+# pinned sha256 when the fetch script has run (build/sparkle/…).
+sha2 = { workspace = true }

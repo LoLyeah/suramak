@@ -187,7 +187,17 @@ jobs:
       - name: Build UI (release)
         run: cargo build --release -p suramak-ui
 
-      - name: Package dist/Suramak.app (ad-hoc codesign)
+      # M12: fetch the pinned Sparkle distribution and build the bundle with
+      # the `updates` feature — the CI smoke below then launches the real
+      # bundle, which proves the embedded framework resolves at runtime (the
+      # rpath) and that the updater starts inside an app bundle. Bounded: one
+      # sha256-verified download, already cached across steps.
+      - name: Fetch the pinned Sparkle distribution (framework + tools)
+        run: ./scripts/fetch-sparkle.sh
+
+      - name: Package dist/Suramak.app (ad-hoc codesign; embeds Sparkle)
+        env:
+          SURAMAK_FEATURES: updates
         run: ./scripts/make-app.sh
 
       - name: Smoke test the bundle

@@ -127,6 +127,11 @@ pub struct SettingsForm {
     /// `settings.polish.send_audio`, **OFF by default**. On: the recording
     /// itself is uploaded to the configured endpoint alongside the transcript.
     pub polish_send_audio: bool,
+    /// M12: "Automatic updates" — persisted as `settings.updates.auto_check`,
+    /// **ON by default**. On: the macOS app checks for new versions in the
+    /// background; the updater (when compiled in) follows this value at boot
+    /// and on every save.
+    pub updates_auto_check: bool,
     /// Transient API-key input; **never** written to settings.toml (macOS/Windows
     /// keychain only).
     pub api_key: String,
@@ -180,6 +185,7 @@ impl SettingsForm {
                 .polish
                 .as_ref()
                 .is_some_and(|polish| polish.send_audio),
+            updates_auto_check: settings.updates.auto_check,
             api_key: String::new(),
             dirty: false,
             status: None,
@@ -322,6 +328,7 @@ impl SettingsForm {
                 send_audio: self.polish_send_audio,
             })
         };
+        settings.updates.auto_check = self.updates_auto_check;
     }
 
     /// "Reset to defaults": the form goes back to [`Settings::default`] (the user
@@ -419,6 +426,7 @@ mod tests {
         assert_eq!(form.sources, vec![RecordSource::Default]);
         assert!(form.polish_base_url.is_empty() && form.polish_model.is_empty());
         assert!(!form.polish_send_audio, "audio-aware polish starts OFF");
+        assert!(form.updates_auto_check, "automatic updates start ON (M12)");
         assert!(form.api_key.is_empty(), "the key field always starts empty");
         assert!(!form.dirty);
     }
@@ -491,6 +499,39 @@ mod tests {
         form.apply(&mut settings);
         settings.save(&path).expect("save");
         assert!(!Settings::load(&path).unwrap().polish.unwrap().send_audio);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    // ---- M12: the automatic-updates toggle ----------------------------------
+
+    #[test]
+    fn updates_auto_check_toggle_roundtrips_form_settings_file_and_back() {
+        let mut settings = Settings::default();
+        let mut form = SettingsForm::from_settings(&settings);
+        assert!(form.updates_auto_check, "the toggle starts ON");
+
+        // Off → persisted → reloaded → the form follows the file.
+        form.updates_auto_check = false;
+        form.apply(&mut settings);
+        assert!(!settings.updates.auto_check);
+
+        let path = temp_path("updates-auto-check");
+        settings.save(&path).expect("save");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("auto_check = false"),
+            "unexpected TOML: {text}"
+        );
+        let reloaded = Settings::load(&path).expect("reload");
+        assert!(!reloaded.updates.auto_check);
+        let form2 = SettingsForm::from_settings(&reloaded);
+        assert!(!form2.updates_auto_check, "the form follows the file");
+
+        // …and back on (the observable value follows the toggle both ways).
+        form.updates_auto_check = true;
+        form.apply(&mut settings);
+        settings.save(&path).expect("save");
+        assert!(Settings::load(&path).unwrap().updates.auto_check);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 

@@ -23,7 +23,17 @@ jobs:
         # runner; no extra runtime dylibs (the Speech framework is OS-side).
         run: cargo build --release -p suramak-ui -p suramak-cli --features suramak-ui/speech-transcriber,suramak-cli/speech-transcriber
 
-      - name: Bundle + ad-hoc sign (includes the generated app icon)
+      - name: Fetch the pinned Sparkle distribution (framework + tools)
+        # M12: the in-app updater's framework — one pinned, sha256-verified
+        # download (scripts/fetch-sparkle.sh); the appcast step below reuses it.
+        run: ./scripts/fetch-sparkle.sh
+
+      - name: Bundle + ad-hoc sign (includes the generated app icon; embeds Sparkle for the updater)
+        # M12: SURAMAK_FEATURES adds the `updates` feature to the bundled UI
+        # build (and keeps M10B's speech-transcriber, which the step above
+        # compiled in — the make-app.sh build is the one that ships).
+        env:
+          SURAMAK_FEATURES: speech-transcriber,updates
         run: ./scripts/make-app.sh
 
       - name: Package (zip + plain dmg with an /Applications drag target)
@@ -35,12 +45,32 @@ jobs:
           ln -s /Applications dmg-staging/Applications
           hdiutil create -volname "Suramak ${TAG}" -srcfolder dmg-staging -ov -format UDZO "Suramak-${TAG}-macos-arm64.dmg"
 
+      - name: Appcast — sign the archive + write appcast.xml (skipped loudly without SPARKLE_ED_KEY)
+        # M12: generate_appcast over a staging dir with the archive + the
+        # CHANGELOG section as a same-named .md (release notes), EdDSA-signed
+        # via `--ed-key-file -` from the SPARKLE_ED_KEY secret, download URLs
+        # pinned to this tag's release assets, delta updates from the previous
+        # releases' archives. No secret → a loud warning, no appcast, no failure.
+        env:
+          SPARKLE_ED_KEY: ${{ secrets.SPARKLE_ED_KEY }}
+        run: ./scripts/make-appcast.sh "${GITHUB_REF_NAME}" "Suramak-${GITHUB_REF_NAME}-macos-arm64.zip"
+
       - uses: actions/upload-artifact@v4
         with:
           name: macos-app
           path: |
             Suramak-*.zip
             Suramak-*.dmg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appcast
+          # M12: empty when the SPARKLE_ED_KEY secret is absent (the loud skip
+          # above) — never a failure.
+          if-no-files-found: ignore
+          path: |
+            build/appcast/appcast.xml
+            build/appcast/*.delta
 
   linux-app:
     name: Linux app (tar.gz)
@@ -113,8 +143,14 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          # M12: appcast.xml (the Sparkle feed, EdDSA-signed) + any delta
+          # updates ride along with the app archives; both come from the
+          # macOS job's `appcast` artifact and are simply absent when the
+          # SPARKLE_ED_KEY secret is not configured.
           files: |
             Suramak-*.zip
             Suramak-*.dmg
             suramak-*-linux-x86_64.tar.gz
+            appcast.xml
+            *.delta
           body_path: RELEASE-NOTES.md

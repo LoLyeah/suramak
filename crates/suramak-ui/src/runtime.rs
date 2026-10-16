@@ -260,6 +260,12 @@ impl Runtime {
         settings_form::SettingsForm::from_settings(&self.settings)
     }
 
+    /// M12: `settings.updates.auto_check` — the "Automatic updates" policy the
+    /// updater follows at boot and after every settings save.
+    pub fn updates_auto_check(&self) -> bool {
+        self.settings.updates.auto_check
+    }
+
     /// The model-manager table for the current models dir + default id.
     ///
     /// Used by the normal `Effect::RefreshModels` path and by the M9c smoke

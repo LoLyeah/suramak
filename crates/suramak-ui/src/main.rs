@@ -47,6 +47,7 @@ mod runtime;
 mod shell;
 mod shutdown;
 mod theme;
+mod updates;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -227,6 +228,11 @@ struct App {
     /// M9e (P1-1): the smoke-only auto-answer for the quit confirm
     /// (`SURAMAK_SMOKE_QUIT_ANSWER`), consumed once. `None` in normal runs.
     smoke_quit_answer: Option<QuitAnswer>,
+    /// M12: the in-app updater (macOS + the `updates` feature; an honest stub
+    /// everywhere else). `None` until [`App::resumed`] started it — the crate
+    /// requires a live AppKit loop and the main thread, so `App::new` must not
+    /// touch it. Kept for the app's lifetime (the crate's contract).
+    updates: Option<updates::Updater>,
 }
 
 impl App {
@@ -257,6 +263,7 @@ impl App {
             repaint_due: None,
             pending_quit: None,
             smoke_quit_answer,
+            updates: None,
         }
     }
 
@@ -477,6 +484,12 @@ impl App {
             .collect();
         runtime.apply(rest, &mut shell.app);
         shell.sync_appearance(runtime.appearance());
+        // M12: a settings save may have flipped "Automatic updates" — re-apply
+        // the policy to the updater (a no-op when unchanged or when the
+        // updater is off in this run).
+        if let Some(updater) = self.updates.as_mut() {
+            updater.set_automatic_checks(runtime.updates_auto_check());
+        }
         if quit.is_some() {
             self.pending_quit = quit;
         }
@@ -786,6 +799,13 @@ impl ApplicationHandler<AccessKitEnabler> for App {
                     None => {}
                 }
 
+                // M12: start the in-app updater — main thread, after the AppKit
+                // window is up and the settings are loaded (the crate requires
+                // a live app bundle + event loop; outside one it logs and stays
+                // off). The persisted "Automatic updates" policy is applied to
+                // Sparkle at start and re-applied after every settings save.
+                self.updates = Some(updates::Updater::start(runtime.updates_auto_check()));
+
                 if let Some(smoke) = &mut self.smoke {
                     let now = Instant::now();
                     smoke.deadline = Some(now + Duration::from_secs(smoke.secs));
@@ -807,6 +827,11 @@ impl ApplicationHandler<AccessKitEnabler> for App {
                         shell.app.model_manager.begin_download("turbo-q5-0");
                         shell.app.on_download_progress(180_000_000, 574_041_195);
                         shell.app.route = app::Route::Models;
+                    }
+                    // M12 harness: open the Settings route so the Updates
+                    // section can be captured headlessly (smoke modes only).
+                    if std::env::var_os("SURAMAK_SMOKE_SETTINGS").is_some() {
+                        shell.app.route = app::Route::Settings;
                     }
                     if let Some(input) = smoke.job.clone() {
                         let effects = shell.app.begin_import(input);

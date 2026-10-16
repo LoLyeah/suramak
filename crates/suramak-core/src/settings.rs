@@ -224,6 +224,30 @@ impl Appearance {
     }
 }
 
+/// In-app update settings (M12; macOS Sparkle). Missing in older settings
+/// files → defaults (automatic checks **ON**).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatesSettings {
+    /// "Automatic updates" — check for a new version in the background and
+    /// offer it in place (Sparkle's standard UI asks before installing).
+    /// **ON by default**; missing in older settings files → `true` (the M12
+    /// policy; the `updates` feature itself stays OFF until a build enables
+    /// it — the setting is inert in builds without the updater).
+    #[serde(default = "default_true")]
+    pub auto_check: bool,
+}
+
+/// `serde` default for the ON-by-default booleans (`bool::default` is false).
+fn default_true() -> bool {
+    true
+}
+
+impl Default for UpdatesSettings {
+    fn default() -> Self {
+        Self { auto_check: true }
+    }
+}
+
 /// UI settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiSettings {
@@ -244,6 +268,10 @@ pub struct Settings {
     /// M3: microphone/system-audio recording options. Missing in older files → defaults.
     #[serde(default)]
     pub recording: RecordingSettings,
+    /// M12: in-app update options (automatic checks ON). Missing in older
+    /// files → defaults.
+    #[serde(default)]
+    pub updates: UpdatesSettings,
 }
 
 impl Default for Settings {
@@ -265,6 +293,7 @@ impl Default for Settings {
                 appearance: Appearance::System,
             },
             recording: RecordingSettings::default(),
+            updates: UpdatesSettings::default(),
         }
     }
 }
@@ -662,5 +691,48 @@ name = "BlackHole 2ch"
         ] {
             assert_eq!(RecordSource::from(&source).legacy_audio_source(), source);
         }
+    }
+
+    // ---- M12: the updates section -------------------------------------------
+
+    #[test]
+    fn updates_auto_check_roundtrips_and_defaults_to_on() {
+        for auto in [true, false] {
+            let mut settings = Settings::default();
+            settings.updates.auto_check = auto;
+            let text = toml::to_string_pretty(&settings).expect("serialize settings");
+            assert!(
+                text.contains(&format!("auto_check = {auto}")),
+                "unexpected TOML: {text}"
+            );
+            let back: Settings = toml::from_str(&text).expect("deserialize settings");
+            assert_eq!(back.updates.auto_check, auto);
+        }
+        // The built-in default is ON (M12's first-run policy).
+        assert!(Settings::default().updates.auto_check);
+        assert!(UpdatesSettings::default().auto_check);
+    }
+
+    #[test]
+    fn updates_defaults_to_on_when_absent() {
+        // A settings file written before M12 has no `[updates]` section.
+        let text = r#"
+[asr]
+model_id = "tiny"
+language = "auto"
+translate_to_english = false
+
+[storage]
+keep_audio = false
+
+[ui]
+glass = "auto"
+font_scale = 1.0
+"#;
+        let settings: Settings = toml::from_str(text).expect("M11-era settings must load");
+        assert!(
+            settings.updates.auto_check,
+            "missing section → automatic checks ON"
+        );
     }
 }

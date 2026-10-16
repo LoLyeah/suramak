@@ -377,6 +377,63 @@ cross-checks the text against the audio).
 - Privacy check: with the toggle **off**, nothing about the recording leaves
   the machine (the request is the pre-M11 text-only one, byte for byte).
 
+## 32. In-app updates (M12) — owner-verify, incl. the one-time key setup
+
+The whole update cycle runs only in a **packaged macOS build with the
+`updates` feature** (the release app; `cargo run` dev builds log that they are
+not a bundle and stay off). Nothing here can be verified from Linux — the
+items below are the verification. Prep on the Mac:
+
+```bash
+./scripts/fetch-sparkle.sh                      # pinned Sparkle 2.9.6 (framework + tools)
+SURAMAK_FEATURES=speech-transcriber,updates ./scripts/make-app.sh
+open dist/Suramak.app                           # or run its binary directly
+```
+
+- **One-time key setup (before the first update cycle)**: run
+  `build/sparkle/2.9.6/bin/generate_keys` (prints the public key), put it into
+  `packaging/Info.plist` as `SUPublicEDKey` (replacing the placeholder), then
+  `build/sparkle/2.9.6/bin/generate_keys -x /tmp/sparkle_ed_key` and store the
+  file's content as the repo secret `SPARKLE_ED_KEY` — the file *is* the base64
+  key string, so paste it as-is: `pbcopy < /tmp/sparkle_ed_key` (never base64
+  the file again; the appcast step refuses a double-encoded value with a
+  message saying so). Delete the local file. Until this is done the app logs,
+  at every boot, `SUPublicEDKey is still the shipped placeholder …`.
+- **The updater starts in the packaged app**: launch the bundle, expected in
+  the log (`RUST_LOG=suramak=info` or the default): `updates: Sparkle started`
+  with the version + feed, and `updates: added "Check for Updates…" to the app
+  menu`. In a dev run (`cargo run`) instead: `updates: not an app bundle — the
+  updater is off`.
+- **The menu item**: the app menu (top of the screen) shows **Check for
+  Updates…** right under "About Suramak". It is greyed out while a check is
+  running and clickable otherwise. Click it on the current release: expected a
+  Sparkle dialog ("You're up to date" / an error if no appcast is published
+  yet — both fine before the first signed release; note which in Report).
+- **The Settings row**: Settings → Updates → **Automatic updates** is **ON**
+  by default; `settings.toml` shows `[updates]` / `auto_check = true`. Toggle
+  it off → Save → expected the log line `updates: automatic checks updated
+  (automatic_checks=false)`, and Sparkle stops scheduling background checks
+  (`updates: no further check is scheduled (automatic checks are off)` in the
+  debug log). The manual menu item keeps working either way.
+- **The first real cycle (the actual verification)**: with the key set and a
+  newer release published (e.g. install v0.2.0's zip from the releases page,
+  publish v0.2.1+ with the appcast attached), start the installed app and
+  expect, within a minute or via the menu item:
+  `updates: a new version is available` → Sparkle's dialog with the release
+  notes (the CHANGELOG section, markdown) → **Install** → download progress →
+  the app quits, installs and relaunches as the new version (About/version
+  line, `CFBundleVersion` bumped). Record: which version → which version, the
+  dialog text, whether the relaunch happened, and the log's `updates:` lines.
+- **Recording in progress + an offered update** (known interaction to check):
+  Sparkle's "Install and Relaunch" while a recording is live should meet the
+  existing M9e quit confirm (Stop & Save / Discard / Keep) — answer Stop &
+  Save and confirm the install still proceeds; if Sparkle instead reports that
+  the app did not quit, note the exact wording in Report.
+- **Failure paths**: with the appcast absent (secret not configured) the check
+  logs an abort (no update); an archive whose signature does not verify must
+  fail with Sparkle's "improperly signed" error and **no install** — that is
+  the EdDSA guarantee doing its job.
+
 ## Report
 
 Anything that deviates from an expected result, with: what you did, what happened, what you expected.

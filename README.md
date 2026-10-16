@@ -16,7 +16,8 @@ Local-first transcription app. Fully native, written in Rust. **macOS first; Win
 - Delete a transcript from the library: a trash button in the editor header with an inline confirm (segments go with it).
 - Export Markdown / TXT / JSON (+ SRT / VTT) — take it to any LLM you like.
 - Optional in-app "polish" via your own OpenAI-compatible endpoint — review side-by-side, accept/undo/discard; the app works fully without it. **Audio-aware polish (M11)**: an opt-in toggle (default OFF) that sends the recording itself alongside the transcript — OpenAI-compatible `input_audio` content parts (base64 WAV, no encoder), chunked at segment boundaries into ≤ 4 MB (~2 min) chunks, the corrected outputs concatenated in order — so corrections resolve names, homophones and jargon against what was actually said. Needs an audio-capable model (`gpt-audio` class, Gemini, Voxtral); a missing recording falls back to text-only with a note, and an endpoint that rejects the audio gets one automatic text-only retry with a note naming the reason. Off = byte-identical to the pre-M11 text-only request.
-- No telemetry. Network only for model downloads and opt-in polish (the recording uploads only when you turn audio-aware polish on).
+- No telemetry. Network only for model downloads, opt-in polish (the recording uploads only when you turn audio-aware polish on) and — in packaged macOS builds — the update check itself (the appcast on our GitHub Releases; nothing about you is sent).
+- **In-app updates (M12, macOS)**: the packaged app checks for a new version in the background (about once a day; toggle "Automatic updates" in Settings, ON by default) and installs it **in place after your confirmation** — Sparkle 2's standard UI shows the release notes (from this repo's CHANGELOG) and asks before installing. A "Check for Updates…" item lives in the app menu. The feed is an EdDSA-signed `appcast.xml` attached to each GitHub release; dev builds (`cargo run`) and Linux/Windows builds have no updater. See **Updates** below.
 - Liquid Glass on macOS 26+ (fallback for older); DWM Mica/Acrylic backdrop on Windows (compile-checked; runtime unverified).
 
 ## Status
@@ -28,6 +29,7 @@ Local-first transcription app. Fully native, written in Rust. **macOS first; Win
 - ✅ `suramak-ui` — the app: import/record → transcript → edit → export, model manager, settings (incl. the M6 checkbox source list + per-app picker), live provisional transcript while recording (M7; the Mac-only live feel is a user-smoke item), in-app polish (M4; polish round-trip + all Mac-only behavior are user-smoke items)
 - ✅ `suramak-taps` — macOS system-audio taps (CoreAudio 14.2+, incl. the M6 per-app `Only` mixdown + process listing); pure Rust, darwin-checked from Linux
 - ✅ `suramak-glass` — AppKit materials (macOS) + real DWM backdrop (Windows, compile-checked from Linux) + Linux no-op
+- ✅ in-app updates (M12) — Sparkle 2 behind the default-OFF `updates` feature: boot-time start on the main thread, event callbacks into the app log, Settings "Automatic updates" (ON) + a "Check for Updates…" app-menu item; pinned + sha256-verified framework fetch, embedded + ad-hoc-signed in `dist/Suramak.app`, EdDSA-signed appcast built by the release workflow. The whole update cycle is owner-verify (USER_SMOKE §32); the macOS module is type-checked from Linux against the real crate (the `build/probe-updates` probe)
 - 📋 release handoff — `scripts/mac-smoke.sh` + `docs/USER_SMOKE.md` (run by the owner on the Mac)
 
 ## Layout
@@ -56,6 +58,61 @@ bash scripts/mac-smoke.sh              # macOS: full release smoke → docs/USER
 ```
 
 Models are downloaded on demand (`suramak-cli models download <id>`, sha256-pinned).
+
+## Updates
+
+In-app updates are **macOS-only** and live behind the default-OFF `updates`
+cargo feature (the whole updater is compiled out of every other build).
+
+What the packaged app does (once the feature is on and the owner has done the
+one-time key setup below): Sparkle 2 checks the feed
+(`https://github.com/LoLyeah/suramak/releases/latest/download/appcast.xml`)
+in the background — roughly once a day, controlled by Settings → **Updates →
+"Automatic updates"** (ON by default) — and, when a newer version exists,
+shows its standard dialog with the release notes (the CHANGELOG section of
+that release) and **installs in place only after you confirm**. The app menu
+also gets a **"Check for Updates…"** item (greyed out while a check runs). The
+app log (`RUST_LOG=suramak=debug`) records every step.
+
+Build/release wiring:
+
+```bash
+./scripts/fetch-sparkle.sh          # pinned + sha256-verified Sparkle 2.9.6 (framework + tools)
+SPARKLE_FRAMEWORK_PATH="$(./scripts/fetch-sparkle.sh)" \
+  cargo build --release -p suramak-ui --features updates   # dev build (needs the framework on disk)
+SURAMAK_FEATURES=speech-transcriber,updates ./scripts/make-app.sh   # the release bundle (embeds + signs Sparkle.framework)
+```
+
+- `scripts/fetch-sparkle.sh` pins the official 2.9.6 archive and its real
+  sha256; the release/CI pipelines never download the framework any other way.
+- `make-app.sh` copies the framework into `Contents/Frameworks` (symlinks
+  preserved) before the existing ad-hoc signing; the
+  `@executable_path/../Frameworks` rpath is a link-time argument
+  (`crates/suramak-ui/build.rs`).
+- The release workflow signs the archive and writes `appcast.xml` with
+  Sparkle's `generate_appcast` (`scripts/make-appcast.sh`), using the
+  `SPARKLE_ED_KEY` repo secret via `--ed-key-file -` (stdin, the documented CI
+  path). Without that secret the release still ships and the appcast step logs
+  a loud skip — the updater then finds no feed and stays dormant.
+
+**One-time owner key setup** (no key material ever enters the repo):
+
+1. On a Mac, from the fetched distribution (`build/sparkle/2.9.6`):
+   `./bin/generate_keys` — generates the EdDSA keypair into your login
+   keychain and prints the public key.
+2. Put the printed public key into `packaging/Info.plist` as `SUPublicEDKey`
+   (replacing the clearly-marked placeholder).
+3. Export the private key and store it as the repo secret — the exported file
+   *is* the base64 key string (`generate_keys -x` writes it in exactly the form
+   `--ed-key-file -` expects), so its content goes in as-is:
+   `./bin/generate_keys -x /tmp/sparkle_ed_key && pbcopy < /tmp/sparkle_ed_key`
+   → GitHub → repo → Settings → Secrets and variables → Actions → new secret
+   **`SPARKLE_ED_KEY`** → paste. Delete the local file afterwards. (Do **not**
+   base64 the file again — a double-encoded value is the one common mistake,
+   and the appcast step refuses it with a message saying exactly this.)
+
+Exact commands, the expected first-cycle behavior and the honest boundaries
+are in `docs/reports/M12.md`; the owner smoke is `docs/USER_SMOKE.md` §32.
 
 ## License
 

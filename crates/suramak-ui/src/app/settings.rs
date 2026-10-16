@@ -35,6 +35,12 @@ use super::{AppState, Effect};
 /// System-audio entries exist on macOS builds only (hidden elsewhere; Addendum A).
 const SYSTEM_AUDIO_OFFERED: bool = cfg!(target_os = "macos");
 
+/// M12: whether this build carries the in-app updater (the `updates` cargo
+/// feature on a macOS target — `crate::updates::compiled()`). Drives the
+/// Updates section's honest platform note; the row itself always exists (the
+/// setting is persisted by every build).
+const UPDATES_COMPILED: bool = crate::updates::compiled();
+
 const ROW_H: f32 = 26.0;
 const LABEL_W: f32 = 150.0;
 /// Bottom reserve inside the scroll content so the form's actions clear the
@@ -126,6 +132,7 @@ fn form(
             effects,
         );
         dirty |= polish_section(ui, tokens, form);
+        dirty |= updates_section(ui, tokens, form);
     }
 
     // ---- actions ------------------------------------------------------------
@@ -713,6 +720,45 @@ fn polish_section(ui: &mut egui::Ui, tokens: &Tokens, form: &mut SettingsForm) -
     dirty
 }
 
+/// M12: the Updates section's caption — the same string the view paints and
+/// the paint test asserts, so the two can never drift.
+fn updates_caption() -> &'static str {
+    if UPDATES_COMPILED {
+        "On by default. The packaged app checks for a new version in the background (about \
+         once a day) and installs it in place — Sparkle shows the release notes and asks \
+         before installing. Off: only the app menu's Check for Updates… checks. Development \
+         builds (`cargo run`) have no updater; the release app does."
+    } else {
+        "On by default, but this build has no updater: in-app updates are macOS-only and \
+         compiled out of this build (the `updates` cargo feature). The setting is persisted \
+         and takes effect in a macOS build that has it."
+    }
+}
+
+/// M12: the in-app updates section — one row ("Automatic updates", ON by
+/// default) and the honest platform note. The updater itself is macOS-only
+/// behind the default-OFF `updates` cargo feature (`crate::updates`); the row
+/// always exists because the setting is persisted by every build.
+fn updates_section(ui: &mut egui::Ui, tokens: &Tokens, form: &mut SettingsForm) -> bool {
+    let mut dirty = false;
+    section(ui, tokens, "Updates");
+
+    row(ui, tokens, "Automatic updates", |ui| {
+        if ui
+            .checkbox(
+                &mut form.updates_auto_check,
+                "Check for new versions in the background",
+            )
+            .changed()
+        {
+            dirty = true;
+        }
+    });
+    row_caption(ui, tokens, updates_caption(), false);
+    ui.add_space(12.0);
+    dirty
+}
+
 /// Model dropdown options as `(value, display label)` pairs: `auto` + every
 /// manifest id (human-labelled) + a custom value if the settings carry one.
 fn model_options(current: &str) -> Vec<(String, String)> {
@@ -845,6 +891,64 @@ mod tests {
                 egui::Shape::Text(text) if text.galley.text() == label => Some(text.pos.y),
                 _ => None,
             })
+    }
+
+    /// M12: the Updates section really renders — the section heading, the
+    /// "Automatic updates" row and its checkbox paint on a tall pane (the
+    /// 900×600 minimum scrolls; labels below the viewport are not painted,
+    /// so this test gives the form room). The toggle itself is covered by the
+    /// `settings_form` round-trip tests; this is the view-level check.
+    #[test]
+    fn the_updates_section_and_its_row_paint() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let tokens = crate::theme::tokens(AppTheme::Light);
+        let motion = Motion::new(false);
+        let mut state = AppState::new();
+        // Tall enough that the whole form (which scrolls at 900×600) is visible.
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(900.0, 2400.0));
+        let run = |state: &mut AppState, time: f64| {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(time),
+                ..Default::default()
+            };
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let mut effects = Vec::new();
+                        super::ui(ui, &tokens, &motion, state, &mut effects);
+                    });
+            })
+        };
+        let _ = run(&mut state, 0.0);
+        let output = run(&mut state, 0.1);
+        let labels: Vec<String> = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        for expected in [
+            "Updates",
+            "Automatic updates",
+            "Check for new versions in the background",
+        ] {
+            assert!(
+                labels.iter().any(|label| label == expected),
+                "missing {expected:?}; got {labels:?}"
+            );
+        }
+        // The caption tells the truth for this build (compiled or not) — the
+        // exact string the view uses.
+        let caption = updates_caption();
+        assert!(
+            labels.iter().any(|label| label == caption),
+            "the updates caption must paint; got {labels:?}"
+        );
     }
 
     /// M9e (P2-3) caption wrap: at the 900×600 minimum the pane is 693 pt wide
