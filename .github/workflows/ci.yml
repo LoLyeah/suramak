@@ -397,6 +397,8 @@ jobs:
       - name: CRT check — dumpbin /dependents must show no VCRUNTIME/MSVCP
         shell: pwsh
         run: |
+          # `build/` is gitignored — a fresh checkout has no such directory.
+          New-Item -ItemType Directory -Force -Path build | Out-Null
           $dumpbin = Get-ChildItem -Path "${env:ProgramFiles}\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $dumpbin) { throw "dumpbin.exe not found under Program Files — unexpected for the pinned windows-2022 image" }
           & $dumpbin.FullName /dependents .\target\release\suramak-cli.exe | Tee-Object -FilePath build\dumpbin-dependents.txt
