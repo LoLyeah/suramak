@@ -130,7 +130,7 @@ No whole candidate needs outright rejection. Rejected implementations and commer
    **Verify:** mixed successful/failed imports, cancellation, shutdown, bounded memory, UI responsiveness.
 2. **M16.2 — Capture/HUD lifecycle · M** — explicit idle, recording, processing, result, cancellation, permission-failure states in a floating Deck surface; warmed models optional and measured distinctly from idle targets.
    **Verify:** rapid start/stop, device removal, long captures, keyboard access, motion preferences, no hidden recording.
-3. **M16.3 — Hotkey and insertion adapters · M per platform** — independently releasable macOS/Windows/Linux integrations; probe platform permissions and compositor support; manual copy when insertion is unavailable; no privileged `uinput`, no clipboard inspection as a universal solution.
+3. **M16.3 — Hotkey and insertion adapters · M per platform** — independently releasable macOS/Windows/Linux integrations (owner order, 2026-10-19: **macOS first, Linux second, Windows with the M14 era**); probe platform permissions and compositor support; manual copy when insertion is unavailable; no privileged `uinput`, no clipboard inspection as a universal solution.
    **Verify:** focus changes, permission denial/revocation, shortcut conflicts, insertion failure, clipboard behavior disclosed.
 4. **M16.4 — VAD chunking · M** — pinned Silero model, worker-side chunking with bounded buffers, cancellation, overlapping-context handling; audio callbacks only enqueue bounded data.
    **Verify:** silence, short utterances, noisy EN+ID code-switching, dropped/duplicated text, CPU use, end-to-end latency on named hardware. Whisper remains the Indonesian fallback.
@@ -212,10 +212,10 @@ Default order: M13 → M14 → M15 → M16 → M17. Existing launch work may con
 - **Destructive cleanup and identity claims:** slang, fillers, and speaker clusters require context and user control.
 - **Unsupported legal/performance marketing:** no automatic compliance guarantees, fabricated precision, or unmeasured latency claims. (Aiko's verified price is $24 one-time, not $9.99 — pricing does not drive this roadmap.)
 
-## 6. Open questions for the owner
+## 6. Decided (owner, 2026-10-19)
 
-1. Approve M15's workbench-first scope, with system-wide dictation moved to M16?
-2. Which desktop platform should receive the first fully verified hotkey/insertion adapter?
-3. Which existing workorder owns the M10A sherpa release packaging, and which artifacts must clear its gate?
-4. With Android Auto Backup ON, which transcript/recording/model/credential categories should be included or excluded?
-5. Should M18 remain an unscheduled experiment pool until M17 quality and resource measurements are reviewed?
+1. **M15 workbench-first: approved.** System-wide dictation stays in M16.
+2. **First hotkey/insertion adapter: macOS**, then Linux (X11 first-class, Wayland best-effort), then Windows (rides the M14 era).
+3. **Sherpa release packaging: a standalone workorder** owned by Hermes, cut when execution resumes. Gate: per-OS shared libraries bundled, signed, with correct rpath; sha-256 pinned; clean-machine dynamic-load test (no dev paths); a feature-on release build. Unblocks both Parakeet-in-releases and M16 diarization.
+4. **Android Auto Backup categories:** the sqlite library + settings are **in**; recordings/imported media, models, and secrets are **out**. Privacy copy states the library rides Google's backup.
+5. **M18 stays an unscheduled experiment pool** until M17 quality/resource measurements are reviewed.

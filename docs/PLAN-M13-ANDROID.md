@@ -368,8 +368,8 @@ scripts/android/build.sh   # cargo ndk -t arm64-v8a [-t x86_64] -o android/app/s
 |---|---|---|
 | Models (multi-hundred MB) | `noBackupFilesDir/models/` | excluded |
 | Imported media, recordings | `filesDir/media/`, `filesDir/recordings/` | excluded (size) |
-| sqlite library | `filesDir/library/suramak.sqlite` | open question: include in Auto Backup? |
-| Settings | alongside the db, via `suramak-core` | follows the db |
+| sqlite library | `filesDir/library/suramak.sqlite` | **included** (owner, 2026-10-19) |
+| Settings | alongside the db, via `suramak-core` | **included** (owner, 2026-10-19) |
 | Polish key | Keystore-wrapped blob in `noBackupFilesDir/secrets/` | never (Keystore keys don't migrate) |
 
 - No external or shared storage permissions are requested.
@@ -453,7 +453,7 @@ scripts/android/build.sh   # cargo ndk -t arm64-v8a [-t x86_64] -o android/app/s
 
 ## 9. Decided (owner, 2026-10-16)
 
-1. **Auto Backup: include the sqlite library.** Transcripts survive a phone migration; the privacy copy states that the library rides Android Auto Backup (Google servers). v1 keeps the default on; the documentation names how to exclude it.
+1. **Auto Backup: include the sqlite library.** Transcripts survive a phone migration; the privacy copy states that the library rides Android Auto Backup (Google servers). v1 keeps the default on; the documentation names how to exclude it. Categories (owner, 2026-10-19): **library + settings in; recordings/imported media, models, secrets out.**
 2. **Distribution for v1: GitHub Releases only** (sideloaded APK). F-Droid/Play stay later decisions; the M13h work is scoped to the GitHub path.
 3. **Minimum supported device: arm64 with 4 GB RAM.** That is the floor — larger models are refused below it with a clear message (4–6 GB devices default small).
 4. **Background transcription: yes, via the foreground service + persistent notification — with a Quit action.** The app exposes an explicit quit/stop affordance (Settings) that cancels running work with the standard semantics, stops the service, and exits.
