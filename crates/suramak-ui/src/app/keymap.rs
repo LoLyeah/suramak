@@ -9,6 +9,13 @@
 //! | ↑ / ↓ | previous / next segment (seek to its start) | editor, with a playable source |
 //! | ⌘⌫ | arm the delete confirm (the existing flow) | editor |
 //!
+//! **Modifiers:** every `⌘` above is `egui::Modifiers::COMMAND`, which is ⌘ on
+//! macOS and **Ctrl on Windows and Linux** — egui-winit fills `modifiers.command`
+//! from the control key off macOS (`egui-winit-0.33.3/src/lib.rs`, the
+//! `ModifiersChanged` arm). No binding needs a platform fork; the M14b audit
+//! pinned that with `the_command_bindings_are_ctrl_off_macos` and
+//! `ctrl_r_toggles_recording_like_command_r` below.
+//!
 //! **The guard:** no shortcut fires while a text edit has focus — the exception
 //! is Esc, which always works (closing the sheet / leaving the editor is the way
 //! out). The guard is read from the focus as of the frame's start
@@ -449,6 +456,54 @@ mod tests {
         assert_eq!(
             resolve(Shortcut::Escape, &typing),
             Some(Action::LeaveEditor)
+        );
+    }
+
+    /// M14b (keyboard audit): `Modifiers::COMMAND` is what egui-winit delivers
+    /// for **Ctrl** off macOS and for ⌘ on macOS — the two pressed sets below are
+    /// exactly what each platform produces, and both match the bindings, so the
+    /// Windows Ctrl mapping needs no code change and no platform fork.
+    #[test]
+    fn the_command_bindings_are_ctrl_off_macos() {
+        let windows_ctrl = Modifiers::CTRL | Modifiers::COMMAND;
+        let macos_cmd = Modifiers::MAC_CMD | Modifiers::COMMAND;
+        assert!(
+            windows_ctrl.matches_logically(Modifiers::COMMAND),
+            "Ctrl (the Windows shape) fires every ⌘ binding"
+        );
+        assert!(macos_cmd.matches_logically(Modifiers::COMMAND));
+        // A bare Ctrl that egui-winit did not promote to `command` is NOT a ⌘
+        // binding; nor may a plain key ever match one.
+        assert!(!Modifiers::CTRL.matches_logically(Modifiers::COMMAND));
+        assert!(!Modifiers::COMMAND.matches_logically(Modifiers::NONE));
+        assert!(!Modifiers::NONE.matches_logically(Modifiers::COMMAND));
+    }
+
+    /// …and the dispatch seam agrees end to end: a Ctrl+R press (the Windows
+    /// shape) starts a recording through the same path as ⌘R, and is consumed so
+    /// egui never sees it.
+    #[test]
+    fn ctrl_r_toggles_recording_like_command_r() {
+        let mut state = AppState::new();
+        state.capture_available = true;
+        let ctx = egui::Context::default();
+        let mut events = vec![key_event(
+            Key::R,
+            Modifiers::CTRL | Modifiers::COMMAND,
+            false,
+        )];
+        let effects = dispatch(&ctx, &mut state, &mut events);
+        assert!(
+            !effects.is_empty(),
+            "Ctrl+R is the record shortcut on Windows"
+        );
+        assert!(
+            matches!(state.record, RecordState::Recording(_)),
+            "Ctrl+R started a recording"
+        );
+        assert!(
+            events.is_empty(),
+            "the press was consumed, not passed to egui"
         );
     }
 

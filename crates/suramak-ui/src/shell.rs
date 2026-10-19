@@ -290,6 +290,24 @@ impl Shell {
         self.apply_float_rect();
     }
 
+    /// M14b (D2): bring the window to the front for a second launch — restore it
+    /// if it is minimized, raise it, and give it keyboard focus.
+    ///
+    /// Runs on the main thread (`UserEvent::Activate` is drained by
+    /// `App::user_event`), because winit allows window calls only there. The
+    /// Windows foreground lock was already waived by the *exiting* process
+    /// (`AllowSetForegroundWindow(ASFW_ANY)`), which is what lets this raise
+    /// stick instead of flashing a taskbar button.
+    // Only the Windows activation path constructs `UserEvent::Activate`, so off
+    // Windows nothing calls this — it stays platform-neutral on purpose, so the
+    // host build type-checks it (`set_minimized` / `focus_window` are cross-platform).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn activate_window(&self) {
+        self.window.set_minimized(false);
+        self.window.focus_window();
+        self.window.request_redraw();
+    }
+
     /// M9a: resolve the effective appearance and apply it everywhere it
     /// matters — the egui token visuals, the macOS window + glass material
     /// (`suramak-glass::set_appearance`), and the Reduce Motion policy.

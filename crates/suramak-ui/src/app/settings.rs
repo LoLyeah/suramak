@@ -41,6 +41,12 @@ const SYSTEM_AUDIO_OFFERED: bool = cfg!(target_os = "macos");
 /// setting is persisted by every build).
 const UPDATES_COMPILED: bool = crate::updates::compiled();
 
+/// M14b: whether this build can reveal a folder in the platform file manager.
+/// Windows only — macOS has no reveal action in the app today, and the Linux
+/// build is layout-truth. The code path stays compiled everywhere (so the host
+/// build type-checks it) and simply never runs elsewhere.
+const REVEAL_IN_FOLDER: bool = cfg!(windows);
+
 const ROW_H: f32 = 26.0;
 const LABEL_W: f32 = 150.0;
 /// Bottom reserve inside the scroll content so the form's actions clear the
@@ -117,7 +123,7 @@ fn form(
     let mut dirty = false;
     {
         let form = &mut state.settings_form;
-        dirty |= transcription_section(ui, tokens, form);
+        dirty |= transcription_section(ui, tokens, motion, form);
         dirty |= appearance_section(ui, tokens, motion, form);
         dirty |= audio_source_section(
             ui,
@@ -210,7 +216,12 @@ fn form(
 
 /// Engine / default model / default language / keep_audio / recordings folder.
 /// Returns whether the user changed something.
-fn transcription_section(ui: &mut egui::Ui, tokens: &Tokens, form: &mut SettingsForm) -> bool {
+fn transcription_section(
+    ui: &mut egui::Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    form: &mut SettingsForm,
+) -> bool {
     let mut dirty = false;
     section(ui, tokens, "Transcription");
 
@@ -341,10 +352,12 @@ fn transcription_section(ui: &mut egui::Ui, tokens: &Tokens, form: &mut Settings
     });
 
     // Recordings folder display.
+    let recordings_path = suramak_core::paths::recordings_dir().ok();
     row(ui, tokens, "Recordings folder", |ui| {
-        let recordings = suramak_core::paths::recordings_dir()
+        let recordings = recordings_path
+            .as_ref()
             .map(|dir| dir.display().to_string())
-            .unwrap_or_else(|_| "unavailable".to_string());
+            .unwrap_or_else(|| "unavailable".to_string());
         let text = if form.keep_audio {
             recordings
         } else {
@@ -357,6 +370,36 @@ fn transcription_section(ui: &mut egui::Ui, tokens: &Tokens, form: &mut Settings
                 .size(11.5)
                 .color(tokens.ink_soft),
         );
+        // M14b: "reveal in folder" — Windows only, because the app has no reveal
+        // action on any other platform (macOS included); this is the one entry,
+        // and it uses `explorer /select,` via `crate::reveal`. The folder is
+        // created first: `explorer` silently opens Documents for a missing path,
+        // which would look like a bug.
+        if REVEAL_IN_FOLDER && form.keep_audio {
+            if let Some(dir) = &recordings_path {
+                ui.add_space(8.0);
+                let response = controls::button(
+                    ui,
+                    tokens,
+                    motion,
+                    "settings-reveal-recordings",
+                    "Show in Explorer",
+                    Tier::Tertiary,
+                    true,
+                );
+                if response.clicked() {
+                    let revealed = std::fs::create_dir_all(dir)
+                        .and_then(|()| crate::reveal::reveal_in_folder(dir));
+                    if let Err(err) = revealed {
+                        tracing::warn!(
+                            error = %err,
+                            path = %dir.display(),
+                            "reveal in Explorer failed"
+                        );
+                    }
+                }
+            }
+        }
     });
     ui.add_space(8.0);
     dirty

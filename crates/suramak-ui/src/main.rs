@@ -1,3 +1,8 @@
+// M14b: the GUI binary is a Windows-subsystem app so launching it never opens a
+// console window (the CLI, `suramak-cli`, stays a console binary). Off Windows
+// the attribute is absent — `cfg_attr` keeps one source root for both.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 //! Suramak app entry point (M1 shell + M2 wiring).
 //!
 //! The window/event loop is winit 0.30 `ApplicationHandler` with **manual**
@@ -41,8 +46,16 @@ mod app;
 mod cadence;
 mod framestats;
 mod instance;
+/// M14b (D2): the Windows named-mutex guard; the unix `flock` path is `instance`.
+#[cfg(windows)]
+mod instance_windows;
 mod motion;
 mod pending_transcription;
+/// M14b: "reveal in folder" (`explorer /select,`). Compiled on every target so
+/// the host build type-checks the whole call path; the spawn is `cfg(windows)`
+/// and the stub elsewhere reports `Unsupported` (never reached — the only caller
+/// checks `cfg!(windows)`).
+mod reveal;
 mod runtime;
 mod shell;
 mod shutdown;
@@ -92,6 +105,12 @@ pub enum UserEvent {
     AccessKit(AccessKitEnabler),
     /// M12: a repaint requested from another thread (worker/bridge).
     Repaint,
+    /// M14b (D2): another launch of Suramak asked this instance to come to the
+    /// front (the Windows activation event, `instance_windows`). Windows-only:
+    /// no other platform has the event, and an unconstructed variant is a
+    /// `dead_code` error under `-D warnings` (the `GuardError` precedent).
+    #[cfg(windows)]
+    Activate,
 }
 
 impl From<egui_winit::accesskit_winit::Event> for UserEvent {
@@ -126,6 +145,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // M9b: the user-event channel carries AccessKit's action requests back into
     // the loop (the proxy is handed to the shell's adapter at startup).
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+    // M14b (D2): if this process owns the mutex, listen for the activation event
+    // a later launch signals (the secondary side exited before this point).
+    // Smoke modes skip the guard, so they skip the watcher too — a transient
+    // smoke run must not swallow a real launch's activation.
+    #[cfg(windows)]
+    if smoke.is_none() {
+        watch_for_activation(&event_loop);
+    }
     let mut app = App::new(smoke, Some(event_loop.create_proxy()));
     // Every quit flavor ends in `App::exiting` (winit dispatches `LoopExiting`
     // on the way out), which tears down and hard-exits — see `App::quit`. For
@@ -139,9 +166,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.quit()
 }
 
+/// Starts the D2 activation watcher, first instance only (Windows).
+///
+/// The watcher thread waits on `Local\Suramak-Activate-<SID>`; every signal posts
+/// `UserEvent::Activate`, which [`App::user_event`] turns into a raise on the
+/// main thread. A failure here is not fatal: the single-instance guarantee is the
+/// mutex, and only the "second launch raises the window" nicety is lost.
+#[cfg(windows)]
+fn watch_for_activation(event_loop: &EventLoop<UserEvent>) {
+    let proxy = event_loop.create_proxy();
+    if let Err(err) = instance_windows::watch_activation(move || {
+        let _ = proxy.send_event(UserEvent::Activate);
+    }) {
+        eprintln!(
+            "suramak: warning: cannot listen for the activation event ({err}) — a second launch will not raise this window"
+        );
+    }
+}
+
 /// Exits with code 2 when another instance holds the data-directory lock; a
 /// lock that cannot even be created only warns (an unusual data dir should not
 /// block the app).
+#[cfg(not(windows))]
 fn acquire_instance_lock(active: bool) {
     if !active {
         return;
@@ -166,6 +212,48 @@ fn acquire_instance_lock(active: bool) {
             eprintln!(
                 "suramak: warning: cannot resolve the data directory ({err}) — continuing without the instance guard"
             );
+        }
+    }
+}
+
+/// Windows (M14b, D2): a named mutex guards the single instance, and a second
+/// launch **raises the running window and exits 0** — it did what the user asked
+/// (the unix guard's exit 2 carries a message to a terminal; a GUI launch has no
+/// console to write to, and the subsystem is `windows`).
+///
+/// A guard that cannot even be created only warns, exactly like the unix path: an
+/// unusual logon should not block the app.
+#[cfg(windows)]
+fn acquire_instance_lock(active: bool) {
+    if !active {
+        return;
+    }
+    match instance_windows::claim() {
+        Ok(instance_windows::Claim::Primary) => {}
+        Ok(instance_windows::Claim::Secondary) => {
+            // The launch's intent (Suramak in front) is satisfied either way, so
+            // the code comes from the protocol's plan (0) — also when the signal
+            // itself failed: this process must not linger.
+            let code = match instance_windows::activate_running_instance() {
+                Ok(report) => {
+                    tracing::info!(
+                        signalled = report.signalled,
+                        foreground_granted = report.foreground_granted,
+                        "another instance is running — activation signalled"
+                    );
+                    report.exit_code
+                }
+                Err(err) => {
+                    eprintln!(
+                        "suramak: another instance is running but could not be signalled ({err}) — exiting"
+                    );
+                    0
+                }
+            };
+            std::process::exit(code);
+        }
+        Err(err) => {
+            eprintln!("suramak: warning: {err} — continuing without the instance guard");
         }
     }
 }
@@ -964,6 +1052,13 @@ impl ApplicationHandler<UserEvent> for App {
         let enabler = match event {
             UserEvent::Repaint => {
                 shell.window.request_redraw();
+                return;
+            }
+            // M14b (D2): a second launch — restore, raise and focus on the main
+            // thread, then paint the frame that shows it.
+            #[cfg(windows)]
+            UserEvent::Activate => {
+                shell.activate_window();
                 return;
             }
             UserEvent::AccessKit(enabler) => enabler,

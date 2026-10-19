@@ -381,11 +381,14 @@ jobs:
 
       # `suramak-taps` is macOS-only and compiles its no-op stub here; the
       # Sparkle (`updates`) and SpeechTranscriber features are off — the
-      # exclusions are by cfg, not by test filters. These four packages are the
+      # exclusions are by cfg, not by test filters. These five packages are the
       # platform-neutral test surface (the workspace crates they pull in come
       # along).
-      - name: Tests (core, asr, cli, playback)
-        run: cargo test -p suramak-core -p suramak-asr -p suramak-cli -p suramak-playback
+      - name: Tests (core, asr, cli, playback, ui)
+        # suramak-ui is included on purpose: its cfg(windows) guard tests
+        # (instance_windows: ERROR_ALREADY_EXISTS path, event round-trip) and
+        # the %LOCALAPPDATA% path rule only execute on this target.
+        run: cargo test -p suramak-core -p suramak-asr -p suramak-cli -p suramak-playback -p suramak-ui
 
       - name: Parakeet feature — compile check only (not packaged on Windows)
         run: cargo check -p suramak-asr --features parakeet
@@ -414,8 +417,9 @@ jobs:
       - name: Restore tiny model cache
         uses: actions/cache@v4
         with:
-          # `directories` ProjectDirs on Windows: %APPDATA%\suramak\Suramak\data\models
-          path: ~\AppData\Roaming\suramak\Suramak\data\models
+          # M14b moved the Windows data dir to %LOCALAPPDATA%\Suramak (the app's
+          # paths::platform_data_dir); models live directly under it.
+          path: ~\AppData\Local\Suramak\models
           key: suramak-windows-models-tiny-be07e048e1e5
 
       - name: Download tiny model (sha256 verified)

@@ -49,6 +49,25 @@ objc2-app-kit = { version = "0.3", optional = true, features = ["NSApplication",
 # Unix-only; the Windows port will need its own mechanism (no-op stub for now).
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+# M14b (D2): `CreateMutexW` / `CreateEventW` / `OpenEventW` / `SetEvent` /
+# `WaitForSingleObject` (single instance + activation), the process-token SID
+# read (`OpenProcessToken` + `GetTokenInformation(TokenUser)`) and
+# `AllowSetForegroundWindow`. Same major as `suramak-glass`'s DWM bindings, so the
+# workspace resolves one `windows` crate.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+# M14b: compiles `packaging/windows/suramak.rc` (icon + VERSIONINFO + application
+# manifest) into the Windows binary, and no-ops on every other target — see
+# `build.rs`.
+embed-resource = "3"
+
 [features]
 # M10A: the Parakeet fast engine (forwards to suramak-asr's `parakeet` feature).
 # OFF by default; the Settings "Fast engine (experimental)" toggle drives it.

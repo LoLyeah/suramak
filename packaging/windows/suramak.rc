@@ -1,0 +1,51 @@
+// Suramak - Windows executable resources (M14b).
+//
+// Compiled into suramak.exe by crates/suramak-ui/build.rs through `embed-resource`,
+// and only when the target is Windows. The version literals below are checked
+// against CARGO_PKG_VERSION at build time: bump them together (build.rs fails the
+// build, naming the line, if they drift).
+//
+// The paths are relative to the crate root on purpose: Cargo runs a build script
+// with the crate directory as its working directory, and rc.exe resolves relative
+// resource file names against it.
+
+#include <windows.h>
+
+// The app icon. The lowest-numbered ICON resource is the one Explorer and the
+// taskbar use; the .ico carries the 16..256 px sizes from
+// assets/logo/icons/windows (copied here so the resource set is self-contained).
+1 ICON "../../packaging/windows/suramak.ico"
+
+// The application manifest, id 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID: PerMonitorV2
+// DPI awareness, longPathAware, UTF-8 active code page, Common Controls v6, and
+// the Windows 10/11 supportedOS GUID.
+1 RT_MANIFEST "../../packaging/windows/suramak.manifest"
+
+1 VERSIONINFO
+FILEVERSION 0,3,0,0
+PRODUCTVERSION 0,3,0,0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"    // 0x0409 US English, code page 1200 (Unicode)
+        BEGIN
+            VALUE "CompanyName", "Suramak"
+            VALUE "FileDescription", "Suramak - on-device transcription"
+            VALUE "FileVersion", "0.3.0"
+            VALUE "InternalName", "suramak"
+            VALUE "LegalCopyright", "GPL-3.0-or-later"
+            VALUE "OriginalFilename", "suramak.exe"
+            VALUE "ProductName", "Suramak"
+            VALUE "ProductVersion", "0.3.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

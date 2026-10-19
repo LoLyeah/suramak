@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Suramak - Windows application manifest (M14b).
+
+  Embedded as RT_MANIFEST id 1 by packaging/windows/suramak.rc. Every element here
+  is load-bearing:
+
+  * assemblyIdentity  - the unpackaged app's identity (dev.suramak.app, matching
+                        CFBundleIdentifier in packaging/Info.plist).
+  * Common-Controls 6 - visual styles for the winit-created window's chrome.
+  * dpiAware true/pm  - the pre-Windows-10 fallback for per-monitor awareness.
+  * dpiAwareness      - PerMonitorV2 on Windows 10 1703+ (the actual contract:
+                        winit receives DPI change notifications per monitor).
+  * longPathAware     - >260 character paths, when the machine's LongPathsEnabled
+                        policy is on (core path tests cover the >260 case).
+  * activeCodePage    - UTF-8 as the process ANSI code page (Windows 10 1903+),
+                        so the C dependencies (whisper.cpp's fopen, libopus) see
+                        non-ASCII paths correctly (PLAN M14e's risk note).
+  * supportedOS       - Windows 10/11. Suramak is Windows 11 only (owner decision,
+                        2026-10-16); the GUID below is the one Windows uses for
+                        both, and no older GUID is declared because older versions
+                        are not supported.
+  * requestedExecutionLevel asInvoker - per-user install, never elevated.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="dev.suramak.app" version="0.3.0.0" processorArchitecture="amd64"/>
+  <description>Suramak</description>
+
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32"
+                        name="Microsoft.Windows.Common-Controls"
+                        version="6.0.0.0"
+                        processorArchitecture="*"
+                        publicKeyToken="6595b64144ccf1df"
+                        language="*"/>
+    </dependentAssembly>
+  </dependency>
+
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 and Windows 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>
