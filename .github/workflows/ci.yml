@@ -28,6 +28,17 @@ jobs:
       # llama.cpp#25275 on ubuntu runners). Pinning llvmpipe/lavapipe to
       # 128-bit vectors is the documented knob; benign for non-mesa steps.
       LP_NATIVE_VECTOR_WIDTH: "128"
+      # SIGILL root cause (gdb backtrace, run 39206922904): the crash was NOT
+      # mesa — it was ggml's own CPU backend init (`whisper_model_load →
+      # ggml_backend_cpu_device_get_extra_buffers_type`) executing instructions
+      # the runner host lacked. whisper.cpp is built by cmake-rs, and
+      # GGML_NATIVE defaults ON → `-march=native`. With Swatinem/rust-cache
+      # reusing `target/` across DIFFERENT runner hosts, an object built on an
+      # AVX-512 host then runs on an AVX2-only host → SIGILL, intermittently,
+      # for byte-identical code. Fix: build a portable baseline (ggml's own
+      # runtime CPU dispatch handles the rest) and invalidate the poisoned
+      # cache below.
+      GGML_NATIVE: "OFF"
     steps:
       - uses: actions/checkout@v4
 
@@ -38,6 +49,11 @@ jobs:
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
+        with:
+          # Bumped when GGML_NATIVE=OFF landed: the previous cache held objects
+          # compiled with `-march=native` on other runner hosts — reusing them
+          # was the intermittent SIGILL. Never reuse pre-baseline objects.
+          key: ggml-baseline-v1
 
       - name: Add cross-check targets (pure-Rust glass crate; no Apple/Windows SDK needed for check)
         run: rustup target add aarch64-apple-darwin x86_64-pc-windows-msvc

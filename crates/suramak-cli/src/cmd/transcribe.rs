@@ -158,7 +158,7 @@ pub fn run(args: TranscribeArgs) -> Result<()> {
                 engine_used,
                 warnings,
                 ..
-            }) => break (transcript, engine_used, warnings),
+            }) => break (*transcript, engine_used, warnings),
             // Unreachable for the CLI (its token is never set) — handled so a
             // future cancellation surface cannot hang the loop.
             Some(WorkerEvent::Cancelled { .. }) => {

@@ -1464,8 +1464,8 @@ impl AppState {
                     status.push_str(&format!(" — {}", warnings.join("; ")));
                 }
                 self.set_status(status, false);
-                let mut effects = self.open_editor(transcript.clone());
-                effects.push(Effect::SaveTranscript(Box::new(transcript)));
+                let mut effects = self.open_editor((*transcript).clone());
+                effects.push(Effect::SaveTranscript(transcript));
                 effects
             }
             WorkerEvent::Error { message, .. } => {
@@ -1949,7 +1949,7 @@ mod tests {
     fn finished_event(transcript: Transcript) -> WorkerEvent {
         WorkerEvent::Finished {
             job_id: 1,
-            transcript,
+            transcript: Box::new(transcript),
             engine_used: EngineId::Cpu,
             warnings: Vec::new(),
         }

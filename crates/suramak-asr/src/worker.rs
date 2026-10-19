@@ -50,9 +50,14 @@ pub enum WorkerEvent {
     /// The final segment list for the job (emitted once, just before `Finished`).
     Segments { job_id: u64, segments: Vec<Segment> },
     /// The completed transcript plus the engine that actually ran.
+    ///
+    /// `transcript` is boxed: `Transcript` is by far the largest payload here
+    /// (~233 B vs the next variant's 32 B), and `clippy::large_enum_variant`
+    /// fails `-D warnings` on the Windows target. Boxing keeps the event enum
+    /// small — it is sent through a channel and matched in hot loops.
     Finished {
         job_id: u64,
-        transcript: Transcript,
+        transcript: Box<Transcript>,
         engine_used: EngineId,
         /// Non-fatal engine notes (downgrades, Core ML fallback).
         warnings: Vec<String>,
@@ -259,7 +264,7 @@ fn run_worker(jobs: Receiver<Job>, events: Sender<WorkerEvent>) {
                 });
                 let _ = events.send(WorkerEvent::Finished {
                     job_id,
-                    transcript: outcome.transcript,
+                    transcript: Box::new(outcome.transcript),
                     engine_used: outcome.engine_used,
                     warnings: outcome.warnings,
                 });
