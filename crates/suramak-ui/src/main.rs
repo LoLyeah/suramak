@@ -149,6 +149,9 @@ fn acquire_instance_lock(active: bool) {
     match paths::data_dir() {
         Ok(dir) => match instance::acquire(&dir.join("suramak.lock")) {
             Ok(()) => {}
+            // The flock guard (and its AlreadyRunning case) exists on unix only;
+            // elsewhere `acquire` cannot fail this way — see `instance`.
+            #[cfg(unix)]
             Err(instance::GuardError::AlreadyRunning) => {
                 eprintln!(
                     "suramak: another Suramak instance is already running — quit it and start again."
