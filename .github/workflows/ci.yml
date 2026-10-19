@@ -20,6 +20,14 @@ jobs:
       # corruption (out)"). Serialize the whole test run — the app itself
       # keeps one session at a time.
       RUST_TEST_THREADS: "1"
+      # SIGILL mitigation (4-of-6 runs red at the scripted smoke before this):
+      # the intermittent "Illegal instruction (exit 132)" right after wgpu
+      # surface configuration is the runner-host CPU-variance class — the
+      # software rasterizer's runtime JIT can emit vectors some hosts don't
+      # execute (mesa bz 108135 lineage; the same intermittent-SIGILL class as
+      # llama.cpp#25275 on ubuntu runners). Pinning llvmpipe/lavapipe to
+      # 128-bit vectors is the documented knob; benign for non-mesa steps.
+      LP_NATIVE_VECTOR_WIDTH: "128"
     steps:
       - uses: actions/checkout@v4
 
@@ -130,7 +138,26 @@ jobs:
           RUST_BACKTRACE: "1"
         run: |
           rm -f build/smoke_job_ok.txt
+          # Crash forensics: keep a core in the CWD so a SIGILL — if the
+          # LP_NATIVE_VECTOR_WIDTH pin proves insufficient — yields a real
+          # backtrace instead of another guess.
+          sudo sysctl -w kernel.core_pattern=core >/dev/null 2>&1 || true
+          ulimit -c unlimited || true
+          set +e
           SURAMAK_SMOKE_SECS=120 SURAMAK_SMOKE_JOB=fixtures/audio/en.wav xvfb-run -a cargo run -p suramak-ui
+          RC=$?
+          set -e
+          if [ "$RC" -ne 0 ]; then
+            echo "smoke app exited rc=$RC — crash forensics follow"
+            sudo apt-get install -y gdb >/dev/null 2>&1 || true
+            CORE=$(ls -t core* 2>/dev/null | head -1 || true)
+            if [ -n "$CORE" ]; then
+              gdb -batch -ex "bt 40" ./target/debug/suramak "$CORE" 2>&1 | tail -70 || true
+            else
+              echo "no core file found"
+            fi
+          fi
+          test "$RC" -eq 0
           test -f build/smoke_job_ok.txt && echo SMOKE-JOB-OK
           ./target/release/suramak-cli library list
           ./target/release/suramak-cli library list | grep -q "en.wav" && echo LIBRARY-OK
@@ -286,3 +313,119 @@ jobs:
       # committed exec bit surviving; the script is +x on disk either way.
       - name: Cross-build both ABIs (scripts/android/build.sh)
         run: bash scripts/android/build.sh
+
+  # M14a: Windows bring-up — the workspace compiles, tests and transcribes on a
+  # native MSVC build (x86_64-pc-windows-msvc) on the pinned `windows-2022`
+  # image (D4: never `windows-latest`; the pin is validated by the first push).
+  # Scope is the shared crates + the CLI — the GUI is later slices (M14b+), so
+  # there is no `suramak.exe` here and no GUI smoke.
+  #
+  # Build settings that live outside the Rust source (all D4):
+  #  * Static CRT. `.cargo/config.toml` carries `-C target-feature=+crt-static`
+  #    for this target; the CMake-built C deps are steered by the env below —
+  #    `CMAKE_MSVC_RUNTIME_LIBRARY` (whisper.cpp/ggml),
+  #    `CMAKE_POLICY_DEFAULT_CMP0091=NEW` (whisper.cpp's
+  #    cmake_minimum_required(3.5) predates CMP0091, the policy that owns that
+  #    switch) and `CMAKE_TOOLCHAIN_FILE` ->
+  #    `scripts/windows/msvc-static-crt.cmake` (libopus's own
+  #    OPUS_STATIC_RUNTIME knob; opusic-sys forwards no CMAKE_* env).
+  #    `cc`-built C deps (SQLite, ring) follow the crt-static target feature
+  #    automatically. The `dumpbin` step below fails the job if any
+  #    VCRUNTIME/MSVCP import survives.
+  #  * Portable CPU baseline: `GGML_NATIVE=OFF` (no build-host tuning) with an
+  #    explicit `GGML_AVX2=ON` x86-64 level; ggml keeps its runtime dispatch for
+  #    the AVX/SSE tiers below AVX2.
+  # `cargo check -p suramak-asr --features parakeet` is a compile check only —
+  # Parakeet is not packaged on Windows (D4 / plan §4).
+  windows:
+    name: windows (windows-2022, MSVC)
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      # whisper sessions are not concurrency-safe in-process (see the linux job)
+      RUST_TEST_THREADS: "1"
+      CMAKE_POLICY_DEFAULT_CMP0091: NEW
+      CMAKE_MSVC_RUNTIME_LIBRARY: MultiThreaded
+      CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/scripts/windows/msvc-static-crt.cmake
+      GGML_NATIVE: "OFF"
+      GGML_AVX2: "ON"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # `suramak-taps` is macOS-only and compiles its no-op stub here; the
+      # Sparkle (`updates`) and SpeechTranscriber features are off — the
+      # exclusions are by cfg, not by test filters. These four packages are the
+      # platform-neutral test surface (the workspace crates they pull in come
+      # along).
+      - name: Tests (core, asr, cli, playback)
+        run: cargo test -p suramak-core -p suramak-asr -p suramak-cli -p suramak-playback
+
+      - name: Parakeet feature — compile check only (not packaged on Windows)
+        run: cargo check -p suramak-asr --features parakeet
+
+      - name: Build release CLI (static CRT)
+        run: cargo build --release -p suramak-cli
+
+      # D4's enforcement: the artifact must import no VC++ runtime DLL.
+      - name: CRT check — dumpbin /dependents must show no VCRUNTIME/MSVCP
+        shell: pwsh
+        run: |
+          $dumpbin = Get-ChildItem -Path "${env:ProgramFiles}\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin.exe not found under Program Files — unexpected for the pinned windows-2022 image" }
+          & $dumpbin.FullName /dependents .\target\release\suramak-cli.exe | Tee-Object -FilePath build\dumpbin-dependents.txt
+          $imports = Get-Content build\dumpbin-dependents.txt -Raw
+          if ($imports -match '(?im)^\s*(vcruntime|msvcp)') {
+            throw "dynamic VC++ runtime import found in suramak-cli.exe — the static CRT (D4) is broken"
+          }
+          Write-Host "CRT-OK: no VCRUNTIME/MSVCP imports"
+
+      - name: doctor
+        run: .\target\release\suramak-cli.exe doctor
+
+      - name: Restore tiny model cache
+        uses: actions/cache@v4
+        with:
+          # `directories` ProjectDirs on Windows: %APPDATA%\suramak\Suramak\data\models
+          path: ~\AppData\Roaming\suramak\Suramak\data\models
+          key: suramak-windows-models-tiny-be07e048e1e5
+
+      - name: Download tiny model (sha256 verified)
+        run: .\target\release\suramak-cli.exe models download tiny
+
+      - name: CLI e2e — English fixture
+        shell: pwsh
+        run: |
+          .\target\release\suramak-cli.exe transcribe fixtures/audio/en.wav --model tiny --lang en --formats json,md --out-dir build/out
+          $d = Get-Content build/out/en.json -Raw | ConvertFrom-Json
+          if (@($d.segments).Count -lt 1) { throw "no segments in build/out/en.json" }
+          Write-Host "en segments: $(@($d.segments).Count)"
+          if (-not (Select-String -Path build/out/en.json -Pattern 'fox' -Quiet)) { throw "expected 'fox' in the English transcript" }
+          Write-Host "EN-OK"
+
+      - name: CLI e2e — Indonesian fixture
+        shell: pwsh
+        run: |
+          .\target\release\suramak-cli.exe transcribe fixtures/audio/id.wav --model tiny --lang id --formats json --out-dir build/out
+          $d = Get-Content build/out/id.json -Raw | ConvertFrom-Json
+          if (@($d.segments).Count -lt 1 -or [string]::IsNullOrWhiteSpace($d.segments[0].text)) { throw "no text in build/out/id.json" }
+          Write-Host "id segments: $(@($d.segments).Count)"
+
+      - name: Upload suramak-cli.exe (+ CRT evidence)
+        uses: actions/upload-artifact@v4
+        with:
+          name: suramak-cli-windows-x86_64
+          path: |
+            target/release/suramak-cli.exe
+            build/dumpbin-dependents.txt
+          if-no-files-found: error

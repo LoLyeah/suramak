@@ -1,0 +1,41 @@
+# M14a — Windows (`x86_64-pc-windows-msvc`) build settings.
+#
+# Target-scoped on purpose: Linux and macOS builds are byte-identical to before
+# this file existed (`cargo tree` diff evidence in docs/reports/M14a.md). The
+# rustflags below apply to a plain `cargo build`/`test`/`clippy` on Windows too
+# — target-specific rustflags are used when the host *is* the requested target,
+# no `--target` needed.
+#
+# D4: the shipping Windows binaries use the **static CRT** — the portable zip
+# carries our executables and nothing else, no VCRUNTIME140.dll / MSVCP140.dll
+# (nor an MSVCP140 from whisper.cpp's C++). The CI `windows` job enforces it: a
+# `dumpbin /dependents suramak-cli.exe` step fails if either DLL shows up.
+#
+# The C dependencies must be built against the same CRT (`/MT`) or the MSVC
+# linker stops the build with
+#   LNK2038: mismatch detected for 'RuntimeLibrary':
+#            value 'MT_StaticRelease' doesn't match value 'MD_DynamicRelease'
+# (and a dynamic-CRT import would fail the dumpbin step even if it linked).
+#
+#  * `cc`-built C deps (libsqlite3-sys's SQLite, ring's C) read the `crt-static`
+#    target feature and switch to `/MT` automatically — no extra wiring.
+#  * CMake-built C deps are steered by the `windows` CI job's environment:
+#      CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded   (whisper.cpp + ggml)
+#      CMAKE_POLICY_DEFAULT_CMP0091=NEW           (whisper.cpp's
+#                                                  cmake_minimum_required(3.5)
+#                                                  predates CMP0091, which owns
+#                                                  that switch; whisper-rs-sys
+#                                                  forwards every CMAKE_* env
+#                                                  var as a CMake define)
+#      CMAKE_TOOLCHAIN_FILE=scripts/windows/msvc-static-crt.cmake
+#                                                 (libopus — opusic-sys forwards
+#                                                  no env vars; libopus has its
+#                                                  own OPUS_STATIC_RUNTIME knob)
+#      GGML_NATIVE=OFF, GGML_AVX2=ON              (portable AVX2 CPU baseline,
+#                                                  D4 — no build-host tuning)
+#
+# A local (non-CI) Windows build must export the same five variables; see
+# "Building on Windows" in docs/reports/M14a.md.
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
