@@ -1,0 +1,16 @@
+[package]
+name = "suramak-android"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Suramak Android shell (M13a: cdylib smoke surface only; the app shell lands in M13b+)"
+
+[lib]
+# `cdylib` is the artifact Android loads (`libsuramak_android.so`). `rlib` is
+# added so the host `cargo test` can link this crate and run its unit tests —
+# a cdylib-only lib target cannot be tested directly.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+suramak-core = { path = "../suramak-core" }
+suramak-asr = { path = "../suramak-asr" }

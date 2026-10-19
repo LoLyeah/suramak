@@ -8,7 +8,15 @@ fn project_dirs() -> Result<ProjectDirs, SuramakError> {
 }
 
 /// Returns the application data directory (platform-specific).
+///
+/// On Android the directory is supplied by the shell (the `crate::android`
+/// seam); `directories::ProjectDirs` has no Android backend, so without the
+/// seam this would always fail there.
 pub fn data_dir() -> Result<PathBuf, SuramakError> {
+    #[cfg(target_os = "android")]
+    if let Some(dir) = crate::android::data_dir_override() {
+        return Ok(dir);
+    }
     Ok(project_dirs()?.data_dir().to_path_buf())
 }
 

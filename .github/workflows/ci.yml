@@ -233,3 +233,56 @@ jobs:
           name: Suramak.app
           path: dist/Suramak.app
           if-no-files-found: error
+
+  # M13a: the engine stack cross-compiles for Android — arm64-v8a (release, the
+  # shipping ABI) + x86_64 (debug, the emulator ABI) — through the same script
+  # CI and humans run (`scripts/android/build.sh`). The NDK is pinned to r27d
+  # (27.3.13750724), sha256-verified before unpacking and cached keyed on that
+  # revision; cargo-ndk is pinned to 4.1.2. Pins + rationale: docs/android.md.
+  # This job proves compile+link only — runtime behaviour is the M13b gates
+  # (emulator smoke, owner device).
+  android-build:
+    name: android-build (NDK r27d, arm64-v8a + x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies (cmake for whisper.cpp)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+
+      - name: Add Android targets
+        run: rustup target add aarch64-linux-android x86_64-linux-android
+
+      - name: Install cargo-ndk (pinned 4.1.2)
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+
+      - name: Restore the pinned NDK (r27d)
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/android-ndk/android-ndk-r27d
+          key: android-ndk-r27d-27.3.13750724
+
+      - name: Download the pinned NDK (r27d) — sha256 verified
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/android-ndk"
+          curl -fL --retry 3 -o "$RUNNER_TEMP/android-ndk-r27d-linux.zip" \
+            https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          echo "601246087a682d1944e1e16dd85bc6e49560fe8b6d61255be2829178c8ed15d9  $RUNNER_TEMP/android-ndk-r27d-linux.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/android-ndk-r27d-linux.zip" -d "$HOME/android-ndk"
+          rm "$RUNNER_TEMP/android-ndk-r27d-linux.zip"
+
+      # `bash` (not a bare `./scripts/...` path) so the job never depends on the
+      # committed exec bit surviving; the script is +x on disk either way.
+      - name: Cross-build both ABIs (scripts/android/build.sh)
+        run: bash scripts/android/build.sh
