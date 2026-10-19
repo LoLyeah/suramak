@@ -47,7 +47,7 @@ pub fn set_api_key(key: &str) -> Result<(), SuramakError> {
         entry
             .set_password(key)
             .map_err(|e| SuramakError::Keychain(e.to_string()))?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
