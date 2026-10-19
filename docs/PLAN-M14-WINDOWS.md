@@ -366,3 +366,13 @@ The Windows changes are additive and fenced: every new code path sits behind `#[
 ## Suggested first slice to dispatch
 
 **`suramak-core` Windows paths + `cargo check --target x86_64-pc-windows-msvc` CI gate (with `suramak-taps`, the SpeechTranscriber feature, and Sparkle cfg-excluded).** Every later item depends on the workspace compiling on Windows. Landing this gate first turns each later item into a small, independently reviewable change instead of one large port.
+
+---
+
+## Addendum — competitive-research refinements (2026-10-19, owner-directed)
+
+Derived from the verified competitive research; full context in `docs/PLAN-M15-M18.md`.
+
+- Add representative Opus imports and mixed-language export fixtures to smoke and release coverage.
+- Keep future capture/insertion adapters (system loopback, global hotkeys) separable — not in launch scope; loopback stays deferred and hotkeys are M16-class work.
+- Launch scope otherwise unchanged: documented DWM acrylic APIs, named-mutex single instance, Credential Manager, Windows 11-only, smaller default model with opt-in higher quality, pinned CI runner + WARP smoke attempt, installer + portable zip, free-signing attempt with unsigned fallback, no in-app updater, no GPU inference.

@@ -464,3 +464,16 @@ scripts/android/build.sh   # cargo ndk -t arm64-v8a [-t x86_64] -o android/app/s
 ## 10. Suggested first slice to dispatch
 
 **M13a + M13b: `cargo ndk` build of `suramak-core` for arm64/x86_64, plus a minimal JNI bridge that loads the library and returns the core version string to an empty Kotlin activity, with the CI build and emulator launch smoke green.** This proves the toolchain, FFI boundary and CI pipeline end to end before any UI or inference work depends on them.
+
+---
+
+## Addendum — competitive-research refinements (2026-10-19, owner-directed)
+
+Derived from the verified competitive research; full context in `docs/PLAN-M15-M18.md`. These refine the approved slices without adding a second Android UI stack.
+
+- **JNI bridge:** handle shared content URIs through supported descriptor/stream access — temporary grants, unreadable content, cancellation; never assume an ordinary filesystem path.
+- **Import + FGS jobs:** add Ogg/Opus share fixtures and reuse the desktop decode path (M10C native Opus via bundled libopus); jobs stay tied to the foreground-service lifecycle with visible notifications; sharing a file must never request microphone permission.
+- **Mic:** verify recording across screen-off / app-switch / service-stop / device-interruption paths; foreground services reduce — not eliminate — termination risk.
+- **Touch Deck (incl. Quit):** the share-result presentation is a compact Deck surface in egui (progress, cancel, transcript, copy, return); a bottom-sheet-like layout is optional, not a Kotlin UI rewrite. Quit semantics cover active jobs.
+- **Packaging:** exercise share-to-import on a clean signed arm64 APK installed from GitHub.
+- **Claim hygiene:** the research's "under three seconds" is removed as a universal promise — record latency by clip duration, device, model, and cold/warm state. Auto Backup stays ON as decided, with contents disclosed.
