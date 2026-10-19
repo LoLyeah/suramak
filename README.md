@@ -2,7 +2,21 @@
 
 <img src="assets/logo/icons/readme-logo.png" alt="Suramak" width="360">
 
-Local-first transcription app. Fully native, written in Rust. **macOS first; Windows and Linux ports to follow.**
+Local-first transcription app. Fully native, written in Rust — **no webview, no ffmpeg, no telemetry**.
+
+[![CI](https://github.com/LoLyeah/suramak/actions/workflows/ci.yml/badge.svg)](https://github.com/LoLyeah/suramak/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/LoLyeah/suramak)](https://github.com/LoLyeah/suramak/releases/latest)
+
+## Platforms
+
+- ✅ **macOS (Apple Silicon)** — shipping since v0.1.1: `.dmg` + `.zip` on the [releases page](https://github.com/LoLyeah/suramak/releases/latest), Liquid Glass, Sparkle in-app updates.
+- ✅ **Linux (x86_64)** — built and shipped in every release (`.tar.gz`); frosted-material fallback, no fake glass.
+- 🚧 **Windows 11 (x86_64)** — the CLI is proven on CI (static CRT, no VC++ redistributable imports, English + Indonesian transcribes green); the GUI shell is in progress (M14).
+- 🚧 **Android (arm64)** — the engine cross-compiles on the NDK (M13a green, arm64-v8a + x86_64); the shell spike and Go/No-Go gate is M13b.
+
+English + Indonesian are the first-class languages; any Whisper language code works.
+
+## Features
 
 - On-device transcription (whisper.cpp via whisper-rs) — English + Indonesian first.
 - Fast path on Apple Silicon: the Whisper encoder runs on the Neural Engine via the official Core ML encoder package (`--engine coreml`; `auto` picks it when installed).
@@ -31,6 +45,8 @@ Local-first transcription app. Fully native, written in Rust. **macOS first; Win
 - ✅ `suramak-glass` — AppKit materials (macOS) + real DWM backdrop (Windows, compile-checked from Linux) + Linux no-op
 - ✅ in-app updates (M12) — Sparkle 2 behind the default-OFF `updates` feature: boot-time start on the main thread, event callbacks into the app log, Settings "Automatic updates" (ON) + a "Check for Updates…" app-menu item; pinned + sha256-verified framework fetch, embedded + ad-hoc-signed in `dist/Suramak.app`, EdDSA-signed appcast built by the release workflow. The whole update cycle is owner-verify (USER_SMOKE §32); the macOS module is type-checked from Linux against the real crate (the `build/probe-updates` probe)
 - 📋 release handoff — `scripts/mac-smoke.sh` + `docs/USER_SMOKE.md` (run by the owner on the Mac)
+- ✅ **`suramak-android` (M13a)** — the engine as an NDK cdylib: arm64-v8a release + x86_64 debug cross-build green against NDK r27d; `android-build` CI job runs on every push
+- ✅ **Windows (M14a)** — platform seams (`cfg(windows)` paths/secrets/updates), `+crt-static` + MSVC static-runtime CMake shim; the `windows-2022` CI job is fully green: clippy, workspace tests, parakeet compile-check, release CLI, **dumpbin CRT check (no VCRUNTIME/MSVCP)**, doctor, English + Indonesian transcribes
 
 ## Layout
 
@@ -41,6 +57,7 @@ crates/suramak-taps   macOS system-audio taps (CoreAudio 14.2+; per-app mixdown 
 crates/suramak-glass  AppKit glass integration (objc2; incl. the M8.5 floating record-control surface) + DWM backdrop (Windows) + Linux no-op
 crates/suramak-ui     the app window (winit + egui, no webview)
 crates/suramak-playback  in-app playback engine (cpal output + transport state; M8)
+crates/suramak-android   Android engine cdylib (NDK cross-build; M13)
 crates/suramak-cli    headless CLI (also powers CI end-to-end tests)
 ```
 
