@@ -17,6 +17,12 @@
 use std::path::Path;
 
 /// What can go wrong acquiring the instance lock.
+///
+/// Unix-only, like the flock guard itself: on other targets `acquire` returns
+/// a plain [`std::io::Result`] (it cannot fail), so this type would be
+/// unreachable there — and `-D warnings` rightly flags an enum nothing can
+/// construct (`clippy::dead_code`, caught by the first windows CI run).
+#[cfg(unix)]
 #[derive(Debug)]
 pub enum GuardError {
     /// Another live instance holds the lock.
@@ -25,6 +31,7 @@ pub enum GuardError {
     Io(std::io::Error),
 }
 
+#[cfg(unix)]
 impl std::fmt::Display for GuardError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -34,6 +41,7 @@ impl std::fmt::Display for GuardError {
     }
 }
 
+#[cfg(unix)]
 impl std::error::Error for GuardError {}
 
 /// Acquires the exclusive instance lock at `lock_path`.
@@ -70,8 +78,12 @@ pub fn acquire(lock_path: &Path) -> Result<(), GuardError> {
 }
 
 /// Non-unix stub: no guard yet (the Windows port does not exist).
+///
+/// Returns a plain [`std::io::Result`] rather than [`GuardError`]: there is no
+/// error to express here, and carrying the unix-only type would leave variants
+/// unreachable on this target (see [`GuardError`]).
 #[cfg(not(unix))]
-pub fn acquire(_lock_path: &Path) -> Result<(), GuardError> {
+pub fn acquire(_lock_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
