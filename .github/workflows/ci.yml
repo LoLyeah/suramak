@@ -396,6 +396,29 @@ jobs:
       - name: Build release CLI (static CRT)
         run: cargo build --release -p suramak-cli
 
+      # M14b's real proof: this is the only step that compiles the .rc via
+      # rc.exe, embeds the manifest/icon/VERSIONINFO and LINKS the GUI binary
+      # (clippy only checks it). The two assertions then verify the results:
+      # the exe must be a GUI-subsystem binary (windows_subsystem attribute) and
+      # must carry the VERSIONINFO from packaging/windows/suramak.rc.
+      - name: Build release GUI (resources + link) and verify subsystem/version
+        shell: pwsh
+        run: |
+          cargo build --release -p suramak-ui
+          if ($LASTEXITCODE -ne 0) { throw "release GUI build failed" }
+          $exe = ".\target\release\suramak-ui.exe"
+          if (-not (Test-Path $exe)) { throw "suramak-ui.exe was not produced" }
+          $dumpbin = Get-ChildItem -Path "${env:ProgramFiles}\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin.exe not found — cannot verify the GUI binary" }
+          $headers = & $dumpbin.FullName /headers $exe
+          $sub = ($headers | Select-String -Pattern "subsystem" | Select-Object -First 1).Line
+          Write-Host "subsystem line: $sub"
+          if ($sub -notmatch "(Windows GUI)") { throw "expected a Windows GUI subsystem binary (windows_subsystem attribute), got: $sub" }
+          $vi = (Get-Item $exe).VersionInfo
+          Write-Host "FileVersion=$($vi.FileVersion) ProductVersion=$($vi.ProductVersion)"
+          if ([string]::IsNullOrWhiteSpace($vi.FileVersion)) { throw "no VERSIONINFO in suramak-ui.exe — the rc.exe resource step did not embed packaging/windows/suramak.rc" }
+          Write-Host "GUI-OK: windows subsystem + version resource present"
+
       # D4's enforcement: the artifact must import no VC++ runtime DLL.
       - name: CRT check — dumpbin /dependents must show no VCRUNTIME/MSVCP
         shell: pwsh
