@@ -406,8 +406,11 @@ jobs:
         run: |
           cargo build --release -p suramak-ui
           if ($LASTEXITCODE -ne 0) { throw "release GUI build failed" }
-          $exe = ".\target\release\suramak-ui.exe"
-          if (-not (Test-Path $exe)) { throw "suramak-ui.exe was not produced" }
+          # The crate is suramak-ui but its [[bin]] is named `suramak`
+          # (packaging/Info.plist CFBundleExecutable agrees) — the exe is
+          # suramak.exe, not suramak-ui.exe.
+          $exe = ".\target\release\suramak.exe"
+          if (-not (Test-Path $exe)) { throw "suramak.exe was not produced" }
           $dumpbin = Get-ChildItem -Path "${env:ProgramFiles}\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $dumpbin) { throw "dumpbin.exe not found — cannot verify the GUI binary" }
           $headers = & $dumpbin.FullName /headers $exe
