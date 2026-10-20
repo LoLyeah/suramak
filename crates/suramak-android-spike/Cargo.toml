@@ -1,0 +1,36 @@
+[package]
+name = "suramak-android-spike"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "M13b Android shell spike: egui/wgpu inside a GameActivity (Go/No-Go harness)"
+
+[lib]
+# `cdylib` is what Android loads (`libsuramak_android_spike.so`); `rlib` lets the
+# host `cargo test`/`clippy` link the crate and exercise the egui screen's state
+# machine. The Android-only modules are `cfg`-gated below, so the host build
+# never sees `android-activity` (which refuses to compile off-Android).
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+egui.workspace = true
+log = "0.4"
+
+# Only the Android cdylib uses these: the window/surface layer (`app.rs`) and
+# the JNI surface (`platform.rs`). Gating them keeps the host clippy/test build
+# to egui + the state machine.
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6.1", features = ["game-activity"] }
+android_logger = "0.14"
+egui-winit.workspace = true
+egui-wgpu.workspace = true
+# The workspace's winit fork, with the Android GameActivity backend switched on
+# (the desktop crates keep their own feature set — Cargo unions only per target).
+winit = { workspace = true, features = ["android-game-activity"] }
+wgpu = "27"
+pollster.workspace = true
+ndk-context = "0.1"
+# One Rust -> Kotlin call (`postRecreate`). 0.21 is the last release with the
+# plain `call_method(&[JValue])` API; the inbound JNI exports take raw
+# `jni::sys` pointers, so no wrapper types cross the FFI boundary.
+jni = "0.21"

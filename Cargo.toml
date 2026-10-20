@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/suramak-core", "crates/suramak-asr", "crates/suramak-glass", "crates/suramak-taps", "crates/suramak-playback", "crates/suramak-ui", "crates/suramak-cli", "crates/suramak-android"]
+members = ["crates/suramak-core", "crates/suramak-asr", "crates/suramak-glass", "crates/suramak-taps", "crates/suramak-playback", "crates/suramak-ui", "crates/suramak-cli", "crates/suramak-android", "crates/suramak-android-spike"]
 resolver = "2"
 
 [workspace.package]

@@ -486,3 +486,76 @@ jobs:
           name: suramak-gui-windows-x86_64
           path: target/release/suramak.exe
           if-no-files-found: error
+
+  # M13b: the Android shell spike (GameActivity + egui/wgpu). Builds the
+  # installable debug APK for arm64-v8a through the same script a human runs
+  # (`scripts/android/build-apk.sh`) and uploads it. Toolchain: JDK 17, NDK
+  # r27d (same cache key as `android-build`), SDK platform 35 + build-tools
+  # 35.0.0, cargo-ndk 4.1.2, Gradle 8.9 / AGP 8.7.3 / Kotlin 2.0.21 (the
+  # wrapper and versions live in `android/`, see docs/reports/M13b.md).
+  #
+  # CI proves the APK builds, contains lib/arm64-v8a/libsuramak_android_spike.so
+  # and carries the right package/minSdk/launchable activity. The four Go/No-Go
+  # checks run on the owner's phone — no Android device exists on the runner.
+  android-spike:
+    name: android-spike (debug APK, arm64-v8a)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android-spike
+
+      - name: Add the Android target
+        run: rustup target add aarch64-linux-android
+
+      - name: Install cargo-ndk (pinned 4.1.2)
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+
+      - name: Restore the pinned NDK (r27d)
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/android-ndk/android-ndk-r27d
+          key: android-ndk-r27d-27.3.13750724
+
+      - name: Download the pinned NDK (r27d) — sha256 verified
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/android-ndk"
+          curl -fL --retry 3 -o "$RUNNER_TEMP/android-ndk-r27d-linux.zip" \
+            https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          echo "601246087a682d1944e1e16dd85bc6e49560fe8b6d61255be2829178c8ed15d9  $RUNNER_TEMP/android-ndk-r27d-linux.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/android-ndk-r27d-linux.zip" -d "$HOME/android-ndk"
+          rm "$RUNNER_TEMP/android-ndk-r27d-linux.zip"
+
+      - name: Install the SDK packages (platform-tools, android-35, build-tools 35.0.0)
+        run: |
+          set -euo pipefail
+          SDKM="$(command -v sdkmanager || true)"
+          if [ -z "$SDKM" ]; then
+            SDKM="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}/cmdline-tools/latest/bin/sdkmanager"
+          fi
+          test -x "$SDKM"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" --install "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Build the debug APK (scripts/android/build-apk.sh)
+        run: bash scripts/android/build-apk.sh
+
+      - name: Upload app-debug.apk
+        uses: actions/upload-artifact@v4
+        with:
+          name: suramak-android-spike-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error

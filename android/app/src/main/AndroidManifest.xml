@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  M13b spike manifest.
+
+  * configChanges is deliberately narrow: only the hardware-keyboard entries,
+    which the soft IME does not touch. Rotation, font scale, density, dark mode
+    and locale all recreate the Activity — that is the behaviour check (2)
+    needs to observe.
+  * screenOrientation="unspecified": the owner can rotate the phone; the
+    recreation is part of the test.
+  * No permissions: this spike does no I/O.
+
+  The activity extends com.google.androidgamesdk.GameActivity, so the theme must
+  be an AppCompat descendant (GameActivity extends AppCompatActivity).
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:allowBackup="false"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.SuramakSpike">
+
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="keyboard|keyboardHidden|navigation"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="unspecified">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

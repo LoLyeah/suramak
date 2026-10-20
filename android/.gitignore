@@ -1,0 +1,7 @@
+# Gradle / AGP build state. Never committed.
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+captures/
