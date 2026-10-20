@@ -23,7 +23,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
 use std::path::{Path, PathBuf};
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 
 use suramak_core::models;
 use suramak_core::settings::LangMode;
@@ -118,7 +118,40 @@ pub fn default_threads() -> i32 {
 /// `WHISPER : COREML = 1 | OPENVINO = 0 | Metal : EMBED_LIBRARY = 1 | CPU : …`.
 ///
 /// This is the linked library reporting its own build features; `doctor` prints it.
+///
+/// # Thread safety
+///
+/// `whisper_print_system_info()` hands back the buffer of a function-static
+/// `std::string` that it **rebuilds on every call** — and `whisper_init_state()`
+/// calls it internally too. Two threads (e.g. our own read and another test's
+/// context init) therefore interleave writes into that one buffer and a read can
+/// come back torn (observed: `… AVX2CPU : SSE3 = 1 …` — two headers spliced).
+///
+/// The value cannot change during the process lifetime, so read it once, and if
+/// the read is torn retry briefly until a complete line appears. `OnceLock`
+/// additionally serialises concurrent callers of this function.
 pub fn system_info() -> String {
+    static INFO: OnceLock<String> = OnceLock::new();
+    INFO.get_or_init(|| {
+        let mut last = String::new();
+        for _ in 0..100 {
+            let candidate = read_system_info();
+            // A complete line carries exactly one WHISPER section and one CPU
+            // section; a torn read splices a second header into the middle
+            // (observed: `… AVX2CPU : SSE3 = 1 …`).
+            if candidate.contains("WHISPER :") && candidate.matches("CPU :").count() == 1 {
+                return candidate;
+            }
+            last = candidate;
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        last
+    })
+    .clone()
+}
+
+/// One raw read of whisper.cpp's system-info buffer.
+fn read_system_info() -> String {
     // SAFETY: `whisper_print_system_info` returns a pointer to a static string owned by
     // whisper.cpp (valid for the process lifetime); it takes no arguments and never
     // requires an initialised context.

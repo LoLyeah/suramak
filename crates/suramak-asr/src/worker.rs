@@ -355,15 +355,21 @@ mod tests {
         // have started — either way the answer is Cancelled (never an Error).
         token.cancel();
         let mut cancelled = false;
-        for _ in 0..4 {
-            match worker.recv() {
+        // Bounded wait: a blocking `recv()` here turns any missed event into an
+        // infinite test-suite hang (observed once on a 2-core box: 13 minutes
+        // wedged at 3.5% CPU). A test must fail, not hang, so poll with a
+        // deadline — 10 s is orders of magnitude more than this path needs
+        // (the job's paths are nonexistent, so the worker answers immediately).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            match worker.try_recv() {
                 Some(WorkerEvent::Cancelled { job_id }) => {
                     assert_eq!(job_id, 7);
                     cancelled = true;
                     break;
                 }
                 Some(_) => continue,
-                None => break,
+                None => std::thread::sleep(std::time::Duration::from_millis(20)),
             }
         }
         assert!(cancelled, "the queued cancellation must be observed");
