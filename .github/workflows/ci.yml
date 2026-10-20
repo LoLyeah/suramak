@@ -477,3 +477,12 @@ jobs:
             target/release/suramak-cli.exe
             build/dumpbin-dependents.txt
           if-no-files-found: error
+
+      # The GUI binary itself — this is what the owner's first-launch checklist
+      # (docs/reports/M14b.md §6) runs. Built by the step above.
+      - name: Upload suramak.exe (the GUI binary)
+        uses: actions/upload-artifact@v4
+        with:
+          name: suramak-gui-windows-x86_64
+          path: target/release/suramak.exe
+          if-no-files-found: error
