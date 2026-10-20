@@ -414,9 +414,15 @@ jobs:
           $dumpbin = Get-ChildItem -Path "${env:ProgramFiles}\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $dumpbin) { throw "dumpbin.exe not found — cannot verify the GUI binary" }
           $headers = & $dumpbin.FullName /headers $exe
-          $sub = ($headers | Select-String -Pattern "subsystem" | Select-Object -First 1).Line
-          Write-Host "subsystem line: $sub"
-          if ($sub -notmatch "(Windows GUI)") { throw "expected a Windows GUI subsystem binary (windows_subsystem attribute), got: $sub" }
+          # The PE headers carry several lines containing "subsystem" (e.g.
+          # "6.00 subsystem version"); the one that matters is the `Subsystem`
+          # field whose value reads "(Windows GUI)" or "(Windows CUI)".
+          $gui = ($headers | Select-String -Pattern '\(Windows GUI\)').Line
+          $cui = ($headers | Select-String -Pattern '\(Windows CUI\)').Line
+          Write-Host "subsystem evidence: GUI=[$gui] CUI=[$cui]"
+          if (-not $gui -or $cui) {
+            throw "expected a Windows GUI subsystem binary (windows_subsystem attribute), got GUI=[$gui] CUI=[$cui]"
+          }
           $vi = (Get-Item $exe).VersionInfo
           Write-Host "FileVersion=$($vi.FileVersion) ProductVersion=$($vi.ProductVersion)"
           if ([string]::IsNullOrWhiteSpace($vi.FileVersion)) { throw "no VERSIONINFO in suramak-ui.exe — the rc.exe resource step did not embed packaging/windows/suramak.rc" }
