@@ -240,8 +240,18 @@ jobs:
 
       - name: Package dist/Suramak.app (ad-hoc codesign; embeds Sparkle)
         env:
-          SURAMAK_FEATURES: updates
+          # Feature parity with release.yml on purpose: the release ships with
+          # `speech-transcriber`, which links a Swift bridge. Building the CI
+          # bundle WITHOUT it hid a launch-blocking dyld failure in v0.3.0
+          # (@rpath/libswift_Concurrency.dylib). The bundle the smoke launches
+          # must be the bundle that ships.
+          SURAMAK_FEATURES: speech-transcriber,updates
         run: ./scripts/make-app.sh
+
+      # Static, before launch: every @rpath dependency must resolve inside the
+      # bundle or against its LC_RPATHs (the v0.3.0 crash class).
+      - name: Bundle dylib resolution (every @rpath dep must resolve)
+        run: bash scripts/mac-check-dylibs.sh dist/Suramak.app
 
       - name: Smoke test the bundle
         run: SURAMAK_SMOKE_SECS=3 ./dist/Suramak.app/Contents/MacOS/suramak

@@ -43,6 +43,22 @@ def bump_plist(version: str) -> None:
         plistlib.dump(data, fh, sort_keys=False)
 
 
+def bump_windows_rc(version: str) -> None:
+    """The Windows resource's version literals.
+
+    `crates/suramak-ui/build.rs` fails the build when these drift from
+    CARGO_PKG_VERSION, so a bump that skips this file breaks the windows job.
+    """
+    path = ROOT / "packaging" / "windows" / "suramak.rc"
+    text = path.read_text()
+    numeric = version.split("-")[0].replace(".", ",") + ",0"
+    text = re.sub(r"(?m)^FILEVERSION .*$", f"FILEVERSION {numeric}", text)
+    text = re.sub(r"(?m)^PRODUCTVERSION .*$", f"PRODUCTVERSION {numeric}", text)
+    text = re.sub(r'VALUE "FileVersion", "[^"]*"', f'VALUE "FileVersion", "{version}"', text)
+    text = re.sub(r'VALUE "ProductVersion", "[^"]*"', f'VALUE "ProductVersion", "{version}"', text)
+    path.write_text(text)
+
+
 def rotate_changelog(version: str) -> None:
     path = ROOT / "CHANGELOG.md"
     text = path.read_text()
@@ -60,8 +76,9 @@ def main() -> None:
     version = sys.argv[1]
     bump_cargo(version)
     bump_plist(version)
+    bump_windows_rc(version)
     rotate_changelog(version)
-    print(f"bumped to {version}: Cargo.toml, packaging/Info.plist, CHANGELOG.md")
+    print(f"bumped to {version}: Cargo.toml, packaging/Info.plist, packaging/windows/suramak.rc, CHANGELOG.md")
 
 
 if __name__ == "__main__":

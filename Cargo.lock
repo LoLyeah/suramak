@@ -4269,7 +4269,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "suramak-android"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "suramak-asr",
  "suramak-core",
@@ -4277,7 +4277,7 @@ dependencies = [
 
 [[package]]
 name = "suramak-android-spike"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "android-activity",
  "android_logger",
@@ -4294,7 +4294,7 @@ dependencies = [
 
 [[package]]
 name = "suramak-asr"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "cpal",
  "serde",
@@ -4310,7 +4310,7 @@ dependencies = [
 
 [[package]]
 name = "suramak-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -4323,7 +4323,7 @@ dependencies = [
 
 [[package]]
 name = "suramak-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -4348,7 +4348,7 @@ dependencies = [
 
 [[package]]
 name = "suramak-glass"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
@@ -4360,7 +4360,7 @@ dependencies = [
 
 [[package]]
 name = "suramak-playback"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chrono",
  "cpal",
@@ -4371,7 +4371,7 @@ dependencies = [
 
 [[package]]
 name = "suramak-taps"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "core-foundation 0.10.1",
  "libc",
@@ -4382,7 +4382,7 @@ dependencies = [
 
 [[package]]
 name = "suramak-ui"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",

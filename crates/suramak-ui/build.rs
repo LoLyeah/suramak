@@ -40,7 +40,32 @@
 
 fn main() {
     macos_sparkle_rpath();
+    macos_swift_runtime_rpath();
     windows_resources();
+}
+
+/// macOS: resolve the Swift runtime's back-deployed `@rpath/libswift_Concurrency.dylib`.
+///
+/// The `speech-transcriber` feature links a Swift bridge (M10B). Every Swift
+/// dylib on macOS is referenced by absolute path under `/usr/lib/swift` —
+/// **except** the concurrency runtime, which the linker emits as
+/// `@rpath/libswift_Concurrency.dylib`. Without an rpath pointing at the OS
+/// Swift directory, dyld aborts at launch:
+///
+/// ```text
+/// Termination Reason: Namespace DYLD, Code 1, Library missing
+/// Library not loaded: @rpath/libswift_Concurrency.dylib
+/// ```
+///
+/// That is exactly how v0.3.0 shipped (the release builds with
+/// `speech-transcriber`; the CI bundle did not, so no smoke could see it).
+/// Added unconditionally on macOS: a binary that does not reference the dylib
+/// ignores the entry, and a build that does now resolves it.
+fn macos_swift_runtime_rpath() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+        return;
+    }
+    println!("cargo:rustc-link-arg-bins=-Wl,-rpath,/usr/lib/swift");
 }
 
 /// M12: `@executable_path/../Frameworks` on macOS builds with `updates`.

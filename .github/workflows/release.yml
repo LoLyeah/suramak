@@ -36,6 +36,12 @@ jobs:
           SURAMAK_FEATURES: speech-transcriber,updates
         run: ./scripts/make-app.sh
 
+      # Hard gate before packaging: a bundle whose @rpath dependency cannot
+      # resolve aborts at launch (v0.3.0 shipped exactly that — missing
+      # libswift_Concurrency). Never publish a bundle this check rejects.
+      - name: Bundle dylib resolution (every @rpath dep must resolve)
+        run: bash scripts/mac-check-dylibs.sh dist/Suramak.app
+
       - name: Package (zip + plain dmg with an /Applications drag target)
         run: |
           TAG="${GITHUB_REF_NAME}"

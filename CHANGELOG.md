@@ -4,7 +4,10 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-21
+
 ### Fixed
+- **macOS launch crash in v0.3.0 — `@rpath/libswift_Concurrency.dylib` not found** — the app aborted at launch (`Termination Reason: Namespace DYLD, Code 1, Library missing`) on every machine. The release binary links the Swift bridge (`speech-transcriber`, M10B), and the concurrency runtime is the one Swift dylib macOS loads through `@rpath` rather than an absolute path; the bundle's only `LC_RPATH` was `Contents/Frameworks`, which has no such file. Fixed by adding `/usr/lib/swift` to the rpath of both the app and the CLI binaries. Two gates now prevent a repeat: CI packages the bundle with the **same features as the release** (`speech-transcriber,updates` — it previously built `updates` only, so the Swift linkage never entered the smoke), and `scripts/mac-check-dylibs.sh` statically fails the CI job and the release when any `@rpath` dependency cannot resolve.
 - **UI: the macOS cross-thread repaint deadlock is gone** — off-thread (worker/bridge) repaint wakes now go through winit's user-event channel (`EventLoopProxy::send_event`) instead of a synchronous main-thread dispatch made while egui's context lock was held; a CI stack sample caught the cycle on the runner (`take_egui_input → lock_shared_slow` on main vs `request_repaint → dispatch_sync(main)` on the bridge). Also unblocks the macOS CI smoke run.
 
 ## [0.3.0] - 2026-10-16
