@@ -101,16 +101,14 @@ Also noted: the Models manager is intentionally **not** in Settings (Home → Mo
 M3), and there is no system-audio source on Windows until **M16** (Windows loopback +
 per-app capture) — both are documented scope, not bugs.
 
-## 8. Item 5 result (second instance) — guard works; raise unverified
+## 8. Item 5 result (second instance) — **full PASS**
 
 The owner ran a second `suramak.exe` while the first was up: **no second window, no
-second process** ✓ — the D2 guard's mutex path works on real Windows. Expected beyond
-"refuse": the SECOND process signals and **the first window raises to the front**
-(`AllowSetForegroundWindow` + auto-reset event → `UserEvent::Activate` →
-restore/focus). The owner's wording ("it refuses to open") suggests the raise did not
-visibly happen — unconfirmed whether the first window was already foreground at the
-moment of the test. To settle on the next run: make sure another app is focused first,
-then launch the second instance and watch whether Suramak jumps forward.
+second process** ✓ — the D2 guard's mutex path works on real Windows. Confirmed on the
+retry: **the first window jumps forward on the second launch** (focus another app,
+launch `suramak.exe` again → Suramak raises; owner-tested) — the
+`AllowSetForegroundWindow` + auto-reset event → `UserEvent::Activate` →
+restore/focus path works end-to-end. Nothing to fix.
 
 ---
 
