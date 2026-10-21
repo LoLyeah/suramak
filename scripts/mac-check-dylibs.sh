@@ -40,10 +40,21 @@ for bin in "$BIN_DIR"/*; do
           [ -n "$rp" ] || continue
           expanded="${rp//@executable_path/$abs_dir}"
           expanded="${expanded//@loader_path/$abs_dir}"
-          if [ -e "$expanded/$suffix" ]; then
+          case "$expanded" in
+            # macOS ships its Swift runtime in the dyld shared cache, not as
+            # on-disk files: /usr/lib/swift/libswift_Concurrency.dylib does NOT
+            # exist on disk, yet dyld resolves it there (v0.3.1's first release
+            # run proved it — the runner also had no such file, and every
+            # absolute /usr/lib/swift dep resolves at launch on real Macs). So
+            # an rpath at /usr/lib/swift counts as resolved by construction.
+            /usr/lib/swift | /usr/lib/swift/*)
+              resolved="$expanded/$suffix (dyld shared cache)"
+              ;;
+          esac
+          if [ -z "$resolved" ] && [ -e "$expanded/$suffix" ]; then
             resolved="$expanded/$suffix"
-            break
           fi
+          [ -n "$resolved" ] && break
         done <<< "$rpaths"
         if [ -n "$resolved" ]; then
           echo "ok:   $(basename "$bin") -> $dep"
