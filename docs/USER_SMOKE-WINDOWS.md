@@ -94,9 +94,23 @@ mac-tuned-constants/copy gaps the Windows bring-up must absorb:
 | 1 | Settings shows **"System follows the macOS light/dark setting live"** on Windows | theme helper text is not cfg-per-platform | copy seam, M14c |
 | 2 | **The floating Record pill overlaps the "Automatic updates" checkbox** (covers "new versions in the background") | the scroll region/pill constants were tuned on macOS fonts; the pill-covers-no-button invariant (USER_SMOKE §20) needs Windows-space verification | layout pass, M14e |
 | 3 | The **"Appearance" heading is clipped** at the top of the Settings scroll | same mac-tuned vertical rhythm | layout pass, M14e |
-| 4 | **No visible way out of the editor** — no Home/back affordance anywhere in the editor chrome; the owner got stuck in the first transcript | by design the editor is keyboard-first: `Esc` = LeaveEditor (keymap §24) — but there is no visible affordance, and mouse-first users cannot discover it | add a quiet "← Home" control to the editor title line (all platforms), M14e |
+| 4 | **"← Home" was not discoverable in the editor** — the owner got stuck in the first transcript; the link IS present top-left of the editor pane (confirmed in the second pass screenshot) | so: not absent, just unnoticed mouse-first (a quiet top-left text link, no button chrome) | make it a real (still quiet) control so mousing works — M14e; owner already knows Esc works (keymap §24) |
 | 5 | **Progress bar sits at 0% until the job completes** (seen on a 9 s clip; the job view's "← Home" link was present here, refining #4) | not a wiring defect — the callback chain (whisper progress cb → trampoline → UI) is correct and test-pinned; balance: whisper.cpp fires progress once per finished encode window (~30 s of audio), so short files produce only 0→100 | UX polish: interpolate the bar between Progress events (elapsed-time estimate over the audio duration) so short jobs show motion; long jobs already tick — motion polish, M14e |
 
 Also noted: the Models manager is intentionally **not** in Settings (Home → Models, since
 M3), and there is no system-audio source on Windows until **M16** (Windows loopback +
 per-app capture) — both are documented scope, not bugs.
+
+---
+
+## 7. First-run verdict (2026-10-21 evening) — **PASS**
+
+The owner's run on the Windows PC, build `suramak-gui` @ `b46a0ff` (`39593916027`):
+
+- **Checklist items 1–8 pass**: no console flash · icon in title bar + taskbar · version properties filled · resize/snap · **multi-monitor + DPI-different displays: fine** (owner-tested) · single instance untested at that moment (item 5) · EN clip (Tiny, `en`): **correct transcription** matching the CI fixture ("The quick brown fox…") · ID clip (Tiny, `id`): **correct transcription**, 3 timed segments · mic recording: done, library row with correct metadata · models downloaded via Home → Models (the manager works; it is **not** a Settings section by design) · "Show in Explorer" present.
+- **Engine/kubernetes honesty at the edges**: `engine: CPU` (no GPU path by scope — Vulkan follows), **Polish dimmed** with the exact reason + the M8 no-console caveat — the §24/§31 degradation copy renders correctly on Windows.
+- **Real waveform** verified on Windows (cover §23's invariant): envelope matches speech, gap bands, click-to-seek, readout ticks.
+- **Logged findings**: §6 items 1–5 above (2 layout/copy bugs + pill-overlap; polish + progress-bar interpolation + Home discoverability assigned to M14c/M14e).
+- **Deliberately untested**: polish end-to-end (Credential Manager is M14d), notifications/taskbar progress (M14f), installer/updater (M14g).
+
+This closes the first real-hardware Windows pass — the M14a/M14b lane is verified beyond CI's reach.
