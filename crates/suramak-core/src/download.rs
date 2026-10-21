@@ -63,8 +63,14 @@ pub fn download_with_progress(
         if status.as_u16() == 416 {
             let _ = std::fs::remove_file(&part_path);
             warn!(
-                "the server refused the resume range (HTTP 416) — removed the stale partial download; the next attempt starts from scratch"
+                "the server refused the resume range (HTTP 416) — removed the stale partial download; returning the error so the next attempt starts from scratch"
             );
+            // RETURN — audit pass 2 (SUR2-NEW-01): without this, execution fell
+            // through to opening .part and streaming the 416 error body (an HTML
+            // page) into it, failing only later at the sha256 check with a
+            // misleading message. The removal already happened above, so a fresh
+            // start is guaranteed; this return just reports the real cause.
+            return Err(SuramakError::Http(resp.error_for_status().unwrap_err()));
         } else if !status.is_success() {
             return Err(SuramakError::Http(resp.error_for_status().unwrap_err()));
         } else {
@@ -486,7 +492,13 @@ mod tests {
             "HTTP/1.1 416 Requested Range Not Satisfiable",
             b"",
         ));
-        assert!(download(&url, &dest, &sha256_hex(FULL)).is_err());
+        let err = download(&url, &dest, &sha256_hex(FULL)).unwrap_err();
+        // The error must name the 416 itself — the fall-through defect
+        // (SUR2-NEW-01) surfaced later as a *checksum* message instead.
+        assert!(
+            format!("{err}").contains("416"),
+            "the surfaced error should name the refused range, got: {err}"
+        );
         assert!(
             !part_path(&dest).exists(),
             "a 416 must not leave the stale .part in place: every later attempt would fail again"

@@ -96,7 +96,11 @@ impl Interleaved for [i16] {
     }
 
     fn sample(&self, index: usize) -> f32 {
-        self[index] as f32 / i16::MAX as f32
+        // Symmetric normalization, matching the `[u16]` path and the audit
+        // recommendation (SUR2-NEW-02): dividing by `i16::MAX` instead maps
+        // `i16::MIN` to −1.00003 — outside the normalized range. /32768.0
+        // already lands inside [−1.0, +0.99997]; the clamp documents intent.
+        (self[index] as f32 / 32768.0).clamp(-1.0, 1.0)
     }
 }
 
@@ -689,9 +693,10 @@ mod tests {
         assert_eq!(ring_capacity(0), 1);
     }
 
-    /// The device-format conversions the old callback did inline (`i16`/`u16`
-    /// → `f32`) are the ones `Interleaved` performs — same constants, same
-    /// arithmetic.
+    /// The device-format conversions (`i16`/`u16` → `f32`) are the ones
+    /// `Interleaved` performs — same constants, same arithmetic. `i16` uses
+    /// symmetric /32768.0 normalization (SUR2-NEW-02): `i16::MIN` must land at
+    /// exactly −1.0, never beyond.
     #[test]
     fn i16_and_u16_blocks_convert_like_the_old_callback() {
         let signed: Vec<i16> = (0..300)
@@ -699,11 +704,21 @@ mod tests {
             .collect();
         let legacy_signed: Vec<f32> = signed
             .iter()
-            .map(|sample| *sample as f32 / i16::MAX as f32)
+            .map(|sample| (*sample as f32 / 32768.0).clamp(-1.0, 1.0))
             .collect();
         let frames: Vec<f32> = MonoFrames::new(&signed[..], 1).collect();
         assert_eq!(frames, legacy_signed);
-
+        // Range check: every converted sample stays inside [−1.0, 1.0],
+        // including the extremes.
+        for sample in signed
+            .iter()
+            .map(|s| (*s as f32 / 32768.0).clamp(-1.0, 1.0))
+        {
+            assert!(
+                (-1.0..=1.0).contains(&sample),
+                "i16 conversion must normalize into [−1.0, 1.0], got {sample}"
+            );
+        }
         let unsigned: Vec<u16> = (0..300u16).map(|index| index.wrapping_mul(619)).collect();
         let legacy_unsigned: Vec<f32> = unsigned
             .iter()
