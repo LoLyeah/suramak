@@ -83,3 +83,18 @@ saw, and (if the app is still running) Task Manager → `suramak.exe` → right-
 *Create dump file* is **not** needed yet — a screenshot and the steps are enough at this
 stage. Anything that looks like a crash: check `Event Viewer → Windows Logs → Application`
 for an `Application Error` entry naming `suramak.exe` and paste its faulting module.
+
+## 6. Findings from the owner's first run (2026-10-21) — to fix, in order
+
+From the first screenshots of the shell on the owner's PC. None block testing; all are
+mac-tuned-constants/copy gaps the Windows bring-up must absorb:
+
+| # | Symptom | Cause (hypothesis) | Fix slice |
+|---|---|---|---|
+| 1 | Settings shows **"System follows the macOS light/dark setting live"** on Windows | theme helper text is not cfg-per-platform | copy seam, M14c |
+| 2 | **The floating Record pill overlaps the "Automatic updates" checkbox** (covers "new versions in the background") | the scroll region/pill constants were tuned on macOS fonts; the pill-covers-no-button invariant (USER_SMOKE §20) needs Windows-space verification | layout pass, M14e |
+| 3 | The **"Appearance" heading is clipped** at the top of the Settings scroll | same mac-tuned vertical rhythm | layout pass, M14e |
+
+Also noted: the Models manager is intentionally **not** in Settings (Home → Models, since
+M3), and there is no system-audio source on Windows until **M16** (Windows loopback +
+per-app capture) — both are documented scope, not bugs.
