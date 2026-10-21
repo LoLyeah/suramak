@@ -12,7 +12,7 @@ jobs:
     name: macOS app bundle
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -61,14 +61,14 @@ jobs:
           SPARKLE_ED_KEY: ${{ secrets.SPARKLE_ED_KEY }}
         run: ./scripts/make-appcast.sh "${GITHUB_REF_NAME}" "Suramak-${GITHUB_REF_NAME}-macos-arm64.zip"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos-app
           path: |
             Suramak-*.zip
             Suramak-*.dmg
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: appcast
           # M12: empty when the SPARKLE_ED_KEY secret is absent (the loud skip
@@ -82,7 +82,7 @@ jobs:
     name: Linux app (tar.gz)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: System dependencies (cmake for whisper.cpp; libasound2-dev kept for the future Linux capture feature)
         run: |
@@ -115,7 +115,7 @@ jobs:
             > "pkg/${DIR}/suramak.desktop"
           tar -czf "${DIR}.tar.gz" -C pkg "${DIR}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-app
           path: suramak-*-linux-x86_64.tar.gz
@@ -127,7 +127,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Extract release notes from CHANGELOG
         run: |
@@ -143,11 +143,11 @@ jobs:
             echo "Owner checklist for this machine: docs/USER_SMOKE.md"
           } >> RELEASE-NOTES.md
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           # M12: appcast.xml (the Sparkle feed, EdDSA-signed) + any delta
           # updates ride along with the app archives; both come from the

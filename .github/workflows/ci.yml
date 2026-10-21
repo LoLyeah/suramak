@@ -40,7 +40,7 @@ jobs:
       # cache below.
       GGML_NATIVE: "OFF"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install system dependencies (cmake for whisper.cpp; libasound2 for the capture feature; xvfb + software GL/Vulkan + libxkbcommon-x11 for the UI smoke)
         run: |
@@ -117,7 +117,7 @@ jobs:
         run: cargo build --release -p suramak-cli
 
       - name: Restore tiny model cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           # `directories` lowercases the app name on Linux → ~/.local/share/suramak
           path: ~/.local/share/suramak/models
@@ -185,7 +185,7 @@ jobs:
       # same in-process whisper-session constraint as the linux job
       RUST_TEST_THREADS: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -200,7 +200,7 @@ jobs:
         run: cargo build -p suramak-asr --features speech-transcriber
 
       - name: Restore tiny model cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           # macOS ProjectDirs project path is the reverse-DNS bundle id
           path: ~/Library/Application Support/dev.suramak.Suramak/models
@@ -281,7 +281,7 @@ jobs:
           ./target/release/suramak-cli library list | grep -q "en.wav" && echo LIBRARY-OK
 
       - name: Upload Suramak.app
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: Suramak.app
           path: dist/Suramak.app
@@ -299,7 +299,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install system dependencies (cmake for whisper.cpp)
         run: |
@@ -319,7 +319,7 @@ jobs:
 
       - name: Restore the pinned NDK (r27d)
         id: ndk-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/android-ndk/android-ndk-r27d
           key: android-ndk-r27d-27.3.13750724
@@ -376,7 +376,7 @@ jobs:
       GGML_NATIVE: "OFF"
       GGML_AVX2: "ON"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -457,7 +457,7 @@ jobs:
         run: .\target\release\suramak-cli.exe doctor
 
       - name: Restore tiny model cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           # M14b moved the Windows data dir to %LOCALAPPDATA%\Suramak (the app's
           # paths::platform_data_dir); models live directly under it.
@@ -486,7 +486,7 @@ jobs:
           Write-Host "id segments: $(@($d.segments).Count)"
 
       - name: Upload suramak-cli.exe (+ CRT evidence)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: suramak-cli-windows-x86_64
           path: |
@@ -497,7 +497,7 @@ jobs:
       # The GUI binary itself — this is what the owner's first-launch checklist
       # (docs/reports/M14b.md §6) runs. Built by the step above.
       - name: Upload suramak.exe (the GUI binary)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: suramak-gui-windows-x86_64
           path: target/release/suramak.exe
@@ -518,10 +518,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
@@ -539,7 +539,7 @@ jobs:
 
       - name: Restore the pinned NDK (r27d)
         id: ndk-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/android-ndk/android-ndk-r27d
           key: android-ndk-r27d-27.3.13750724
@@ -570,7 +570,7 @@ jobs:
         run: bash scripts/android/build-apk.sh
 
       - name: Upload app-debug.apk
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: suramak-android-spike-debug
           path: android/app/build/outputs/apk/debug/app-debug.apk
