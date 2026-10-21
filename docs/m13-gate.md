@@ -141,3 +141,29 @@ If a check fails:
   frame pacing are load-bearing for every later slice.
 - **Check 4** → fix the shim first (it is small); do not start the Deck work on
   guessed insets.
+
+---
+
+## 8. Owner device result (2026-10-21) — **NO-GO (escalate)**
+
+The owner ran the spike on a real device the day the APK shipped:
+
+- **Check 3 (Motion / 60 fps): GO** — the one working check. wgpu rendering and
+  frame pacing on real hardware are proven.
+- **Checks 1 (IME text), 2 (Lifecycle), 4 (Insets/back): broken "so much that
+  the application refused to open before force stopped"** — the app wedged into
+  a state where it would not relaunch until a force-stop.
+
+Per the table above this is the **stop-and-escalate** branch: check 2 (surface
+teardown/recreate) is load-bearing for every later slice. Interpretation
+pending the failure details, but the pattern is consistent with the audit-known
+limitation: the only check that avoids the Kotlin↔Rust bridge and lifecycle
+transitions is the one that passed — rendering is fine, the platform glue is
+what broke. Note the spike's JNI text bridge was always a probe (whole-buffer
+replace), not the real IME bridge M13c was to own.
+
+**Decision pending** the failure details (crash timing, relaunch symptom,
+device/Android version, logcat if available): either (a) a spike v2 with
+on-screen diagnostics + the real bridge design, or (b) pulling the text-field
+fallback (option C) trigger now. Rendering at 60 fps surviving the gate means
+option A is not dead — the bridge and lifecycle handling are what failed.
