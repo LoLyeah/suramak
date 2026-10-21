@@ -7,6 +7,12 @@ use crate::SuramakError;
 pub const TARGET_RATE: u32 = 16_000;
 
 /// Resamples and mono-mixes `buf` to 16 kHz mono f32.
+///
+/// The returned length is the **exact** duration of the input at 16 kHz
+/// (`round(len * 16000 / rate)`, SUR-LOW-04): rubato pads the final chunk to
+/// `chunk_size` and emits a full output chunk for it, so the raw stream carries up
+/// to a chunk of artificial silence at the tail — audible as a gap at the end of a
+/// transcript's audio and pure noise for whisper.
 pub fn to_16khz_mono(buf: &AudioBuffer) -> Result<Vec<f32>, SuramakError> {
     let mono = mixdown_mono(&buf.samples, buf.channels as usize);
 
@@ -17,7 +23,7 @@ pub fn to_16khz_mono(buf: &AudioBuffer) -> Result<Vec<f32>, SuramakError> {
     let chunk_size = 1024;
     let mut resampler =
         FftFixedIn::<f32>::new(buf.rate as usize, TARGET_RATE as usize, chunk_size, 2, 1)
-            .map_err(|e| SuramakError::Polish(format!("resampler init: {e}")))?;
+            .map_err(|e| SuramakError::ResamplerInit(format!("resampler init: {e}")))?;
 
     let mut output: Vec<f32> = Vec::new();
     let mut pos = 0usize;
@@ -33,6 +39,10 @@ pub fn to_16khz_mono(buf: &AudioBuffer) -> Result<Vec<f32>, SuramakError> {
         output.extend_from_slice(&frames[0]);
         pos += chunk_size;
     }
+
+    let expected_len =
+        ((mono.len() as f64 * TARGET_RATE as f64) / buf.rate as f64).round() as usize;
+    output.truncate(expected_len);
 
     Ok(output)
 }
@@ -123,5 +133,62 @@ mod tests {
         assert_eq!(mono.len(), 2);
         assert!((mono[0] - 0.0).abs() < 1e-6);
         assert!((mono[1] - 0.0).abs() < 1e-6);
+    }
+
+    /// SUR-LOW-04: rubato pads the final chunk and emits a whole output chunk for
+    /// it, so the raw stream is longer than the audio. The returned buffer must be
+    /// exactly the input's duration at 16 kHz — no appended silence.
+    #[test]
+    fn the_resampled_length_is_exactly_the_input_duration() {
+        let rate = 44_100u32;
+        let samples = sine_wave(440.0, rate, 0.5);
+        let expected = ((samples.len() as f64 * TARGET_RATE as f64) / rate as f64).round() as usize;
+        assert_eq!(expected, 8_000, "0.5 s at 16 kHz is 8 000 samples");
+
+        let buf = AudioBuffer {
+            rate,
+            channels: 1,
+            samples,
+        };
+        let resampled = to_16khz_mono(&buf).expect("resample");
+        assert_eq!(
+            resampled.len(),
+            expected,
+            "the tail must be cut to the real duration, not rubato's padded chunk"
+        );
+
+        // A 44.1 kHz input whose length is not a multiple of the chunk size never
+        // gains samples: rubato's FFT latency can leave a short clip a little
+        // under its ideal duration (pre-existing), but the fix guarantees it is
+        // never *longer* — the appended-silence direction.
+        let odd = sine_wave(440.0, rate, 0.1234);
+        let ideal = ((odd.len() as f64 * TARGET_RATE as f64) / rate as f64).round() as usize;
+        let buf = AudioBuffer {
+            rate,
+            channels: 1,
+            samples: odd,
+        };
+        let resampled = to_16khz_mono(&buf).expect("resample");
+        assert!(
+            resampled.len() <= ideal,
+            "resampled {} samples for an ideal {ideal}: the padded tail must be cut",
+            resampled.len()
+        );
+        assert!(!resampled.is_empty());
+    }
+
+    /// SUR-LOW-01: an impossible rate is a *resampler* error, not a polish one.
+    #[test]
+    fn an_impossible_rate_is_reported_as_a_resampler_error() {
+        let buf = AudioBuffer {
+            rate: 0,
+            channels: 1,
+            samples: vec![0.0; 128],
+        };
+        let err = to_16khz_mono(&buf).expect_err("0 Hz cannot be resampled");
+        assert!(
+            matches!(err, SuramakError::ResamplerInit(_)),
+            "unexpected error: {err}"
+        );
     }
 }

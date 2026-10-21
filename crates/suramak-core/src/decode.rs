@@ -231,6 +231,16 @@ fn decode_stream(
     })
 }
 
+/// Maps a signed integer PCM sample onto `[-1.0, 1.0]`.
+///
+/// `full_scale` is the magnitude of the format's **negative** extreme (128,
+/// 32_768, 2^23, 2^31), not `MAX` (SUR-LOW-05): dividing by `MAX` maps `MIN` to
+/// −1.00003…, outside the normalized interval the rest of the pipeline assumes.
+/// The clamp makes that invariant explicit even if a sample overshoots.
+fn normalize_pcm(sample: f32, full_scale: f32) -> f32 {
+    (sample / full_scale).clamp(-1.0, 1.0)
+}
+
 /// Appends interleaved f32 samples from any `AudioBufferRef` variant.
 fn append_samples(out: &mut Vec<f32>, buf: AudioBufferRef<'_>) {
     match buf {
@@ -257,7 +267,7 @@ fn append_samples(out: &mut Vec<f32>, buf: AudioBufferRef<'_>) {
             let n_ch = b.spec().channels.count();
             for i in 0..n_frames {
                 for ch in 0..n_ch {
-                    out.push(b.chan(ch)[i] as f32 / i8::MAX as f32);
+                    out.push(normalize_pcm(b.chan(ch)[i] as f32, 128.0));
                 }
             }
         }
@@ -275,7 +285,7 @@ fn append_samples(out: &mut Vec<f32>, buf: AudioBufferRef<'_>) {
             let n_ch = b.spec().channels.count();
             for i in 0..n_frames {
                 for ch in 0..n_ch {
-                    out.push(b.chan(ch)[i] as f32 / i16::MAX as f32);
+                    out.push(normalize_pcm(b.chan(ch)[i] as f32, 32_768.0));
                 }
             }
         }
@@ -293,7 +303,7 @@ fn append_samples(out: &mut Vec<f32>, buf: AudioBufferRef<'_>) {
             let n_ch = b.spec().channels.count();
             for i in 0..n_frames {
                 for ch in 0..n_ch {
-                    out.push(b.chan(ch)[i].0 as f32 / 8_388_607.0);
+                    out.push(normalize_pcm(b.chan(ch)[i].0 as f32, 8_388_608.0));
                 }
             }
         }
@@ -311,7 +321,7 @@ fn append_samples(out: &mut Vec<f32>, buf: AudioBufferRef<'_>) {
             let n_ch = b.spec().channels.count();
             for i in 0..n_frames {
                 for ch in 0..n_ch {
-                    out.push(b.chan(ch)[i] as f32 / i32::MAX as f32);
+                    out.push(normalize_pcm(b.chan(ch)[i] as f32, 2_147_483_648.0));
                 }
             }
         }
@@ -384,4 +394,29 @@ pub fn write_wav_i16(
         .finalize()
         .map_err(|e| SuramakError::Io(std::io::Error::other(e.to_string())))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SUR-LOW-05: every signed integer width must map `MIN` to exactly −1.0 and
+    /// `MAX` to just under +1.0 — the asymmetry of `/MAX` pushed the negative
+    /// peak past the normalized range (and into whisper's input).
+    #[test]
+    fn signed_pcm_normalization_is_symmetric_at_full_scale() {
+        // 8-bit: -128 → -1.0, 127 → 0.9921875
+        assert_eq!(normalize_pcm(i8::MIN as f32, 128.0), -1.0);
+        assert!((normalize_pcm(i8::MAX as f32, 128.0) - 127.0 / 128.0).abs() < 1e-6);
+        // 16-bit: the width the audit cited (-32768 → -1.0000305 before the fix).
+        assert_eq!(normalize_pcm(i16::MIN as f32, 32_768.0), -1.0);
+        assert!((normalize_pcm(i16::MAX as f32, 32_768.0) - 32_767.0 / 32_768.0).abs() < 1e-6);
+        // 24-bit and 32-bit use the same rule (symphonia's i24/i32 sources).
+        assert_eq!(normalize_pcm(-8_388_608.0, 8_388_608.0), -1.0);
+        assert_eq!(normalize_pcm(-2_147_483_648.0, 2_147_483_648.0), -1.0);
+        // Digital silence stays zero, and no value escapes the interval.
+        assert_eq!(normalize_pcm(0.0, 32_768.0), 0.0);
+        assert_eq!(normalize_pcm(40_000.0, 32_768.0), 1.0);
+        assert_eq!(normalize_pcm(-40_000.0, 32_768.0), -1.0);
+    }
 }

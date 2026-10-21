@@ -87,16 +87,32 @@ mod contract {
     /// reads is one). Deliberately dependency-free and pure: the same function
     /// backs the boot-time bundle check on macOS and the packaging tests on
     /// Linux.
+    ///
+    /// Whitespace inside and around the `<key>` tags is tolerated (SUR-LOW-08):
+    /// `<key> CFBundleName </key>` and `<key>\n  SUFeedURL\n</key>` are the same
+    /// key as the compact spelling, which a hand-edited or generator-formatted
+    /// `Info.plist` can produce. The value must still be the next element; a key
+    /// whose value is an array/dict is not ours and returns `None`.
     pub(super) fn plist_string(plist: &str, key: &str) -> Option<String> {
-        let needle = format!("<key>{key}</key>");
-        let after = plist.get(plist.find(&needle)? + needle.len()..)?;
-        let open = after.find('<')?;
-        if !after[open..].starts_with("<string>") {
-            return None; // not a key/string pair (array, dict, …) — not ours
+        let mut rest = plist;
+        while let Some(start) = rest.find("<key") {
+            let after_open = &rest[start + "<key".len()..];
+            // Skip the rest of the opening tag (`>` or attributes/whitespace).
+            let body = &after_open[after_open.find('>')? + 1..];
+            let end = body.find("</key")?;
+            if body[..end].trim() == key {
+                // The value must be the very next element.
+                let after_key = &body[end..];
+                let element = &after_key[after_key.find('>')? + 1..];
+                let element = &element[element.find('<')?..];
+                let text = element.strip_prefix("<string>")?;
+                let stop = text.find("</string>")?;
+                return Some(text[..stop].trim().to_string());
+            }
+            // Not this key: continue after it (another `<key>` may follow).
+            rest = &body[end..];
         }
-        let value_start = open + "<string>".len();
-        let end = after[value_start..].find("</string>")?;
-        Some(after[value_start..value_start + end].trim().to_string())
+        None
     }
 
     /// Whether the plist still carries the shipped placeholder `SUPublicEDKey`
@@ -606,6 +622,35 @@ mod tests {
         assert_eq!(plist_string(array_valued, "SUAllowedChannels"), None);
     }
 
+    /// SUR-LOW-08: a plist whose `<key>` tags carry surrounding whitespace (a
+    /// hand-edited or generator-formatted bundle) must still be read, and the
+    /// first *other* key must not shadow the wanted one.
+    #[test]
+    fn plist_string_tolerates_whitespace_inside_the_key_tags() {
+        let plist = r#"<?xml version="1.0"?>
+<plist version="1.0">
+<dict>
+	<key> CFBundleName </key>
+	<string>Suramak</string>
+	<key>
+		SUFeedURL
+	</key>
+	<string>https://example.test/appcast.xml</string>
+</dict>
+</plist>"#;
+        assert_eq!(
+            plist_string(plist, "CFBundleName").as_deref(),
+            Some("Suramak"),
+            "whitespace inside <key>…</key> must not hide the key"
+        );
+        assert_eq!(
+            plist_string(plist, "SUFeedURL").as_deref(),
+            Some("https://example.test/appcast.xml"),
+            "a multi-line key must still be found"
+        );
+        assert_eq!(plist_string(plist, "SUPublicEDKey"), None);
+    }
+
     // ---- the shipped Info.plist contract ------------------------------------
 
     #[test]
@@ -738,15 +783,31 @@ mod tests {
             script.contains("ditto"),
             "frameworks carry symlinks — the copy must preserve them (ditto)"
         );
+        // SUR-LOW-09: nested code is signed inside-out explicitly, and the
+        // deprecated `--deep` recursion is gone (it does not reliably sign
+        // nested code, and the helper's signature must be sealed before its
+        // enclosing bundle's).
         assert!(
-            script.contains("codesign --force --deep --sign -"),
-            "the existing ad-hoc signing flow (which signs nested code) must stay"
+            !script.contains("codesign --force --deep") && !script.contains("codesign --deep"),
+            "`codesign --deep` is deprecated — sign nested code inside-out instead"
         );
-        // The embed must happen before the signing line, or the signature
+        assert!(
+            script.contains("find \"$APP/Contents/Frameworks\" -depth"),
+            "nested bundles must be signed deepest-first"
+        );
+        assert!(
+            script.contains("codesign --force --sign - \"$nested\""),
+            "each nested bundle must be signed explicitly"
+        );
+        assert!(
+            script.contains("codesign --force --sign - \"$APP\""),
+            "the app bundle itself must still be signed, just without --deep"
+        );
+        // The embed must happen before the signing block, or the signature
         // would not cover the framework.
         let embed = script.find("Contents/Frameworks").expect("embed");
         let sign = script
-            .find("codesign --force --deep --sign -")
+            .find("codesign --force --sign - \"$APP\"")
             .expect("signing");
         assert!(embed < sign, "the framework must be copied before signing");
         // The rpath lives in build.rs (a build-time link argument); the
@@ -760,6 +821,33 @@ mod tests {
             build_rs.contains("rustc-link-arg-bins")
                 && build_rs.contains("@executable_path/../Frameworks"),
             "build.rs must emit the @executable_path/../Frameworks rpath"
+        );
+    }
+
+    /// SUR2-NEW-06: the dependency check must cover the embedded frameworks (not
+    /// just `Contents/MacOS/*`) and must not split `otool -L` paths on spaces.
+    #[test]
+    fn mac_check_dylibs_scans_frameworks_and_keeps_paths_with_spaces_whole() {
+        let script = repo_file("scripts/mac-check-dylibs.sh");
+        assert!(
+            script.contains("\"$APP/Contents/Frameworks\""),
+            "embedded frameworks carry their own @rpath deps — they must be scanned"
+        );
+        assert!(
+            script.contains("*Mach-O*"),
+            "only Mach-O files may be handed to otool (frameworks hold plists too)"
+        );
+        assert!(
+            !script.contains("awk '{print $1}'"),
+            "splitting otool -L on whitespace truncates a path containing spaces"
+        );
+        assert!(
+            script.contains("(compatibility version"),
+            "the dependency parser must strip otool's trailing annotation, not the path"
+        );
+        assert!(
+            script.contains("-print0") && script.contains("read -r -d ''"),
+            "paths must be carried NUL-separated (spaces are legal in a bundle path)"
         );
     }
 

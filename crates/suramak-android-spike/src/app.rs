@@ -586,6 +586,16 @@ impl Gpu {
                 .update_texture(&self.device, &self.queue, *id, image_delta);
         }
 
+        // Release the textures egui retired *before* anything can return early
+        // (SUR2-NEW-07). The free list is one-shot: if a frame bails out on a
+        // surface error first, the ids are never offered again and the renderer's
+        // cache keeps those textures for the life of the surface. Freeing here is
+        // safe — egui only frees textures no live paint job references, and every
+        // paint job still holding an id was just re-uploaded above.
+        for id in &full_output.textures_delta.free {
+            self.renderer.free_texture(id);
+        }
+
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [self.config.width, self.config.height],
             pixels_per_point,
@@ -643,9 +653,5 @@ impl Gpu {
             .submit(user_commands.into_iter().chain(Some(encoder.finish())));
         self.window.pre_present_notify();
         frame.present();
-
-        for id in &full_output.textures_delta.free {
-            self.renderer.free_texture(id);
-        }
     }
 }

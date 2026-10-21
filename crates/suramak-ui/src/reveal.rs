@@ -30,6 +30,24 @@ pub(crate) fn explorer_args(path: &Path) -> Vec<OsString> {
     vec![OsString::from(format!("/select,{}", path.display()))]
 }
 
+/// The `explorer.exe` to spawn: `%SystemRoot%\explorer.exe` when the environment
+/// names a system root, else the bare name.
+///
+/// SUR-LOW-03: an unqualified `explorer.exe` is resolved through `PATH`, so a
+/// planted `explorer.exe` in a user-writable `PATH` entry would run instead of the
+/// shell. Naming the system copy absolutely removes the search entirely; the bare
+/// fallback only exists for an environment with no `SystemRoot` at all (where PATH
+/// lookup is the only option left).
+///
+/// Pure so the rule is host-tested; only the Windows spawn calls it.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn explorer_exe(system_root: Option<&std::ffi::OsStr>) -> std::path::PathBuf {
+    match system_root {
+        Some(root) if !root.is_empty() => Path::new(root).join("explorer.exe"),
+        _ => std::path::PathBuf::from("explorer.exe"),
+    }
+}
+
 /// Opens the containing folder with `path` selected.
 ///
 /// Spawns and returns immediately — `explorer.exe` hands the request to the
@@ -37,7 +55,7 @@ pub(crate) fn explorer_args(path: &Path) -> Vec<OsString> {
 /// opens its default folder instead (the caller creates the folder it reveals).
 #[cfg(windows)]
 pub(crate) fn reveal_in_folder(path: &Path) -> io::Result<()> {
-    std::process::Command::new("explorer.exe")
+    std::process::Command::new(explorer_exe(std::env::var_os("SystemRoot").as_deref()))
         .args(explorer_args(path))
         // `explorer` detaches; without this a console build would wait for it.
         .spawn()
@@ -80,6 +98,25 @@ mod tests {
         assert!(
             !args[0].to_string_lossy().contains('"'),
             "no manual quoting"
+        );
+    }
+
+    /// SUR-LOW-03: the system copy of explorer is named absolutely, so a planted
+    /// `explorer.exe` on `PATH` cannot be the process that runs.
+    #[test]
+    fn the_explorer_executable_is_qualified_with_the_system_root() {
+        let qualified = explorer_exe(Some(std::ffi::OsStr::new(r"C:\Windows")));
+        assert_eq!(qualified, Path::new(r"C:\Windows").join("explorer.exe"));
+        assert!(
+            qualified.to_string_lossy().contains(r"C:\Windows"),
+            "the spawn target must name the system root: {}",
+            qualified.display()
+        );
+        // No usable environment value → the old bare name (PATH lookup) remains.
+        assert_eq!(explorer_exe(None), std::path::PathBuf::from("explorer.exe"));
+        assert_eq!(
+            explorer_exe(Some(std::ffi::OsStr::new(""))),
+            std::path::PathBuf::from("explorer.exe")
         );
     }
 

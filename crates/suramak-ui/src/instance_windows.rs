@@ -42,7 +42,9 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, WAIT_OBJECT_0,
 };
-use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+use windows::Win32::Security::{
+    GetTokenInformation, IsValidSid, TokenUser, PSID, TOKEN_QUERY, TOKEN_USER,
+};
 use windows::Win32::System::Threading::{
     CreateEventW, CreateMutexW, GetCurrentProcess, OpenEventW, OpenProcessToken, SetEvent,
     WaitForSingleObject, EVENT_MODIFY_STATE, INFINITE,
@@ -109,8 +111,19 @@ pub(crate) fn user_sid() -> io::Result<String> {
         // same buffer, which lives until the end of this closure.
         // SAFETY: the API wrote a TOKEN_USER at the start of `buffer`.
         let user: TOKEN_USER = unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast()) };
-        // SAFETY: the SID lives inside `buffer` (still alive here) and is
-        // well-formed — the token API produced it.
+        // SUR-LOW-06: the SID bytes come from the token API, but `read_sid` walks
+        // them as raw pointers. `IsValidSid` is the documented guard — it checks
+        // the revision, the sub-authority count and that the whole SID fits inside
+        // the buffer the API sized — so a malformed/hostile token cannot make this
+        // read out of bounds.
+        // SAFETY: `user.User.Sid` points into `buffer`; the call only reads it.
+        if !unsafe { IsValidSid(PSID(user.User.Sid.0)) }.as_bool() {
+            return Err(io::Error::other(
+                "the process token returned an invalid user SID",
+            ));
+        }
+        // SAFETY: the SID lives inside `buffer` (still alive here) and was just
+        // validated by `IsValidSid`.
         Ok(unsafe { read_sid(user.User.Sid.0.cast()) })
     })();
 
@@ -125,7 +138,10 @@ pub(crate) fn user_sid() -> io::Result<String> {
 ///
 /// # Safety
 ///
-/// `sid` must point at a valid SID of at least `8 + 4 * SubAuthorityCount` bytes.
+/// `sid` must point at a SID that passed `IsValidSid` — the guard [`user_sid`]
+/// applies before calling this — so its revision byte, its sub-authority count
+/// (≤ 255, i.e. at most `8 + 4 * 255` bytes) and every sub-authority lie inside
+/// the buffer that holds it.
 unsafe fn read_sid(sid: *const u8) -> String {
     let revision = *sid;
     let count = usize::from(*sid.add(1));

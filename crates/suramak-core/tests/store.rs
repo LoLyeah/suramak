@@ -110,6 +110,33 @@ fn search_by_segment_text() {
 }
 
 #[test]
+fn search_treats_wildcards_as_literal_text() {
+    // SUR-LOW-02: `%` and `_` used to act as LIKE wildcards, so "100%" matched
+    // every title beginning with "100" (and "_" matched any single character).
+    let store = Store::open_in_memory().unwrap();
+    let literal = make_transcript("100% done");
+    let wildcard_lookalike = make_transcript("100 items done");
+    let underscore = make_transcript("a_b notes");
+    let any_char = make_transcript("axb notes");
+    for t in [&literal, &wildcard_lookalike, &underscore, &any_char] {
+        store.insert_transcript(t).unwrap();
+    }
+
+    let results = store.search("100%").unwrap();
+    assert_eq!(results.len(), 1, "percent must be literal, got {results:?}");
+    assert_eq!(results[0].title, "100% done");
+
+    let results = store.search("a_b").unwrap();
+    assert_eq!(results.len(), 1, "underscore must be literal");
+    assert_eq!(results[0].title, "a_b notes");
+
+    // A backslash is literal too (it is the escape character; it must be doubled).
+    let backslash = make_transcript(r"path\to\file");
+    store.insert_transcript(&backslash).unwrap();
+    assert_eq!(store.search(r"path\to").unwrap().len(), 1);
+}
+
+#[test]
 fn on_disk_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");

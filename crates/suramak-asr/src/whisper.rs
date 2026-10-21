@@ -277,6 +277,25 @@ fn create_state_probed(ctx: &WhisperContext) -> Result<(WhisperState, CoremlProb
     state.map(|state| (state, probe))
 }
 
+/// Serialises filesystem work on Core ML encoder directories, in this process.
+///
+/// [`hidden_encoder_path`]'s sequence counter makes concurrent *hides* disjoint,
+/// but the directory they hide is one shared resource. Without this lock two
+/// threads on the same model file interleave badly (audit pass 2, SUR2-NEW-03):
+/// with the package hidden by thread A, thread B's Core ML state init finds no
+/// encoder and silently degrades to Metal/CPU for the rest of the session; and a
+/// hide started inside that window stashes nothing, so A's restore lands while B
+/// is still inside its critical section.
+///
+/// Holding it across hide → `f()` → restore, and across the Core ML state init
+/// that needs the package present, makes the two operations mutually exclusive.
+/// Poisoning is ignored: the guarded work is `rename` plus an RAII restore, so a
+/// panicked holder leaves nothing for the next one to distrust.
+fn encoder_fs_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Runs `f` with the model's Core ML encoder directory moved out of the way.
 ///
 /// whisper.cpp has no runtime Core ML switch: it uses the encoder package whenever the
@@ -284,6 +303,11 @@ fn create_state_probed(ctx: &WhisperContext) -> Result<(WhisperState, CoremlProb
 /// therefore how `metal`/`cpu` requests (and the Core ML retry) are honoured; the
 /// directory is restored afterwards — also when `f` fails.
 fn with_encoder_hidden<T>(model_path: &Path, f: impl FnOnce() -> T) -> T {
+    // The hide, `f()` and the restore are one critical section (SUR2-NEW-03): a
+    // concurrent hide/state-init on the same model must not observe the gap.
+    // Declared first, so the guard outlives the `StashedEncoder` restore below
+    // (drops run in reverse declaration order).
+    let _lock = encoder_fs_lock();
     let dir = models::encoder_dir_for(model_path);
     recover_stranded_encoder(model_path);
     let hidden = hidden_encoder_path(&dir);
@@ -411,7 +435,16 @@ fn create_state_for_plan(
     let fallback = EngineAvailability::current(model_path, None).best_without_coreml();
 
     if plan.engine == EngineId::CoreML {
-        return match create_state_probed(ctx) {
+        // The package must exist and stay put for the whole state init: a
+        // concurrent `with_encoder_hidden` (live decoder vs. worker) would hide
+        // it mid-load and this thread would degrade to Metal/CPU for the rest of
+        // the session (SUR2-NEW-03). Taken in its own scope, so the retry below
+        // can take it again through `with_encoder_hidden`.
+        let attempt = {
+            let _lock = encoder_fs_lock();
+            create_state_probed(ctx)
+        };
+        return match attempt {
             // `loaded` is whisper.cpp's explicit confirmation; absence of a *failure*
             // report means the encoder was in use by construction (it existed and
             // whisper.cpp only skips Core ML when `whisper_coreml_init` returned null).
@@ -770,6 +803,84 @@ mod tests {
         assert!(
             encoder.join("coremldata.bin").is_file(),
             "the RAII guard must restore the encoder dir during unwinding"
+        );
+        let leftovers: Vec<String> = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with('.'))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover hidden dirs: {leftovers:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn concurrent_hides_of_the_same_encoder_are_mutually_exclusive() {
+        // SUR2-NEW-03: the hide/restore pair is one critical section per model,
+        // so two threads can never be "inside" at once — and a thread that
+        // starts while another holds the encoder must find it hidden for its own
+        // whole closure (never restored underneath it).
+        let root = scratch_dir("hidden-concurrent");
+        let model = root.join("ggml-tiny.bin");
+        fs::write(&model, b"model").unwrap();
+        let encoder = models::encoder_dir_for(&model);
+        fs::create_dir_all(encoder.join("weights")).unwrap();
+        fs::write(encoder.join("coremldata.bin"), b"x").unwrap();
+
+        let inside = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+
+        let first = {
+            let (inside, peak, encoder, model) =
+                (inside.clone(), peak.clone(), encoder.clone(), model.clone());
+            std::thread::spawn(move || {
+                with_encoder_hidden(&model, || {
+                    let now = inside.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                    // Tell the second thread the hide has happened, then stay
+                    // inside long enough that an unlocked second hide would see
+                    // the restore land mid-closure.
+                    tx.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(120));
+                    assert!(
+                        !encoder.exists(),
+                        "the encoder must stay hidden for the whole closure"
+                    );
+                    inside.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                });
+            })
+        };
+
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the first hide must start");
+        let second = {
+            let (inside, peak, encoder, model) =
+                (inside.clone(), peak.clone(), encoder.clone(), model.clone());
+            std::thread::spawn(move || {
+                with_encoder_hidden(&model, || {
+                    let now = inside.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    assert!(
+                        !encoder.exists(),
+                        "a hide queued behind another must stash the encoder itself"
+                    );
+                    inside.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                });
+            })
+        };
+
+        first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "two threads were inside the encoder critical section at once"
+        );
+        assert!(
+            encoder.join("coremldata.bin").is_file(),
+            "the encoder must be back in place after both hides"
         );
         let leftovers: Vec<String> = fs::read_dir(&root)
             .unwrap()

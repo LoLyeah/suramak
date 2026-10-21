@@ -309,14 +309,39 @@ impl Settings {
     }
 
     /// Saves settings to `path` as TOML.
+    ///
+    /// Atomic replace (SUR-MED-05): the text lands in a sibling temp file that is
+    /// then renamed over `path`, so a crash mid-save cannot leave a truncated or
+    /// half-written `settings.toml` — which would fail to parse on the next start
+    /// and silently reset every setting to its default.
+    ///
+    /// `fsync` is deliberately skipped: the gap this closes is a torn *write* at
+    /// process death, not power-loss durability. `rename` is atomic on the same
+    /// filesystem, which is why the temp lives next to `path` rather than in the
+    /// system temp dir; the pid suffix keeps two instances (or a stale temp from
+    /// a killed save) from colliding.
     pub fn save(&self, path: &std::path::Path) -> Result<(), SuramakError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let text = toml::to_string_pretty(self)?;
-        std::fs::write(path, text)?;
+        let tmp = temp_sibling(path);
+        std::fs::write(&tmp, text)?;
+        if let Err(err) = std::fs::rename(&tmp, path) {
+            // Never leave the half-finished sibling behind.
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err.into());
+        }
         Ok(())
     }
+}
+
+/// `<file name>.<pid>.tmp` beside `path` — same directory, so the rename that
+/// replaces the real file stays atomic (a cross-filesystem move is not).
+fn temp_sibling(path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.tmp", std::process::id()));
+    path.with_file_name(name)
 }
 
 #[cfg(test)]
@@ -449,6 +474,45 @@ font_scale = 1.0
         let polish = settings.polish.expect("polish section");
         assert!(!polish.send_audio, "missing key → OFF");
         assert_eq!(polish.model, "llama3");
+    }
+
+    #[test]
+    fn settings_save_replaces_the_file_atomically_and_leaves_no_temp_behind() {
+        // SUR-MED-05: the save must never truncate the real file in place, and a
+        // second save must leave exactly one valid settings.toml (no temp sibling).
+        let dir =
+            std::env::temp_dir().join(format!("suramak-settings-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("settings.toml");
+
+        let mut settings = Settings::default();
+        settings.asr.model_id = "first-pass".to_string();
+        settings.save(&path).expect("first save");
+
+        settings.asr.model_id = "second-pass".to_string();
+        settings.asr.engine = EngineSetting::Cpu;
+        settings
+            .save(&path)
+            .expect("second save over the existing file");
+
+        // The file is complete, parseable TOML with the new values — the old
+        // version would be gone or truncated had the write been in place.
+        let text = std::fs::read_to_string(&path).expect("read back");
+        let back: Settings = toml::from_str(&text).expect("saved settings must parse");
+        assert_eq!(back.asr.model_id, "second-pass");
+        assert_eq!(back.asr.engine, EngineSetting::Cpu);
+
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .expect("list the settings dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["settings.toml".to_string()],
+            "the temp sibling must be renamed away, not left behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

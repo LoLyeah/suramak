@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Suramak — assert every @rpath dependency of a bundle's binary resolves.
+# Suramak — assert every @rpath dependency of a bundle's binaries resolves.
 #
 # Why this exists: v0.3.0 shipped a macOS app that aborted at launch with
 #   Library not loaded: @rpath/libswift_Concurrency.dylib
@@ -8,6 +8,12 @@
 # launched a bundle built *without* that feature, so nothing noticed. This check
 # is static: it fails the build when a dependency cannot resolve, before anyone
 # downloads the artifact.
+#
+# Scope (SUR2-NEW-06): **every Mach-O file in the bundle**, not just
+# `Contents/MacOS/*`. Embedded code under `Contents/Frameworks` — Sparkle's
+# framework, its Autoupdate/Updater.app helpers and the two XPC services — has
+# its own LC_RPATH and its own @rpath dependencies; checking only the app's
+# executables passed a bundle whose framework would fail to load.
 #
 # Usage: scripts/mac-check-dylibs.sh [path/to/Suramak.app]   (default dist/Suramak.app)
 set -euo pipefail
@@ -20,9 +26,35 @@ BIN_DIR="$APP/Contents/MacOS"
 status=0
 checked=0
 
-for bin in "$BIN_DIR"/*; do
-  [ -f "$bin" ] || continue
+# NUL-separated candidates from both roots; `find -print0` + `read -d ''` keeps a
+# path with spaces in one piece.
+bundle_files() {
+  local root
+  for root in "$APP/Contents/MacOS" "$APP/Contents/Frameworks"; do
+    [ -d "$root" ] || continue
+    find "$root" -type f -print0
+  done
+}
+
+# The dependency paths recorded in the load commands, one per line.
+#
+# `otool -L` prints "\t<path> (compatibility version …)" and a path may contain
+# spaces, so strip the trailing annotation from the end of the line instead of
+# splitting each line on whitespace, which truncated such a path and reported a
+# false failure (SUR2-NEW-06).
+dependency_paths() {
+  otool -L "$1" | tail -n +2 | sed -n 's/^[[:space:]]*\(.*\) (compatibility version .*$/\1/p'
+}
+
+while IFS= read -r -d '' bin; do
+  # Only Mach-O files are handed to otool: a framework also holds plists,
+  # headers and .tbd stubs, and otool would fail the run on the first of them.
+  case "$(file -b "$bin" 2>/dev/null || true)" in
+    *Mach-O*) ;;
+    *) continue ;;
+  esac
   checked=$((checked + 1))
+  label="${bin#"$APP"/}"
   abs_dir="$(cd "$(dirname "$bin")" && pwd)"
 
   # LC_RPATH entries (one per line). macOS ships bash 3.2: no mapfile here.
@@ -57,19 +89,19 @@ for bin in "$BIN_DIR"/*; do
           [ -n "$resolved" ] && break
         done <<< "$rpaths"
         if [ -n "$resolved" ]; then
-          echo "ok:   $(basename "$bin") -> $dep"
+          echo "ok:   $label -> $dep"
         else
-          echo "FAIL: $(basename "$bin") -> $dep cannot be resolved" >&2
+          echo "FAIL: $label -> $dep cannot be resolved" >&2
           echo "      LC_RPATH entries: ${rpaths:-<none>}" >&2
           status=1
         fi
         ;;
     esac
-  done < <(otool -L "$bin" | tail -n +2 | awk '{print $1}')
-done
+  done < <(dependency_paths "$bin")
+done < <(bundle_files)
 
 if [ "$checked" -eq 0 ]; then
-  echo "error: no binaries under $BIN_DIR" >&2
+  echo "error: no Mach-O binaries under $APP/Contents" >&2
   exit 1
 fi
 
@@ -78,4 +110,4 @@ if [ "$status" -ne 0 ]; then
   exit 1
 fi
 
-echo "dylibs-ok: every @rpath dependency of $APP resolves"
+echo "dylibs-ok: every @rpath dependency of $checked bundle binaries resolves"

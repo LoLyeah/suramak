@@ -7,10 +7,10 @@
 # Sparkle distribution is fetched through scripts/fetch-sparkle.sh (never a
 # bare download), the build links Sparkle.framework (SPARKLE_FRAMEWORK_PATH,
 # which the crate's build script requires) and the framework is embedded into
-# Contents/Frameworks before the existing ad-hoc signing — `--deep` signs the
-# nested code (the framework, its Autoupdate/Updater.app helpers and the two
-# XPC services). The @executable_path/../Frameworks rpath is a link-time
-# argument (crates/suramak-ui/build.rs), so nothing here patches the binary.
+# Contents/Frameworks before signing — nested code is signed inside-out (see
+# the signing block below; `--deep` is no longer used). The
+# @executable_path/../Frameworks rpath is a link-time argument
+# (crates/suramak-ui/build.rs), so nothing here patches the binary.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -68,10 +68,22 @@ if [[ -n "$SPARKLE_DIR" ]]; then
   ditto "$SPARKLE_DIR/Sparkle.framework" "$APP/Contents/Frameworks/Sparkle.framework"
 fi
 
-# Ad-hoc signature: stable per binary; the user may re-see the mic prompt after a rebuild.
-# M12: `--deep` signs nested code first — including the embedded Sparkle.framework
-# and its helpers/XPC services when the `updates` feature is on.
-codesign --force --deep --sign - "$APP"
+# Ad-hoc signature: stable per binary; the user may re-see the mic prompt after a
+# rebuild.
+#
+# Inside-out, **without** `--deep` (SUR-LOW-09): `--deep` is deprecated and does
+# not reliably sign nested code, so every nested bundle is signed here first —
+# deepest first (`find -depth`), because a helper's signature is sealed into its
+# enclosing bundle. The two XPC services and the Autoupdate/Updater.app helpers
+# live inside Sparkle.framework, so they must be signed before the framework
+# itself, which must be signed before the app that seals it.
+if [[ -d "$APP/Contents/Frameworks" ]]; then
+  while IFS= read -r -d '' nested; do
+    codesign --force --sign - "$nested"
+  done < <(find "$APP/Contents/Frameworks" -depth \
+    \( -name '*.xpc' -o -name '*.app' -o -name '*.dylib' -o -name '*.framework' \) -print0)
+fi
+codesign --force --sign - "$APP"
 codesign --verify --verbose=2 "$APP"
 
 echo "built $APP"

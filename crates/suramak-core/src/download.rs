@@ -278,6 +278,15 @@ fn check_size(path: &Path, expected: u64) -> Result<(), SuramakError> {
     Ok(())
 }
 
+/// Hard ceiling on the total bytes one archive may expand to (SUR-MED-01).
+///
+/// The official whisper.cpp Core ML encoder packages are on the order of 1–2 GB
+/// expanded, so 5 GiB leaves >2× headroom for a legitimate (or re-packed) encoder
+/// archive while capping how much disk a hostile one can fill. Enforced across the
+/// whole extraction, not per entry: a zip bomb is many modest-looking entries
+/// whose *expanded* total is enormous.
+pub const MAX_EXTRACTED_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
 /// Extracts `zip_path` into `dest_dir` (created/replaced).
 ///
 /// The official encoder packages wrap their contents in a single top-level directory;
@@ -286,24 +295,14 @@ fn check_size(path: &Path, expected: u64) -> Result<(), SuramakError> {
 /// skipped. Paths are sanitized — absolute paths and `..` components are rejected, so a
 /// hostile archive cannot escape `dest_dir`.
 ///
-/// Extraction is atomic: files land in a sibling `<dest_dir>.<pid>.tmp` directory which
-/// replaces `dest_dir` only after every entry was written.
+/// Extraction is atomic: files land in a sibling `<dest_dir>.<pid>-<seq>.tmp`
+/// directory which replaces `dest_dir` only after every entry was written, and the
+/// expanded total is capped at [`MAX_EXTRACTED_BYTES`].
 pub fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<(), SuramakError> {
     let file = std::fs::File::open(zip_path)?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| SuramakError::Zip(e.to_string()))?;
 
-    // Top-level directory = first path component of the first entry.
-    let prefix = archive
-        .file_names()
-        .next()
-        .map(|n| n.split('/').next().unwrap_or("").to_string())
-        .unwrap_or_default();
-    if prefix.is_empty() {
-        return Err(SuramakError::Zip(format!(
-            "{}: archive has no entries",
-            zip_path.display()
-        )));
-    }
+    let prefix = archive_prefix(&mut archive)?;
 
     let tmp = temp_sibling(dest_dir);
     if tmp.exists() {
@@ -311,7 +310,7 @@ pub fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<(), SuramakError>
     }
     std::fs::create_dir_all(&tmp)?;
 
-    match extract_entries(&mut archive, &prefix, &tmp) {
+    match extract_entries(&mut archive, &prefix, &tmp, MAX_EXTRACTED_BYTES) {
         Ok((files, skipped)) => {
             debug!("extracted {files} files (skipped {skipped} foreign entries)");
             if dest_dir.exists() {
@@ -328,14 +327,64 @@ pub fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<(), SuramakError>
     }
 }
 
+/// The archive's single top-level directory (the wrapper the extractor strips).
+///
+/// Every *content* entry must share one first path component. Metadata entries do
+/// not count: `__MACOSX/…` resource forks and root-level files (a bare
+/// `.DS_Store` or README, i.e. no `/`) say nothing about the layout. The old
+/// "first entry wins" rule picked `__MACOSX` for an archive that listed its junk
+/// first and then extracted nothing at all (SUR-MED-01).
+///
+/// An archive whose content genuinely spans several roots is rejected instead of
+/// half-extracted: `download_zip`'s destination layout (the package files at the
+/// root of `dest_dir`) cannot represent two top-level directories, so keeping one
+/// of them would silently misroute the install.
+fn archive_prefix<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> Result<String, SuramakError> {
+    let mut roots: Vec<String> = Vec::new();
+    for name in archive.file_names() {
+        if name.starts_with("__MACOSX/") {
+            continue; // macOS resource-fork junk, never package content
+        }
+        let Some((root, _)) = name.split_once('/') else {
+            continue; // a root-level file: not part of a package directory
+        };
+        if root.is_empty() {
+            continue;
+        }
+        if !roots.iter().any(|seen| seen == root) {
+            roots.push(root.to_string());
+        }
+    }
+    match roots.len() {
+        0 => Err(SuramakError::Zip(
+            "archive has no directory entries".to_string(),
+        )),
+        1 => Ok(roots.remove(0)),
+        _ => Err(SuramakError::Zip(format!(
+            "archive spans {} top-level directories ({}); expected one model directory",
+            roots.len(),
+            roots.join(", ")
+        ))),
+    }
+}
+
 /// Writes every entry under `prefix/` into `tmp`, returning `(files_written, entries_skipped)`.
+///
+/// `budget_bytes` caps the **expanded** total across the whole archive
+/// (SUR-MED-01): each entry is read through `Read::take` — the archive's declared
+/// sizes are not trusted — and the extraction fails as soon as one entry would
+/// push the total past the budget.
 fn extract_entries<R: Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     prefix: &str,
     tmp: &Path,
+    budget_bytes: u64,
 ) -> Result<(usize, usize), SuramakError> {
     let mut files = 0usize;
     let mut skipped = 0usize;
+    let mut remaining = budget_bytes;
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
@@ -362,7 +411,16 @@ fn extract_entries<R: Read + std::io::Seek>(
             std::fs::create_dir_all(parent)?;
         }
         let mut sink = std::fs::File::create(&out)?;
-        std::io::copy(&mut entry, &mut sink)?;
+        // `take(remaining + 1)`: one byte past the budget is enough to prove the
+        // entry wants more than the archive may have, without reading the rest.
+        let mut limited = (&mut entry).take(remaining.saturating_add(1));
+        let written = std::io::copy(&mut limited, &mut sink)?;
+        if written > remaining {
+            return Err(SuramakError::Zip(format!(
+                "archive expands past the {budget_bytes}-byte extraction limit (at '{name}')"
+            )));
+        }
+        remaining -= written;
         files += 1;
     }
     if files == 0 {
@@ -392,14 +450,24 @@ fn sanitized_relative(rel: &str) -> Option<PathBuf> {
     }
 }
 
-/// Sibling temp directory used for atomic extraction (`<dest_dir>.<pid>.tmp`).
+/// Sibling temp directory used for atomic extraction
+/// (`<dest_dir>.<pid>-<seq>.tmp`).
+///
+/// Unique per call, not per process (SUR-MED-01): two concurrent extractions into
+/// the same parent would otherwise share `<name>.<pid>.tmp` and each delete the
+/// other's work in progress. The pid keeps different processes apart; the counter
+/// keeps threads of this process apart (the same argument as the encoder-hide
+/// path's sequence).
 fn temp_sibling(dest_dir: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let name = dest_dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("extract");
     let parent = dest_dir.parent().unwrap_or(Path::new("."));
-    parent.join(format!("{name}.{}.tmp", std::process::id()))
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!("{name}.{}-{seq}.tmp", std::process::id()))
 }
 
 #[cfg(test)]
@@ -518,5 +586,150 @@ mod tests {
         let got = std::fs::read(&dest).unwrap();
         assert_eq!(got, FULL, "resume must rebuild the exact original bytes");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- SUR-MED-01: archive extraction limits + prefix detection ------------
+
+    /// An in-memory zip built from `(name, bytes)`; a name ending in `/` is a
+    /// directory entry (no data written).
+    fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write as _;
+        use zip::write::SimpleFileOptions;
+        use zip::{CompressionMethod, ZipWriter};
+        let mut buf = Vec::new();
+        let mut writer = ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        for (name, data) in entries {
+            if name.ends_with('/') {
+                writer.add_directory(*name, options).unwrap();
+            } else {
+                writer.start_file(*name, options).unwrap();
+                writer.write_all(data).unwrap();
+            }
+        }
+        writer.finish().unwrap();
+        buf
+    }
+
+    fn scratch_zip_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("suramak-zip-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The archive we actually extract is an encoder package whose first listed
+    /// entry can be `__MACOSX/` junk. The old "first entry wins" rule picked that
+    /// junk as the prefix and extracted nothing; the common-root rule must find
+    /// the real package.
+    #[test]
+    fn a_macos_junk_first_entry_does_not_become_the_extraction_prefix() {
+        let dir = scratch_zip_dir("prefix-junk");
+        let zip_path = dir.join("pkg.zip");
+        std::fs::write(
+            &zip_path,
+            zip_bytes(&[
+                ("__MACOSX/", b""),
+                ("__MACOSX/pkg/._model.bin", b"junk"),
+                ("pkg/", b""),
+                ("pkg/model.bin", b"weights"),
+            ]),
+        )
+        .unwrap();
+
+        let dest = dir.join("pkg");
+        extract_zip(&zip_path, &dest).expect("the real package must be found");
+        assert_eq!(std::fs::read(dest.join("model.bin")).unwrap(), b"weights");
+        assert!(!dest.join("._model.bin").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two content roots cannot be represented by `download_zip`'s layout, so the
+    /// extraction is refused instead of silently keeping one of them.
+    #[test]
+    fn an_archive_with_two_top_level_directories_is_rejected() {
+        let dir = scratch_zip_dir("prefix-two");
+        let zip_path = dir.join("pkg.zip");
+        std::fs::write(
+            &zip_path,
+            zip_bytes(&[
+                ("pkg-a/", b""),
+                ("pkg-a/a.bin", b"a"),
+                ("pkg-b/b.bin", b"b"),
+            ]),
+        )
+        .unwrap();
+
+        let dest = dir.join("pkg");
+        let err = extract_zip(&zip_path, &dest).expect_err("two roots must not half-extract");
+        let message = format!("{err}");
+        assert!(
+            message.contains("top-level directories"),
+            "unexpected error: {message}"
+        );
+        assert!(!dest.exists(), "nothing may be extracted on rejection");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hostile-shaped archive: 200 directories deep, then one entry that
+    /// expands past the budget. A tiny deflated payload (64 KiB of zeros ≈ 80
+    /// bytes) proves the cap works without a real bomb.
+    #[test]
+    fn deep_nesting_extracts_but_an_oversized_expansion_is_refused() {
+        let dir = scratch_zip_dir("cap");
+        let deep = format!("pkg/{}", (0..200).map(|_| "d/").collect::<String>());
+        let deep_name = format!("{deep}leaf.bin");
+        let zip_path = dir.join("pkg.zip");
+        std::fs::write(
+            &zip_path,
+            zip_bytes(&[
+                ("pkg/", b""),
+                (deep_name.as_str(), b"deep"),
+                ("pkg/big.bin", &[0u8; 65_536]),
+            ]),
+        )
+        .unwrap();
+
+        // Within a 1 MiB budget the deep path extracts fine…
+        let ok_tmp = dir.join("ok");
+        std::fs::create_dir_all(&ok_tmp).unwrap();
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&zip_path).unwrap()).unwrap();
+        let prefix = archive_prefix(&mut archive).unwrap();
+        assert_eq!(prefix, "pkg");
+        let (files, skipped) = extract_entries(&mut archive, &prefix, &ok_tmp, 1024 * 1024)
+            .expect("deep nesting is legal");
+        // The two files land; the wrapper's own `pkg/` entry is the one skip.
+        assert_eq!((files, skipped), (2, 1));
+        assert!(ok_tmp.join(&deep_name["pkg/".len()..]).is_file());
+
+        // …and the same archive is refused under a 32 KiB budget: the 65 536-byte
+        // entry cannot fit, and the extraction stops at the first byte past it.
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&zip_path).unwrap()).unwrap();
+        let capped_tmp = dir.join("capped");
+        std::fs::create_dir_all(&capped_tmp).unwrap();
+        let err = extract_entries(&mut archive, &prefix, &capped_tmp, 32 * 1024)
+            .expect_err("an entry past the budget must fail the extraction");
+        assert!(
+            format!("{err}").contains("extraction limit"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unique temp siblings: two extractions into the same parent must not pick
+    /// the same staging directory (the PID-only name collided across threads).
+    #[test]
+    fn temp_siblings_are_unique_within_one_process() {
+        let dest = std::env::temp_dir().join("suramak-tmp-sibling").join("pkg");
+        let first = temp_sibling(&dest);
+        let second = temp_sibling(&dest);
+        assert_ne!(first, second, "two staging dirs must never collide");
+        assert_eq!(first.parent(), dest.parent());
+        assert_eq!(second.parent(), dest.parent());
+        assert!(first
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("pkg."));
     }
 }

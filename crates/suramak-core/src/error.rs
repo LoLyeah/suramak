@@ -27,6 +27,15 @@ pub enum SuramakError {
     #[error("Rubato error: {0}")]
     Rubato(#[from] rubato::ResampleError),
 
+    /// A resampler could not be constructed for the input's rate/channel shape.
+    ///
+    /// Its own variant rather than a `Polish`/`Rubato` string: this is a property
+    /// of the *audio* (a container claiming an impossible rate), not of an LLM
+    /// backend, so the user-facing message must not read like a polish failure
+    /// (SUR-LOW-01).
+    #[error("Resampler initialization error: {0}")]
+    ResamplerInit(String),
+
     #[error("Checksum mismatch — expected {expected}, got {actual}")]
     ChecksumMismatch { expected: String, actual: String },
 

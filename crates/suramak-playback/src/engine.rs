@@ -492,14 +492,25 @@ pub fn mono_mixdown(samples: &[f32], channels: usize) -> Vec<f32> {
 /// Resamples mono f32 samples from `from` Hz to `to` Hz with rubato's FFT
 /// resampler — the same one `suramak_core::resample` uses for whisper (rubato
 /// pads the final chunk, so the tail carries a little silence).
+///
+/// A zero rate is an error, not a pass-through (SUR-MED-04): returning the input
+/// unchanged claimed success while the caller's stream then ran at the wrong
+/// rate. The output capacity is computed in `u64` (see
+/// [`resample_capacity`]) so a long buffer cannot overflow a 32-bit `usize`.
 pub fn resample_mono(samples: &[f32], from: u32, to: u32) -> Result<Vec<f32>, EngineError> {
-    if from == to || from == 0 || to == 0 {
+    if from == 0 || to == 0 {
+        return Err(EngineError::new(
+            format!("sample rate cannot be zero (from {from} Hz to {to} Hz)"),
+            false,
+        ));
+    }
+    if from == to {
         return Ok(samples.to_vec());
     }
     let chunk = 1_024;
     let mut resampler = FftFixedIn::<f32>::new(from as usize, to as usize, chunk, 2, 1)
         .map_err(|err| EngineError::new(format!("resampler init failed: {err}"), false))?;
-    let mut output = Vec::with_capacity(samples.len() * to as usize / from as usize + chunk);
+    let mut output = Vec::with_capacity(resample_capacity(samples.len(), from, to, chunk));
     let mut pos = 0;
     while pos < samples.len() {
         let end = (pos + chunk).min(samples.len());
@@ -514,6 +525,21 @@ pub fn resample_mono(samples: &[f32], from: u32, to: u32) -> Result<Vec<f32>, En
         pos += chunk;
     }
     Ok(output)
+}
+
+/// Capacity hint for [`resample_mono`]'s output buffer: the frames `len` inputs
+/// expand to, plus one chunk of slack.
+///
+/// The multiply happens in `u64` because `len * to` overflows a 32-bit `usize`
+/// above roughly 15 minutes of 44.1 kHz audio (SUR-MED-04). A result that does
+/// not fit in `usize` falls back to the input length: the capacity is only a
+/// hint, and `Vec` grows correctly either way.
+fn resample_capacity(len: usize, from: u32, to: u32, chunk: usize) -> usize {
+    let frames = (len as u64)
+        .saturating_mul(u64::from(to))
+        .checked_div(u64::from(from.max(1)))
+        .unwrap_or(0);
+    usize::try_from(frames).unwrap_or(len).saturating_add(chunk)
 }
 
 #[cfg(test)]
@@ -586,6 +612,49 @@ mod tests {
             resample_mono(&samples, from, from).expect("same rate"),
             samples
         );
+    }
+
+    #[test]
+    fn a_zero_rate_is_refused_instead_of_pretending_the_audio_was_resampled() {
+        // SUR-MED-04: the old guard folded `from == 0 || to == 0` into the
+        // same-rate pass-through, so invalid audio claimed success.
+        let samples = sine(440.0, 16_000, 0.1);
+        let err = resample_mono(&samples, 0, 16_000).expect_err("0 Hz source is invalid");
+        assert!(
+            err.message.contains("zero"),
+            "unexpected error: {}",
+            err.message
+        );
+        assert!(resample_mono(&samples, 16_000, 0).is_err());
+        assert!(resample_mono(&samples, 0, 0).is_err());
+        // Both rates valid and equal: the honest pass-through stays.
+        assert_eq!(resample_mono(&samples, 16_000, 16_000).unwrap(), samples);
+    }
+
+    #[test]
+    fn resample_capacity_survives_empty_and_integer_extreme_lengths() {
+        // Zero-length input resamples to nothing (no allocation, no panic).
+        assert!(resample_mono(&[], 44_100, 16_000)
+            .expect("empty input is not an error")
+            .is_empty());
+
+        // A long-but-real buffer: 60 M frames at 44.1 kHz → 16 kHz. The naive
+        // `len * to` is 9.6e11, which wraps a 32-bit usize; the u64 form does not.
+        let frames = 60_000_000u64 * 16_000 / 44_100;
+        assert_eq!(
+            resample_capacity(60_000_000, 44_100, 16_000, 1_024),
+            usize::try_from(frames).unwrap() + 1_024
+        );
+
+        // Integer-extreme input: the u64 arithmetic saturates instead of wrapping,
+        // so the two possible outcomes are the exact frame count (+ chunk) where
+        // it fits in `usize`, or the `len`-fallback saturation — never a panic.
+        let extreme = resample_capacity(usize::MAX, 44_100, 192_000, 1_024);
+        let frames = (usize::MAX as u64).saturating_mul(192_000) / 44_100;
+        match usize::try_from(frames) {
+            Ok(fits) => assert_eq!(extreme, fits + 1_024),
+            Err(_) => assert_eq!(extreme, usize::MAX),
+        }
     }
 
     #[test]

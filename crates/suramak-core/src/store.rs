@@ -11,6 +11,17 @@ pub struct Store {
     conn: Connection,
 }
 
+/// What one `PRAGMA wal_checkpoint(PASSIVE)` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Checkpoint {
+    /// Whether a reader held the checkpoint back (true = incomplete).
+    pub busy: bool,
+    /// Frames in the WAL log when the checkpoint started.
+    pub log_frames: i64,
+    /// Frames copied into the database file by this call.
+    pub checkpointed_frames: i64,
+}
+
 impl Store {
     /// Opens (or creates) the database at `path` and runs migrations.
     pub fn open(path: &Path) -> Result<Self, SuramakError> {
@@ -90,7 +101,9 @@ impl Store {
                 audio_path,
             ],
         )?;
-        self.upsert_segments(t.id, &t.segments)?; // same connection → joins the transaction
+        // The row writer only: the caller's `updated_at` is authoritative on
+        // insert, so the public `upsert_segments` wrapper is deliberately bypassed.
+        self.write_segments(t.id, &t.segments)?; // same connection → joins the transaction
         tx.commit()?;
         Ok(())
     }
@@ -101,7 +114,41 @@ impl Store {
     /// deleted, so a re-transcribe or polish that shrinks the transcript leaves
     /// no stale tail behind (stale rows would resurface as garbled text when
     /// the segments are read back in idx order).
+    ///
+    /// Self-contained and atomic (SUR2-NEW-05): called directly by the CLI's
+    /// polish command, it runs the inserts, the stale-tail delete and the
+    /// `updated_at` touch in one savepoint instead of SQLite's per-statement
+    /// autocommit — an interrupted polish leaves the previous segment set intact,
+    /// and a wholesale re-polish is visible as a modified transcript in the
+    /// library. A savepoint (not `BEGIN`) because this also runs inside
+    /// `insert_transcript`'s transaction.
     pub fn upsert_segments(&self, id: Uuid, segments: &[Segment]) -> Result<(), SuramakError> {
+        self.conn.execute_batch("SAVEPOINT upsert_segments")?;
+        let written = (|| -> Result<(), SuramakError> {
+            self.write_segments(id, segments)?;
+            self.conn.execute(
+                "UPDATE transcripts SET updated_at = ?1 WHERE id = ?2",
+                params![Utc::now().to_rfc3339(), id.to_string()],
+            )?;
+            Ok(())
+        })();
+        match written {
+            Ok(()) => {
+                self.conn.execute_batch("RELEASE upsert_segments")?;
+                Ok(())
+            }
+            Err(err) => {
+                // Undo the partial upsert; the release pops the savepoint.
+                let _ = self
+                    .conn
+                    .execute_batch("ROLLBACK TO upsert_segments; RELEASE upsert_segments");
+                Err(err)
+            }
+        }
+    }
+
+    /// The segment rows themselves: upsert every row, then drop the stale tail.
+    fn write_segments(&self, id: Uuid, segments: &[Segment]) -> Result<(), SuramakError> {
         for seg in segments {
             self.conn.execute(
                 "INSERT INTO segments(transcript_id, idx, start_ms, end_ms, text)
@@ -118,6 +165,34 @@ impl Store {
             params![id.to_string(), segments.len() as i64],
         )?;
         Ok(())
+    }
+
+    /// Flushes the write-ahead log back into the database file.
+    ///
+    /// The quit path ends in `shutdown::hard_exit` (`libc::_exit`, a deliberate
+    /// ggml-teardown workaround — see that module), which runs no destructors:
+    /// the connection is never closed and SQLite's own close-time checkpoint
+    /// never happens, so the last committed transactions would sit only in
+    /// `suramak.db-wal` (SUR-MED-02). Committed data is not lost — SQLite
+    /// recovers from the WAL on the next open — but a hard exit immediately
+    /// after a long job otherwise leaves a multi-megabyte WAL that the next
+    /// start has to replay. `PASSIVE` never blocks on readers, which is what a
+    /// best-effort teardown needs.
+    ///
+    /// A no-op success for an in-memory or non-WAL database (both columns read −1).
+    pub fn checkpoint(&self) -> Result<Checkpoint, SuramakError> {
+        // `query_row`, not `execute_batch`: the pragma returns a row, and only
+        // stepping it runs the checkpoint.
+        let outcome = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok(Checkpoint {
+                    busy: row.get::<_, i64>(0)? != 0,
+                    log_frames: row.get(1)?,
+                    checkpointed_frames: row.get(2)?,
+                })
+            })?;
+        Ok(outcome)
     }
 
     /// Updates a single segment's text and touches `updated_at` on the transcript.
@@ -264,14 +339,22 @@ impl Store {
     }
 
     /// Full-text search over transcript titles and segment text.
+    ///
+    /// The query is a **literal** substring, not a pattern (SUR-LOW-02): `%`, `_`
+    /// and `\` are escaped and the statement says `ESCAPE '\'`, so searching for
+    /// "100%" finds that text instead of matching every title starting with "100".
     pub fn search(&self, query: &str) -> Result<Vec<Transcript>, SuramakError> {
-        let pattern = format!("%{}%", query);
+        let escaped = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT t.id, t.title, t.created_at, t.updated_at, t.source_json,
                     t.model, t.language, t.audio_path
              FROM transcripts t
              LEFT JOIN segments s ON s.transcript_id = t.id
-             WHERE t.title LIKE ?1 OR s.text LIKE ?1
+             WHERE t.title LIKE ?1 ESCAPE '\\' OR s.text LIKE ?1 ESCAPE '\\'
              ORDER BY t.created_at DESC",
         )?;
         let rows = stmt.query_map(params![pattern], |row| {
@@ -395,6 +478,120 @@ mod tests {
         let got = store.get_transcript(t.id).unwrap();
         assert_eq!(got.segments.len(), 2);
         assert_eq!(got.segments[1].text, "new second");
+    }
+
+    #[test]
+    fn checkpoint_drains_the_wal_into_the_database_file() {
+        // SUR-MED-02: the quit path's hard exit runs no destructors, so the WAL
+        // is checkpointed explicitly instead of at connection close.
+        let dir = std::env::temp_dir().join(format!("suramak-store-wal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("suramak.db");
+
+        let store = Store::open(&path).expect("store");
+        let t = sample("checkpoint.wav");
+        store.insert_transcript(&t).unwrap();
+        // Committed rows live in the WAL until something folds them back.
+        let wal = dir.join("suramak.db-wal");
+        assert!(
+            std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0) > 0,
+            "a commit must leave WAL frames to checkpoint"
+        );
+
+        let outcome = store.checkpoint().expect("checkpoint");
+        assert!(!outcome.busy, "no reader may hold the checkpoint back");
+        assert!(
+            outcome.log_frames > 0,
+            "the checkpoint must have seen the committed frames"
+        );
+        assert_eq!(
+            outcome.checkpointed_frames, outcome.log_frames,
+            "every WAL frame must be copied into the database file"
+        );
+
+        // A second PASSIVE checkpoint finds the WAL reset to its head and
+        // nothing left that is not already in the file.
+        let again = store.checkpoint().expect("second checkpoint");
+        assert!(!again.busy, "no reader may hold the checkpoint back");
+        assert_eq!(
+            again.checkpointed_frames, again.log_frames,
+            "a repeated checkpoint still copies every frame it reports"
+        );
+
+        // The rows are in the database file itself: a fresh connection reads them.
+        drop(store);
+        let reopened = Store::open(&path).expect("reopen");
+        assert_eq!(reopened.get_transcript(t.id).unwrap().segments.len(), 2);
+
+        // An in-memory / non-WAL database answers the pragma without failing.
+        Store::open_in_memory().unwrap().checkpoint().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_standalone_upsert_touches_updated_at_and_keeps_the_insert_stamp() {
+        // SUR2-NEW-05: `insert_transcript` keeps the caller's `updated_at`, but a
+        // standalone upsert (the CLI polish path) is a modification and must show
+        // as one in the library.
+        let store = Store::open_in_memory().expect("store");
+        let mut t = sample("polish.wav");
+        t.updated_at = "2020-01-01T00:00:00+00:00".parse().expect("timestamp");
+        store.insert_transcript(&t).unwrap();
+        assert_eq!(
+            store.get_transcript(t.id).unwrap().updated_at,
+            t.updated_at,
+            "insert must keep the caller's stamp"
+        );
+
+        t.segments.truncate(1);
+        t.segments[0].text = "polished".to_string();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        store.upsert_segments(t.id, &t.segments).unwrap();
+
+        let got = store.get_transcript(t.id).unwrap();
+        assert_eq!(got.segments.len(), 1);
+        assert_eq!(got.segments[0].text, "polished");
+        assert!(
+            got.updated_at > t.updated_at,
+            "a standalone upsert must touch updated_at (got {})",
+            got.updated_at
+        );
+    }
+
+    #[test]
+    fn a_failed_standalone_upsert_rolls_back_to_the_previous_segments() {
+        // SUR2-NEW-05: the insert loop and the stale-tail delete are one unit of
+        // work, so a failure half-way cannot leave a rewritten first row behind.
+        let store = Store::open_in_memory().expect("store");
+        let t = sample("upsert-rollback.wav");
+        store.insert_transcript(&t).unwrap();
+
+        // Abort the *second* row: the first one has already been written when the
+        // error fires.
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER refuse_idx_one BEFORE INSERT ON segments
+                 WHEN NEW.idx = 1 BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )
+            .unwrap();
+
+        let mut replacement = t.segments.clone();
+        replacement[0].text = "rewritten".to_string();
+        replacement[1].text = "doomed".to_string();
+        let err = store
+            .upsert_segments(t.id, &replacement)
+            .expect_err("the trigger must abort the upsert");
+        assert!(format!("{err}").contains("boom"), "unexpected error: {err}");
+
+        let got = store.get_transcript(t.id).unwrap();
+        assert_eq!(got.segments.len(), 2, "the previous rows must all survive");
+        assert_eq!(
+            got.segments[0].text, "first",
+            "the row written before the failure must be rolled back"
+        );
+        assert_eq!(got.segments[1].text, "second");
     }
 
     #[test]

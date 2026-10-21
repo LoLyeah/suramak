@@ -1180,7 +1180,22 @@ impl Runtime {
         self.playback_command(None, PlaybackCommand::Stop);
 
         // 4. The worker bridge: close the job channel, then wait for the thread.
-        self.bridge.shutdown_and_wait(remaining(deadline))
+        let stopped = self.bridge.shutdown_and_wait(remaining(deadline));
+
+        // 5. The store: checkpoint the WAL, then drop the connection here rather
+        //    than at process death (SUR-MED-02). `shutdown::hard_exit` is
+        //    `libc::_exit`, which runs no destructors — without this, the last
+        //    committed transactions stay only in `suramak.db-wal` and the next
+        //    start has to replay it. Best-effort: a failure must never block the
+        //    quit, and committed data is recoverable either way.
+        if let Some(store) = self.store.take() {
+            if let Err(err) = store.checkpoint() {
+                tracing::warn!("quit: could not checkpoint the transcript store: {err}");
+            }
+            drop(store);
+        }
+
+        stopped
     }
 }
 

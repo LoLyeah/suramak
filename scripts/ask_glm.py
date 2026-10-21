@@ -22,7 +22,6 @@ MODEL = os.environ.get("PLAN_MODEL", "glm-5.3")
 PROMPT = "/home/ubuntu/suramak/docs/plan_prompt.md"
 OUT_MD = "/home/ubuntu/suramak/docs/PLAN-glm.md"
 OUT_RAW = "/home/ubuntu/suramak/docs/PLAN-glm.raw.json"
-PAYLOAD = "/tmp/glm_payload.json"
 
 key = os.environ.get("OPENCODE_GO_API_KEY")
 if not key:
@@ -39,16 +38,20 @@ def call(messages, max_tokens):
         "max_tokens": max_tokens,
         "stream": False,
     }
-    with open(PAYLOAD, "w", encoding="utf-8") as f:
-        json.dump(body, f)
+    # The payload goes to curl on stdin (`--data-binary @-`) instead of through a
+    # file in /tmp (SUR-MED-06): a fixed, predictable path there is a symlink
+    # target on any multi-user machine, and a private tempfile buys nothing when
+    # no file is needed at all.
     cmd = [
         "curl", "-sS", "-m", "1500", "-X", "POST", API,
         "-H", f"Authorization: Bearer {key}",
         "-H", "Content-Type: application/json",
         "-H", f"x-opencode-session: {SESSION}",
-        "--data-binary", f"@{PAYLOAD}",
+        "--data-binary", "@-",
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(
+        cmd, input=json.dumps(body), capture_output=True, text=True
+    )
     if r.returncode != 0:
         sys.exit(f"curl rc={r.returncode}: {r.stderr[:800]}")
     try:

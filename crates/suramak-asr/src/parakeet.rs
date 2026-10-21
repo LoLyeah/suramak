@@ -422,6 +422,11 @@ mod ffi {
         samples: &[f32],
         sample_rate: u32,
     ) -> Result<ParakeetResult, AsrError> {
+        // Validate the length before any FFI call (SUR-MED-03), so an oversized
+        // buffer is an error with nothing to clean up — the FFI's sample count is
+        // an `int32`, and a longer buffer would wrap to a negative length and let
+        // the C++ side walk past the pointer.
+        let sample_count = sample_count_i32(samples.len())?;
         // SAFETY: the recognizer handle is live (owned by `inner`); the stream is
         // created and destroyed within this call; every pointer read below points
         // into the result that is destroyed after it was copied out.
@@ -436,7 +441,7 @@ mod ffi {
                 stream,
                 sample_rate as i32,
                 samples.as_ptr(),
-                samples.len() as i32,
+                sample_count,
             );
             sys::SherpaOnnxDecodeOfflineStream(inner.recognizer, stream);
             let result_ptr = sys::SherpaOnnxGetOfflineStreamResult(stream);
@@ -480,6 +485,22 @@ mod ffi {
     }
 }
 
+/// The `int32` sample count the sherpa-onnx FFI takes.
+///
+/// Split out so the boundary is unit-tested: `samples.len() as i32` used to wrap
+/// silently for a buffer longer than `i32::MAX` samples, handing the C++ side a
+/// negative length (SUR-MED-03).
+// Only the `parakeet` FFI path calls this; the boundary test exercises it in
+// every build, hence the scoped allow rather than a cfg on the function.
+#[cfg_attr(not(feature = "parakeet"), allow(dead_code))]
+fn sample_count_i32(len: usize) -> Result<i32, AsrError> {
+    i32::try_from(len).map_err(|_| {
+        AsrError::Parakeet(format!(
+            "audio buffer of {len} samples exceeds the i32 sample count the recognizer accepts"
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,6 +516,29 @@ mod tests {
             timestamps_s,
         };
         segments_from_result(&result, audio_ms)
+    }
+
+    #[test]
+    fn the_ffi_sample_count_is_bounds_checked_not_wrapped() {
+        // SUR-MED-03: the boundary is exact at i32::MAX and everything above it
+        // is an error — a wrapping cast would go negative (-1 for 2^32-1) and the
+        // C++ decoder would read out of bounds.
+        assert_eq!(sample_count_i32(0).expect("empty buffer"), 0);
+        assert_eq!(sample_count_i32(16_000).expect("one second"), 16_000);
+        assert_eq!(
+            sample_count_i32(i32::MAX as usize).expect("at the limit"),
+            i32::MAX
+        );
+
+        let err = sample_count_i32(i32::MAX as usize + 1)
+            .expect_err("one sample past i32::MAX must be refused");
+        assert!(
+            matches!(err, AsrError::Parakeet(_)),
+            "unexpected error: {err}"
+        );
+
+        // The 32-bit wrap value specifically (2^32 - 1 → -1 as i32).
+        assert!(sample_count_i32(u32::MAX as usize).is_err());
     }
 
     #[test]

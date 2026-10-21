@@ -573,6 +573,15 @@ pub struct LiveDecoder {
     shared: Arc<(Mutex<DecoderShared>, Condvar)>,
     handle: Option<JoinHandle<()>>,
     capacity: usize,
+    /// The token every window inference on the decode thread runs under.
+    ///
+    /// Torn on teardown (SUR2-NEW-04): a 4 s window takes 300–800 ms of
+    /// inference, and the quit path only waits [`crate::shutdown`]-style for a
+    /// short grace — without this the decode thread would be mid-inference when
+    /// `hard_exit` kills the process. whisper.cpp checks the token between
+    /// chunks, so tripping it lets the thread return and drop its context inside
+    /// the grace.
+    cancel: CancelToken,
 }
 
 impl LiveDecoder {
@@ -582,15 +591,25 @@ impl LiveDecoder {
     pub fn spawn(settings: LiveDecodeSettings, max_queued: usize) -> LiveDecoder {
         let shared = Arc::new((Mutex::new(DecoderShared::default()), Condvar::new()));
         let thread_shared = Arc::clone(&shared);
+        let cancel = CancelToken::new();
+        let thread_cancel = cancel.clone();
         let handle = thread::Builder::new()
             .name(LIVE_DECODE_THREAD_NAME.to_string())
-            .spawn(move || run_decoder(thread_shared, settings))
+            .spawn(move || run_decoder(thread_shared, settings, thread_cancel))
             .expect("failed to spawn the suramak-live-decode thread");
         LiveDecoder {
             shared,
             handle: Some(handle),
             capacity: max_queued.max(1),
+            cancel,
         }
+    }
+
+    /// The token the decode thread's window inferences honour.
+    ///
+    /// A clone of the shared flag: cancelling it aborts the in-flight window.
+    pub fn cancel_token(&self) -> CancelToken {
+        self.cancel.clone()
     }
 
     /// Queues a window for decode. Returns the evicted oldest window when the
@@ -659,6 +678,10 @@ impl LiveDecoder {
     /// thread exited within `grace`; on timeout it is left detached exactly
     /// like [`Drop`] leaves it. Idempotent.
     pub fn shutdown_and_wait(&mut self, grace: std::time::Duration) -> bool {
+        // Trip the inference token first (SUR2-NEW-04): a window already inside
+        // `whisper::transcribe` aborts at its next chunk check instead of running
+        // its full 300–800 ms past the grace and into the hard exit.
+        self.cancel.cancel();
         {
             let (lock, cvar) = &*self.shared;
             if let Ok(mut state) = lock.lock() {
@@ -685,6 +708,10 @@ impl LiveDecoder {
 
 impl Drop for LiveDecoder {
     fn drop(&mut self) {
+        // Also the cancel-then-detach path: Drop is what Stop uses, and an
+        // in-flight window must not keep burning the ANE after the session is
+        // over (SUR2-NEW-04).
+        self.cancel.cancel();
         {
             let (lock, cvar) = &*self.shared;
             if let Ok(mut state) = lock.lock() {
@@ -697,7 +724,11 @@ impl Drop for LiveDecoder {
     }
 }
 
-fn run_decoder(shared: Arc<(Mutex<DecoderShared>, Condvar)>, settings: LiveDecodeSettings) {
+fn run_decoder(
+    shared: Arc<(Mutex<DecoderShared>, Condvar)>,
+    settings: LiveDecodeSettings,
+    cancel: CancelToken,
+) {
     let mut cache = ContextCache::new();
     loop {
         let window = {
@@ -716,7 +747,7 @@ fn run_decoder(shared: Arc<(Mutex<DecoderShared>, Condvar)>, settings: LiveDecod
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
             }
         };
-        let result = decode_window(&mut cache, &settings, &window);
+        let result = decode_window(&mut cache, &settings, &window, &cancel);
         let (lock, _) = &*shared;
         let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         state.running = false;
@@ -729,6 +760,7 @@ fn decode_window(
     cache: &mut ContextCache,
     settings: &LiveDecodeSettings,
     window: &LiveWindow,
+    cancel: &CancelToken,
 ) -> LiveResult {
     let run = (|| -> Result<Vec<Segment>, AsrError> {
         let ctx = cache.get_or_load(&settings.model_path, settings.plan.engine.use_gpu())?;
@@ -740,11 +772,10 @@ fn decode_window(
             settings.initial_prompt.as_deref(),
             settings.n_threads,
             &settings.plan,
-            // M9e (P2-2): the live path takes the signature's token but never
-            // sets it — a fresh, uncancelled token per window. The live
-            // machinery is torn down by its existing shutdown path, not by the
-            // job-cancel mechanism (the audio path stays untouched).
-            &CancelToken::new(),
+            // The session's shared token (SUR2-NEW-04): `LiveDecoder` trips it on
+            // teardown, so a window that is mid-inference aborts between chunks
+            // instead of outliving the quit grace.
+            cancel,
             |_| {},
         )?;
         Ok(outcome.segments)
@@ -1122,6 +1153,21 @@ mod tests {
 
     // ---- the decode thread --------------------------------------------------
 
+    /// Settings whose model file does not exist: a submitted window fails fast
+    /// at load, which is all the thread-plumbing tests need.
+    fn missing_model_settings() -> LiveDecodeSettings {
+        LiveDecodeSettings {
+            model_path: PathBuf::from("/nonexistent/suramak/ggml-tiny.bin"),
+            lang: LangMode::Fixed("en".to_string()),
+            initial_prompt: None,
+            plan: EngineDecision {
+                engine: EngineId::Cpu,
+                warning: None,
+            },
+            n_threads: 2,
+        }
+    }
+
     #[test]
     fn the_live_decoder_reports_a_missing_model_through_its_results() {
         let settings = LiveDecodeSettings {
@@ -1167,6 +1213,45 @@ mod tests {
         assert_eq!(decoder.queued_windows(), 0);
         assert_eq!(decoder.dropped_windows(), 0);
         drop(decoder); // signals shutdown; the thread exits on its own
+    }
+
+    /// SUR2-NEW-04: the decode thread's window inferences run under a token the
+    /// teardown actually trips, so a window mid-inference aborts inside the
+    /// quit grace instead of running its full 300–800 ms past it.
+    #[test]
+    fn teardown_trips_the_token_the_live_window_inference_honours() {
+        let decoder = LiveDecoder::spawn(missing_model_settings(), 2);
+        let token = decoder.cancel_token();
+        // The accessor hands out clones of one shared flag, not fresh tokens.
+        let second_handle = decoder.cancel_token();
+        assert!(!token.is_cancelled(), "a live session is not cancelled");
+        assert!(!second_handle.is_cancelled());
+
+        let mut decoder = decoder;
+        assert!(
+            decoder.shutdown_and_wait(std::time::Duration::from_millis(250)),
+            "an idle decode thread must exit within the grace"
+        );
+        assert!(
+            token.is_cancelled(),
+            "shutdown must trip the token the decode path passes to whisper"
+        );
+        assert!(
+            second_handle.is_cancelled(),
+            "every handle shares the one flag"
+        );
+    }
+
+    /// Drop (the Stop path) is a teardown too: it must trip the same token.
+    #[test]
+    fn dropping_the_decoder_also_trips_the_inference_token() {
+        let decoder = LiveDecoder::spawn(missing_model_settings(), 2);
+        let token = decoder.cancel_token();
+        drop(decoder);
+        assert!(
+            token.is_cancelled(),
+            "Drop must cancel the in-flight window"
+        );
     }
 
     /// The quit path's decode-thread teardown (WORKORDER-HOTFIX-QUIT): an idle

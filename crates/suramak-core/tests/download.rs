@@ -266,14 +266,18 @@ fn extract_zip_flattens_top_level_and_skips_junk() {
     // `__MACOSX/` junk is skipped, not written next to the package.
     assert!(!dir.path().join("__MACOSX").exists());
     assert!(!dest.join("._coremldata.bin").exists());
-    // No temp directory is left behind.
-    assert!(!dir
-        .path()
-        .join(format!(
-            "ggml-tiny-encoder.mlmodelc.{}.tmp",
-            std::process::id()
-        ))
-        .exists());
+    // No temp directory is left behind (the name carries a per-call sequence
+    // number since SUR-MED-01 — assert on the shape, not one exact name).
+    let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "staging dirs must be renamed away: {leftovers:?}"
+    );
 }
 
 #[test]
