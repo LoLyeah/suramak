@@ -35,6 +35,7 @@ impl Store {
         self.conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
+             PRAGMA foreign_keys=ON;
              CREATE TABLE IF NOT EXISTS meta (
                  key   TEXT PRIMARY KEY,
                  value TEXT NOT NULL
@@ -62,7 +63,7 @@ impl Store {
         Ok(())
     }
 
-    /// Inserts a new transcript (header + segments).
+    /// Inserts a new transcript (header + segments) atomically.
     pub fn insert_transcript(&self, t: &Transcript) -> Result<(), SuramakError> {
         let source_json = serde_json::to_string(&t.source)?;
         let audio_path = t
@@ -71,7 +72,11 @@ impl Store {
             .and_then(|p| p.to_str())
             .map(|s| s.to_string());
 
-        self.conn.execute(
+        // Header and segments land atomically: a crash mid-insert must not
+        // leave a header row with a partial segment set (autocommit would
+        // commit each statement independently).
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO transcripts(id, title, created_at, updated_at, source_json, model, language, audio_path)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
@@ -85,12 +90,17 @@ impl Store {
                 audio_path,
             ],
         )?;
-
-        self.upsert_segments(t.id, &t.segments)?;
+        self.upsert_segments(t.id, &t.segments)?; // same connection → joins the transaction
+        tx.commit()?;
         Ok(())
     }
 
-    /// Upserts all segments for a transcript.
+    /// Upserts the complete segment set for a transcript, replacing what was there.
+    ///
+    /// Callers must pass the FULL list: rows with `idx >= segments.len()` are
+    /// deleted, so a re-transcribe or polish that shrinks the transcript leaves
+    /// no stale tail behind (stale rows would resurface as garbled text when
+    /// the segments are read back in idx order).
     pub fn upsert_segments(&self, id: Uuid, segments: &[Segment]) -> Result<(), SuramakError> {
         for seg in segments {
             self.conn.execute(
@@ -103,6 +113,10 @@ impl Store {
                 params![id.to_string(), seg.idx, seg.start_ms, seg.end_ms, seg.text],
             )?;
         }
+        self.conn.execute(
+            "DELETE FROM segments WHERE transcript_id = ?1 AND idx >= ?2",
+            params![id.to_string(), segments.len() as i64],
+        )?;
         Ok(())
     }
 
@@ -352,6 +366,54 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("count segments")
+    }
+
+    #[test]
+    fn upserting_fewer_segments_deletes_the_stale_tail() {
+        let store = Store::open_in_memory().expect("store");
+        let mut t = sample("shrink.wav");
+        store.insert_transcript(&t).unwrap();
+        assert_eq!(segment_rows(&store, t.id), 2);
+
+        // A polish pass that merges the two segments into one (same id, fewer rows).
+        t.segments.truncate(1);
+        t.segments[0].text = "merged".to_string();
+        store.upsert_segments(t.id, &t.segments).unwrap();
+
+        let got = store.get_transcript(t.id).unwrap();
+        assert_eq!(got.segments.len(), 1, "the stale idx=1 row must be deleted");
+        assert_eq!(got.segments[0].text, "merged");
+
+        // Growing again works too (no leftover higher-idx conflicts).
+        t.segments.push(Segment {
+            idx: 1,
+            start_ms: 0,
+            end_ms: 500,
+            text: "new second".to_string(),
+        });
+        store.upsert_segments(t.id, &t.segments).unwrap();
+        let got = store.get_transcript(t.id).unwrap();
+        assert_eq!(got.segments.len(), 2);
+        assert_eq!(got.segments[1].text, "new second");
+    }
+
+    #[test]
+    fn foreign_keys_are_enforced_on_this_connection() {
+        // The schema relies on ON DELETE CASCADE; SQLite ignores it unless
+        // `PRAGMA foreign_keys = ON` ran on the connection (init does).
+        let store = Store::open_in_memory().expect("store");
+        let t = sample("cascade.wav");
+        store.insert_transcript(&t).unwrap();
+        assert_eq!(segment_rows(&store, t.id), 2);
+
+        store
+            .conn
+            .execute(
+                "DELETE FROM transcripts WHERE id = ?1",
+                params![t.id.to_string()],
+            )
+            .unwrap();
+        assert_eq!(segment_rows(&store, t.id), 0, "cascade must have fired");
     }
 
     #[test]

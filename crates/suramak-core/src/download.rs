@@ -46,12 +46,36 @@ pub fn download_with_progress(
 
     let mut req = client.get(url);
     if existing_bytes > 0 {
-        debug!("resuming from byte {existing_bytes}");
         req = req.header("Range", format!("bytes={existing_bytes}-"));
     }
 
     let mut resp = req.send()?;
-    if !resp.status().is_success() && resp.status().as_u16() != 206 {
+    let status = resp.status();
+    // A server either honours the Range (206: body starts at `existing_bytes`)
+    // or it doesn't. Both non-206 answers poison the append below: a 200 body
+    // appended to the existing bytes corrupts the file (double data), and a
+    // stale `.part` that is already complete-sized gets HTTP 416 on every
+    // retry, locking the user out of the download forever. So: resume ONLY on a
+    // real 206; on 416 drop the stale part (the next attempt starts clean);
+    // on 200 restart from byte 0.
+    let resuming = existing_bytes > 0 && status.as_u16() == 206;
+    if existing_bytes > 0 && !resuming {
+        if status.as_u16() == 416 {
+            let _ = std::fs::remove_file(&part_path);
+            warn!(
+                "the server refused the resume range (HTTP 416) — removed the stale partial download; the next attempt starts from scratch"
+            );
+        } else if !status.is_success() {
+            return Err(SuramakError::Http(resp.error_for_status().unwrap_err()));
+        } else {
+            // 200: the server ignored the Range header — the body is the full
+            // file, so discard the partial bytes and write from zero.
+            debug!(
+                "the server ignored the Range header (HTTP 200) — restarting the download from byte 0"
+            );
+            on_progress(0);
+        }
+    } else if !status.is_success() && status.as_u16() != 206 {
         return Err(SuramakError::Http(resp.error_for_status().unwrap_err()));
     }
 
@@ -59,11 +83,21 @@ pub fn download_with_progress(
         std::fs::create_dir_all(parent)?;
     }
 
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&part_path)?;
+    let mut file = if resuming {
+        debug!("resuming from byte {existing_bytes}");
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&part_path)?
+    } else {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&part_path)?
+    };
 
+    let base = if resuming { existing_bytes } else { 0 };
     let mut written = 0u64;
     let mut buf = [0u8; 65536];
     loop {
@@ -73,12 +107,18 @@ pub fn download_with_progress(
         }
         file.write_all(&buf[..n])?;
         written += n as u64;
-        on_progress(existing_bytes + written);
+        on_progress(base + written);
     }
     drop(file);
 
-    // Verify checksum over the full file.
-    verify_sha256(&part_path, expected_sha256)?;
+    // Verify checksum over the full file. A mismatch means the bytes on disk
+    // are corrupt (or the server misbehaved): keep nothing — a leftover .part
+    // would either fail verification again or 416 the next attempt.
+    if let Err(err) = verify_sha256(&part_path, expected_sha256) {
+        let _ = std::fs::remove_file(&part_path);
+        warn!("checksum mismatch — removed the partial download; the next attempt starts from scratch");
+        return Err(err);
+    }
 
     std::fs::rename(&part_path, dest)?;
     info!("download complete: {}", dest.display());
@@ -354,4 +394,117 @@ fn temp_sibling(dest_dir: &Path) -> PathBuf {
         .unwrap_or("extract");
     let parent = dest_dir.parent().unwrap_or(Path::new("."));
     parent.join(format!("{name}.{}.tmp", std::process::id()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sha256_hex(data: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// Serves ONE hand-crafted response on an ephemeral port and returns its URL.
+    fn serve_once(response: Vec<u8>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            // Drain the request head; a single GET with headers is well under
+            // one buffer, but read to the terminator to be safe.
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                seen.extend_from_slice(&buf[..n]);
+                if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = std::io::Write::write_all(&mut stream, &response);
+        });
+        format!("http://{addr}/model.bin")
+    }
+
+    fn http_response(status_line: &str, body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "{status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    fn ok_200(body: &[u8]) -> Vec<u8> {
+        http_response("HTTP/1.1 200 OK", body)
+    }
+
+    fn partial_and_dest(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("suramak-dl-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        (dir.join("model.bin"), dir)
+    }
+
+    #[test]
+    fn a_server_that_ignores_the_range_header_restarts_from_zero() {
+        const FULL: &[u8] = b"0123456789";
+        let (dest, dir) = partial_and_dest("restart-200");
+        // Half the file already on disk — appending a full 200 body would corrupt it.
+        std::fs::write(part_path(&dest), &FULL[..5]).unwrap();
+
+        let url = serve_once(ok_200(FULL));
+        download(&url, &dest, &sha256_hex(FULL)).unwrap();
+
+        let got = std::fs::read(&dest).unwrap();
+        assert_eq!(
+            got, FULL,
+            "the file must contain exactly one copy of the body"
+        );
+        assert!(!part_path(&dest).exists(), "the .part must be renamed away");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_complete_part_is_removed_on_416_not_locked_out_forever() {
+        const FULL: &[u8] = b"0123456789";
+        let (dest, dir) = partial_and_dest("stale-416");
+        std::fs::write(part_path(&dest), FULL).unwrap(); // complete-sized → 416
+
+        let url = serve_once(http_response(
+            "HTTP/1.1 416 Requested Range Not Satisfiable",
+            b"",
+        ));
+        assert!(download(&url, &dest, &sha256_hex(FULL)).is_err());
+        assert!(
+            !part_path(&dest).exists(),
+            "a 416 must not leave the stale .part in place: every later attempt would fail again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_real_206_resume_appends_only_the_second_half() {
+        const FULL: &[u8] = b"0123456789";
+        let (dest, dir) = partial_and_dest("resume-206");
+        std::fs::write(part_path(&dest), &FULL[..5]).unwrap();
+
+        let url = serve_once(http_response("HTTP/1.1 206 Partial Content", &FULL[5..]));
+        download(&url, &dest, &sha256_hex(FULL)).unwrap();
+
+        let got = std::fs::read(&dest).unwrap();
+        assert_eq!(got, FULL, "resume must rebuild the exact original bytes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -269,8 +269,12 @@ fn string_property(object: AudioObjectId, selector: u32) -> Result<String, TapEr
             "CoreAudio returned a null string property".to_string(),
         ));
     }
-    // SAFETY: non-null CFStringRef owned by CoreAudio; `wrap_under_get_rule` retains.
-    Ok(unsafe { CFString::wrap_under_get_rule(value) }.to_string())
+    // SAFETY: non-null CFStringRef handed to us by CoreAudio. Property reads of
+    // CFString values follow the **create rule** (the HAL returns a +1 reference
+    // it expects the caller to release) — `wrap_under_get_rule` would retain a
+    // second time and leak one reference per call. The sibling
+    // `optional_string_property` documents the same contract.
+    Ok(unsafe { CFString::wrap_under_create_rule(value) }.to_string())
 }
 
 /// Reads an optional CFString-valued property, `None` when the object does not
