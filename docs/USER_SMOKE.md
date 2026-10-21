@@ -445,3 +445,21 @@ Worth a note even if not fatal:
 - polish: endpoint used, error text if it failed;
 - window chrome/glass: does the window read as the intended glass shell (rounded, translucent), and does it follow your Mac's light/dark (or the Appearance override you set);
 - anything about the app icon.
+
+## Report (2026-10-21, owner pass on v0.3.1 build `b46a0ff`)
+
+**Confirmed working** (owner screenshots, 5 shots):
+
+- **Launches without crashing** (the v0.3.0 dyld abort is gone in v0.3.1).
+- **Liquid glass is real** (NSGlassEffectView): the Home window frosts the live desktop (Telegram) behind it — the M8.5/M9 material ladder on real wallpaper.
+- **Live transcription while recording (M7) verified on the Mac**: provisional text visible in the 24 s recording view while the level meter ran; final pass replaced it correctly ("Hello, why are you here? I am the best human in the world. Okay? Let's go." — `engine: Metal`, 25 s).
+- **Multi-source recording (M6) verified**: Default microphone + System audio (all processes) ticked together; per-source gain sliders present; virtual-device note renders.
+- **Real waveform (§23)** — envelope matches speech on the 25 s take; readout + transport present.
+- **Honest edges render**: the stale `sample-en.mp4` row shows "the source audio is gone — import the file again to play" (library survives, audio note actionable); `[BLANK_AUDIO]` first segment is whisper on leading silence (expected on tiny; polish cleans it — not a smoke failure).
+- Engine/fast-engine/model dropdowns all render in Settings; SpeechTranscriber routing requires **language `en`** (`auto` stays Whisper by design — pinned in engine.rs; the owner hit exactly this and it is the documented behavior, not a bug).
+
+**Findings**
+
+| # | Symptom | Type | Fix slice |
+|---|---|---|---|
+| 1 | **The model dropdown sheet does not blur/fill its backdrop** — Settings rows behind it bleed through and the list reads cluttered (owner-reported: "the drop down not blurring the bg so it cluttered") | real polish gap: the popup layer renders plain over content | sheet backdrop (blur or solid), M15 workbench polish batch |
