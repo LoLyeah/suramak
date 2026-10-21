@@ -94,6 +94,7 @@ mac-tuned-constants/copy gaps the Windows bring-up must absorb:
 | 1 | Settings shows **"System follows the macOS light/dark setting live"** on Windows | theme helper text is not cfg-per-platform | copy seam, M14c |
 | 2 | **The floating Record pill overlaps the "Automatic updates" checkbox** (covers "new versions in the background") | the scroll region/pill constants were tuned on macOS fonts; the pill-covers-no-button invariant (USER_SMOKE §20) needs Windows-space verification | layout pass, M14e |
 | 3 | The **"Appearance" heading is clipped** at the top of the Settings scroll | same mac-tuned vertical rhythm | layout pass, M14e |
+| 4 | **No visible way out of the editor** — no Home/back affordance anywhere in the editor chrome; the owner got stuck in the first transcript | by design the editor is keyboard-first: `Esc` = LeaveEditor (keymap §24) — but there is no visible affordance, and mouse-first users cannot discover it | add a quiet "← Home" control to the editor title line (all platforms), M14e |
 
 Also noted: the Models manager is intentionally **not** in Settings (Home → Models, since
 M3), and there is no system-audio source on Windows until **M16** (Windows loopback +
