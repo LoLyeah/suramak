@@ -167,3 +167,34 @@ device/Android version, logcat if available): either (a) a spike v2 with
 on-screen diagnostics + the real bridge design, or (b) pulling the text-field
 fallback (option C) trigger now. Rendering at 60 fps surviving the gate means
 option A is not dead — the bridge and lifecycle handling are what failed.
+
+## 9. v2 — the diagnostics build (`0.3.0-m13b.2`)
+
+v2 is the same four checks with the blindfold off: it records its own crashes
+and shows them on the phone screen, because the reason nothing could be
+diagnosed in §8 is that a failure was only ever visible in logcat. The build
+report is `docs/reports/M13b2-spike-v2.md`.
+
+Install it the same way (`adb install -r app-debug.apk`; it replaces v1 — same
+package, versionCode 2). Then:
+
+1. Launch. If the previous session ended badly, the **top half of the screen is a
+   red text panel** titled `⚠ CRASH RECORDED — LAST SESSION` (or
+   `⚠ NATIVE CRASH — THIS SESSION` if it just happened). Screenshot it; that text
+   is the answer §8 was missing. `Hide` dismisses it for this launch only —
+   nothing deletes it except the app's own **Clear crash** button.
+2. Inside the app, the header reads **M13B v2 DIAGNOSTICS** and a red banner
+   repeats the crash text. Under the verdict strip there is a **LOG** row: tap it
+   to expand the last 40 platform events (every IME update, inset push, back
+   press, surface create/destroy, resume/suspend, wgpu error), timestamped and
+   collapsed to one line when shut — the header always shows the newest event.
+3. **2 · LIFECYCLE** has a new **Restart surface** button: it drops the wgpu
+   surface/device and rebuilds them, which is the suspend/resume path on demand.
+   If check 2 is what wedges the app, this reproduces it without switching apps.
+4. Re-run the four checks from §3–§6 exactly as before. If something breaks, do
+   not force-stop: screenshot the red panel and the expanded LOG, then relaunch
+   and photograph whatever the next launch says about the failure.
+
+`files/spike-last-crash.txt` (and the append-only `files/spike-crash-log.txt`)
+hold the same text if you can pull them with `adb shell run-as app.suramak.spike
+cat files/spike-last-crash.txt`.

@@ -5,3 +5,6 @@ local.properties
 *.iml
 .idea/
 captures/
+# Kotlin 2.x incremental-compilation session dir (AGP 8.7 writes it next to the
+# project, not inside build/).
+.kotlin/

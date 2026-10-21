@@ -1,18 +1,30 @@
-//! The M13b Go/No-Go screen.
+//! The M13b v2 screen — Go/No-Go checks plus the self-diagnostics surface.
 //!
 //! Pure egui: no platform types, so this module compiles (and its tests run) on
 //! the host as well as on Android. `app.rs` owns the window/surface and feeds
-//! the state below; `platform.rs` owns the JNI surface that fills it.
+//! the state below; `platform.rs` owns the JNI surface that fills it; `diag.rs`
+//! owns the crash record and the event ring this module renders.
 //!
 //! The four sections map 1:1 to the four things that can kill option A
 //! (`docs/PLAN-M13-ANDROID.md` §2.1 / §M13b):
 //!
 //! 1. text input through the soft keyboard (GameTextInput → winit IME → egui);
-//! 2. lifecycle — state survives surface teardown and activity recreation;
+//! 2. lifecycle — state survives surface teardown and activity recreation, plus
+//!    the user-triggerable surface restart;
 //! 3. motion — a 60 fps animation with a measured frame-time readout;
 //! 4. insets and the back gesture, delivered from the Kotlin shim over JNI.
+//!
+//! v2 adds three always-present diagnostics elements: a red **crash banner**
+//! (this session's panic or the previous launch's, read from the app's files
+//! dir), a collapsible **event log** of the last [`crate::diag::RING_CAPACITY`]
+//! platform callbacks, and per-tab panic isolation — a check that panics while
+//! drawing is disabled on its own, with the panic text on screen and a retry
+//! button, instead of taking the whole surface (and the other three checks)
+//! down with it.
 
 use std::collections::VecDeque;
+
+use crate::diag;
 
 /// Which of the four checks is on screen.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -26,6 +38,8 @@ pub enum Tab {
 
 impl Tab {
     pub const ALL: [Tab; 4] = [Tab::Text, Tab::Lifecycle, Tab::Motion, Tab::Insets];
+    /// Number of tabs — also the length of [`SpikeState::tab_errors`].
+    pub const COUNT: usize = 4;
 
     pub fn title(self) -> &'static str {
         match self {
@@ -33,6 +47,16 @@ impl Tab {
             Tab::Lifecycle => "2 · LIFECYCLE",
             Tab::Motion => "3 · MOTION",
             Tab::Insets => "4 · INSETS/BACK",
+        }
+    }
+
+    /// Stable slot for per-tab state (panic isolation, resets).
+    pub fn index(self) -> usize {
+        match self {
+            Tab::Text => 0,
+            Tab::Lifecycle => 1,
+            Tab::Motion => 2,
+            Tab::Insets => 3,
         }
     }
 }
@@ -96,6 +120,10 @@ pub struct SpikeState {
     pub resumes: u32,
     pub surface_recreates: u32,
     pub recreate_requests: u32,
+    /// "Restart surface" presses (the suspend/resume path, on demand).
+    pub surface_restarts: u32,
+    /// Set by the button, consumed by the frame loop.
+    pub restart_surface: bool,
     // (3) motion
     pub anim_seconds: f64,
     frame_times: VecDeque<f32>,
@@ -107,6 +135,18 @@ pub struct SpikeState {
     // diagnostics
     pub backend: String,
     pub gpu_error: Option<String>,
+    /// Per-tab panic isolation: a tab that panicked while drawing is marked
+    /// here and rendered as an error card instead, so the other checks keep
+    /// working.
+    pub tab_errors: [Option<String>; Tab::COUNT],
+    /// Cached copy of [`crate::diag::ring`], refreshed on revision change.
+    pub log_lines: Vec<diag::LogLine>,
+    log_rev: u64,
+    pub log_open: bool,
+    /// Cached crash record (this session's or the previous launch's).
+    pub crash: Option<diag::CrashView>,
+    crash_rev: u64,
+    pub crash_clear_error: Option<String>,
 }
 
 /// Stable widget id for the text field, so the IME bridge can move its cursor.
@@ -128,6 +168,8 @@ impl Default for SpikeState {
             resumes: 0,
             surface_recreates: 0,
             recreate_requests: 0,
+            surface_restarts: 0,
+            restart_surface: false,
             anim_seconds: 0.0,
             frame_times: VecDeque::with_capacity(MAX_FRAME_SAMPLES),
             frames: 0,
@@ -136,6 +178,13 @@ impl Default for SpikeState {
             recreate_requested: false,
             backend: "not initialised".to_owned(),
             gpu_error: None,
+            tab_errors: [None, None, None, None],
+            log_lines: Vec::new(),
+            log_rev: u64::MAX,
+            log_open: false,
+            crash: None,
+            crash_rev: u64::MAX,
+            crash_clear_error: None,
         }
     }
 }
@@ -143,12 +192,16 @@ impl Default for SpikeState {
 /// Frame-time window for the average fps readout (~2 s at 60 fps).
 pub const MAX_FRAME_SAMPLES: usize = 120;
 
+/// A gap longer than this is a suspend/restart, not a frame — feeding it into
+/// the window would show a bogus 0.3 fps for two seconds after every resume.
+const MAX_FRAME_GAP_SECS: f32 = 0.5;
+
 impl SpikeState {
     /// Advance the animation clock and record one frame's duration.
     pub fn tick(&mut self, dt: f32) {
         self.frames += 1;
         self.anim_seconds += f64::from(dt.max(0.0));
-        if dt.is_finite() && dt > 0.0 {
+        if dt.is_finite() && dt > 0.0 && dt <= MAX_FRAME_GAP_SECS {
             if self.frame_times.len() == MAX_FRAME_SAMPLES {
                 self.frame_times.pop_front();
             }
@@ -196,6 +249,20 @@ impl SpikeState {
             ime_bottom,
             updates: self.insets.updates.saturating_add(1),
         };
+    }
+
+    /// Pull the crash record and the event ring only when they changed.
+    pub fn refresh_diagnostics(&mut self) {
+        let ring_rev = diag::ring_revision();
+        if ring_rev != self.log_rev {
+            self.log_rev = ring_rev;
+            self.log_lines = diag::ring();
+        }
+        let crash_rev = diag::crash_revision();
+        if crash_rev != self.crash_rev {
+            self.crash_rev = crash_rev;
+            self.crash = diag::crash_for_display();
+        }
     }
 
     /// The four verdicts, in check order. Each is evidence-based; the quality
@@ -266,11 +333,44 @@ impl SpikeState {
         self.resumes = 0;
         self.surface_recreates = 0;
         self.recreate_requests = 0;
+        self.surface_restarts = 0;
         self.frame_times.clear();
         self.frames = 0;
         self.back_presses = 0;
         self.insets = Insets::default();
         self.anim_seconds = 0.0;
+        self.tab_errors = [None, None, None, None];
+    }
+
+    /// Clear one check's evidence without touching the others — the isolation
+    /// half of "a wedge in one check must not poison the rest".
+    pub fn reset_tab(&mut self, tab: Tab) {
+        match tab {
+            Tab::Text => {
+                self.text.clear();
+                self.chars_received = 0;
+                self.deletions_seen = 0;
+                self.last_text_chars = 0;
+                self.ime_updates = 0;
+                self.ime_cursor = None;
+                self.winit_text_chars = 0;
+            }
+            Tab::Lifecycle => {
+                self.probe.clear();
+                self.recreate_requests = 0;
+                self.surface_restarts = 0;
+            }
+            Tab::Motion => {
+                self.frame_times.clear();
+                self.frames = 0;
+                self.anim_seconds = 0.0;
+            }
+            Tab::Insets => {
+                self.insets = Insets::default();
+                self.back_presses = 0;
+            }
+        }
+        self.tab_errors[tab.index()] = None;
     }
 }
 
@@ -281,14 +381,40 @@ fn verdict_color(v: Verdict) -> egui::Color32 {
     }
 }
 
+const RED: egui::Color32 = egui::Color32::from_rgb(255, 96, 96);
+const AMBER: egui::Color32 = egui::Color32::from_rgb(235, 185, 70);
+const DIM: egui::Color32 = egui::Color32::from_gray(150);
+
+fn level_color(level: diag::Level) -> egui::Color32 {
+    match level {
+        diag::Level::Info => egui::Color32::from_gray(190),
+        diag::Level::Warn => AMBER,
+        diag::Level::Error => RED,
+    }
+}
+
 /// Draw one frame. Returns nothing: all state lives in `state`.
 pub fn draw(ctx: &egui::Context, state: &mut SpikeState) {
+    state.refresh_diagnostics();
+    draw_header(ctx, state);
+    draw_crash_banner(ctx, state);
+    draw_verdicts(ctx, state);
+    draw_log_panel(ctx, state);
+
+    egui::CentralPanel::default().show(ctx, |ui| {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| draw_tab(ui, state, state.tab));
+    });
+}
+
+fn draw_header(ctx: &egui::Context, state: &mut SpikeState) {
     egui::TopBottomPanel::top("m13b-header").show(ctx, |ui| {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new("M13B GO/NO-GO")
-                    .size(26.0)
+                egui::RichText::new("M13B v2 DIAGNOSTICS")
+                    .size(24.0)
                     .strong()
                     .color(egui::Color32::from_rgb(120, 190, 255)),
             );
@@ -298,19 +424,40 @@ pub fn draw(ctx: &egui::Context, state: &mut SpikeState) {
                 }
             });
         });
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Suramak Android shell spike — egui/wgpu in a GameActivity")
+                    .size(11.0)
+                    .color(DIM),
+            );
+            let crashes = diag::crash_count();
+            if crashes > 0 {
+                ui.label(
+                    egui::RichText::new(format!("· {crashes} panic(s) this session"))
+                        .size(11.0)
+                        .color(RED),
+                );
+            }
+        });
         ui.label(
-            egui::RichText::new("Suramak Android shell spike — egui/wgpu in a GameActivity")
-                .size(12.0)
-                .color(egui::Color32::from_gray(160)),
+            egui::RichText::new("build 0.3.0-m13b.2 · crash text survives a restart")
+                .size(10.0)
+                .color(egui::Color32::from_gray(120)),
         );
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             for tab in Tab::ALL {
                 let selected = state.tab == tab;
+                let broken = state.tab_errors[tab.index()].is_some();
+                let label = if broken {
+                    format!("{} !", tab.title())
+                } else {
+                    tab.title().to_owned()
+                };
                 if ui
                     .add_sized(
-                        [ui.available_width() / 4.0, 46.0],
-                        egui::Button::selectable(selected, tab.title()),
+                        [ui.available_width() / 4.0, 44.0],
+                        egui::Button::selectable(selected, label),
                     )
                     .clicked()
                 {
@@ -320,7 +467,75 @@ pub fn draw(ctx: &egui::Context, state: &mut SpikeState) {
         });
         ui.add_space(4.0);
     });
+}
 
+/// The single most important element: whatever killed the process last time,
+/// on screen, in red, until the owner presses **Clear crash**.
+fn draw_crash_banner(ctx: &egui::Context, state: &mut SpikeState) {
+    let Some(crash) = state.crash.as_ref() else {
+        return;
+    };
+    let title = if crash.live {
+        "CRASH — THIS SESSION (caught, app still running)"
+    } else {
+        "CRASH — LAST LAUNCH (read from the crash file)"
+    };
+    let body = crash.text.clone();
+
+    egui::TopBottomPanel::top("m13b-crash")
+        .frame(
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(58, 14, 14))
+                .inner_margin(10.0),
+        )
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(title).size(16.0).strong().color(RED));
+            });
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Button::new(
+                        egui::RichText::new("Clear crash").size(14.0).strong(),
+                    ))
+                    .clicked()
+                {
+                    match diag::clear_crash() {
+                        Ok(()) => {
+                            state.crash = None;
+                            state.crash_clear_error = None;
+                            state.crash_rev = diag::crash_revision();
+                        }
+                        Err(err) => state.crash_clear_error = Some(err),
+                    }
+                }
+                ui.label(
+                    egui::RichText::new("deletes files/spike-last-crash.txt + the history log")
+                        .size(10.0)
+                        .color(DIM),
+                );
+            });
+            egui::ScrollArea::vertical()
+                .max_height(170.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(&body)
+                            .monospace()
+                            .size(10.5)
+                            .color(egui::Color32::from_rgb(255, 210, 205)),
+                    );
+                });
+            if let Some(err) = &state.crash_clear_error {
+                ui.label(
+                    egui::RichText::new(format!("clear failed: {err}"))
+                        .size(11.0)
+                        .color(AMBER),
+                );
+            }
+        });
+}
+
+fn draw_verdicts(ctx: &egui::Context, state: &mut SpikeState) {
     egui::TopBottomPanel::bottom("m13b-verdicts").show(ctx, |ui| {
         ui.add_space(3.0);
         for (name, verdict, detail) in state.verdicts() {
@@ -340,23 +555,170 @@ pub fn draw(ctx: &egui::Context, state: &mut SpikeState) {
             });
         }
         ui.label(
-            egui::RichText::new(format!("gpu: {}", state.backend))
-                .size(10.0)
-                .color(egui::Color32::from_gray(120)),
+            egui::RichText::new(format!(
+                "gpu: {} · restarts {} · rebuilds {} T{} · uptime {:.0}s",
+                state.backend,
+                state.surface_restarts,
+                state.surface_recreates,
+                state.resumes,
+                diag::uptime_secs(),
+            ))
+            .size(10.0)
+            .color(egui::Color32::from_gray(120)),
         );
+        if let Some(err) = &state.gpu_error {
+            ui.label(
+                egui::RichText::new(format!("gpu error: {err}"))
+                    .size(10.5)
+                    .color(RED),
+            );
+        }
         ui.add_space(3.0);
     });
+}
 
-    egui::CentralPanel::default().show(ctx, |ui| {
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| match state.tab {
-                Tab::Text => draw_text_check(ui, state),
-                Tab::Lifecycle => draw_lifecycle_check(ui, state),
-                Tab::Motion => draw_motion_check(ui, state),
-                Tab::Insets => draw_insets_check(ui, state),
+/// The always-visible (collapsible) event ring. Collapsed, the header still
+/// shows the newest line, so a screenshot of any tab carries the last event.
+fn draw_log_panel(ctx: &egui::Context, state: &mut SpikeState) {
+    let open = state.log_open;
+    let count = state.log_lines.len();
+    let dropped = diag::dropped_lines();
+    let newest = state
+        .log_lines
+        .last()
+        .map(|line| (format!("[{:7.2}s]", line.at), line.level, line.text.clone()));
+
+    egui::TopBottomPanel::bottom("m13b-log")
+        .frame(
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(18, 18, 20))
+                .inner_margin(6.0),
+        )
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let arrow = if open { "▾" } else { "▸" };
+                let header = format!("{arrow} LOG — {count} events");
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(header)
+                                .monospace()
+                                .size(12.0)
+                                .color(egui::Color32::from_rgb(120, 190, 255)),
+                        )
+                        .frame(false),
+                    )
+                    .clicked()
+                {
+                    state.log_open = !open;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("↻ surface").clicked() {
+                        state.restart_surface = true;
+                    }
+                    if dropped > 0 {
+                        ui.label(
+                            egui::RichText::new(format!("{dropped} dropped"))
+                                .size(9.0)
+                                .color(egui::Color32::from_gray(110)),
+                        );
+                    }
+                });
             });
-    });
+
+            if open {
+                egui::ScrollArea::vertical()
+                    .max_height(150.0)
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        if state.log_lines.is_empty() {
+                            ui.label(
+                                egui::RichText::new("no events yet")
+                                    .size(10.5)
+                                    .color(egui::Color32::from_gray(110)),
+                            );
+                        }
+                        for line in &state.log_lines {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "[{:7.2}s] {} {}",
+                                    line.at,
+                                    line.level.tag(),
+                                    line.text
+                                ))
+                                .monospace()
+                                .size(10.0)
+                                .color(level_color(line.level)),
+                            );
+                        }
+                    });
+            } else if let Some((at, level, text)) = newest {
+                ui.label(
+                    egui::RichText::new(format!("{at} {} {text}", level.tag()))
+                        .monospace()
+                        .size(10.0)
+                        .color(level_color(level)),
+                );
+            }
+        });
+}
+
+/// Draw one tab with panic isolation: a panic inside a check disables that tab
+/// (with its message on screen) and leaves the other three untouched.
+fn draw_tab(ui: &mut egui::Ui, state: &mut SpikeState, tab: Tab) {
+    let index = tab.index();
+    if let Some(message) = state.tab_errors[index].clone() {
+        ui.add_space(12.0);
+        ui.label(
+            egui::RichText::new(format!("{} is disabled after a panic", tab.title()))
+                .size(18.0)
+                .strong()
+                .color(RED),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(message)
+                .monospace()
+                .size(11.0)
+                .color(egui::Color32::from_rgb(255, 200, 195)),
+        );
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("Retry this tab").clicked() {
+                state.tab_errors[index] = None;
+            }
+            if ui.button("Reset this check").clicked() {
+                state.reset_tab(tab);
+            }
+        });
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(
+                "The other checks are unaffected: each tab keeps its own state and is drawn \
+                 inside its own catch_unwind. The panic is in the event log and the crash files.",
+            )
+            .size(11.0)
+            .color(DIM),
+        );
+        return;
+    }
+
+    // SAFETY (unwind safety): the closure mutates only `SpikeState` fields that
+    // are counters and buffers; a panic mid-draw leaves a value stale, never a
+    // dangling one. egui rebuilds its per-frame layout state each frame, so a
+    // partially laid-out `Ui` is discarded by the next `Context::run`.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match tab {
+        Tab::Text => draw_text_check(ui, state),
+        Tab::Lifecycle => draw_lifecycle_check(ui, state),
+        Tab::Motion => draw_motion_check(ui, state),
+        Tab::Insets => draw_insets_check(ui, state),
+    }));
+    if let Err(payload) = result {
+        let message = diag::payload_text(payload.as_ref());
+        diag::note_contained("tab draw");
+        state.tab_errors[index] = Some(message);
+    }
 }
 
 fn section(ui: &mut egui::Ui, title: &str, body: &str) {
@@ -431,6 +793,12 @@ fn draw_text_check(ui: &mut egui::Ui, state: &mut SpikeState) {
         .size(12.0)
         .color(egui::Color32::from_gray(150)),
     );
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if ui.button("Reset this check").clicked() {
+            state.reset_tab(Tab::Text);
+        }
+    });
 }
 
 /// Convert a Java UTF-16 index (what `State.selectionStart` reports) into an
@@ -495,6 +863,14 @@ fn draw_lifecycle_check(ui: &mut egui::Ui, state: &mut SpikeState) {
             .monospace(),
     );
     ui.label(
+        egui::RichText::new(format!(
+            "surface restarts (button): {}",
+            state.surface_restarts
+        ))
+        .size(17.0)
+        .monospace(),
+    );
+    ui.label(
         egui::RichText::new(format!("recreate requests: {}", state.recreate_requests))
             .size(17.0)
             .monospace(),
@@ -511,6 +887,25 @@ fn draw_lifecycle_check(ui: &mut egui::Ui, state: &mut SpikeState) {
         state.recreate_requested = true;
         state.recreate_requests += 1;
     }
+    ui.add_space(6.0);
+    if ui
+        .add_sized(
+            [ui.available_width(), 52.0],
+            egui::Button::new("Restart surface (drop + rebuild wgpu)"),
+        )
+        .clicked()
+    {
+        state.restart_surface = true;
+    }
+    ui.label(
+        egui::RichText::new(
+            "Restart surface drops the wgpu surface, device, queue and renderer and rebuilds them \
+             against the current window — the same path a suspend/resume takes, on demand. If it \
+             fails, the reason is in the log line and the gpu error above.",
+        )
+        .size(11.5)
+        .color(egui::Color32::from_gray(150)),
+    );
 
     ui.add_space(8.0);
     ui.label(
@@ -521,6 +916,12 @@ fn draw_lifecycle_check(ui: &mut egui::Ui, state: &mut SpikeState) {
         .size(12.0)
         .color(egui::Color32::from_gray(150)),
     );
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if ui.button("Reset this check").clicked() {
+            state.reset_tab(Tab::Lifecycle);
+        }
+    });
 }
 
 fn draw_motion_check(ui: &mut egui::Ui, state: &mut SpikeState) {
@@ -578,6 +979,12 @@ fn draw_motion_check(ui: &mut egui::Ui, state: &mut SpikeState) {
         .size(12.0)
         .color(egui::Color32::from_gray(150)),
     );
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if ui.button("Reset this check").clicked() {
+            state.reset_tab(Tab::Motion);
+        }
+    });
 }
 
 fn draw_insets_check(ui: &mut egui::Ui, state: &mut SpikeState) {
@@ -646,6 +1053,12 @@ fn draw_insets_check(ui: &mut egui::Ui, state: &mut SpikeState) {
         .size(12.0)
         .color(egui::Color32::from_gray(150)),
     );
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if ui.button("Reset this check").clicked() {
+            state.reset_tab(Tab::Insets);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -707,6 +1120,19 @@ mod tests {
     }
 
     #[test]
+    fn a_suspend_gap_is_not_a_frame_time() {
+        let mut state = SpikeState::default();
+        for _ in 0..30 {
+            state.tick(1.0 / 60.0);
+        }
+        // A 30 s resume gap must not enter the window.
+        state.tick(30.0);
+        let fps = state.avg_fps().unwrap();
+        assert!((fps - 60.0).abs() < 1.0, "{fps}");
+        assert_eq!(state.frames, 31);
+    }
+
+    #[test]
     fn java_utf16_indices_map_to_char_indices() {
         assert_eq!(utf16_to_char_index("halo", 0), 0);
         assert_eq!(utf16_to_char_index("halo", 4), 4);
@@ -730,5 +1156,127 @@ mod tests {
         assert_eq!(state.tab, Tab::Insets);
         assert_eq!(state.chars_received, 0);
         assert_eq!(state.back_presses, 0);
+    }
+
+    #[test]
+    fn tab_indices_are_unique_and_cover_the_array() {
+        let mut seen = [false; Tab::COUNT];
+        for tab in Tab::ALL {
+            let index = tab.index();
+            assert!(index < Tab::COUNT);
+            assert!(!seen[index], "duplicate index for {tab:?}");
+            seen[index] = true;
+        }
+        assert!(seen.iter().all(|slot| *slot));
+    }
+
+    #[test]
+    fn reset_tab_touches_only_that_check() {
+        let mut state = SpikeState {
+            text: "halo".to_owned(),
+            probe: "lifecycle-123".to_owned(),
+            back_presses: 3,
+            tab_errors: [Some("boom".to_owned()), None, None, None],
+            ..Default::default()
+        };
+        state.observe_text();
+        state.set_insets(64, 48, 0, 0, 0);
+
+        state.reset_tab(Tab::Text);
+        assert_eq!(state.chars_received, 0);
+        assert_eq!(state.text, "");
+        // Other checks are untouched.
+        assert_eq!(state.probe, "lifecycle-123");
+        assert_eq!(state.back_presses, 3);
+        assert_eq!(state.insets.top, 64);
+        // And the tab's own error flag is cleared, not the others'.
+        assert_eq!(state.tab_errors[0], None);
+
+        state.reset_tab(Tab::Insets);
+        assert_eq!(state.back_presses, 0);
+        assert_eq!(state.insets.top, 0);
+        assert_eq!(state.probe, "lifecycle-123");
+    }
+
+    #[test]
+    fn a_panicking_tab_is_disabled_without_taking_the_others_down() {
+        let mut state = SpikeState::default();
+        // Simulate what `draw_tab` does on a panic, without an egui context.
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| panic!("draw blew up")));
+        if let Err(payload) = result {
+            state.tab_errors[Tab::Text.index()] = Some(crate::diag::payload_text(payload.as_ref()));
+        }
+        assert!(state.tab_errors[0].is_some());
+        assert!(state.tab_errors[1..].iter().all(Option::is_none));
+        state.reset_tab(Tab::Text);
+        assert!(state.tab_errors[0].is_none());
+    }
+
+    /// Drive the real `draw` for a few frames at phone size. egui needs no GPU
+    /// for layout + tessellation, so this is the only place the panels, the
+    /// crash banner, the log panel and all four tab bodies are executed off the
+    /// device — a panic here would be a panic on the phone.
+    fn draw_frames(ctx: &egui::Context, state: &mut SpikeState, frames: usize) {
+        for _ in 0..frames {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 360.0),
+                )),
+                ..Default::default()
+            };
+            let output = ctx.run(raw, |ctx| draw(ctx, state));
+            assert!(!output.shapes.is_empty(), "nothing was drawn");
+        }
+    }
+
+    #[test]
+    fn the_whole_screen_draws_headlessly_on_every_tab() {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(2.75);
+        // The crash banner only exists when the diag buffer holds a record:
+        // make one the same way the process does, then draw with it present.
+        crate::diag::init_panic_hook();
+        let _ = std::panic::catch_unwind(|| panic!("headless banner fixture"));
+        crate::diag::info("jni: nativeSetInsets(top=64, bottom=48, left=0, right=0, ime=0)");
+
+        let mut state = SpikeState {
+            text: "Saya sedang menguji papan ketik.".to_owned(),
+            probe: "lifecycle-123".to_owned(),
+            ..Default::default()
+        };
+        state.observe_text();
+        state.set_insets(64, 48, 0, 0, 0);
+        state.back_presses = 2;
+        for _ in 0..30 {
+            state.tick(1.0 / 60.0);
+        }
+
+        for open in [false, true] {
+            state.log_open = open;
+            for tab in Tab::ALL {
+                state.tab = tab;
+                draw_frames(&ctx, &mut state, 2);
+            }
+        }
+        assert!(state.crash.is_some(), "the banner had no crash to show");
+        assert!(!state.log_lines.is_empty(), "the log panel had no events");
+    }
+
+    #[test]
+    fn a_disabled_tab_draws_its_error_card_and_the_rest_still_draw() {
+        let ctx = egui::Context::default();
+        let mut state = SpikeState::default();
+        state.tab_errors[Tab::Motion.index()] = Some("frame math exploded".to_owned());
+        state.tab = Tab::Motion;
+        draw_frames(&ctx, &mut state, 2);
+        assert!(state.tab_errors[Tab::Motion.index()].is_some());
+
+        // The other tabs still draw with the same state.
+        for tab in [Tab::Text, Tab::Lifecycle, Tab::Insets] {
+            state.tab = tab;
+            draw_frames(&ctx, &mut state, 1);
+        }
     }
 }
