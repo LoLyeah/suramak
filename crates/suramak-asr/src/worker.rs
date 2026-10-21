@@ -257,17 +257,32 @@ fn run_worker(jobs: Receiver<Job>, events: Sender<WorkerEvent>) {
         };
 
         match result {
+            // M9e contract, re-checked at the emission point (the dequeue-time
+            // check at the top of the loop is one snapshot): a cancel that
+            // lands any time before the terminal event must win the outcome —
+            // otherwise a fast failure (e.g. a model load error) can beat a
+            // cancel that was queued with the job, and the UI reports Error
+            // for a job the user cancelled. Bounded test that caught it:
+            // `a_cancel_queued_with_the_job_is_observed_before_the_model_load`.
             Ok(outcome) => {
-                let _ = events.send(WorkerEvent::Segments {
-                    job_id,
-                    segments: outcome.transcript.segments.clone(),
-                });
-                let _ = events.send(WorkerEvent::Finished {
-                    job_id,
-                    transcript: Box::new(outcome.transcript),
-                    engine_used: outcome.engine_used,
-                    warnings: outcome.warnings,
-                });
+                if job.cancel.is_cancelled() {
+                    tracing::info!(
+                        job_id,
+                        "job cancelled while finishing — surfacing cancellation, not the outcome"
+                    );
+                    let _ = events.send(WorkerEvent::Cancelled { job_id });
+                } else {
+                    let _ = events.send(WorkerEvent::Segments {
+                        job_id,
+                        segments: outcome.transcript.segments.clone(),
+                    });
+                    let _ = events.send(WorkerEvent::Finished {
+                        job_id,
+                        transcript: Box::new(outcome.transcript),
+                        engine_used: outcome.engine_used,
+                        warnings: outcome.warnings,
+                    });
+                }
             }
             // M9e (P2-2): a cancelled job is terminal but is not a failure —
             // the partial results were dropped by the pipeline and the worker
@@ -277,10 +292,15 @@ fn run_worker(jobs: Receiver<Job>, events: Sender<WorkerEvent>) {
                 let _ = events.send(WorkerEvent::Cancelled { job_id });
             }
             Err(err) => {
-                let _ = events.send(WorkerEvent::Error {
-                    job_id,
-                    message: err.to_string(),
-                });
+                if job.cancel.is_cancelled() {
+                    tracing::info!(job_id, "job cancelled around a failure — cancel wins");
+                    let _ = events.send(WorkerEvent::Cancelled { job_id });
+                } else {
+                    let _ = events.send(WorkerEvent::Error {
+                        job_id,
+                        message: err.to_string(),
+                    });
+                }
             }
         }
     }
