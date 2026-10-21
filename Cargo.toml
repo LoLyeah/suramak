@@ -48,6 +48,10 @@ hound = "3.5"
 # bytes go on the wire base64'd, per the OpenAI-compatible shape). Already in
 # the lock via reqwest's transitive graph; pinned here directly.
 base64 = "0.22"
+# M14B2: the SPSC ring between the RT audio callback and its consumer thread
+# (audit SUR-HIGH-03). Pinned: the callback's guarantees (wait-free push, exact
+# capacity, no allocation after construction) are the API contract we rely on.
+rtrb = "=0.3.1"
 clap = { version = "4", features = ["derive"] }
 pollster = "0.4"
 egui = { version = "0.33", features = ["accesskit"] }

@@ -14,6 +14,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# M14B2: the SPSC ring under the capture callback (no_std, no dependencies of
+# its own; attacks SUR-HIGH-03).
+rtrb = { workspace = true }
 
 [features]
 # Microphone capture (cpal). OFF by default so Linux builds never need ALSA headers.

@@ -18,6 +18,11 @@
 
 pub mod cancel;
 pub mod capture;
+// M14B2: the RT-safe half of capture (SPSC ring + consumer thread); crate-private
+// so the public `capture` surface is unchanged. Without the `capture` feature only
+// the unit tests exercise it, hence the dead-code allowance there.
+#[cfg_attr(not(feature = "capture"), allow(dead_code))]
+pub(crate) mod capture_rt;
 pub mod engine;
 pub mod live;
 pub mod mix;

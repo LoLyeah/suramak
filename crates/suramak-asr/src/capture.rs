@@ -27,6 +27,14 @@
 //! session span. [`list_audio_processes`] + [`resolve_app_processes`] back the
 //! per-app picker: settings store app keys (bundle ids), live pids are
 //! resolved at record time.
+//!
+//! M14B2 (audit SUR-HIGH-03): the cpal callback no longer locks or allocates.
+//! It mixes down through the allocation-free [`mono_mixdown`] iterator and
+//! try-pushes the samples into an SPSC ring (`crate::capture_rt`); a
+//! per-session consumer thread owns the mutex-guarded buffer, the rolling RMS
+//! and the live-chunk cursor feeding, exactly as the callback used to. A full
+//! ring drops the incoming samples and counts them (see the report
+//! `docs/reports/M14b2-audio-rt.md`).
 
 use std::path::Path;
 
@@ -56,12 +64,13 @@ pub struct InputDeviceInfo {
 /// A mono block passes through unchanged; a trailing partial frame is averaged
 /// over the channels it actually has. This is the same mixdown the stream
 /// callback performs, so the unit tests cover the live path's math.
+///
+/// M14B2: the arithmetic lives in the allocation-free
+/// `crate::capture_rt::MonoFrames` iterator — the callback runs that iterator
+/// straight into the ring, so this allocating helper and the RT path can never
+/// drift apart.
 pub fn mono_mixdown(block: &[f32], channels: usize) -> Vec<f32> {
-    let channels = channels.max(1);
-    block
-        .chunks(channels)
-        .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
-        .collect()
+    crate::capture_rt::MonoFrames::new(block, channels).collect()
 }
 
 /// Resamples mono samples at `rate` to 16 kHz (core's rubato path).
@@ -366,18 +375,20 @@ pub fn resolve_app_processes(
 
 #[cfg(feature = "capture")]
 mod imp {
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use cpal::StreamConfig;
+    use rtrb::RingBuffer;
     use suramak_core::decode::AudioBuffer;
     use suramak_core::settings::AudioSource;
 
     use super::{
-        mono_mixdown, resolve_input_source, system_audio_available, AudioProcessInfo, CaptureInput,
-        InputDeviceInfo, ResolvedSource, RollingRms, RMS_WINDOW,
+        resolve_input_source, system_audio_available, AudioProcessInfo, CaptureInput,
+        InputDeviceInfo, ResolvedSource, RMS_WINDOW,
     };
+    use crate::capture_rt::{ring_capacity, CaptureConsumer, ConsumerThread, RtProducer};
     use crate::whisper::AsrError;
 
     /// A running capture session. Dropping it (or calling [`Recorder::stop`]) ends capture.
@@ -401,6 +412,15 @@ mod imp {
         /// and is logged quietly; before it, errors stay loud (see
         /// [`stream_error`]). Shared with the stream's error callback.
         teardown: Arc<AtomicBool>,
+        /// The non-RT half of the lock-free path (M14B2): drains the ring into
+        /// `samples` / `rms_bits`. Declared last so a plain `Drop` (the quit
+        /// path) joins it after the stream — and therefore the RT callback and
+        /// its producer — is gone.
+        consumer: ConsumerThread,
+        /// Samples the RT callback dropped because the ring was full. Only ever
+        /// non-zero when the consumer thread could not keep up (a dead or
+        /// hopelessly starved thread), in which case the recording is short.
+        dropped: Arc<AtomicU64>,
     }
 
     impl Recorder {
@@ -431,20 +451,37 @@ mod imp {
         /// Marks the teardown before the stream is dropped: a stream error racing
         /// this drop is the benign stop-time race (see [`stream_error`]) and is
         /// logged quietly, while genuine mid-recording errors stay loud.
+        ///
+        /// M14B2: the stream is dropped first (which stops the RT callback and
+        /// drops its ring producer), then the consumer thread is joined — its
+        /// final drain moves everything still in the ring into `samples`, so the
+        /// returned buffer is the same one the old in-callback accumulation
+        /// produced.
         pub fn stop(self) -> AudioBuffer {
             self.teardown.store(true, Ordering::Relaxed);
             let Recorder {
                 stream,
                 samples,
                 sample_rate,
-                device_name: _,
+                device_name,
                 rms_bits: _,
                 warning: _,
                 tap,
                 teardown: _,
+                mut consumer,
+                dropped,
             } = self;
-            drop(stream); // stops the cpal stream
+            drop(stream); // stops the cpal stream (and the RT callback)
             drop(tap); // then tears down aggregate device + tap (macOS system audio)
+            consumer.shutdown(); // final drain + join
+            let dropped = dropped.load(Ordering::Relaxed);
+            if dropped > 0 {
+                tracing::warn!(
+                    device = %device_name,
+                    dropped,
+                    "audio capture dropped samples — the capture consumer thread could not keep up"
+                );
+            }
             let samples = samples
                 .lock()
                 .map(|guard| guard.clone())
@@ -601,16 +638,34 @@ mod imp {
         let window =
             ((config.sample_rate.0 as u128 * RMS_WINDOW.as_millis()) / 1000).max(1) as usize;
 
+        // M14B2: the SPSC ring between the RT callback and the consumer thread.
+        // Sized at one second of mono samples (48 kHz → 48 000 slots ≈ 192 KiB);
+        // the allocation happens here, at session start, never on the RT thread.
+        let (producer, consumer) = RingBuffer::new(ring_capacity(config.sample_rate.0));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let consumer = CaptureConsumer::new(
+            consumer,
+            Arc::clone(&samples),
+            Arc::clone(&rms_bits),
+            window,
+        );
+        let consumer = ConsumerThread::spawn(consumer).map_err(|err| {
+            AsrError::Capture(format!(
+                "could not start the audio capture consumer thread: {err}"
+            ))
+        })?;
+
+        // The callback's whole workload: mix down and try-push. No lock, no
+        // allocation, no syscall — see `crate::capture_rt`.
         let stream = match sample_format {
             cpal::SampleFormat::F32 => {
-                let (samples, rms_bits) = (samples.clone(), rms_bits.clone());
+                let mut sink = RtProducer::new(producer, Arc::clone(&dropped));
                 let channels = config.channels as usize;
-                let mut rolling = RollingRms::new(window);
                 device
                     .build_input_stream(
                         &config,
                         move |data: &[f32], _| {
-                            accumulate(&samples, &rms_bits, &mut rolling, data, channels);
+                            sink.write_block(data, channels);
                         },
                         stream_error(Arc::clone(&teardown)),
                         None,
@@ -618,16 +673,13 @@ mod imp {
                     .map_err(|e| AsrError::Capture(e.to_string()))?
             }
             cpal::SampleFormat::I16 => {
-                let (samples, rms_bits) = (samples.clone(), rms_bits.clone());
+                let mut sink = RtProducer::new(producer, Arc::clone(&dropped));
                 let channels = config.channels as usize;
-                let mut rolling = RollingRms::new(window);
                 device
                     .build_input_stream(
                         &config,
                         move |data: &[i16], _| {
-                            let floats: Vec<f32> =
-                                data.iter().map(|s| *s as f32 / i16::MAX as f32).collect();
-                            accumulate(&samples, &rms_bits, &mut rolling, &floats, channels);
+                            sink.write_block(data, channels);
                         },
                         stream_error(Arc::clone(&teardown)),
                         None,
@@ -635,18 +687,13 @@ mod imp {
                     .map_err(|e| AsrError::Capture(e.to_string()))?
             }
             cpal::SampleFormat::U16 => {
-                let (samples, rms_bits) = (samples.clone(), rms_bits.clone());
+                let mut sink = RtProducer::new(producer, Arc::clone(&dropped));
                 let channels = config.channels as usize;
-                let mut rolling = RollingRms::new(window);
                 device
                     .build_input_stream(
                         &config,
                         move |data: &[u16], _| {
-                            let floats: Vec<f32> = data
-                                .iter()
-                                .map(|s| (*s as f32 - 32768.0) / 32768.0)
-                                .collect();
-                            accumulate(&samples, &rms_bits, &mut rolling, &floats, channels);
+                            sink.write_block(data, channels);
                         },
                         stream_error(Arc::clone(&teardown)),
                         None,
@@ -673,6 +720,8 @@ mod imp {
             warning,
             tap,
             teardown,
+            consumer,
+            dropped,
         })
     }
 
@@ -817,27 +866,6 @@ mod imp {
              grant the audio-capture permission and retry",
             tap.device_uid()
         )))
-    }
-
-    /// Mono-mixes one interleaved block into `samples` and updates the rolling RMS.
-    fn accumulate(
-        samples: &Mutex<Vec<f32>>,
-        rms_bits: &AtomicU32,
-        rolling: &mut RollingRms,
-        data: &[f32],
-        channels: usize,
-    ) {
-        if data.is_empty() {
-            return;
-        }
-        let mut buffer = samples
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for mono in mono_mixdown(data, channels) {
-            buffer.push(mono);
-            rolling.push(mono);
-        }
-        rms_bits.store(rolling.value().to_bits(), Ordering::Relaxed);
     }
 
     /// The line a cpal stream error logs, or `None` while the session is being
