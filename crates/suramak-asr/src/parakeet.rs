@@ -426,7 +426,7 @@ mod ffi {
         // buffer is an error with nothing to clean up — the FFI's sample count is
         // an `int32`, and a longer buffer would wrap to a negative length and let
         // the C++ side walk past the pointer.
-        let sample_count = sample_count_i32(samples.len())?;
+        let sample_count = super::sample_count_i32(samples.len())?;
         // SAFETY: the recognizer handle is live (owned by `inner`); the stream is
         // created and destroyed within this call; every pointer read below points
         // into the result that is destroyed after it was copied out.

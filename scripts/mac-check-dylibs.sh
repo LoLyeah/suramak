@@ -23,6 +23,13 @@ BIN_DIR="$APP/Contents/MacOS"
 
 [ -d "$BIN_DIR" ] || { echo "error: no $BIN_DIR — run make-app.sh first" >&2; exit 1; }
 
+# The app binary and its rpaths (the consuming image for embedded frameworks).
+app_bin="$(find "$BIN_DIR" -maxdepth 1 -type f | sort | head -1)"
+app_dir="$(cd "$(dirname "$app_bin")" && pwd)"
+app_rpaths="$(otool -l "$app_bin" | awk '
+  /cmd LC_RPATH/ { getline; getline; sub(/^[ \t]*path /, ""); sub(/ \(offset .*/, ""); print }
+')"
+
 status=0
 checked=0
 
@@ -68,17 +75,16 @@ while IFS= read -r -d '' bin; do
       @rpath/*)
         suffix="${dep#@rpath/}"
         resolved=""
+        # First pass: the checked binary's own rpaths, expanded against its own
+        # directory (correct for executables in Contents/MacOS and for
+        # @loader_path inside embedded frameworks).
         while IFS= read -r rp; do
           [ -n "$rp" ] || continue
           expanded="${rp//@executable_path/$abs_dir}"
           expanded="${expanded//@loader_path/$abs_dir}"
           case "$expanded" in
-            # macOS ships its Swift runtime in the dyld shared cache, not as
-            # on-disk files: /usr/lib/swift/libswift_Concurrency.dylib does NOT
-            # exist on disk, yet dyld resolves it there (v0.3.1's first release
-            # run proved it — the runner also had no such file, and every
-            # absolute /usr/lib/swift dep resolves at launch on real Macs). So
-            # an rpath at /usr/lib/swift counts as resolved by construction.
+            # The dyld shared-cache carve-out (comment preserved verbatim):
+            # /usr/lib/swift has no on-disk files, dyld still resolves it.
             /usr/lib/swift | /usr/lib/swift/*)
               resolved="$expanded/$suffix (dyld shared cache)"
               ;;
@@ -88,6 +94,27 @@ while IFS= read -r -d '' bin; do
           fi
           [ -n "$resolved" ] && break
         done <<< "$rpaths"
+        # Second pass (SUR2-NEW-06 macOS false-fail): an embedded framework's
+        # `@rpath/…` dependency resolves against the CONSUMING image's rpaths —
+        # @executable_path then means the APP binary's directory, and the
+        # framework's own rpath list is legitimately empty (Sparkle ships no
+        # LC_RPATH; its location comes from the app's rpath entry).
+        if [ -z "$resolved" ]; then
+          while IFS= read -r rp; do
+            [ -n "$rp" ] || continue
+            expanded="${rp//@executable_path/$app_dir}"
+            expanded="${expanded//@loader_path/$abs_dir}"
+            case "$expanded" in
+              /usr/lib/swift | /usr/lib/swift/*)
+                resolved="$expanded/$suffix (dyld shared cache)"
+                ;;
+            esac
+            if [ -z "$resolved" ] && [ -e "$expanded/$suffix" ]; then
+              resolved="$expanded/$suffix (via the app's rpath)"
+            fi
+            [ -n "$resolved" ] && break
+          done <<< "$app_rpaths"
+        fi
         if [ -n "$resolved" ]; then
           echo "ok:   $label -> $dep"
         else
