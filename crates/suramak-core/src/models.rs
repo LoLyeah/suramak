@@ -211,6 +211,12 @@ pub const PARAKEET_REQUIRED_FILES: &[&str] = &[
     "tokens.txt",
 ];
 
+/// The Parakeet model's total download size (the sum of its pinned files,
+/// ~670 MB) — what the Settings readiness row and the install card show.
+pub fn parakeet_total_bytes() -> u64 {
+    PARAKEET.files.iter().map(|file| file.size_bytes).sum()
+}
+
 /// Looks up the Parakeet model by manifest id (`parakeet`).
 pub fn find_parakeet(id: &str) -> Option<&'static ParakeetModelInfo> {
     if id == PARAKEET.id {
@@ -484,6 +490,15 @@ mod tests {
             );
         }
         assert_eq!(PARAKEET.files.len(), PARAKEET_REQUIRED_FILES.len());
+        // The size the Settings readiness row and the install card show is the
+        // sum of the pins — never a hand-copied number.
+        let summed: u64 = PARAKEET.files.iter().map(|file| file.size_bytes).sum();
+        assert_eq!(parakeet_total_bytes(), summed);
+        assert!(
+            (660_000_000..=690_000_000).contains(&parakeet_total_bytes()),
+            "the published ~670 MB must match the pins: {}",
+            parakeet_total_bytes()
+        );
         for file in PARAKEET.files {
             assert!(file.size_bytes > 0, "{}: size", file.name);
             assert_eq!(file.sha256.len(), 64, "{}: sha256", file.name);

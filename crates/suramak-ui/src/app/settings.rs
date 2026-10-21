@@ -25,9 +25,11 @@ use suramak_core::models as core_models;
 use suramak_core::settings::{Appearance, EngineSetting, RecordSource};
 
 use crate::app::controls::{self, Tier};
+use crate::app::fast_engine;
 use crate::motion::Motion;
 use crate::theme::Tokens;
 
+use super::model_manager::DownloadState;
 use super::settings_form::{self, SettingsForm, LANGUAGES};
 use super::views::{pane_caption, pane_title, PANE_PAD_X};
 use super::{AppState, Effect};
@@ -49,9 +51,16 @@ const REVEAL_IN_FOLDER: bool = cfg!(windows);
 
 const ROW_H: f32 = 26.0;
 const LABEL_W: f32 = 150.0;
-/// Bottom reserve inside the scroll content so the form's actions clear the
-/// floating record pill (24 pt inset + 52 pt pill height) at 900×600.
-const FORM_BOTTOM_RESERVE: f32 = 76.0;
+/// Air kept between the scroll viewport's bottom edge and an **opaque** record
+/// pill's top edge (M14e): a painted pill hides whatever is under it, so the
+/// viewport must end above it.
+const PILL_CLEARANCE: f32 = 10.0;
+/// Tail reserve for the **glass** pill case (macOS 26+): content still scrolls
+/// under the real material (the intended floating look), so the form's actions
+/// need to clear it at the end of the scroll — the M9e value, unchanged.
+const GLASS_FORM_BOTTOM_RESERVE: f32 = 76.0;
+/// Tail reserve when the viewport already ends above a painted pill: only air.
+const PAINTED_FORM_BOTTOM_RESERVE: f32 = 14.0;
 
 pub fn ui(
     ui: &mut egui::Ui,
@@ -86,10 +95,42 @@ pub fn ui(
     // M9e (P2-3): the form scrolls. Everything below the header — sections,
     // rows and the Save/Reset actions — lives inside the scroll area, so at
     // 900×600 the form is reachable end to end (the actions are its tail).
-    let scroll_rect = Rect::from_min_max(
-        pos2(left, rect.top() + 96.0),
-        pos2(right, rect.bottom() - 6.0),
+    //
+    // M14e (two Windows findings at once):
+    // * top — the scroll starts **below the header as measured**, not at a
+    //   mac-tuned 96 pt. A platform whose fonts set the title/caption block
+    //   taller had the scroll's clip edge cut into the first heading
+    //   ("Appearance" clipped at the top of the scroll).
+    // * bottom — when the pill is the **painted** fallback (Windows, Linux, a
+    //   pre-26 Mac) the viewport ends above its actual rect: a painted pill is
+    //   opaque and hid "Check for new versions in the background" mid-scroll,
+    //   which the old 76 pt *content* reserve only fixed at the very end of the
+    //   scroll. Real glass (macOS 26+) is designed to float over content and
+    //   keeps the old geometry exactly — the owner's Mac scrolls correctly
+    //   today, so its layout is untouched.
+    // `min_rect` here is the pane's max rect (a CentralPanel ui starts at its
+    // full height), so the header's true end is the **flow cursor** after it.
+    let header_bottom = ui.cursor().top();
+    let viewport = ui.ctx().viewport_rect();
+    let pill = suramak_glass::float_rect(
+        (viewport.width(), viewport.height()),
+        ui.ctx().pixels_per_point(),
     );
+    let pill_top = viewport.min.y + pill.y;
+    let painted_pill = !state.float_glass;
+    let scroll_top = header_bottom.max(rect.top() + 96.0) + 10.0;
+    let scroll_bottom = if painted_pill {
+        (pill_top - PILL_CLEARANCE).min(rect.bottom() - 6.0)
+    } else {
+        rect.bottom() - 6.0
+    }
+    .max(scroll_top + 120.0);
+    let tail_reserve = if painted_pill {
+        PAINTED_FORM_BOTTOM_RESERVE
+    } else {
+        GLASS_FORM_BOTTOM_RESERVE
+    };
+    let scroll_rect = Rect::from_min_max(pos2(left, scroll_top), pos2(right, scroll_bottom));
     ui.scope_builder(egui::UiBuilder::new().max_rect(scroll_rect), |ui| {
         egui::ScrollArea::vertical()
             // The salt keeps this form's scroll offset its own: both this and
@@ -99,7 +140,10 @@ pub fn ui(
             .id_salt("settings-form")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                form(ui, tokens, motion, state, effects);
+                // A hair of air under the clip edge: a heading scrolled to the
+                // top must not touch it.
+                ui.add_space(2.0);
+                form(ui, tokens, motion, state, effects, tail_reserve);
             });
     });
 }
@@ -111,6 +155,7 @@ fn form(
     motion: &Motion,
     state: &mut AppState,
     effects: &mut Vec<Effect>,
+    tail_reserve: f32,
 ) {
     // The form sections borrow only `state.settings_form`; snapshots are
     // copied out first so the borrows stay disjoint.
@@ -121,9 +166,14 @@ fn form(
     let capture_available = state.capture_available;
 
     let mut dirty = false;
+    // The form is borrowed in two spans (M14e): the readiness list between them
+    // needs the whole state (probe + download), which cannot coexist with the
+    // form borrow.
+    dirty |= transcription_section_head(ui, tokens, &mut state.settings_form);
+    fast_engine_readiness(ui, tokens, motion, state, effects);
     {
         let form = &mut state.settings_form;
-        dirty |= transcription_section(ui, tokens, motion, form);
+        dirty |= transcription_section_tail(ui, tokens, motion, form);
         dirty |= appearance_section(ui, tokens, motion, form);
         dirty |= audio_source_section(
             ui,
@@ -207,21 +257,15 @@ fn form(
             pane_caption(ui, "unsaved changes — press Save", tokens, false);
         }
     });
-    // Breathing room at the end of the scroll content: the floating record
-    // pill floats over the window's bottom ~76 pt (24 pt inset + its 52 pt
-    // height), so the form's actions must clear it at the 900×600 minimum —
-    // Reset sat under the pill without this reserve.
-    ui.add_space(FORM_BOTTOM_RESERVE);
+    // The tail reserve: 76 pt of air under the glass pill (macOS 26+, where
+    // content still scrolls under the material), or plain air when the viewport
+    // already ends above a painted pill (M14e — see `ui`).
+    ui.add_space(tail_reserve);
 }
 
 /// Engine / default model / default language / keep_audio / recordings folder.
 /// Returns whether the user changed something.
-fn transcription_section(
-    ui: &mut egui::Ui,
-    tokens: &Tokens,
-    motion: &Motion,
-    form: &mut SettingsForm,
-) -> bool {
+fn transcription_section_head(ui: &mut egui::Ui, tokens: &Tokens, form: &mut SettingsForm) -> bool {
     let mut dirty = false;
     section(ui, tokens, "Transcription");
 
@@ -244,6 +288,8 @@ fn transcription_section(
 
     // M10A: the fast engine (experimental) — one toggle, OFF by default.
     // M10B: the same toggle now drives the engine order per platform.
+    // M14e: the toggle's copy loses the CLI instruction — the readiness list
+    // right below it installs, deletes and explains everything in place.
     row(ui, tokens, "Fast engine", |ui| {
         if ui
             .checkbox(
@@ -261,27 +307,48 @@ fn transcription_section(
         "Off by default. When on, covered languages use the fast engines in order — \
          on macOS 26+: SpeechTranscriber → Parakeet → Whisper; elsewhere: \
          Parakeet → Whisper (covered languages only; Indonesian always Whisper). \
-         Parakeet needs its model installed (`suramak-cli models download parakeet`); \
-         SpeechTranscriber's models are managed by macOS. The engine line names what \
-         actually ran.",
+         The engine line names what actually ran.",
         false,
     );
+
+    dirty
+}
+
+/// The rest of the Transcription section (model / language / keep_audio /
+/// folder). Split from the head (M14e) so the fast-engine readiness list — which
+/// needs the whole `AppState` (download state, the probe) — can sit between the
+/// toggle and the model row without two mutable borrows of `state`.
+fn transcription_section_tail(
+    ui: &mut egui::Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    form: &mut SettingsForm,
+) -> bool {
+    let mut dirty = false;
 
     // Default model. M9c copy sweep: the combobox shows the human display
     // names; the raw id stays the value that persists.
     row(ui, tokens, "Default model", |ui| {
         let current = form.model_id.clone();
-        let mut chosen = current.clone();
-        egui::ComboBox::from_id_salt("suramak-default-model")
-            .selected_text(super::model_manager::display_name(&current))
-            .show_ui(ui, |ui| {
-                for (value, display) in model_options(&current) {
-                    ui.selectable_value(&mut chosen, value.clone(), display);
-                }
-            });
-        if chosen != current {
-            form.model_id = chosen;
-            dirty = true;
+        let options = model_options(&current);
+        // M14e: our dropdown (scrim + opaque sheet), not egui's translucent
+        // popup — the owner's "the drop down not blurring the bg so it
+        // cluttered" finding.
+        let chosen = super::dropdown::dropdown(
+            ui,
+            tokens,
+            motion,
+            "suramak-default-model",
+            &current,
+            &super::model_manager::display_name(&current),
+            &options,
+            280.0,
+        );
+        if let Some(chosen) = chosen {
+            if chosen != current {
+                form.model_id = chosen;
+                dirty = true;
+            }
         }
         if !core_models::MODELS.iter().any(|m| m.id == current) && current != "auto" {
             pane_caption(
@@ -405,6 +472,298 @@ fn transcription_section(
     dirty
 }
 
+/// M14e: the fast-engine **readiness list** — one line per fast engine, each
+/// with a live status dot and its action inline.
+///
+/// Nothing here routes: Indonesian still never goes fast (the guard is pinned in
+/// `suramak-asr::engine`), and the toggle above still decides whether covered
+/// languages use a fast engine at all. This list only *reports* what this build
+/// and this machine can do, and provisions the one thing that needs bytes on
+/// disk — Parakeet — through the same installer the CLI runs.
+fn fast_engine_readiness(
+    ui: &mut egui::Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    state: &mut AppState,
+    effects: &mut Vec<Effect>,
+) {
+    let readiness = state.fast_engine;
+    if !readiness.probed {
+        // Before the first probe the list says nothing rather than guessing a
+        // state (the probe runs when Settings opens).
+        return;
+    }
+    let download = state.model_manager.download.clone();
+    let any_download = download.is_running();
+    let installing = download.active_id() == Some(core_models::PARAKEET.id);
+
+    let mut effects_here: Vec<Effect> = Vec::new();
+    let mut note: Option<String> = None;
+
+    // ---- Apple SpeechTranscriber (macOS 26+) -------------------------------
+    let stt = readiness.stt;
+    row(ui, tokens, "Apple speech", |ui| {
+        status_chip(ui, tokens, stt_color(tokens, stt), stt.ready(), stt.label());
+        if stt.offers_permission_link() {
+            ui.add_space(8.0);
+            let allow = controls::button(
+                ui,
+                tokens,
+                motion,
+                "settings-stt-permission",
+                "Allow speech recognition…",
+                Tier::Secondary,
+                true,
+            )
+            .on_hover_text("Open System Settings → Privacy & Security → Speech Recognition");
+            if allow.clicked() {
+                note = Some(match fast_engine::open_stt_permission_settings() {
+                    Ok(()) => "System Settings → Privacy & Security → Speech Recognition is open"
+                        .to_string(),
+                    Err(err) => format!("could not open System Settings: {err}"),
+                });
+            }
+        }
+    });
+    row_caption(ui, tokens, fast_engine::STT_CAPTION, false);
+
+    // ---- Parakeet (the fast engine with a model to install) ----------------
+    let parakeet = readiness.parakeet;
+    let total = super::model_manager::human_size(core_models::parakeet_total_bytes());
+    row(ui, tokens, "Parakeet (0.6B v3)", |ui| {
+        status_chip(
+            ui,
+            tokens,
+            parakeet_color(tokens, parakeet),
+            parakeet.ready(),
+            parakeet.label(),
+        );
+        if parakeet.ready() || parakeet.offers_download() {
+            // The size is part of the decision, not a surprise after the click.
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(format!("· {total}"))
+                    .size(12.0)
+                    .color(tokens.ink_soft),
+            );
+        }
+        if parakeet.offers_download() && !installing {
+            ui.add_space(8.0);
+            let button = controls::button(
+                ui,
+                tokens,
+                motion,
+                "settings-parakeet-download",
+                "Download",
+                Tier::Secondary,
+                !any_download,
+            )
+            .on_hover_text(format!(
+                "Download {total} from HuggingFace (sha256-verified, resumable)"
+            ));
+            if button.clicked() {
+                effects_here.extend(state.start_model_download(core_models::PARAKEET.id));
+            }
+        }
+        if parakeet.offers_delete() && !installing {
+            ui.add_space(6.0);
+            let button = controls::button(
+                ui,
+                tokens,
+                motion,
+                "settings-parakeet-delete",
+                "Delete",
+                Tier::Tertiary,
+                !any_download,
+            )
+            .on_hover_text("Remove the Parakeet model files from this machine");
+            if button.clicked() {
+                effects_here.extend(state.delete_model(core_models::PARAKEET.id));
+            }
+        }
+    });
+    row_caption(ui, tokens, fast_engine::PARAKEET_COVERAGE_CAPTION, false);
+    // The coverage list, expandable (a collapsible line — never a wall of text).
+    let open_id = ui.id().with("settings-parakeet-coverage-open");
+    let mut open = ui
+        .ctx()
+        .data(|data| data.get_temp::<bool>(open_id).unwrap_or(false));
+    ui.horizontal(|ui| {
+        ui.add_space(LABEL_W);
+        let count = fast_engine::parakeet_coverage_lines().len();
+        let label = if open {
+            "Hide languages".to_string()
+        } else {
+            format!("Show the {count} languages")
+        };
+        if controls::button(
+            ui,
+            tokens,
+            motion,
+            "settings-parakeet-coverage",
+            &label,
+            Tier::Tertiary,
+            true,
+        )
+        .clicked()
+        {
+            open = !open;
+            ui.ctx().data_mut(|data| data.insert_temp(open_id, open));
+        }
+    });
+    if open {
+        row_caption(ui, tokens, &fast_engine::parakeet_coverage_hover(), false);
+    }
+
+    // ---- the install card (the existing job-card machinery) -----------------
+    if installing && install_card(ui, tokens, motion, &download, &mut effects_here) {
+        effects_here.extend(state.cancel_download());
+    }
+
+    for effect in effects_here {
+        effects.push(effect);
+    }
+    if let Some(note) = note {
+        state.settings_form.status = Some(Ok(note));
+    }
+    ui.add_space(4.0);
+}
+
+/// The readiness dot's colour: green when ready, amber when the user can do
+/// something about it, faint when this build/machine cannot.
+fn stt_color(tokens: &Tokens, status: fast_engine::SttStatus) -> egui::Color32 {
+    match status {
+        fast_engine::SttStatus::Available => tokens.ok,
+        fast_engine::SttStatus::NeedsPermission => tokens.warn,
+        fast_engine::SttStatus::NeedsMacOs26 | fast_engine::SttStatus::NotInThisBuild => {
+            tokens.ink_faint
+        }
+    }
+}
+
+fn parakeet_color(tokens: &Tokens, status: fast_engine::ParakeetStatus) -> egui::Color32 {
+    match status {
+        fast_engine::ParakeetStatus::Installed => tokens.ok,
+        fast_engine::ParakeetStatus::Partial => tokens.warn,
+        fast_engine::ParakeetStatus::Missing | fast_engine::ParakeetStatus::NotInThisBuild => {
+            tokens.ink_faint
+        }
+    }
+}
+
+/// A status dot + word (the readiness chip). The word carries the meaning for
+/// screen readers and colour-blind users; the dot is the glance. A ready state
+/// reads in full ink, anything else dims (the state is the one loud thing).
+fn status_chip(ui: &mut egui::Ui, tokens: &Tokens, dot: egui::Color32, ready: bool, label: &str) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(9.0, 16.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 3.5, dot);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, label));
+    ui.label(
+        egui::RichText::new(label)
+            .size(12.0)
+            .color(if ready { tokens.ink } else { tokens.ink_soft })
+            .family(egui::FontFamily::Proportional),
+    );
+}
+
+/// The inline install card (M14e): the job-card pattern inside Settings —
+/// bytes, per-file progress, the honest total, and a Cancel that really stops
+/// the transfer. Returns true when Cancel was pressed.
+fn install_card(
+    ui: &mut egui::Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    download: &DownloadState,
+    _effects: &mut Vec<Effect>,
+) -> bool {
+    let fraction = f32::from(download.percent().unwrap_or(0)) / 100.0;
+    let height = 62.0;
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width().max(240.0) - LABEL_W, height),
+        egui::Sense::hover(),
+    );
+    // Indent to the field column so the card belongs to the Parakeet row.
+    let rect = rect.translate(egui::vec2(LABEL_W, 0.0));
+    super::views::paint_card(ui.painter(), rect, tokens);
+    let painter = ui.painter();
+    let title = format!(
+        "Installing {} — {} of {}",
+        super::model_manager::display_name(core_models::PARAKEET.id),
+        super::model_manager::human_size(download_bytes_done(download)),
+        super::model_manager::human_size(core_models::parakeet_total_bytes()),
+    );
+    painter.text(
+        egui::pos2(rect.left() + 12.0, rect.top() + 8.0),
+        egui::Align2::LEFT_TOP,
+        title,
+        egui::FontId::new(12.0, egui::FontFamily::Proportional),
+        tokens.ink,
+    );
+    if let Some(line) = download.file_line() {
+        painter.text(
+            egui::pos2(rect.right() - 12.0, rect.top() + 8.0),
+            egui::Align2::RIGHT_TOP,
+            line,
+            egui::FontId::new(10.5, egui::FontFamily::Monospace),
+            tokens.ink_soft,
+        );
+    }
+    let bar = Rect::from_min_size(
+        egui::pos2(rect.left() + 12.0, rect.top() + 30.0),
+        egui::vec2(rect.width() - 24.0, 8.0),
+    );
+    painter.rect_filled(bar, egui::CornerRadius::same(4), tokens.panel_faint);
+    if fraction > 0.0 {
+        painter.rect_filled(
+            Rect::from_min_size(bar.min, egui::vec2(bar.width() * fraction, bar.height())),
+            egui::CornerRadius::same(4),
+            tokens.accent,
+        );
+    }
+    painter.text(
+        egui::pos2(bar.left(), bar.bottom() + 4.0),
+        egui::Align2::LEFT_TOP,
+        format!("{}%", (fraction * 100.0).round() as u8),
+        egui::FontId::new(10.5, egui::FontFamily::Monospace),
+        tokens.ink_soft,
+    );
+
+    // Cancel (or the in-flight label): the run stops at its next chunk.
+    let mut cancel = false;
+    let cancel_rect = Rect::from_min_size(
+        egui::pos2(rect.right() - 96.0, rect.top() + 26.0),
+        egui::vec2(84.0, 24.0),
+    );
+    ui.scope_builder(egui::UiBuilder::new().max_rect(cancel_rect), |ui| {
+        let label = if download.is_cancelling() {
+            "cancelling…"
+        } else {
+            "Cancel"
+        };
+        if controls::button(
+            ui,
+            tokens,
+            motion,
+            "settings-parakeet-cancel",
+            label,
+            Tier::Tertiary,
+            !download.is_cancelling(),
+        )
+        .clicked()
+        {
+            cancel = true;
+        }
+    });
+    cancel
+}
+
+fn download_bytes_done(download: &DownloadState) -> u64 {
+    match download {
+        DownloadState::Running { bytes_done, .. } => *bytes_done,
+        _ => 0,
+    }
+}
+
 /// M9a appearance: System (follows the OS live) | Light | Dark, as a segmented
 /// control. Applied when the form saves — no restart.
 fn appearance_section(
@@ -435,12 +794,8 @@ fn appearance_section(
         }
     });
 
-    row_caption(
-        ui,
-        tokens,
-        "System follows the macOS light/dark setting live; Light or Dark forces this app's appearance. Applied when you press Save.",
-        false,
-    );
+    // M14e: the copy resolves per platform (it said "macOS" on Windows).
+    row_caption(ui, tokens, crate::app::copy::theme_caption_here(), false);
     ui.add_space(4.0);
     dirty
 }
@@ -992,6 +1347,230 @@ mod tests {
             labels.iter().any(|label| label == caption),
             "the updates caption must paint; got {labels:?}"
         );
+    }
+
+    // ---- M14e: the fast-engine readiness list -------------------------------
+
+    fn frame_settings(
+        ctx: &egui::Context,
+        state: &mut AppState,
+        size: (f32, f32),
+        time: f64,
+    ) -> egui::FullOutput {
+        let tokens = crate::theme::tokens(AppTheme::Light);
+        let motion = Motion::new(false);
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(size.0, size.1));
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            time: Some(time),
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    let mut effects = Vec::new();
+                    super::ui(ui, &tokens, &motion, state, &mut effects);
+                });
+        })
+    }
+
+    fn painted_labels(output: &egui::FullOutput) -> Vec<String> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// M14e: the readiness list renders both rows with a live status and the
+    /// inline action — the toggle's one checkbox plus a CLI hint is gone.
+    #[test]
+    fn the_readiness_list_shows_every_fast_engine_with_its_status_and_action() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut state = AppState::new();
+        // A macOS-26 machine with speech permission granted and no Parakeet yet.
+        state.fast_engine = fast_engine::FastEngineReadiness {
+            stt: fast_engine::SttStatus::Available,
+            parakeet: fast_engine::ParakeetStatus::Missing,
+            probed: true,
+        };
+        // Tall enough that the whole form is laid out (the form scrolls at 900×600).
+        let _ = frame_settings(&ctx, &mut state, (900.0, 2600.0), 0.0);
+        let output = frame_settings(&ctx, &mut state, (900.0, 2600.0), 0.2);
+        let labels = painted_labels(&output);
+        for expected in [
+            "Fast engine",
+            "(experimental) — fast engines for covered languages",
+            "Apple speech",
+            "Available",
+            "Parakeet (0.6B v3)",
+            "Not downloaded",
+            "Download",
+        ] {
+            assert!(
+                labels.iter().any(|label| label == expected),
+                "missing {expected:?}; got {labels:?}"
+            );
+        }
+        // The two captions are painted verbatim (they are the copy pins).
+        for caption in [
+            fast_engine::STT_CAPTION,
+            fast_engine::PARAKEET_COVERAGE_CAPTION,
+        ] {
+            assert!(
+                labels.iter().any(|label| label == caption),
+                "the caption must paint: {caption:?}"
+            );
+        }
+        // No "Needs permission" control when the permission is granted.
+        assert!(!labels.iter().any(|label| label.contains("Allow speech")));
+
+        // …and the permission state offers the exact-pane control instead.
+        state.fast_engine.stt = fast_engine::SttStatus::NeedsPermission;
+        let _ = frame_settings(&ctx, &mut state, (900.0, 2600.0), 0.3);
+        let output = frame_settings(&ctx, &mut state, (900.0, 2600.0), 0.4);
+        let labels = painted_labels(&output);
+        assert!(labels.iter().any(|label| label == "Needs permission"));
+        assert!(
+            labels
+                .iter()
+                .any(|label| label == "Allow speech recognition…"),
+            "a needs-permission row must never be a dead end; got {labels:?}"
+        );
+    }
+
+    /// M14e: an installed Parakeet offers Delete + its size and no Download.
+    #[test]
+    fn an_installed_parakeet_costs_a_delete_control_not_a_download() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut state = AppState::new();
+        state.fast_engine = fast_engine::FastEngineReadiness {
+            stt: fast_engine::SttStatus::NotInThisBuild,
+            parakeet: fast_engine::ParakeetStatus::Installed,
+            probed: true,
+        };
+        let _ = frame_settings(&ctx, &mut state, (900.0, 2600.0), 0.0);
+        let output = frame_settings(&ctx, &mut state, (900.0, 2600.0), 0.2);
+        let labels = painted_labels(&output);
+        assert!(labels.iter().any(|label| label == "Installed"));
+        assert!(labels.iter().any(|label| label == "Delete"));
+        assert!(
+            !labels.iter().any(|label| label == "Download"),
+            "an installed model never offers a second download: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|label| label.contains("670")),
+            "the installed row states its size: {labels:?}"
+        );
+        // The SpeechTranscriber row is honest about a feature-off build.
+        assert!(labels.iter().any(|label| label == "Not in this build"));
+    }
+
+    /// The copy seam (M14e): the Settings screen never tells a GUI user to run a
+    /// CLI command. This is the check the workorder names — it scans every
+    /// painted label of the real Settings frame.
+    #[test]
+    fn no_settings_copy_asks_the_user_to_run_a_cli_command() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut state = AppState::new();
+        state.fast_engine = fast_engine::FastEngineReadiness {
+            stt: fast_engine::SttStatus::NeedsPermission,
+            parakeet: fast_engine::ParakeetStatus::Missing,
+            probed: true,
+        };
+        let _ = frame_settings(&ctx, &mut state, (900.0, 2800.0), 0.0);
+        let output = frame_settings(&ctx, &mut state, (900.0, 2800.0), 0.3);
+        for label in painted_labels(&output) {
+            // A backtick alone is fine ("feature `capture`" is a build
+            // feature, not a command); the checks are the command shapes.
+            for leak in [
+                "suramak-cli",
+                "--encoder",
+                "models download",
+                "cargo build",
+                "cargo run",
+            ] {
+                assert!(
+                    !label.contains(leak),
+                    "Settings copy leaks {leak:?} to a GUI user: {label:?}"
+                );
+            }
+        }
+    }
+
+    /// M14e (the Windows pill finding): the scroll viewport ends **above** the
+    /// floating record pill's actual rect, so no row can sit under it, and the
+    /// first heading is never clipped by a mac-tuned top offset.
+    #[test]
+    fn the_form_viewport_clears_the_pill_and_starts_under_the_measured_header() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut state = AppState::new();
+        state.fast_engine = fast_engine::FastEngineReadiness {
+            stt: fast_engine::SttStatus::NotInThisBuild,
+            parakeet: fast_engine::ParakeetStatus::Missing,
+            probed: true,
+        };
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(900.0, 600.0));
+        let run = |state: &mut AppState, time: f64| {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(time),
+                ..Default::default()
+            };
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let mut effects = Vec::new();
+                        super::ui(
+                            ui,
+                            &crate::theme::tokens(AppTheme::Light),
+                            &Motion::new(false),
+                            state,
+                            &mut effects,
+                        );
+                    });
+            })
+        };
+        let _ = run(&mut state, 0.0);
+        let output = run(&mut state, 0.2);
+        // The pill's rect at this window (the same function the painter and the
+        // macOS glass use).
+        let pill = suramak_glass::float_rect((900.0, 600.0), 1.0);
+        // Every painted label of the form body must end above the pill's top.
+        let mut body_shapes = 0;
+        for clipped in &output.shapes {
+            let bounds = clipped.shape.visual_bounding_rect();
+            if !bounds.is_finite() || bounds.is_negative() || bounds.height() <= 0.0 {
+                continue;
+            }
+            // Only what is actually *visible* counts: a control that straddles
+            // the scroll viewport's edge is clipped away by the viewport, so the
+            // test intersects each shape with its clip rect (the same thing the
+            // renderer does).
+            let visible = bounds.intersect(clipped.clip_rect);
+            if !visible.is_positive() || visible.top() < 150.0 {
+                continue;
+            }
+            body_shapes += 1;
+            assert!(
+                visible.bottom() <= pill.y,
+                "a form shape is visible under the record pill ({visible:?} vs pill top {}): {bounds:?}",
+                pill.y,
+            );
+        }
+        assert!(body_shapes > 0, "the form body painted nothing");
+        // …and the heading is inside the viewport (not clipped away).
+        let labels = painted_labels(&output);
+        assert!(labels.iter().any(|label| label == "Transcription"));
     }
 
     /// M9e (P2-3) caption wrap: at the 900×600 minimum the pane is 693 pt wide

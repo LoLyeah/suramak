@@ -71,6 +71,15 @@ pub const HEADER_CAPTION_GAP: f32 = 2.0;
 pub const HEADER_CAPTION_ROW: f32 = 18.0;
 /// How many caption rows the block reserves (meta, save, status).
 pub const HEADER_CAPTION_ROWS: usize = 3;
+/// M14e: the slot the title row reserves at its left for the Home control.
+///
+/// The owner's Windows finding: "← Home was not discoverable in the editor" —
+/// and it was worse than that, the editor route had no Home control at all.
+/// The slot is a **constant** like the rest of this header (the title's x never
+/// depends on what a control measured this frame): the `← Home` control's
+/// designed width (~78 pt) plus the cluster gap.
+pub const NAV_HOME_SLOT: f32 = 88.0;
+
 /// The title's right reserve for the action cluster (trash + Polish + Undo +
 /// the confirm step); a longer title truncates with an ellipsis instead of
 /// pushing the cluster or growing the row.
@@ -489,9 +498,24 @@ fn title_line(
         None => ("No transcript open".to_string(), false),
     };
 
+    // M14e: the quiet `← Home` control at the row's left — a real control
+    // (hover/press/focus states, a ≥24 pt target), not a text link. Drawn
+    // first so the title starts after its constant slot.
+    let nav_slot = Rect::from_min_size(
+        pos2(row.left() + PANE_PAD_X - 8.0, row.center().y - 13.0),
+        vec2(NAV_HOME_SLOT - tokens.space.xs, 26.0),
+    );
+    ui.scope_builder(egui::UiBuilder::new().max_rect(nav_slot), |ui| {
+        if controls::nav_home(ui, tokens, motion, "editor-nav").clicked() {
+            effects.extend(state.back_home());
+        }
+    });
+
     // The title: a single truncated row, centred in the constant row rect.
-    let title_left = row.left() + PANE_PAD_X - 8.0;
-    let max_width = (row.width() - (PANE_PAD_X - 8.0) * 2.0 - HEADER_CLUSTER_RESERVE).max(120.0);
+    let title_left = row.left() + PANE_PAD_X - 8.0 + NAV_HOME_SLOT;
+    let max_width =
+        (row.width() - (PANE_PAD_X - 8.0) * 2.0 - HEADER_CLUSTER_RESERVE - NAV_HOME_SLOT)
+            .max(120.0);
     let galley = title_galley(ui, tokens, &title, max_width);
     ui.painter().galley(
         pos2(title_left, row.center().y - galley.size().y / 2.0),
@@ -1441,8 +1465,21 @@ mod tests {
             // Every painted shape either belongs to a cluster control (inside
             // its rect + the ring allowance) or is the title (left of the
             // cluster); nothing may span the trash ↔ Polish gap.
+            //
+            // M14e: the row's leftmost control is the `← Home` navigation (the
+            // editor had no Home control at all before this slice — the owner's
+            // "not discoverable" finding), so the cluster is what follows it.
             let mut cluster: Vec<Rect> = records.iter().map(|record| record.rect).collect();
             cluster.sort_by(|a, b| a.left().partial_cmp(&b.left()).unwrap());
+            let nav = cluster.remove(0);
+            assert!(
+                nav.height() >= 24.0 && nav.width() >= 24.0,
+                "the Home control's click target must be ≥ 24 px: {nav:?}"
+            );
+            assert!(
+                nav.left() < row.left() + NAV_HOME_SLOT,
+                "the Home control sits in the row's reserved left slot: {nav:?}"
+            );
             let trash = *cluster.first().expect("the trash capsule");
             let polish = *cluster.last().expect("the Polish capsule");
             for clipped in &output.shapes {
@@ -1476,12 +1513,13 @@ mod tests {
             records
         };
 
-        // No undo: exactly the trash + Polish capsules.
+        // No undo: the Home control plus exactly the trash + Polish capsules.
         let mut state = demo_state("titleline");
         let records = run(&mut state);
         let mut cluster: Vec<Rect> = records.iter().map(|record| record.rect).collect();
         cluster.sort_by(|a, b| a.left().partial_cmp(&b.left()).unwrap());
-        assert_eq!(cluster.len(), 2, "trash + Polish: {cluster:?}");
+        assert_eq!(cluster.len(), 3, "Home + trash + Polish: {cluster:?}");
+        cluster.remove(0); // the nav slot (asserted above)
         let trash = cluster[0];
         let polish = cluster[1];
         let gap = polish.left() - trash.right();
@@ -1509,7 +1547,12 @@ mod tests {
         let records = run(&mut undo_state);
         let mut cluster: Vec<Rect> = records.iter().map(|record| record.rect).collect();
         cluster.sort_by(|a, b| a.left().partial_cmp(&b.left()).unwrap());
-        assert_eq!(cluster.len(), 3, "trash + Undo + Polish: {cluster:?}");
+        assert_eq!(
+            cluster.len(),
+            4,
+            "Home + trash + Undo + Polish: {cluster:?}"
+        );
+        cluster.remove(0); // the nav slot
         for pair in cluster.windows(2) {
             assert!(
                 !pair[0].intersects(pair[1]),

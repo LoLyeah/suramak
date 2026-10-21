@@ -23,6 +23,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -100,10 +101,27 @@ struct PeaksJob {
 }
 
 /// A model download running on a detached thread; the UI polls it.
+///
+/// M14e: a download may be a *set* of files (Parakeet) and must be cancellable,
+/// so the job also carries a shared progress record (bytes + file) and the
+/// stop flag its progress callback reads.
 struct DownloadJob {
     id: String,
-    bytes: Arc<Mutex<u64>>,
+    /// `(bytes_done, bytes_total, files_done, files_total, current file)`.
+    progress: Arc<Mutex<DownloadProgress>>,
+    /// Set by the Cancel control; the transfer stops at its next chunk.
+    cancel: Arc<AtomicBool>,
     result: Arc<Mutex<Option<Result<(), String>>>>,
+}
+
+/// The shared progress record one download thread writes and the UI polls.
+#[derive(Debug, Clone, Default)]
+struct DownloadProgress {
+    bytes_done: u64,
+    bytes_total: u64,
+    files_done: u32,
+    files_total: u32,
+    file: Option<String>,
 }
 
 /// A polish run on a detached thread (`suramak-polish`); the UI polls it.
@@ -131,6 +149,10 @@ pub struct DownloadStatus {
     pub id: String,
     pub bytes_done: u64,
     pub bytes_total: u64,
+    /// M14e: the file set's progress (`0 of 1` for a single-file model).
+    pub files_done: u32,
+    pub files_total: u32,
+    pub file: Option<String>,
     /// `Some` exactly once, when the download finished.
     pub finished: Option<Result<(), String>>,
 }
@@ -395,27 +417,45 @@ impl Runtime {
     /// must treat `finished: Some(..)` as terminal.
     pub fn download_status(&mut self) -> Option<DownloadStatus> {
         let job = self.download.as_ref()?;
-        let bytes_done = job.bytes.lock().map(|guard| *guard).unwrap_or(0);
-        let bytes_total = core_models::find_model(&job.id)
-            .map(|info| info.size_bytes)
-            .unwrap_or(0);
+        let progress = job
+            .progress
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
         let finished = job.result.lock().ok().and_then(|guard| guard.clone());
         if finished.is_some() {
             let id = job.id.clone();
             self.download = None;
             return Some(DownloadStatus {
                 id,
-                bytes_done,
-                bytes_total,
+                bytes_done: progress.bytes_done,
+                bytes_total: progress.bytes_total,
+                files_done: progress.files_done,
+                files_total: progress.files_total,
+                file: progress.file,
                 finished,
             });
         }
         Some(DownloadStatus {
             id: job.id.clone(),
-            bytes_done,
-            bytes_total,
+            bytes_done: progress.bytes_done,
+            bytes_total: progress.bytes_total,
+            files_done: progress.files_done,
+            files_total: progress.files_total,
+            file: progress.file,
             finished: None,
         })
+    }
+
+    /// M14e: stop the running download at its next chunk (no-op without one).
+    pub fn cancel_download(&self) -> bool {
+        match self.download.as_ref() {
+            Some(job) => {
+                job.cancel.store(true, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Executes effects (and any effects they produce) in order.
@@ -465,6 +505,11 @@ impl Runtime {
                     state.on_models_loaded(rows);
                 }
                 Effect::DownloadModel { id } => self.start_download(&id, state),
+                Effect::CancelDownload => {
+                    if !self.cancel_download() {
+                        tracing::warn!("cancel requested with no download running");
+                    }
+                }
                 Effect::DeleteModel { id } => {
                     let result = model_manager::delete_plan(&self.models_dir, &id)
                         .and_then(|plan| model_manager::apply_delete(&plan))
@@ -954,22 +999,42 @@ impl Runtime {
     }
 
     /// Starts the background download for `id` (one at a time).
+    ///
+    /// M14e: `parakeet` is the fast engine's model **set** — the same install
+    /// path the CLI runs (`suramak_core::download::download_files`), now with
+    /// per-file progress and a real Cancel. Single-file whisper models keep the
+    /// original `download_with_progress` path.
     fn start_download(&mut self, id: &str, state: &mut AppState) {
         if self.download.is_some() {
             state.on_download_done(id, Err("a download is already running".to_string()));
             return;
         }
-        let Some(info) = core_models::find_model(id) else {
+        let parakeet = core_models::find_parakeet(id).is_some();
+        let single = core_models::find_model(id);
+        if !parakeet && single.is_none() {
             state.on_download_done(id, Err(format!("unknown model '{id}'")));
             return;
-        };
+        }
         let dir = self.models_dir.clone();
-        let dest = dir.join(info.hf_file);
-        let url = core_models::model_url(info);
-        let sha256 = info.sha256.to_string();
-        let bytes = Arc::new(Mutex::new(0u64));
+        // The thread owns its own id: it outlives this borrow (`&str` param).
+        let job_id = id.to_string();
+        let progress = Arc::new(Mutex::new(DownloadProgress {
+            bytes_total: if parakeet {
+                core_models::parakeet_total_bytes()
+            } else {
+                single.map(|info| info.size_bytes).unwrap_or(0)
+            },
+            files_total: if parakeet {
+                core_models::PARAKEET.files.len() as u32
+            } else {
+                1
+            },
+            ..DownloadProgress::default()
+        }));
+        let cancel = Arc::new(AtomicBool::new(false));
         let result: Arc<Mutex<Option<Result<(), String>>>> = Arc::new(Mutex::new(None));
-        let progress = Arc::clone(&bytes);
+        let shared = Arc::clone(&progress);
+        let stop = Arc::clone(&cancel);
         let outcome = Arc::clone(&result);
 
         let spawned = thread::Builder::new()
@@ -977,14 +1042,60 @@ impl Runtime {
             .spawn(move || {
                 let run = (|| -> Result<(), String> {
                     std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
-                    suramak_core::download::download_with_progress(
+                    if parakeet {
+                        let info = &core_models::PARAKEET;
+                        let dest = core_models::parakeet_dir(&dir);
+                        let pins: Vec<(&str, u64, &str)> = info
+                            .files
+                            .iter()
+                            .map(|file| (file.name, file.size_bytes, file.sha256))
+                            .collect();
+                        suramak_core::download::download_files_with_progress(
+                            &dest,
+                            &pins,
+                            |name| core_models::parakeet_file_url(info, name),
+                            core_models::PARAKEET_REQUIRED_FILES,
+                            |file| {
+                                if let Ok(mut guard) = shared.lock() {
+                                    guard.bytes_done = file.bytes_done;
+                                    guard.bytes_total = file.bytes_total;
+                                    guard.files_done = file.file_index;
+                                    guard.files_total = file.file_count;
+                                    guard.file = Some(file.file.to_string());
+                                }
+                                !stop.load(Ordering::SeqCst)
+                            },
+                        )
+                        .map_err(|err| err.to_string())?;
+                        // The same post-check the CLI does: a downloaded set that
+                        // does not form the layout is not an install.
+                        if !core_models::parakeet_installed(&dir) {
+                            return Err(format!(
+                                "downloaded into {} but the Parakeet layout is incomplete",
+                                dest.display()
+                            ));
+                        }
+                        if let Ok(mut guard) = shared.lock() {
+                            guard.bytes_done = guard.bytes_total;
+                        }
+                        return Ok(());
+                    }
+                    let info = single.ok_or_else(|| format!("unknown model '{job_id}'"))?;
+                    let dest = dir.join(info.hf_file);
+                    let url = core_models::model_url(info);
+                    let total = info.size_bytes;
+                    suramak_core::download::download_with_progress_checked(
                         &url,
                         &dest,
-                        &sha256,
+                        info.sha256,
                         |written| {
-                            if let Ok(mut guard) = progress.lock() {
-                                *guard = written;
+                            if let Ok(mut guard) = shared.lock() {
+                                guard.bytes_done = written;
+                                guard.bytes_total = total;
+                                guard.files_done = 0;
+                                guard.files_total = 1;
                             }
+                            !stop.load(Ordering::SeqCst)
                         },
                     )
                     .map_err(|err| err.to_string())
@@ -997,7 +1108,8 @@ impl Runtime {
             Ok(_handle) => {
                 self.download = Some(DownloadJob {
                     id: id.to_string(),
-                    bytes,
+                    progress,
+                    cancel,
                     result,
                 });
             }
@@ -1069,6 +1181,11 @@ impl Runtime {
             plan.warning.clone(),
         );
 
+        // M14e: the card's interpolation clock starts now, with the input's
+        // header-read duration (no decode) and the job's forced language.
+        let duration_ms = suramak_core::decode::probe_duration_ms(&input);
+        state.job_started(Instant::now(), duration_ms, language);
+
         self.next_job_id += 1;
         // M9e (P2-2): one fresh cancel token per job; the runtime keeps the
         // handle the Cancel control sets, the worker observes its clone.
@@ -1087,6 +1204,11 @@ impl Runtime {
             state.job_failed(err);
         } else {
             self.job_cancel = Some(cancel);
+            if duration_ms.is_none() {
+                tracing::debug!(
+                    "no duration in the container header — the progress bar stays honest (estimating)"
+                );
+            }
         }
     }
 

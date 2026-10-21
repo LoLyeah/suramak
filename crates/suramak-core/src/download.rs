@@ -24,6 +24,25 @@ pub fn download_with_progress(
     expected_sha256: &str,
     mut on_progress: impl FnMut(u64),
 ) -> Result<(), SuramakError> {
+    download_with_progress_checked(url, dest, expected_sha256, |written| {
+        on_progress(written);
+        true
+    })
+}
+
+/// [`download_with_progress`] whose callback can also **stop** the transfer.
+///
+/// Returning `false` from `on_progress` abandons the stream at the next chunk
+/// and returns [`SuramakError::Cancelled`]. The bytes already written stay in
+/// `dest.part`, so a later attempt resumes from them — a cancel never throws
+/// away what the network already delivered. M14e: the in-app Cancel on the
+/// Parakeet model download (a 652 MB file must stop when asked).
+pub fn download_with_progress_checked(
+    url: &str,
+    dest: &Path,
+    expected_sha256: &str,
+    mut on_progress: impl FnMut(u64) -> bool,
+) -> Result<(), SuramakError> {
     let part_path = part_path(dest);
 
     if dest.exists() {
@@ -37,7 +56,9 @@ pub fn download_with_progress(
     } else {
         0
     };
-    on_progress(existing_bytes);
+    if !on_progress(existing_bytes) {
+        return Err(SuramakError::Cancelled);
+    }
 
     let client = reqwest::blocking::Client::builder()
         .https_only(false)
@@ -79,7 +100,9 @@ pub fn download_with_progress(
             debug!(
                 "the server ignored the Range header (HTTP 200) — restarting the download from byte 0"
             );
-            on_progress(0);
+            if !on_progress(0) {
+                return Err(SuramakError::Cancelled);
+            }
         }
     } else if !status.is_success() && status.as_u16() != 206 {
         return Err(SuramakError::Http(resp.error_for_status().unwrap_err()));
@@ -113,7 +136,10 @@ pub fn download_with_progress(
         }
         file.write_all(&buf[..n])?;
         written += n as u64;
-        on_progress(base + written);
+        if !on_progress(base + written) {
+            // Keep the .part: the next attempt resumes from here.
+            return Err(SuramakError::Cancelled);
+        }
     }
     drop(file);
 
@@ -225,6 +251,45 @@ pub fn download_files(
     url_for: impl Fn(&str) -> String,
     required: &[&str],
 ) -> Result<(), SuramakError> {
+    download_files_with_progress(dest_dir, files, url_for, required, |_| true)
+}
+
+/// Progress of one multi-file download ([`download_files_with_progress`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FilesProgress<'a> {
+    /// The file being transferred (its manifest name).
+    pub file: &'a str,
+    /// Index of that file in the pinned set (0-based).
+    pub file_index: u32,
+    /// How many files the set has.
+    pub file_count: u32,
+    /// Bytes of **this** file on disk so far (a resume reports its offset).
+    pub file_bytes: u64,
+    /// The pinned size of this file.
+    pub file_size: u64,
+    /// Bytes across the whole set (files already done + this file's bytes).
+    pub bytes_done: u64,
+    /// The pinned size of the whole set.
+    pub bytes_total: u64,
+}
+
+/// [`download_files`] with per-file progress that can also **stop** the run.
+///
+/// `on_progress` receives every chunk's position (plus one report per file
+/// boundary, so a skipped/resumed file still shows as complete), and returning
+/// `false` cancels at the next chunk — [`SuramakError::Cancelled`], with the
+/// partial bytes kept for the next attempt. M14e: the in-app Parakeet install
+/// (four pinned files, ~670 MB) reports which file and how far, and its Cancel
+/// control really stops the transfer.
+pub fn download_files_with_progress(
+    dest_dir: &Path,
+    files: &[(&str, u64, &str)],
+    url_for: impl Fn(&str) -> String,
+    required: &[&str],
+    mut on_progress: impl FnMut(FilesProgress<'_>) -> bool,
+) -> Result<(), SuramakError> {
+    let bytes_total: u64 = files.iter().map(|(_, size, _)| *size).sum();
+    let file_count = files.len() as u32;
     if dir_ready(dest_dir, required) {
         for (name, size, sha256) in files {
             let path = dest_dir.join(name);
@@ -235,20 +300,46 @@ pub fn download_files(
         return Ok(());
     }
     std::fs::create_dir_all(dest_dir)?;
-    for (name, size, sha256) in files {
+    let mut bytes_done = 0u64;
+    for (index, (name, size, sha256)) in files.iter().enumerate() {
         let dest = dest_dir.join(name);
         if dest.exists() {
             // A file from an earlier interrupted run: verify before trusting it.
             check_size(&dest, *size)?;
             verify_sha256(&dest, sha256)?;
+            bytes_done += *size;
+            let report = FilesProgress {
+                file: name,
+                file_index: index as u32,
+                file_count,
+                file_bytes: *size,
+                file_size: *size,
+                bytes_done,
+                bytes_total,
+            };
+            if !on_progress(report) {
+                return Err(SuramakError::Cancelled);
+            }
             continue;
         }
         let url = url_for(name);
         debug!("downloading {name} from {url}");
-        download(&url, &dest, sha256)?;
+        let file_base = bytes_done;
+        download_with_progress_checked(&url, &dest, sha256, |file_bytes| {
+            on_progress(FilesProgress {
+                file: name,
+                file_index: index as u32,
+                file_count,
+                file_bytes,
+                file_size: *size,
+                bytes_done: file_base + file_bytes,
+                bytes_total,
+            })
+        })?;
         // Re-verify the final file (post-rename) so the claim is airtight.
         check_size(&dest, *size)?;
         verify_sha256(&dest, sha256)?;
+        bytes_done += *size;
     }
     if !dir_ready(dest_dir, required) {
         let missing: Vec<&str> = required
@@ -585,6 +676,165 @@ mod tests {
 
         let got = std::fs::read(&dest).unwrap();
         assert_eq!(got, FULL, "resume must rebuild the exact original bytes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- M14e: cancellation + per-file progress ------------------------------
+
+    /// Serves `bodies.len()` sequential GETs on one ephemeral port.
+    fn serve_many(bodies: Vec<Vec<u8>>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for body in bodies {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 1024];
+                while let Ok(n) = stream.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    seen.extend_from_slice(&buf[..n]);
+                    if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let _ = std::io::Write::write_all(&mut stream, &ok_200(&body));
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A cancel really stops the stream and keeps the bytes on disk: the next
+    /// attempt resumes from the `.part` instead of re-downloading 652 MB.
+    #[test]
+    fn a_cancelled_transfer_keeps_its_partial_file() {
+        let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let (dest, dir) = partial_and_dest("cancel-mid");
+        let url = format!("{}/big.bin", serve_many(vec![body.clone()]));
+
+        let mut seen = Vec::new();
+        let err = download_with_progress_checked(&url, &dest, &sha256_hex(&body), |written| {
+            seen.push(written);
+            // Stop once the first 64 KiB chunk landed.
+            written < 100_000
+        })
+        .expect_err("a false from the callback must stop the transfer");
+        assert!(matches!(err, SuramakError::Cancelled), "got {err:?}");
+        assert!(
+            !dest.exists(),
+            "a cancelled transfer must not publish the destination file"
+        );
+        let kept = std::fs::metadata(part_path(&dest))
+            .expect("the partial bytes stay for the next attempt")
+            .len();
+        assert!(
+            kept > 0 && kept < body.len() as u64,
+            "the kept part must be partial: {kept} of {}",
+            body.len()
+        );
+        assert_eq!(
+            seen.last().copied(),
+            Some(kept),
+            "the last report is the bytes on disk"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The multi-file progress names the file it is on, counts files, and the
+    /// set's byte total spans every pinned file (the Settings card's copy).
+    #[test]
+    fn multi_file_progress_names_each_file_and_totals_the_set() {
+        let first = b"abcd".to_vec();
+        let second = b"efghij".to_vec();
+        let dir = std::env::temp_dir().join(format!("suramak-mf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = serve_many(vec![first.clone(), second.clone()]);
+        let (first_sha, second_sha) = (sha256_hex(&first), sha256_hex(&second));
+        let files = vec![
+            ("a.bin", first.len() as u64, first_sha.as_str()),
+            ("b.bin", second.len() as u64, second_sha.as_str()),
+        ];
+
+        let mut reports = Vec::new();
+        download_files_with_progress(
+            &dir,
+            &files,
+            |name| format!("{base}/{name}"),
+            &["a.bin", "b.bin"],
+            |progress| {
+                reports.push((
+                    progress.file.to_string(),
+                    progress.file_index,
+                    progress.file_count,
+                    progress.bytes_done,
+                    progress.bytes_total,
+                ));
+                true
+            },
+        )
+        .expect("both files download");
+
+        assert_eq!(
+            reports.first().map(|r| r.0.as_str()),
+            Some("a.bin"),
+            "the first report names the first file: {reports:?}"
+        );
+        assert_eq!(reports.last().map(|r| r.0.as_str()), Some("b.bin"));
+        assert!(reports.iter().all(|r| r.2 == 2), "file_count: {reports:?}");
+        assert!(
+            reports.iter().all(|r| r.4 == 10),
+            "bytes_total: {reports:?}"
+        );
+        assert_eq!(
+            reports.last().map(|r| r.3),
+            Some(10),
+            "the set's done bytes reach the full total: {reports:?}"
+        );
+        assert!(dir.join("a.bin").is_file() && dir.join("b.bin").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cancelling mid-set keeps the files already verified and the current
+    /// one's `.part` — a retry does not re-download what it already has.
+    #[test]
+    fn a_cancel_mid_set_keeps_completed_files_and_the_current_part() {
+        let first = b"abcd".to_vec();
+        let body: Vec<u8> = (0..200_000u32).map(|i| (i % 97) as u8).collect();
+        let dir = std::env::temp_dir().join(format!("suramak-mf-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = serve_many(vec![first.clone(), body.clone()]);
+        let (first_sha, body_sha) = (sha256_hex(&first), sha256_hex(&body));
+        let files = vec![
+            ("a.bin", first.len() as u64, first_sha.as_str()),
+            ("b.bin", body.len() as u64, body_sha.as_str()),
+        ];
+
+        let err = download_files_with_progress(
+            &dir,
+            &files,
+            |name| format!("{base}/{name}"),
+            &["a.bin", "b.bin"],
+            |progress| {
+                // Cancel as soon as the big second file starts moving.
+                !(progress.file == "b.bin" && progress.file_bytes > 0)
+            },
+        )
+        .expect_err("a cancel must surface as an error");
+        assert!(matches!(err, SuramakError::Cancelled), "got {err:?}");
+        assert!(
+            dir.join("a.bin").is_file(),
+            "the completed first file stays"
+        );
+        assert!(
+            dir.join("b.bin.part").is_file(),
+            "the current file's partial bytes stay"
+        );
+        assert!(!dir.join("b.bin").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -53,6 +53,34 @@ pub fn ui(
         Job::Idle => ("—".to_string(), 0, None, None, Vec::new(), None, false),
     };
     let running = matches!(state.job, Job::Running(_));
+    // M14e: the bar moves between the engine's sparse progress events — from the
+    // wall clock against the input's duration, clamped below 97 % until a real
+    // event confirms more. A job without a known duration keeps the honest
+    // "estimating…" label instead of a bar that pretends.
+    let progress = match &state.job {
+        Job::Running(run) => Some(run.progress(std::time::Instant::now())),
+        _ => None,
+    };
+    let fraction = progress
+        .as_ref()
+        .map(|progress| progress.fraction)
+        .unwrap_or_else(|| f32::from(pct) / 100.0);
+    let label = progress
+        .as_ref()
+        .map(|progress| progress.label.clone())
+        .unwrap_or_else(|| format!("{pct}%"));
+    if progress.as_ref().is_some_and(|progress| progress.animating) {
+        // Heat budget: the bar is the only thing moving on this screen, and only
+        // while it visibly moves (the estimate stops at the ceiling).
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(120));
+    }
+    // Why a fast engine is idle on this job: `auto` never routes to one. Shown
+    // only when the fast engine is on (otherwise there is nothing to explain).
+    let auto_note = match (&state.job, state.settings_form.fast_engine) {
+        (Job::Running(run), true) => run.auto_language_note(),
+        _ => None,
+    };
 
     ui.horizontal(|ui| {
         ui.add_space(PANE_PAD_X - 8.0);
@@ -85,7 +113,6 @@ pub fn ui(
         vec2(card.width() - 44.0, 14.0),
     );
     painter.rect_filled(bar, CornerRadius::same(7), tokens.panel_faint);
-    let fraction = f32::from(pct) / 100.0;
     if fraction > 0.0 {
         let filled = Rect::from_min_size(bar.min, vec2(bar.width() * fraction, bar.height()));
         painter.rect_filled(filled, CornerRadius::same(7), tokens.accent);
@@ -93,7 +120,7 @@ pub fn ui(
     painter.text(
         pos2(bar.center().x, bar.top() - 14.0),
         Align2::CENTER_CENTER,
-        format!("{pct}%"),
+        label,
         FontId::new(12.0, FontFamily::Monospace),
         tokens.ink,
     );
@@ -149,6 +176,18 @@ pub fn ui(
     }
 
     let mut y = card.bottom() + 16.0;
+    if let Some(note) = auto_note {
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(Rect::from_min_size(pos2(left, y), vec2(right - left, 18.0))),
+            |ui| {
+                ui.horizontal(|ui| {
+                    pane_caption(ui, note, tokens, false);
+                });
+            },
+        );
+        y += 18.0;
+    }
     for warning in &warnings {
         ui.scope_builder(
             egui::UiBuilder::new()
@@ -192,5 +231,124 @@ pub fn ui(
                 });
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{AppState, Job};
+    use crate::theme::AppTheme;
+
+    fn frame(ctx: &egui::Context, state: &mut AppState, time: f64) -> egui::FullOutput {
+        let tokens = crate::theme::tokens(AppTheme::Light);
+        let motion = Motion::new(false);
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 600.0));
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            time: Some(time),
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    let mut effects = Vec::new();
+                    super::ui(ui, &tokens, &motion, state, &mut effects);
+                });
+        })
+    }
+
+    fn labels(output: &egui::FullOutput) -> Vec<String> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn running_job(auto_language: bool, with_duration: bool) -> AppState {
+        let mut state = AppState::new();
+        let dir = std::env::temp_dir().join(format!("suramak-m14e-jc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("clip.wav");
+        std::fs::write(&input, b"x").unwrap();
+        state.begin_import(input);
+        let language = if auto_language { None } else { Some("en") };
+        let duration = if with_duration { Some(9_000) } else { None };
+        state.job_started(std::time::Instant::now(), duration, language);
+        // The fast engine is on (the note only exists to explain a fast engine).
+        state.settings_form.fast_engine = true;
+        state
+    }
+
+    /// M14e: with the fast engine on and the language on `auto`, the card says
+    /// why no fast engine ran — a quiet one-liner, not a warning.
+    #[test]
+    fn the_card_explains_an_auto_language_when_the_fast_engine_is_on() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut state = running_job(true, true);
+        let _ = frame(&ctx, &mut state, 0.0);
+        let output = frame(&ctx, &mut state, 0.3);
+        let painted = labels(&output);
+        assert!(
+            painted
+                .iter()
+                .any(|label| label == crate::app::fast_engine::AUTO_LANGUAGE_CAPTION),
+            "the card must say why the fast engine is idle: {painted:?}"
+        );
+
+        // A forced language has nothing to explain…
+        let mut forced = running_job(false, true);
+        let _ = frame(&ctx, &mut forced, 0.0);
+        let output = frame(&ctx, &mut forced, 0.3);
+        assert!(
+            !labels(&output)
+                .iter()
+                .any(|label| label == crate::app::fast_engine::AUTO_LANGUAGE_CAPTION),
+            "a forced language must not show the auto note"
+        );
+
+        // …and neither has a fast-engine-off job.
+        let mut off = running_job(true, true);
+        off.settings_form.fast_engine = false;
+        let _ = frame(&ctx, &mut off, 0.0);
+        let output = frame(&ctx, &mut off, 0.3);
+        assert!(!labels(&output)
+            .iter()
+            .any(|label| label == crate::app::fast_engine::AUTO_LANGUAGE_CAPTION));
+    }
+
+    /// M14e: between progress events the bar moves on the clock, and its label
+    /// says the value is an estimate (never a bare `0%` for a worked job).
+    #[test]
+    fn the_bar_moves_between_events_and_labels_the_estimate() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut state = running_job(true, true);
+        // Pretend the worker reported nothing yet and one second has passed.
+        if let Job::Running(run) = &mut state.job {
+            run.model = Some("turbo-q5-0".to_string());
+            run.planned_engine = Some("metal".to_string());
+            run.started_at =
+                Some(std::time::Instant::now() - std::time::Duration::from_millis(700));
+        }
+        let _ = frame(&ctx, &mut state, 0.0);
+        let output = frame(&ctx, &mut state, 0.1);
+        let painted = labels(&output);
+        assert!(
+            painted.iter().any(|label| label.starts_with('~')),
+            "an interpolated value is labelled as an estimate: {painted:?}"
+        );
+        assert!(
+            !painted.iter().any(|label| label == "0%"),
+            "a worked job must not still read 0%: {painted:?}"
+        );
+        // The button/cancel chrome is unchanged.
+        assert!(painted.iter().any(|label| label == "Cancel"));
     }
 }

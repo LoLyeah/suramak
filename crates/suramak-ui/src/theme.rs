@@ -151,6 +151,13 @@ pub struct Tokens {
     /// Text/icon ink on an accent fill (white on the light ladder's deep blue,
     /// near-black on the dark ladder's light blue).
     pub on_accent: Color32,
+    /// M14e: the **ready** green — the fast-engine readiness dot ("Available",
+    /// "Installed"). A non-text indicator, so WCAG's 3:1 UI-component
+    /// threshold applies (it clears it on every ladder's card surface).
+    pub ok: Color32,
+    /// M14e: the **attention** amber — "Needs permission" on the readiness
+    /// list. A non-text indicator (3:1); the word beside it carries the ink.
+    pub warn: Color32,
     // ---- material ladder ---------------------------------------------------
     /// Base level: transparent over real glass (macOS), opaque elsewhere.
     pub window: Color32,
@@ -161,6 +168,13 @@ pub struct Tokens {
     /// ONE card fill (with [`Tokens::hairline`] + [`Tokens::card_shadow`]).
     pub card: Color32,
     pub card_shadow: Shadow,
+    /// M14e: the **popup sheet's** fill — an OPAQUE surface, unlike `card`
+    /// (the macOS ladder's card is a glass wash and let the page bleed through
+    /// the dropdown; the owner's "it cluttered" report). #fff / #1c1c1e family.
+    pub sheet: Color32,
+    /// M14e: the sheet's backdrop scrim — the page behind a popup is dimmed so
+    /// the list reads above it (egui has no blur; a dim is the honest ceiling).
+    pub scrim: Color32,
     // ---- control-state deltas ---------------------------------------------
     /// Secondary control, rest.
     pub control_fill: Color32,
@@ -228,10 +242,14 @@ pub fn macos_ladder(theme: AppTheme) -> Tokens {
             record_red: Color32::from_rgb(0xe0, 0x35, 0x2b),
             record_red_text: Color32::from_rgb(0xc8, 0x28, 0x1e),
             on_accent: Color32::WHITE,
+            ok: Color32::from_rgb(0x2e, 0x8b, 0x45),
+            warn: Color32::from_rgb(0xb4, 0x6a, 0x00),
             window: Color32::TRANSPARENT,
             panel: Color32::from_white_alpha(96),
             panel_faint: Color32::from_white_alpha(56),
             card: Color32::from_white_alpha(150),
+            sheet: Color32::from_rgb(0xff, 0xff, 0xff),
+            scrim: Color32::from_black_alpha(72),
             card_shadow: Shadow {
                 offset: [0, 8],
                 blur: 20,
@@ -265,10 +283,14 @@ pub fn macos_ladder(theme: AppTheme) -> Tokens {
             record_red: Color32::from_rgb(0xff, 0x45, 0x3a),
             record_red_text: Color32::from_rgb(0xff, 0x5a, 0x50),
             on_accent: Color32::from_rgb(0x0b, 0x12, 0x26),
+            ok: Color32::from_rgb(0x54, 0xc8, 0x7a),
+            warn: Color32::from_rgb(0xe0, 0xa4, 0x3c),
             window: Color32::TRANSPARENT,
             panel: Color32::from_white_alpha(20),
             panel_faint: Color32::from_white_alpha(10),
             card: Color32::from_white_alpha(32),
+            sheet: Color32::from_rgb(0x1c, 0x1c, 0x1e),
+            scrim: Color32::from_black_alpha(130),
             card_shadow: Shadow {
                 offset: [0, 10],
                 blur: 24,
@@ -316,10 +338,14 @@ pub fn desktop_ladder(theme: AppTheme) -> Tokens {
             record_red: Color32::from_rgb(0xe0, 0x35, 0x2b),
             record_red_text: Color32::from_rgb(0xc8, 0x28, 0x1e),
             on_accent: Color32::WHITE,
+            ok: Color32::from_rgb(0x2e, 0x8b, 0x45),
+            warn: Color32::from_rgb(0xb4, 0x6a, 0x00),
             window: Color32::from_rgb(0xe9, 0xeb, 0xf0),
             panel: Color32::from_rgb(0xf4, 0xf6, 0xfa),
             panel_faint: Color32::from_rgb(0xed, 0xef, 0xf4),
             card: Color32::from_rgb(0xff, 0xff, 0xff),
+            sheet: Color32::from_rgb(0xff, 0xff, 0xff),
+            scrim: Color32::from_black_alpha(60),
             card_shadow: Shadow {
                 offset: [0, 8],
                 blur: 20,
@@ -353,10 +379,14 @@ pub fn desktop_ladder(theme: AppTheme) -> Tokens {
             record_red: Color32::from_rgb(0xff, 0x45, 0x3a),
             record_red_text: Color32::from_rgb(0xff, 0x5a, 0x50),
             on_accent: Color32::from_rgb(0x0b, 0x12, 0x26),
+            ok: Color32::from_rgb(0x54, 0xc8, 0x7a),
+            warn: Color32::from_rgb(0xe0, 0xa4, 0x3c),
             window: Color32::from_rgb(0x0e, 0x15, 0x26),
             panel: Color32::from_rgb(0x17, 0x20, 0x3a),
             panel_faint: Color32::from_rgb(0x12, 0x1a, 0x30),
             card: Color32::from_rgb(0x1a, 0x24, 0x40),
+            sheet: Color32::from_rgb(0x1c, 0x1c, 0x1e),
+            scrim: Color32::from_black_alpha(140),
             card_shadow: Shadow {
                 offset: [0, 10],
                 blur: 24,
@@ -768,6 +798,22 @@ mod tests {
                     indicator >= 3.0,
                     "{ladder} {theme:?}: the record dot = {indicator:.2}:1 — under the 3:1 UI floor"
                 );
+                // M14e readiness chips: the green/amber dots are non-text
+                // indicators too, and they sit on the card (the list) as well as
+                // on the popup sheet — both must clear 3:1.
+                for (name, color) in [("ok", t.ok), ("warn", t.warn)] {
+                    for (surface, bg) in [("card", card), ("sheet", t.sheet)] {
+                        let ratio = contrast_ratio(color, bg);
+                        measured.push(format!(
+                            "{ladder} {theme:?}: {name} dot on {surface}: {ratio:.2}:1"
+                        ));
+                        assert!(
+                            ratio >= 3.0,
+                            "{ladder} {theme:?}: the {name} dot on {surface} = {ratio:.2}:1 \
+                             — under the 3:1 UI floor"
+                        );
+                    }
+                }
             }
         }
         for line in &measured {

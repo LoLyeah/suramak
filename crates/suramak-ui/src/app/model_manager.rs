@@ -10,6 +10,11 @@ use std::path::{Path, PathBuf};
 use suramak_core::models::{self, ModelInfo};
 use suramak_core::settings::Settings;
 
+/// The message `suramak-core` returns for a cancelled transfer
+/// ([`SuramakError::Cancelled`]'s display). Matched exactly so a cancel is
+/// reported as a cancel, never as a download failure.
+pub const CANCELLED: &str = "cancelled";
+
 /// Install state of one manifest model's decoder file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallState {
@@ -69,6 +74,10 @@ pub struct ModelRow {
 }
 
 /// Background download state (progress comes from `download_with_progress`).
+///
+/// M14e: a download may be a **set** of files (the Parakeet model is four
+/// pinned artifacts), so a running download also reports which file it is on
+/// and how many there are — the Settings install card says "file 2 of 4".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum DownloadState {
     #[default]
@@ -77,6 +86,14 @@ pub enum DownloadState {
         id: String,
         bytes_done: u64,
         bytes_total: u64,
+        /// Files finished so far in a multi-file set (0 for a single file).
+        files_done: u32,
+        /// Files in the set (1 for a single-file model).
+        files_total: u32,
+        /// The file currently transferring (its manifest name), when known.
+        file: Option<String>,
+        /// The Cancel control was pressed: the stream stops at its next chunk.
+        cancelling: bool,
     },
     Done {
         id: String,
@@ -84,6 +101,10 @@ pub enum DownloadState {
     Failed {
         id: String,
         message: String,
+    },
+    /// The user cancelled: the partial bytes stay on disk and resume next time.
+    Cancelled {
+        id: String,
     },
 }
 
@@ -116,6 +137,38 @@ impl DownloadState {
 
     pub fn is_running(&self) -> bool {
         matches!(self, DownloadState::Running { .. })
+    }
+
+    /// "file 2 of 4 · encoder.int8.onnx" for a multi-file set, `None` for a
+    /// single-file model (whose row already names itself).
+    pub fn file_line(&self) -> Option<String> {
+        match self {
+            DownloadState::Running {
+                files_total,
+                files_done,
+                file,
+                ..
+            } if *files_total > 1 || file.is_some() => Some(match file {
+                Some(file) => format!(
+                    "file {} of {} · {file}",
+                    (files_done + 1).min(*files_total),
+                    files_total
+                ),
+                None => format!("file {} of {}", files_done.min(files_total), files_total),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The Cancel control is in flight (the label says `cancelling…`).
+    pub fn is_cancelling(&self) -> bool {
+        matches!(
+            self,
+            DownloadState::Running {
+                cancelling: true,
+                ..
+            }
+        )
     }
 }
 
@@ -191,23 +244,39 @@ pub fn display_name(id: &str) -> String {
         "turbo-q5-0" => "Large v3 Turbo (balanced)".to_string(),
         "turbo-q8-0" => "Large v3 Turbo (high quality)".to_string(),
         "turbo" => "Large v3 Turbo (full precision)".to_string(),
+        // M14e: the fast engine's model in the same copy system (the Settings
+        // readiness row and the install card both use it).
+        "parakeet" => "Parakeet (fast engine)".to_string(),
         other => other.to_string(),
     }
 }
 
 impl ModelManager {
     /// Marks that a download of `id` is starting (the runtime does the work).
+    ///
+    /// `id` is a whisper manifest id or `parakeet` (the fast engine's model
+    /// directory); the totals come from the pins either way.
     pub fn begin_download(&mut self, id: &str) -> bool {
         if self.download.is_running() {
             return false;
         }
-        let total = models::find_model(id)
-            .map(|info| info.size_bytes)
-            .unwrap_or(0);
+        let (total, files) = match models::find_parakeet(id) {
+            Some(info) => (models::parakeet_total_bytes(), info.files.len() as u32),
+            None => (
+                models::find_model(id)
+                    .map(|info| info.size_bytes)
+                    .unwrap_or(0),
+                1,
+            ),
+        };
         self.download = DownloadState::Running {
             id: id.to_string(),
             bytes_done: 0,
             bytes_total: total,
+            files_done: 0,
+            files_total: files,
+            file: None,
+            cancelling: false,
         };
         // A fresh download restarts the smoothed bar at the bottom.
         self.progress_ease = ProgressEase::default();
@@ -235,6 +304,52 @@ impl ModelManager {
         }
     }
 
+    /// M14e: per-file progress (the Parakeet install is four files). The
+    /// totals keep their maximum so a resumed file reporting a smaller offset
+    /// can never make the bar jump backwards.
+    pub fn on_file_progress(
+        &mut self,
+        bytes_done: u64,
+        bytes_total: u64,
+        files_done: u32,
+        files_total: u32,
+        file: Option<&str>,
+    ) {
+        if let DownloadState::Running {
+            bytes_done: done,
+            bytes_total: total,
+            files_done: done_files,
+            files_total: total_files,
+            file: current,
+            ..
+        } = &mut self.download
+        {
+            *done = bytes_done;
+            *total = bytes_total.max(*total);
+            *done_files = files_done;
+            *total_files = files_total.max(*total_files);
+            *current = file.map(str::to_string);
+        }
+    }
+
+    /// The Cancel control: the transfer stops at its next chunk.
+    pub fn begin_cancel(&mut self) -> bool {
+        if let DownloadState::Running { cancelling, .. } = &mut self.download {
+            *cancelling = true;
+            return true;
+        }
+        false
+    }
+
+    /// The runtime confirmed the cancel (the partial bytes stay on disk).
+    pub fn on_download_cancelled(&mut self, id: &str) {
+        self.download = DownloadState::Cancelled { id: id.to_string() };
+        self.status = Some(Ok(format!(
+            "{} download cancelled — the partial files stay, so the next try resumes",
+            display_name(id)
+        )));
+    }
+
     /// Terminal result of the download.
     pub fn on_download_done(&mut self, id: &str, result: Result<(), String>) {
         match &result {
@@ -245,6 +360,9 @@ impl ModelManager {
                     display_name(id)
                 )));
             }
+            // A cancel is not a failure: core reports it with the exact
+            // `cancelled` message, and the copy says what survived.
+            Err(err) if err == CANCELLED => self.on_download_cancelled(id),
             Err(err) => {
                 self.download = DownloadState::Failed {
                     id: id.to_string(),
@@ -318,12 +436,26 @@ pub struct DeletePlan {
     pub encoder_dir: Option<PathBuf>,
     /// Installed models that keep the shared encoder alive (M1.5 rule).
     pub encoder_kept_for: Vec<String>,
+    /// M14e: the Parakeet model directory (a set of pinned files, not a single
+    /// decoder) — removed whole, with any `.part` files inside it.
+    pub parakeet_dir: Option<PathBuf>,
 }
 
 /// Builds the delete plan for `id`, honouring the shared-encoder rule: all three
 /// turbo decoders pair with one encoder package, so it only goes when the last
 /// decoder that needs it goes.
+///
+/// `parakeet` (M14e) is the fast engine's model directory: the plan removes the
+/// whole directory, partial files included — the same thing the CLI's
+/// `models remove parakeet` does.
 pub fn delete_plan(models_dir: &Path, id: &str) -> Result<DeletePlan, String> {
+    if models::find_parakeet(id).is_some() {
+        let dir = models::parakeet_dir(models_dir);
+        return Ok(DeletePlan {
+            parakeet_dir: dir.exists().then_some(dir),
+            ..DeletePlan::default()
+        });
+    }
     let info = models::find_model(id).ok_or_else(|| format!("unknown model '{id}'"))?;
     let dest = models_dir.join(info.hf_file);
     let decoder = [dest.clone(), part_path(&dest)]
@@ -335,6 +467,7 @@ pub fn delete_plan(models_dir: &Path, id: &str) -> Result<DeletePlan, String> {
         decoder,
         encoder_dir: None,
         encoder_kept_for: Vec::new(),
+        parakeet_dir: None,
     };
     let dir_name = models::encoder_dir_name(info.hf_file);
     let dir = models_dir.join(&dir_name);
@@ -354,6 +487,9 @@ pub fn delete_plan(models_dir: &Path, id: &str) -> Result<DeletePlan, String> {
 }
 
 /// Executes a [`DeletePlan`]; returns the removed paths.
+///
+/// A Parakeet directory reports the **files** it contained (so the status line
+/// reads "removed 4 files" rather than "removed 1 file" for a directory).
 pub fn apply_delete(plan: &DeletePlan) -> Result<Vec<PathBuf>, String> {
     let mut removed = Vec::new();
     for path in &plan.decoder {
@@ -365,6 +501,18 @@ pub fn apply_delete(plan: &DeletePlan) -> Result<Vec<PathBuf>, String> {
         std::fs::remove_dir_all(dir)
             .map_err(|err| format!("cannot remove {}: {err}", dir.display()))?;
         removed.push(dir.clone());
+    }
+    if let Some(dir) = &plan.parakeet_dir {
+        // Collect what is actually there before removing the directory (the
+        // report counts real files, never the manifest's four).
+        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+            .map_err(|err| format!("cannot read {}: {err}", dir.display()))?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .collect();
+        files.sort();
+        std::fs::remove_dir_all(dir)
+            .map_err(|err| format!("cannot remove {}: {err}", dir.display()))?;
+        removed.extend(files);
     }
     Ok(removed)
 }
@@ -587,6 +735,121 @@ mod tests {
         manager.begin_download("base");
         manager.on_progress(5, 0);
         assert_eq!(manager.download.percent(), Some(0));
+    }
+
+    // ---- M14e: the Parakeet install through the same manager -----------------
+
+    #[test]
+    fn a_parakeet_download_reports_the_manifest_total_and_its_file_set() {
+        let mut manager = ModelManager::default();
+        assert!(manager.begin_download("parakeet"));
+        match &manager.download {
+            DownloadState::Running {
+                id,
+                bytes_total,
+                files_total,
+                files_done,
+                file,
+                cancelling,
+                ..
+            } => {
+                assert_eq!(id, "parakeet");
+                assert_eq!(
+                    *bytes_total,
+                    models::parakeet_total_bytes(),
+                    "the total is the sum of the pins (~670 MB)"
+                );
+                assert_eq!(*files_total, 4);
+                assert_eq!(*files_done, 0);
+                assert_eq!(*file, None);
+                assert!(!cancelling);
+            }
+            other => panic!("expected a running download, got {other:?}"),
+        }
+        // The single-file models keep files_total = 1 and no file line.
+        let mut whisper = ModelManager::default();
+        assert!(whisper.begin_download("tiny"));
+        assert_eq!(whisper.download.file_line(), None);
+
+        // Per-file progress: the card names the file and counts the set.
+        manager.on_file_progress(
+            100_000,
+            models::parakeet_total_bytes(),
+            1,
+            4,
+            Some("encoder.int8.onnx"),
+        );
+        assert_eq!(
+            manager.download.file_line().as_deref(),
+            Some("file 2 of 4 · encoder.int8.onnx")
+        );
+        // The byte total never shrinks when a resumed file reports an offset.
+        manager.on_file_progress(50_000, 10, 1, 4, Some("encoder.int8.onnx"));
+        match &manager.download {
+            DownloadState::Running { bytes_total, .. } => {
+                assert_eq!(*bytes_total, models::parakeet_total_bytes())
+            }
+            other => panic!("expected a running download, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_cancelled_download_is_not_a_failure() {
+        let mut manager = ModelManager::default();
+        assert!(manager.begin_download("parakeet"));
+        assert!(manager.begin_cancel(), "the Cancel control arms the stop");
+        assert!(manager.download.is_cancelling());
+
+        manager.on_download_done("parakeet", Err(CANCELLED.to_string()));
+        assert!(matches!(manager.download, DownloadState::Cancelled { .. }));
+        let status = manager.status.as_ref().expect("a status line");
+        let note = status.as_ref().expect("a cancel is not an error");
+        assert!(note.contains("cancelled"), "unexpected: {note}");
+        assert!(
+            note.contains("resumes"),
+            "the copy says the partial files survive: {note}"
+        );
+
+        // A real failure still reads as a failure.
+        let mut failed = ModelManager::default();
+        assert!(failed.begin_download("parakeet"));
+        failed.on_download_done("parakeet", Err("checksum mismatch".to_string()));
+        assert!(matches!(failed.download, DownloadState::Failed { .. }));
+        assert!(failed.status.as_ref().unwrap().is_err());
+        // …and an idle manager cannot arm a cancel.
+        let mut idle = ModelManager::default();
+        assert!(!idle.begin_cancel());
+    }
+
+    #[test]
+    fn deleting_parakeet_removes_its_directory_and_counts_its_files() {
+        let dir = temp_models_dir("parakeet-delete");
+        std::fs::create_dir_all(models::parakeet_dir(&dir)).unwrap();
+        for file in models::PARAKEET.files {
+            std::fs::write(models::parakeet_dir(&dir).join(file.name), b"x").unwrap();
+        }
+        // A partial file from an interrupted attempt goes with the directory.
+        std::fs::write(
+            models::parakeet_dir(&dir).join("decoder.int8.onnx.part"),
+            b"x",
+        )
+        .unwrap();
+
+        let plan = delete_plan(&dir, "parakeet").expect("a parakeet plan");
+        assert_eq!(plan.decoder.len(), 0, "no whisper decoder is involved");
+        assert_eq!(plan.encoder_dir, None);
+        assert_eq!(plan.parakeet_dir, Some(models::parakeet_dir(&dir)));
+
+        let removed = apply_delete(&plan).expect("apply");
+        assert_eq!(removed.len(), 5, "the four pinned files + the .part");
+        assert!(!models::parakeet_dir(&dir).exists());
+
+        // Nothing installed → an empty plan, not an error.
+        let again = delete_plan(&dir, "parakeet").expect("a plan");
+        assert_eq!(again.parakeet_dir, None);
+        assert!(apply_delete(&again).unwrap().is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

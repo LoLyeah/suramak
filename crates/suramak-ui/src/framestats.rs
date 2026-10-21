@@ -207,6 +207,9 @@ mod tests {
             planned_engine: None,
             warnings: Vec::new(),
             cancelling: false,
+            language: Some("en".to_string()),
+            started_at: None,
+            duration_ms: None,
         });
         assert_eq!(classify(&state), FrameState::Job);
 

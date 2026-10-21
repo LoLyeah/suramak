@@ -337,6 +337,56 @@ fn append_samples(out: &mut Vec<f32>, buf: AudioBufferRef<'_>) {
     }
 }
 
+/// The audio duration of a file, read from the container's headers — **no
+/// samples are decoded** (a 2-hour file costs one seek, not two hours of CPU).
+///
+/// M14e: the transcribe card interpolates its progress bar between whisper's
+/// (sparse) progress events using the wall clock against this duration, so the
+/// bar moves on short files instead of sitting at 0 %.
+///
+/// `None` when the container does not carry a frame count (a headerless MP3, a
+/// stream) — callers must stay honest about the missing size ("estimating")
+/// rather than invent one. The value is the *nominal* duration: a container
+/// with a wrong header yields a wrong estimate, which is exactly what the 97 %
+/// clamp is for.
+pub fn probe_duration_ms(path: &std::path::Path) -> Option<u64> {
+    let file = std::fs::File::open(path).ok()?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .ok()?;
+    let format = probed.format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|track| track.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)?;
+    let params = &track.codec_params;
+    let frames = params.n_frames?;
+    if frames == 0 {
+        return None;
+    }
+    // Frame count over the sample rate is the normal answer (wav/flac/mp4).
+    if let Some(rate) = params.sample_rate.filter(|rate| *rate > 0) {
+        return Some(frames.saturating_mul(1000) / u64::from(rate));
+    }
+    // A container that only knows its timebase still answers honestly.
+    let time = params.time_base?.calc_time(frames);
+    Some(
+        time.seconds
+            .saturating_mul(1000)
+            .saturating_add((time.frac * 1000.0).round() as u64),
+    )
+}
+
 /// Writes f32 samples to a WAV file using hound.
 pub fn write_wav(
     path: &std::path::Path,
@@ -418,5 +468,32 @@ mod tests {
         assert_eq!(normalize_pcm(0.0, 32_768.0), 0.0);
         assert_eq!(normalize_pcm(40_000.0, 32_768.0), 1.0);
         assert_eq!(normalize_pcm(-40_000.0, 32_768.0), -1.0);
+    }
+
+    /// M14e: the duration probe reads the header and never decodes samples —
+    /// a 2 s WAV answers ~2000 ms, a file that is not audio answers `None`
+    /// (the card then says "estimating" instead of inventing a size).
+    #[test]
+    fn the_duration_probe_reads_headers_and_refuses_what_it_cannot_know() {
+        let dir = std::env::temp_dir().join(format!("suramak-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let wav = dir.join("two-seconds.wav");
+        let samples = vec![0.0f32; 32_000];
+        write_wav(&wav, &samples, 16_000, 1).expect("write the fixture");
+        let ms = probe_duration_ms(&wav).expect("a WAV header carries its frame count");
+        assert!(
+            (1_990..=2_010).contains(&ms),
+            "2 s at 16 kHz must probe as ~2000 ms, got {ms}"
+        );
+
+        // A file that is not audio (and a missing file) answer `None`.
+        let junk = dir.join("not-audio.txt");
+        std::fs::write(&junk, b"hello").unwrap();
+        assert_eq!(probe_duration_ms(&junk), None);
+        assert_eq!(probe_duration_ms(&dir.join("missing.wav")), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

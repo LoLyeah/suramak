@@ -479,9 +479,15 @@ impl App {
             changed = true;
             let effects = match (status.finished, self.shell.as_mut()) {
                 (None, Some(shell)) => {
-                    shell
-                        .app
-                        .on_download_progress(status.bytes_done, status.bytes_total);
+                    // M14e: a model set (Parakeet) also reports which file it is
+                    // on; single-file models keep the plain byte path.
+                    shell.app.on_download_file_progress(
+                        status.bytes_done,
+                        status.bytes_total,
+                        status.files_done,
+                        status.files_total,
+                        status.file.as_deref(),
+                    );
                     Vec::new()
                 }
                 (Some(result), Some(shell)) => shell.app.on_download_done(&status.id, result),
@@ -944,6 +950,9 @@ impl ApplicationHandler<UserEvent> for App {
                     // section can be captured headlessly (smoke modes only).
                     if std::env::var_os("SURAMAK_SMOKE_SETTINGS").is_some() {
                         shell.app.route = app::Route::Settings;
+                        // M14e: probe the fast-engine readiness list so the
+                        // headless Settings shot shows real rows, not blanks.
+                        shell.app.refresh_fast_engine();
                     }
                     if let Some(input) = smoke.job.clone() {
                         let effects = shell.app.begin_import(input);

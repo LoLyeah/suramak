@@ -31,8 +31,11 @@ use self::settings_form::SettingsForm;
 
 pub mod bounds;
 pub mod controls;
+pub mod copy;
+pub mod dropdown;
 pub mod editor;
 pub mod export;
+pub mod fast_engine;
 pub mod home;
 pub mod keymap;
 pub mod library;
@@ -232,6 +235,136 @@ pub struct RunningJob {
     /// the card reads `cancelling…` until the worker's `Cancelled` event lands
     /// (the job is not gone until the worker says so). One-shot.
     pub cancelling: bool,
+    /// M14e: the job's forced language (`None` = auto-detect). Drives the
+    /// card's one-liner about why a fast engine stays idle.
+    pub language: Option<String>,
+    /// M14e: when the worker took the job. The bar interpolates between the
+    /// engine's sparse progress events from this clock (and only from it — a
+    /// job the worker has not started yet does not move).
+    pub started_at: Option<Instant>,
+    /// M14e: the input's duration, from the container header
+    /// ([`suramak_core::decode::probe_duration_ms`]). `None` = unknown, and the
+    /// card then says `estimating…` instead of inventing a size.
+    pub duration_ms: Option<u64>,
+}
+
+/// The transcribe card's bar state for one frame (M14e).
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobProgress {
+    /// 0..=1 — the fraction the bar fills.
+    pub fraction: f32,
+    /// The label above the bar (`42%`, `~31%`, `estimating…`).
+    pub label: String,
+    /// True while the fraction is still moving on the clock alone: the view
+    /// asks for a timed repaint, and stops asking once it settles.
+    pub animating: bool,
+}
+
+/// The nominal throughput of a model, in **audio seconds per wall second**
+/// (≈ 1 / RTF), used only to interpolate the bar between real progress events.
+/// Deliberately conservative: the estimate is clamped below 97 % and a real
+/// event always wins, so being slow here costs a few seconds of motion, never
+/// an overclaim.
+pub fn nominal_speed(model: Option<&str>, engine: Option<&str>) -> f32 {
+    // A fast engine's throughput is its own (it does not run whisper tiles).
+    match engine {
+        Some("parakeet") => return 5.0,
+        Some("speech-transcriber") => return 4.0,
+        _ => {}
+    }
+    match model.unwrap_or_default() {
+        "tiny" => 8.0,
+        "base" => 5.0,
+        "small" => 3.0,
+        "turbo-q5-0" => 1.6,
+        "turbo-q8-0" => 1.2,
+        "turbo" => 0.8,
+        _ => 2.0,
+    }
+}
+
+/// The ceiling an estimate may reach without a real progress event: below 97 %
+/// there is always room for the event that confirms the finish.
+pub const ESTIMATE_CEILING: f32 = 0.97;
+
+/// The bar's position between the engine's sparse progress events (M14e).
+///
+/// whisper.cpp reports progress once per finished encode window (~30 s of
+/// audio), so a 9 s clip reports only 0 → 100: the bar sat at 0 % for the whole
+/// job. This interpolates from the wall clock and the input's duration instead,
+/// **clamped below [`ESTIMATE_CEILING`]** until a real event confirms more —
+/// the bar can never claim a finish that has not happened.
+///
+/// Pure (`elapsed` in, fraction out) so every rule is pinned headless.
+pub fn interpolate_progress(
+    reported_pct: u8,
+    elapsed: Option<std::time::Duration>,
+    duration_ms: Option<u64>,
+    speed: f32,
+) -> JobProgress {
+    let reported = (f32::from(reported_pct.min(100)) / 100.0).clamp(0.0, 1.0);
+    if reported >= 1.0 {
+        return JobProgress {
+            fraction: 1.0,
+            label: "100%".to_string(),
+            animating: false,
+        };
+    }
+    let audio_s = duration_ms
+        .map(|ms| ms as f32 / 1000.0)
+        .filter(|s| *s > 0.0);
+    let estimate = match (elapsed, audio_s) {
+        (Some(elapsed), Some(audio_s)) if speed > 0.0 => {
+            let worked = elapsed.as_secs_f32() * speed;
+            (worked / audio_s).clamp(0.0, ESTIMATE_CEILING)
+        }
+        _ => 0.0,
+    };
+    if estimate <= reported {
+        // A real event leads: show it, never animate, and say so honestly.
+        let label = if reported > 0.0 {
+            format!("{reported_pct}%")
+        } else if elapsed.is_some_and(|elapsed| elapsed.as_secs_f32() >= 1.2) && audio_s.is_none() {
+            // No size, nothing to interpolate: say we are estimating rather
+            // than show a bar that never moves.
+            "estimating…".to_string()
+        } else {
+            "0%".to_string()
+        };
+        return JobProgress {
+            fraction: reported,
+            label,
+            animating: false,
+        };
+    }
+    JobProgress {
+        fraction: estimate,
+        label: format!("~{}%", (estimate * 100.0).round() as u8),
+        // The clock keeps moving it until it reaches the ceiling.
+        animating: estimate < ESTIMATE_CEILING,
+    }
+}
+
+impl RunningJob {
+    /// This frame's bar state (M14e) — the estimate uses the job's own clock,
+    /// duration and model.
+    pub fn progress(&self, now: Instant) -> JobProgress {
+        let elapsed = self
+            .started_at
+            .map(|start| now.saturating_duration_since(start));
+        interpolate_progress(
+            self.pct,
+            elapsed,
+            self.duration_ms,
+            nominal_speed(self.model.as_deref(), self.planned_engine.as_deref()),
+        )
+    }
+
+    /// Why a fast engine is idle on this job: `auto` can never route to one.
+    /// `None` when the job's language is forced (no note) or unknown.
+    pub fn auto_language_note(&self) -> Option<&'static str> {
+        (self.language.is_none()).then_some(fast_engine::AUTO_LANGUAGE_CAPTION)
+    }
 }
 
 /// M9e (P1-1): which quit path asked for the confirm. Both paths answer
@@ -578,6 +711,10 @@ pub struct AppState {
     pub model_manager: ModelManager,
     /// Settings-form state (M3).
     pub settings_form: SettingsForm,
+    /// M14e: the fast-engine readiness list's live probe (SpeechTranscriber
+    /// permission/OS, Parakeet install). Probed when Settings opens and after
+    /// an install/delete — never per frame (the probe crosses the Swift bridge).
+    pub fast_engine: fast_engine::FastEngineReadiness,
     /// Enumerated input device names (for the Audio sources checkbox list).
     pub audio_devices: Vec<String>,
     /// Enumeration problem (no capture compiled / no host support), shown as a note.
@@ -664,8 +801,12 @@ pub enum Effect {
     RefreshModels,
     /// Download a model in the background (progress polled by the runtime).
     DownloadModel { id: String },
-    /// Delete a model (decoder + unshared encoder, M1.5 rule).
+    /// Delete a model (decoder + unshared encoder, M1.5 rule; M14e: the
+    /// Parakeet model directory).
     DeleteModel { id: String },
+    /// M14e: cancel the running model download (the transfer stops at its next
+    /// chunk; the partial bytes stay for a resumed retry).
+    CancelDownload,
     /// Delete a transcript from the library (its segments cascade in the store).
     DeleteTranscript { id: Uuid },
     /// Write `settings.model_id = id`.
@@ -723,6 +864,8 @@ impl AppState {
             record: RecordState::Idle,
             model_manager: ModelManager::default(),
             settings_form: SettingsForm::from_settings(&suramak_core::settings::Settings::default()),
+            // Not probed until Settings opens (`refresh_fast_engine`).
+            fast_engine: fast_engine::FastEngineReadiness::default(),
             audio_devices: Vec::new(),
             audio_devices_error: None,
             audio_processes: Vec::new(),
@@ -1268,9 +1411,34 @@ impl AppState {
         self.model_manager.on_progress(bytes_done, bytes_total);
     }
 
+    /// M14e: per-file progress polled by the runtime (a model set, e.g. Parakeet).
+    pub fn on_download_file_progress(
+        &mut self,
+        bytes_done: u64,
+        bytes_total: u64,
+        files_done: u32,
+        files_total: u32,
+        file: Option<&str>,
+    ) {
+        self.model_manager
+            .on_file_progress(bytes_done, bytes_total, files_done, files_total, file);
+    }
+
+    /// M14e: the Cancel control on a download.
+    pub fn cancel_download(&mut self) -> Vec<Effect> {
+        if self.model_manager.begin_cancel() {
+            vec![Effect::CancelDownload]
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Download finished (Ok/Err) → refresh the table (the row's state changed).
     pub fn on_download_done(&mut self, id: &str, result: Result<(), String>) -> Vec<Effect> {
         self.model_manager.on_download_done(id, result);
+        // The disk changed: the readiness row must re-probe, not trust a stale
+        // "Not downloaded" (or a stale "Installed").
+        self.refresh_fast_engine();
         vec![Effect::RefreshModels]
     }
 
@@ -1286,6 +1454,9 @@ impl AppState {
         result: Result<Vec<String>, String>,
     ) -> Vec<Effect> {
         let name = model_manager::display_name(id);
+        if result.is_ok() {
+            self.refresh_fast_engine();
+        }
         self.model_manager.status = Some(match result {
             Ok(removed) if removed.is_empty() => {
                 Ok(format!("{name} is not installed — nothing to remove"))
@@ -1322,7 +1493,18 @@ impl AppState {
     /// running audio processes for the per-app picker).
     pub fn open_settings(&mut self) -> Vec<Effect> {
         self.route = Route::Settings;
+        // M14e: the readiness list probes when the screen opens (and after
+        // installs/deletes), never per frame.
+        self.refresh_fast_engine();
         vec![Effect::RefreshAudioDevices, Effect::RefreshAudioProcesses]
+    }
+
+    /// M14e: re-probe the fast engines (Settings opening, an install landing, a
+    /// delete finishing). Cheap, but it crosses the Swift bridge on macOS, so it
+    /// is called at those moments only — never per frame.
+    pub fn refresh_fast_engine(&mut self) {
+        let dir = suramak_core::paths::models_dir().unwrap_or_default();
+        self.fast_engine = fast_engine::FastEngineReadiness::probe(&dir);
     }
 
     /// Runtime: enumerated input devices for the Audio sources checkbox list.
@@ -1391,6 +1573,9 @@ impl AppState {
             planned_engine: None,
             warnings: Vec::new(),
             cancelling: false,
+            language: None,
+            started_at: None,
+            duration_ms: None,
         });
         effects.push(Effect::SubmitJob { input });
         effects
@@ -1404,6 +1589,16 @@ impl AppState {
             return Vec::new();
         }
         self.begin_import(PathBuf::from(raw))
+    }
+
+    /// M14e: the worker took the job — start the interpolation clock and record
+    /// the input's duration and forced language (the runtime probes the header).
+    pub fn job_started(&mut self, now: Instant, duration_ms: Option<u64>, language: Option<&str>) {
+        if let Job::Running(run) = &mut self.job {
+            run.started_at = Some(now);
+            run.duration_ms = duration_ms;
+            run.language = language.map(|code| code.trim().to_ascii_lowercase());
+        }
     }
 
     /// The runtime reports the resolved model + engine plan for the running job.
@@ -1912,6 +2107,123 @@ fn home_dir() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use suramak_core::transcript::{Segment, Source};
+
+    // ---- M14e: the transcribe bar's interpolation -----------------------------
+
+    #[test]
+    fn the_bar_interpolates_from_the_clock_below_the_ceiling() {
+        use std::time::Duration;
+        // Just started: 0 %, no motion claim.
+        let start = interpolate_progress(0, Some(Duration::ZERO), Some(10_000), 5.0);
+        assert_eq!(start.fraction, 0.0);
+        assert_eq!(start.label, "0%");
+        assert!(!start.animating);
+
+        // One second in on a 10 s clip at 5× realtime: half the audio's worth.
+        let mid = interpolate_progress(0, Some(Duration::from_secs(1)), Some(10_000), 5.0);
+        assert!((mid.fraction - 0.5).abs() < 1e-6, "{mid:?}");
+        assert_eq!(mid.label, "~50%", "an estimate is labelled as one");
+        assert!(mid.animating, "the estimate still moves");
+
+        // Never past the ceiling without a real event.
+        let late = interpolate_progress(0, Some(Duration::from_secs(60)), Some(10_000), 5.0);
+        assert_eq!(late.fraction, ESTIMATE_CEILING);
+        assert_eq!(late.label, "~97%");
+        assert!(!late.animating, "at the ceiling the clock must stop asking");
+
+        // A real event always wins, and it is not labelled as an estimate.
+        let real = interpolate_progress(80, Some(Duration::from_secs(1)), Some(10_000), 5.0);
+        assert!((real.fraction - 0.8).abs() < 1e-6);
+        assert_eq!(real.label, "80%");
+        assert!(!real.animating);
+
+        // The finish is the finish.
+        let done = interpolate_progress(100, None, None, 5.0);
+        assert_eq!(done.fraction, 1.0);
+        assert_eq!(done.label, "100%");
+        assert!(!done.animating);
+    }
+
+    #[test]
+    fn a_missing_duration_says_estimating_instead_of_inventing_one() {
+        use std::time::Duration;
+        // No duration: no interpolation — the bar stays on the real value…
+        let early = interpolate_progress(0, Some(Duration::from_millis(200)), None, 5.0);
+        assert_eq!(early.fraction, 0.0);
+        assert_eq!(early.label, "0%");
+        // …and after a moment the label admits it is only estimating.
+        let waiting = interpolate_progress(0, Some(Duration::from_secs(3)), None, 5.0);
+        assert_eq!(waiting.fraction, 0.0);
+        assert_eq!(waiting.label, "estimating…");
+        assert!(!waiting.animating);
+        // A job whose worker has not taken it yet is not "estimating" — it has
+        // not started.
+        let queued = interpolate_progress(0, None, Some(9_000), 5.0);
+        assert_eq!(queued.label, "0%");
+    }
+
+    #[test]
+    fn the_nominal_speed_follows_the_model_and_the_fast_engine() {
+        // Bigger whisper tiers are slower; a fast engine has its own figure.
+        assert!(nominal_speed(Some("tiny"), None) > nominal_speed(Some("turbo"), None));
+        assert_eq!(nominal_speed(Some("turbo-q5-0"), None), 1.6);
+        assert_eq!(nominal_speed(Some("turbo-q5-0"), Some("parakeet")), 5.0);
+        assert_eq!(
+            nominal_speed(Some("turbo-q5-0"), Some("speech-transcriber")),
+            4.0
+        );
+        // An unknown model still gets a sane, conservative figure.
+        assert_eq!(nominal_speed(None, None), 2.0);
+        assert_eq!(nominal_speed(Some("custom"), None), 2.0);
+    }
+
+    #[test]
+    fn a_running_job_uses_its_own_clock_duration_and_language() {
+        let now = Instant::now();
+        // `begin_import` validates the path, so the fixture is a real file.
+        let dir = std::env::temp_dir().join(format!("suramak-m14e-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("x.wav");
+        std::fs::write(&input, b"x").unwrap();
+        let mut state = AppState::new();
+        state.begin_import(input.clone());
+        // The worker has not taken the job: nothing animates.
+        let progress = match &state.job {
+            Job::Running(run) => run.progress(now),
+            other => panic!("expected a running job, got {other:?}"),
+        };
+        assert_eq!(progress.fraction, 0.0);
+        assert!(!progress.animating);
+
+        state.job_started(now, Some(10_000), None);
+        let later = now + Duration::from_secs(1);
+        let progress = match &state.job {
+            Job::Running(run) => {
+                assert_eq!(run.duration_ms, Some(10_000));
+                assert_eq!(run.language, None, "auto stays None");
+                assert_eq!(
+                    run.auto_language_note(),
+                    Some(fast_engine::AUTO_LANGUAGE_CAPTION),
+                    "an auto job explains why the fast engine is idle"
+                );
+                run.progress(later)
+            }
+            other => panic!("expected a running job, got {other:?}"),
+        };
+        assert!(progress.animating && progress.fraction > 0.0);
+
+        // A forced language has nothing to explain, and is normalised.
+        let mut forced = AppState::new();
+        forced.begin_import(input.clone());
+        forced.job_started(now, Some(5_000), Some(" EN "));
+        match &forced.job {
+            Job::Running(run) => {
+                assert_eq!(run.language.as_deref(), Some("en"));
+                assert_eq!(run.auto_language_note(), None);
+            }
+            other => panic!("expected a running job, got {other:?}"),
+        }
+    }
 
     fn segment(idx: u32, text: &str) -> Segment {
         Segment {

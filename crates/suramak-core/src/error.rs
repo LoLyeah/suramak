@@ -47,6 +47,12 @@ pub enum SuramakError {
     #[error("download error: {0}")]
     Download(String),
 
+    /// The download was stopped through its progress callback (M14e: the
+    /// in-app Cancel on a model download). The bytes already on disk stay in
+    /// `<file>.part`, so the next attempt resumes where this one stopped.
+    #[error("cancelled")]
+    Cancelled,
+
     #[error("Model not found: {0}")]
     ModelNotFound(String),
 
