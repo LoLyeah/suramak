@@ -1481,7 +1481,9 @@ fn run_bridge(
                 Some(event) => {
                     let terminal = matches!(
                         event,
-                        WorkerEvent::Finished { .. } | WorkerEvent::Error { .. }
+                        WorkerEvent::Finished { .. }
+                            | WorkerEvent::Error { .. }
+                            | WorkerEvent::Cancelled { .. }
                     );
                     push(&queue, event);
                     ctx.request_repaint();

@@ -285,6 +285,7 @@ fn create_state_probed(ctx: &WhisperContext) -> Result<(WhisperState, CoremlProb
 /// directory is restored afterwards — also when `f` fails.
 fn with_encoder_hidden<T>(model_path: &Path, f: impl FnOnce() -> T) -> T {
     let dir = models::encoder_dir_for(model_path);
+    recover_stranded_encoder(model_path);
     let hidden = hidden_encoder_path(&dir);
     let mut stashed = false;
     if dir.is_dir() {
@@ -296,27 +297,99 @@ fn with_encoder_hidden<T>(model_path: &Path, f: impl FnOnce() -> T) -> T {
             ),
         }
     }
-    let out = f();
-    if stashed {
-        if let Err(err) = std::fs::rename(&hidden, &dir) {
+    // RAII: the restore must survive a panic inside `f` (e.g. a C++ assertion in
+    // whisper init). Without Drop, unwinding strands the encoder directory and
+    // the model silently loses Core ML acceleration until manual repair.
+    let _guard = StashedEncoder {
+        dir: dir.clone(),
+        hidden,
+        stashed,
+    };
+    f()
+}
+
+/// Restores an encoder directory a previous process left hidden (hard exit
+/// while stashed). Only directories parked by a *different* pid are touched —
+/// a same-pid one belongs to a concurrent hide in this process.
+fn recover_stranded_encoder(model_path: &Path) {
+    let dir = models::encoder_dir_for(model_path);
+    if dir.is_dir() {
+        return; // the encoder is where it belongs; nothing stranded
+    }
+    let Some(parent) = dir.parent() else { return };
+    let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let candidate = entry.path();
+        let Some(fname) = candidate.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(pid) = fname
+            .strip_prefix(&format!(".{name}.hidden-"))
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() {
+            continue; // ours — another thread is mid-hide/restore
+        }
+        match std::fs::rename(&candidate, &dir) {
+            Ok(()) => tracing::info!(
+                "recovered a Core ML encoder directory left hidden by a previous exit (pid {pid})"
+            ),
+            Err(err) => warn!(
+                "could not recover the stranded Core ML encoder directory {}: {err}",
+                candidate.display()
+            ),
+        }
+        return; // one restore is enough; the dir now exists
+    }
+}
+
+/// RAII restore for [`with_encoder_hidden`].
+struct StashedEncoder {
+    dir: PathBuf,
+    hidden: PathBuf,
+    stashed: bool,
+}
+
+impl Drop for StashedEncoder {
+    fn drop(&mut self) {
+        if !self.stashed {
+            return;
+        }
+        if let Err(err) = std::fs::rename(&self.hidden, &self.dir) {
             warn!(
                 "could not restore the Core ML encoder directory {} (left at {}): {err}",
-                dir.display(),
-                hidden.display()
+                self.dir.display(),
+                self.hidden.display()
             );
         }
     }
-    out
 }
 
 /// Sibling path the encoder directory is parked at while hidden.
+///
+/// Unique per call, not per process: the live decoder thread and the
+/// transcription worker can hide the *same* model's encoder concurrently, and a
+/// PID-only suffix makes the second hide collide with the first restore. A
+/// process-wide call counter keeps concurrent hides disjoint (the pid keeps it
+/// disjoint across processes, which [`recover_stranded_encoder`] relies on).
 fn hidden_encoder_path(dir: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let name = dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("encoder");
     let parent = dir.parent().unwrap_or(Path::new("."));
-    parent.join(format!(".{name}.hidden-{}", std::process::id()))
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(".{name}.hidden-{}-{seq}", std::process::id()))
 }
 
 /// Creates the decode state for `plan`, returning the state and the engine that will
@@ -678,6 +751,63 @@ mod tests {
             .filter(|name| name.starts_with('.'))
             .collect();
         assert!(leftovers.is_empty(), "leftover hidden dirs: {leftovers:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn encoder_hiding_restores_even_when_the_closure_panics() {
+        let root = scratch_dir("hidden-panic");
+        let model = root.join("ggml-tiny.bin");
+        fs::write(&model, b"model").unwrap();
+        let encoder = models::encoder_dir_for(&model);
+        fs::create_dir_all(encoder.join("weights")).unwrap();
+        fs::write(encoder.join("coremldata.bin"), b"x").unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_encoder_hidden(&model, || panic!("whisper init blew up"));
+        }));
+        assert!(result.is_err(), "the panic must propagate");
+        assert!(
+            encoder.join("coremldata.bin").is_file(),
+            "the RAII guard must restore the encoder dir during unwinding"
+        );
+        let leftovers: Vec<String> = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with('.'))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover hidden dirs: {leftovers:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recovery_restores_an_encoder_hidden_by_a_dead_process() {
+        let root = scratch_dir("hidden-recover");
+        let model = root.join("ggml-tiny.bin");
+        fs::write(&model, b"model").unwrap();
+        let encoder = models::encoder_dir_for(&model);
+        let encoder_name = encoder.file_name().unwrap().to_string_lossy().into_owned();
+
+        // A dir parked by a dead pid (1 is never us) must be restored…
+        let stranded = root.join(format!(".{encoder_name}.hidden-1-7"));
+        fs::create_dir_all(stranded.join("weights")).unwrap();
+        fs::write(stranded.join("coremldata.bin"), b"x").unwrap();
+        recover_stranded_encoder(&model);
+        assert!(
+            encoder.join("coremldata.bin").is_file(),
+            "a foreign-pid stranded dir must be restored"
+        );
+
+        // …but a dir parked by OUR pid belongs to a concurrent hide: leave it.
+        let _ = fs::remove_dir_all(&encoder);
+        let ours = root.join(format!(".{encoder_name}.hidden-{}-9", std::process::id()));
+        fs::create_dir_all(&ours).unwrap();
+        recover_stranded_encoder(&model);
+        assert!(
+            !encoder.is_dir() && ours.is_dir(),
+            "a same-pid dir must be left alone (another thread owns it)"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
