@@ -168,7 +168,29 @@ on-screen diagnostics + the real bridge design, or (b) pulling the text-field
 fallback (option C) trigger now. Rendering at 60 fps surviving the gate means
 option A is not dead — the bridge and lifecycle handling are what failed.
 
-## 9. v2 — the diagnostics build (`0.3.0-m13b.2`)
+---
+
+## 9. v2 field results (2026-10-23) — verdict per check, all four have data
+
+v2's diagnostics worked: every failure named itself on screen (no logcat/PC needed).
+
+| Check | Verdict | Evidence (device: Vivo X300 / Android 16) |
+|---|---|---|
+| 3 · MOTION | **GO** | 90.5 fps avg (twice-confirmed; v1 gave 60.3) — Mali-G1-Ultra MC12 Vulkan |
+| 1 · TEXT | **GO (data path)** | Gboard ID autocorrect + suggestions render correctly via the JNI probe; counter mismatch + frozen deletions = the probe's whole-buffer-replace design (documented) |
+| 2 · LIFECYCLE | broken ×2 → **fixed in v2.1** | resume texture panic (`egui-wgpu renderer.rs:557` "texture not allocated yet" on the first frame after EVERY resume-rebuild; attempts 3/4/5 contained — app survived) + `Recreate activity` threw `postRecreate(): Java exception` silently |
+| 4 · INSETS/BACK | broken ×2 → **fixed in v2.1** | back NOT intercepted → the second back **exited the app**; insets dropped to all-zero and never re-pushed (`inset updates` regressed 1→0 — a state reset) |
+
+**Gate verdict on v2 glue: NO-GO** — the predicted thin-layer branch. Everything heavy is
+proven (rendering at 90 fps, IME data path, insets delivery at startup, GPU retry/
+containment). All failures localize to the shim: egui-Context-vs-renderer lifecycle,
+recreate path, back dispatch, insets continuity → **all four fixed in v2.1**
+(commit `94f7364`, release `android-spike-m13b-v2.1`, versionCode 3).
+
+**Decisive pass**: v2.1 on the device — zero red banners + the four GO lines = M13
+unblocked, real IME bridge work starts. Any red that still appears names itself.
+
+## 10. v2 — the diagnostics build (`0.3.0-m13b.2`)
 
 v2 is the same four checks with the blindfold off: it records its own crashes
 and shows them on the phone screen, because the reason nothing could be
