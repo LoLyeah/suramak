@@ -33,10 +33,18 @@
 //! arm a relaunch (see `docs/reports/M13b5-spike-v2.3.md`). This module is pure
 //! egui with no `platform` import, which is what makes that structural rather
 //! than a promise: on the host, JNI does not even exist here.
+//!
+//! v2.4 (`docs/WORKORDER-M13B6.md`) adds the **instance-state** evidence the
+//! rotation pass needs: [`SpikeState::probe_saves`] / `probe_restores` count the
+//! `onSaveInstanceState` ⇄ JNI round trips, and
+//! [`SpikeState::restore_from_instance_state`] is the one explicit path that
+//! brings text back from a previous Activity (or a previous *process*). Nothing
+//! here talks to Android; the counters are what the owner reads on the phone.
 
 use std::collections::VecDeque;
 
 use crate::diag;
+use crate::probe_state::ProbePayload;
 
 /// Which of the four checks is on screen.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -188,6 +196,18 @@ pub struct SpikeState {
     /// against a destroyed window, so this counter being non-zero *without* a
     /// rebuild is the fix working.
     pub frames_gated: u64,
+    /// Redraws dropped because the Activity was already being destroyed (v2.4).
+    /// The rotation-kill gate: a frame that arrives after
+    /// `nativeActivityDestroyed` must never touch the window, and this is the
+    /// count that proves it was refused rather than attempted.
+    pub frames_after_destroy: u64,
+    /// Instance-state round trips (v2.4): `nativeSaveProbe` calls from
+    /// `MainActivity.onSaveInstanceState`.
+    pub probe_saves: u32,
+    /// Payloads that came back through `onCreate` and were applied.
+    pub probe_restores: u32,
+    /// The last restore, in one line, for the lifecycle tab.
+    pub probe_restore_note: Option<String>,
     /// Set by the button, consumed by the frame loop.
     pub restart_surface: bool,
     /// Outcome of the last "Recreate activity" press (v2.1; re-purposed in v2.3
@@ -244,6 +264,10 @@ impl Default for SpikeState {
             recreate_requests: 0,
             surface_restarts: 0,
             frames_gated: 0,
+            frames_after_destroy: 0,
+            probe_saves: 0,
+            probe_restores: 0,
+            probe_restore_note: None,
             restart_surface: false,
             recreate_status: None,
             anim_seconds: 0.0,
@@ -345,6 +369,33 @@ impl SpikeState {
         });
     }
 
+    /// One `nativeSaveProbe` round trip (v2.4): `MainActivity.onSaveInstanceState`
+    /// asked for the payload it is about to put in the `Bundle`.
+    pub fn note_probe_saved(&mut self) {
+        self.probe_saves = self.probe_saves.saturating_add(1);
+    }
+
+    /// Apply a payload that came back from the Activity's instance state (v2.4).
+    ///
+    /// This is the **only** path that brings text back from a previous Activity
+    /// or a previous process, and it is deliberately explicit: no frame, no event
+    /// and no surface decision can trigger it — `MainActivity.onCreate` calls
+    /// `nativeRestoreProbe` and nothing else does. `last_text_chars` is reset so
+    /// the restored characters are not counted as freshly typed ones (check 1's
+    /// counters stay honest), and the caret is dropped because it belonged to the
+    /// dead Activity's IME session.
+    pub fn restore_from_instance_state(&mut self, payload: &ProbePayload) {
+        self.probe = payload.probe.clone();
+        self.text = payload.text.clone();
+        self.last_text_chars = self.text.chars().count();
+        self.ime_cursor = None;
+        self.probe_restores = self.probe_restores.saturating_add(1);
+        let (probe_chars, text_chars) = payload.char_counts();
+        self.probe_restore_note = Some(format!(
+            "restored {probe_chars} probe char(s) + {text_chars} text char(s) from the instance state"
+        ));
+    }
+
     /// Pull the crash record and the event ring only when they changed.
     pub fn refresh_diagnostics(&mut self) {
         let ring_rev = diag::ring_revision();
@@ -429,6 +480,10 @@ impl SpikeState {
         self.recreate_requests = 0;
         self.surface_restarts = 0;
         self.frames_gated = 0;
+        self.frames_after_destroy = 0;
+        self.probe_saves = 0;
+        self.probe_restores = 0;
+        self.probe_restore_note = None;
         self.recreate_status = None;
         self.frame_times.clear();
         self.frames = 0;
@@ -457,6 +512,7 @@ impl SpikeState {
                 self.recreate_requests = 0;
                 self.surface_restarts = 0;
                 self.frames_gated = 0;
+                self.frames_after_destroy = 0;
                 self.recreate_status = None;
             }
             Tab::Motion => {
@@ -513,7 +569,7 @@ fn draw_header(ctx: &egui::Context, state: &mut SpikeState) {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new("M13B v2.3 DIAGNOSTICS")
+                egui::RichText::new("M13B v2.4 DIAGNOSTICS")
                     .size(24.0)
                     .strong()
                     .color(egui::Color32::from_rgb(120, 190, 255)),
@@ -541,7 +597,7 @@ fn draw_header(ctx: &egui::Context, state: &mut SpikeState) {
         });
         ui.label(
             egui::RichText::new(
-                "build 0.3.0-m13b.2.3 · recreate: named unavailable, no Java call · surface per epoch",
+                "build 0.3.0-m13b.2.4 · rotation: destroy gate + native signal · probe in instance state",
             )
             .size(10.0)
             .color(egui::Color32::from_gray(120)),
@@ -944,8 +1000,10 @@ fn draw_lifecycle_check(ui: &mut egui::Ui, state: &mut SpikeState) {
         "(2) Lifecycle",
         "Type a marker into the probe, send the app to the background (Home / app switch), then \
          bring it back. The probe text and the resume counter must both survive the surface \
-         destroy/recreate. \"Recreate activity\" is NOT available in this shim and makes no Java \
-         call at all — see the evidence under the button.",
+         destroy/recreate. Then rotate the phone: the Activity is destroyed and rebuilt, and \
+         \"instance state\" below must show a save and a restore. \"Recreate activity\" is NOT \
+         available in this shim and makes no Java call at all — see the evidence under the \
+         button.",
     );
 
     ui.horizontal(|ui| {
@@ -984,6 +1042,37 @@ fn draw_lifecycle_check(ui: &mut egui::Ui, state: &mut SpikeState) {
         .size(17.0)
         .monospace(),
     );
+    ui.label(
+        egui::RichText::new(format!(
+            "frames refused after destroy: {}",
+            state.frames_after_destroy
+        ))
+        .size(17.0)
+        .monospace(),
+    );
+    ui.label(
+        egui::RichText::new(format!(
+            "instance state: {} save(s) · {} restore(s)",
+            state.probe_saves, state.probe_restores
+        ))
+        .size(17.0)
+        .monospace()
+        .color(if state.probe_restores > 0 { AMBER } else { DIM }),
+    );
+    match &state.probe_restore_note {
+        Some(note) => ui.label(
+            egui::RichText::new(format!("last restore: {note}"))
+                .size(11.5)
+                .color(egui::Color32::from_gray(150)),
+        ),
+        None => ui.label(
+            egui::RichText::new(
+                "last restore: none — this launch started with an empty instance state (cold start)",
+            )
+            .size(11.5)
+            .color(egui::Color32::from_gray(150)),
+        ),
+    };
     ui.label(
         egui::RichText::new(format!("recreate requests: {}", state.recreate_requests))
             .size(17.0)
@@ -1089,7 +1178,11 @@ fn draw_lifecycle_check(ui: &mut egui::Ui, state: &mut SpikeState) {
     ui.label(
         egui::RichText::new(
             "Go if: the probe text is still there after Home → return, with the resume counter at 2 \
-             or more and the app still the same live process (no fresh start, no crash banner).",
+             or more and the app still the same live process (no fresh start, no crash banner), and \
+             a rotation lands back on the same task with the text intact and \
+             \"instance state\" showing at least one save and one restore. A rotation that kills \
+             the process must leave a NATIVE SIGNAL block in spike-last-crash.txt naming the phase \
+             it died in — that block is the next launch's banner.",
         )
         .size(12.0)
         .color(egui::Color32::from_gray(150)),
@@ -1501,6 +1594,49 @@ mod tests {
     }
 
     #[test]
+    fn an_instance_state_restore_is_explicit_and_does_not_inflate_the_typed_counters() {
+        let mut state = SpikeState {
+            text: "typed before the kill".to_owned(),
+            ..Default::default()
+        };
+        state.observe_text();
+        let typed = state.chars_received;
+        assert!(typed > 0);
+
+        let payload =
+            crate::probe_state::ProbePayload::new("lifecycle-123", "restored sentence 🎹");
+        state.restore_from_instance_state(&payload);
+        assert_eq!(state.probe, "lifecycle-123");
+        assert_eq!(state.text, "restored sentence 🎹");
+        assert_eq!(state.probe_restores, 1);
+        let note = state.probe_restore_note.as_deref().unwrap_or_default();
+        assert!(note.contains("instance state"), "{note}");
+        assert!(note.contains("13 probe char(s)"), "{note}");
+
+        // The restored characters are not "typed": the next observation must see
+        // no delta, or check 1's counters would lie about what the owner typed.
+        state.observe_text();
+        assert_eq!(
+            state.chars_received, typed,
+            "a restore must not look like typing"
+        );
+        assert_eq!(state.deletions_seen, 0);
+
+        // Saving counts on its own side of the round trip.
+        state.note_probe_saved();
+        assert_eq!(state.probe_saves, 1);
+
+        // The reset button still clears the probe (the workorder's condition)...
+        state.reset_tab(Tab::Lifecycle);
+        assert!(state.probe.is_empty(), "the reset clears the probe");
+        // ...and the header reset clears the mechanism's counters with the rest.
+        state.reset_counters();
+        assert_eq!(state.probe_saves, 0);
+        assert_eq!(state.probe_restores, 0);
+        assert_eq!(state.probe_restore_note, None);
+    }
+
+    #[test]
     fn the_whole_screen_draws_headlessly_on_every_tab() {
         let ctx = egui::Context::default();
         ctx.set_pixels_per_point(2.75);
@@ -1522,6 +1658,14 @@ mod tests {
         // path like any other, and its evidence block is the longest text on the
         // lifecycle tab.
         state.tap_recreate();
+        // v2.4: the instance-state line and its "restored" note are draw paths
+        // too — render them with a payload, not just the cold-start wording.
+        state.note_probe_saved();
+        state.restore_from_instance_state(&crate::probe_state::ProbePayload::new(
+            "lifecycle-123",
+            "Saya sedang menguji papan ketik.",
+        ));
+        state.frames_after_destroy = 3;
         for _ in 0..30 {
             state.tick(1.0 / 60.0);
         }

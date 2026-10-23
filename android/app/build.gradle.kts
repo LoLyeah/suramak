@@ -14,13 +14,13 @@ android {
         // compileSdk avoids the "targetSdk > compileSdk" AGP refusal.
         minSdk = 29
         targetSdk = 35
-        // v2.3: the recreate edge — the button is a named limitation and makes
-        // no Java call, so nothing can arm Android's relaunch machinery
-        // (WORKORDER-M13B5). `scripts/android/build-apk.sh` asserts this exact
+        // v2.4: the rotation kill — a destroy gate inside the gpu init path, the
+        // native-signal dump, and the probe in the Activity's instance state
+        // (WORKORDER-M13B6). `scripts/android/build-apk.sh` asserts this exact
         // versionName with `aapt dump badging`, which is what the owner checks
         // before installing.
-        versionCode = 5
-        versionName = "0.3.0-m13b.2.3"
+        versionCode = 6
+        versionName = "0.3.0-m13b.2.4"
 
         // Only the phone ABI: this APK exists to be installed by the owner.
         ndk {

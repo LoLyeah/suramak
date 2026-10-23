@@ -31,6 +31,21 @@
 //! code ever ran. The button is now a named limitation rendered by [`ui`], with
 //! no flag for the frame loop and no Kotlin method to reach.
 //!
+//! v2.4 (`docs/WORKORDER-M13B6.md`) answers the owner's rotation kill, and adds
+//! the two things that make the next one legible instead of invisible:
+//!
+//! * a POSIX handler for `SIGSEGV`/`SIGABRT`/`SIGBUS` armed here and in
+//!   `nativeInit` ([`diag::init_signal_handlers`]), which writes the event ring
+//!   plus the phase the app was in to `spike-last-crash.txt` and then re-raises
+//!   so the tombstone is still written;
+//! * a **destroy gate** in [`surface_lifecycle`] (`Phase::Destroying`,
+//!   [`surface_lifecycle::KillLatch`]) that makes "a destroy arrived while the
+//!   init path was running" a refused build rather than a driver call against a
+//!   window the platform already tore down;
+//! * the probe's **instance state** ([`probe_state`]): `MainActivity` saves it
+//!   in `onSaveInstanceState` and hands it back on the next entry, so the text
+//!   survives a rotation *and* a process kill.
+//!
 //! Nothing here is shared with `suramak-ui`: the spike exists to answer four
 //! questions on a real device before M13 commits to option A
 //! (`docs/PLAN-M13-ANDROID.md` §2.1).
@@ -39,6 +54,7 @@
 
 pub mod diag;
 pub mod gpu_context;
+pub mod probe_state;
 pub mod surface_lifecycle;
 pub mod ui;
 
@@ -67,6 +83,9 @@ mod platform;
 #[no_mangle]
 pub fn android_main(app: android_activity::AndroidApp) {
     diag::init_panic_hook();
+    // v2.4: the native-signal dump, armed before the first window call. It is
+    // the only record a SIGSEGV/SIGABRT leaves in this process (see `diag`).
+    diag::init_signal_handlers();
     // Each `android_main` serves one Activity instance; the generation makes a
     // "destroyed" signal from a previous Activity harmless to this one.
     let generation = platform::begin_activity();

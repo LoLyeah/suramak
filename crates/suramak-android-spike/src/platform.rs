@@ -9,10 +9,21 @@
 //!     editing state from `GameActivity.stateChanged`;
 //!   * `nativeLogLine(line)` — a plain lifecycle line (onCreate, surfaceCreated,
 //!     `recreate:`/`settle:` …) for the on-screen event ring;
-//!   * `nativeActivityDestroyed()` — the Activity is going away, stop the loop.
+//!   * `nativeActivityDestroyed()` — the Activity is going away, stop the loop;
+//!   * `nativeSaveProbe()` — **Rust → Kotlin** (a return value): the instance-state
+//!     payload `onSaveInstanceState` puts in the `Bundle` (v2.4);
+//!   * `nativeRestoreProbe(payload)` — the same payload coming back on the next
+//!     `onCreate`, applied to [`crate::ui::SpikeState`] with a log line.
 //!
-//! Rust → Kotlin: [`request_insets_push`] and [`request_crash_overlay`] call
-//! `MainActivity.postPushInsets()` / `postShowCrashOverlay()` over JNI.
+//! **v2.4: two atomics the init path reads without the looper.** The event loop
+//! only learns about a lifecycle transition when it pumps the looper — and while
+//! it is *inside* `Gpu::new` it is not pumping. So the two signals that mean "do
+//! not touch the window again" are also latched here, where `app.rs` can read
+//! them between init stages with a single atomic load: [`window_gone`] (the Java
+//! `surfaceDestroyed` line, emitted *before* `super.surfaceDestroyed`) and
+//! [`kill_pending`] (that, or `nativeActivityDestroyed`, which Kotlin calls
+//! before `super.onDestroy`). This is the same discipline as the v2.2 suspend
+//! gate, moved inside the build.
 //!
 //! **v2.3: the recreate call is gone, and here is why it could never work.**
 //! `android-activity` 0.6.1 initialises `ndk_context` with
@@ -104,6 +115,29 @@ pub fn take_surface_destroyed_hint() -> bool {
     SURFACE_DESTROYED.swap(false, Ordering::SeqCst)
 }
 
+/// Has Kotlin reported `surfaceDestroyed` and no resume cleared it yet?
+///
+/// Unlike [`take_surface_destroyed_hint`] this does **not** consume the signal:
+/// the init path reads it between gpu stages (it must not eat the event the
+/// frame loop is waiting for), and `Handler::resumed` is the only place that
+/// clears it.
+pub fn window_gone() -> bool {
+    SURFACE_DESTROYED.load(Ordering::SeqCst)
+}
+
+/// Must this Activity generation do no more platform work (v2.4)?
+///
+/// `true` from the moment either signal lands — the Java `surfaceDestroyed`
+/// line (the native window is about to be released) or
+/// `nativeActivityDestroyed` (the Activity is being destroyed) — until a new
+/// `android_main` starts with its own generation. `app.rs` asks this before
+/// every gpu-init stage, at the top of every frame and before every retry; once
+/// it is true, nothing in this generation may create a surface, configure one,
+/// or draw.
+pub fn kill_pending(generation: u32) -> bool {
+    activity_destroyed(generation) || window_gone()
+}
+
 /// Which Activity instance this process is serving. Bumped on every
 /// `android_main` entry, so a "destroyed" flag left by a *previous* Activity can
 /// never stop the next one — the flag records which generation was destroyed,
@@ -153,6 +187,9 @@ pub fn activity_destroyed(generation: u32) -> bool {
 fn mark_activity_destroyed() {
     let generation = CURRENT_GENERATION.load(Ordering::SeqCst);
     let previous = DESTROYED_GENERATION.swap(generation, Ordering::SeqCst);
+    // The signal dump's phase too: if this generation still dies natively
+    // during the destroy path, the file must say which stage that was.
+    diag::set_phase(diag::Phase::Destroying);
     if previous < generation {
         diag::info(format!(
             "jni: nativeActivityDestroyed (activity generation {generation}) — the event loop will exit"
@@ -236,6 +273,10 @@ pub extern "system" fn Java_app_suramak_spike_MainActivity_nativeInit(
                 diag::warn("jni: nativeInit got an empty files dir — crash persistence off");
             } else {
                 diag::set_files_dir(&dir);
+                // `set_files_dir` arms this too (it is the first call that knows
+                // where the file goes); the explicit call makes the order
+                // readable and covers a dir that was already set.
+                diag::init_signal_handlers();
                 diag::info(format!("jni: nativeInit files dir = {dir}"));
             }
         }
@@ -362,6 +403,93 @@ pub extern "system" fn Java_app_suramak_spike_MainActivity_nativeImeText(
             selection_start: start,
             selection_end: end,
         });
+    });
+}
+
+/// `MainActivity.nativeSaveProbe()` — the instance-state payload (v2.4).
+///
+/// Called from the UI thread inside `onSaveInstanceState`, i.e. while the native
+/// thread may be inside a frame. It only takes the state lock for the clone
+/// (a frame holds it for its own duration, so this can wait one frame — well
+/// inside the platform's patience), then builds the JNI string outside the lock.
+/// Returns null if anything at all goes wrong: Kotlin treats null as "nothing to
+/// save", never as an error to throw inside a lifecycle callback.
+#[no_mangle]
+pub extern "system" fn Java_app_suramak_spike_MainActivity_nativeSaveProbe(
+    env: *mut jni::sys::JNIEnv,
+    _this: jni::sys::jobject,
+) -> jni::sys::jstring {
+    if env.is_null() {
+        return std::ptr::null_mut();
+    }
+    let mut out: jni::sys::jstring = std::ptr::null_mut();
+    jni_guard("nativeSaveProbe", || {
+        let payload = {
+            let mut state = crate::app::state()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.note_probe_saved();
+            crate::probe_state::ProbePayload::new(state.probe.clone(), state.text.clone())
+        };
+        let encoded = crate::probe_state::encode(&payload);
+        let (probe_chars, text_chars) = payload.char_counts();
+        // SAFETY: the JVM passes a valid JNIEnv for the duration of this call.
+        let Ok(env) = (unsafe { jni::JNIEnv::from_raw(env) }) else {
+            diag::warn("jni: nativeSaveProbe: JNIEnv::from_raw failed");
+            return;
+        };
+        match env.new_string(encoded) {
+            Ok(java) => {
+                out = java.into_raw();
+                diag::info(format!(
+                    "instance state: saved ({probe_chars} probe chars, {text_chars} text chars) \
+                     for onSaveInstanceState"
+                ));
+            }
+            Err(err) => diag::warn(format!("jni: nativeSaveProbe: new_string failed: {err}")),
+        }
+    });
+    out
+}
+
+/// `MainActivity.nativeRestoreProbe(payload)` — the payload coming back on the
+/// next `onCreate` (v2.4).
+///
+/// Called *before* `super.onCreate`, so the restored text is already in the
+/// process-wide state when `android_main` entry #1 of the new Activity runs —
+/// same process (rotation) or a brand-new one (after a kill). Restoring is
+/// explicit and logged, as the workorder requires: `probe restored from instance
+/// state (N chars)`, or the named reason it was refused.
+#[no_mangle]
+pub extern "system" fn Java_app_suramak_spike_MainActivity_nativeRestoreProbe(
+    env: *mut jni::sys::JNIEnv,
+    _this: jni::sys::jobject,
+    payload: jni::sys::jstring,
+) {
+    jni_guard("nativeRestoreProbe", || {
+        let Some(raw) = read_jstring(env, payload, "nativeRestoreProbe") else {
+            return;
+        };
+        match crate::probe_state::decode(&raw) {
+            Ok(payload) => {
+                let (probe_chars, text_chars) = payload.char_counts();
+                {
+                    let mut state = crate::app::state()
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.restore_from_instance_state(&payload);
+                }
+                diag::info(format!(
+                    "probe restored from instance state ({probe_chars} chars)"
+                ));
+                if text_chars > 0 {
+                    diag::info(format!(
+                        "text restored from instance state ({text_chars} chars)"
+                    ));
+                }
+            }
+            Err(err) => diag::warn(format!("instance state: restore refused — {err}")),
+        }
     });
 }
 

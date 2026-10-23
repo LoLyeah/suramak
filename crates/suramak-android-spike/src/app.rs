@@ -82,6 +82,33 @@
 //! Activity, so the old call could only fail its method lookup) is in
 //! `docs/reports/M13b5-spike-v2.3.md` §3; the button now reports the limitation
 //! from [`crate::ui`] alone.
+//!
+//! **v2.4: the destroy gate — the v2.2 rule, moved inside the build.** The
+//! owner's v2.3 run rotated within ~1 s of launch and died natively. Every gate
+//! v2.2 added consults the lifecycle *events* (`resumed`/`suspended`), and those
+//! are only delivered when this loop pumps the looper — which it does not do
+//! while it is inside `Gpu::new`, i.e. exactly during launch. So a
+//! `surfaceDestroyed` (Java, before the window is released) or an Activity
+//! destroy (Java, before `super.onDestroy` frees the glue) could land with the
+//! build already in flight, and `surface.configure` would run against a buffer
+//! queue the platform had torn down. Three things close that:
+//!
+//! 1. [`Handler::note_destroyed`] turns `nativeActivityDestroyed` into a
+//!    **terminal** [`SurfaceLifecycle::on_destroyed`]: the epoch ends, the
+//!    generation is dropped, every later build is refused and every later frame
+//!    is counted in `frames_after_destroy` and dropped.
+//! 2. [`Gpu::new`] checks a [`KillLatch`] at every stage (`surface` → `adapter`
+//!    → `device` → `configure`), reading `platform::kill_pending` — an atomic the
+//!    JNI exports set on the UI thread, no looper turn required. A build that
+//!    sees either signal aborts at that stage, is logged as
+//!    `gpu init aborted at 'adapter'`, and adopts nothing.
+//! 3. Every phase boundary is published to [`diag::set_phase`], so if the driver
+//!    still faults, the SIGSEGV dump names the call that was running.
+//!
+//! The remaining window is the width of one non-blocking call (the gap between
+//! `stage(Configure)` returning and `surface.configure` entering), not the
+//! hundreds of milliseconds of a Vulkan adapter/device request. §9 of the report
+//! states that boundary rather than claiming more.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -97,7 +124,8 @@ use crate::diag;
 use crate::gpu_context;
 use crate::platform;
 use crate::surface_lifecycle::{
-    BuildTicket, SurfaceAction, SurfaceFault, SurfaceLifecycle, MAX_AUTO_REBUILDS_PER_EVENT,
+    BuildTicket, InitStage, KillLatch, SurfaceAction, SurfaceFault, SurfaceLifecycle,
+    MAX_AUTO_REBUILDS_PER_EVENT,
 };
 use crate::ui::{self, SpikeState};
 
@@ -139,6 +167,9 @@ pub fn run(app: android_activity::AndroidApp, generation: u32) {
 
     let entry = MAIN_ENTRIES.fetch_add(1, Ordering::SeqCst) + 1;
     log::info!("android_main entered (entry #{entry}, activity generation {generation})");
+    // Publish the stage to the native-signal dump: if this entry dies before the
+    // first frame (the v2.3 shape), the file says "event loop", not "boot".
+    diag::set_phase(diag::Phase::EventLoop);
 
     let event_loop = match EventLoop::builder().with_android_app(app).build() {
         Ok(event_loop) => event_loop,
@@ -243,6 +274,15 @@ struct Handler {
 
 impl ApplicationHandler for Handler {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        // A `Resumed` queued behind a destroy would resurrect a generation that
+        // is going away; the destroy wins (v2.4).
+        if self.note_destroyed() {
+            log::warn!(
+                "resume event after the Activity was destroyed — ignored (generation {} is over)",
+                self.generation
+            );
+            return;
+        }
         let resumes = {
             let mut state = lock_state();
             state.resumes = state.resumes.saturating_add(1);
@@ -310,10 +350,15 @@ impl ApplicationHandler for Handler {
         // the one whose surface cannot be trusted. `build_gpu` is the same entry
         // the surface-fault path and the button use.
         self.build_gpu("resume");
+        // A dead-gpu resume has nothing to draw; the retry loop owns that case.
+        if self.gpu.is_some() {
+            diag::set_phase(diag::Phase::Frame);
+        }
         window.request_redraw();
     }
 
     fn suspended(&mut self, event_loop: &ActiveEventLoop) {
+        diag::set_phase(diag::Phase::Suspended);
         // The ANativeWindow behind the surface is going away; drop every wgpu
         // object that references it — surface, device, queue, renderer and the
         // `egui::Context` with them (the context owns the texture bookkeeping
@@ -397,7 +442,7 @@ impl ApplicationHandler for Handler {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if platform::activity_destroyed(self.generation) {
+        if self.note_destroyed() {
             log::info!("event: activity destroyed — exiting the event loop");
             event_loop.exit();
             return;
@@ -420,6 +465,41 @@ impl ApplicationHandler for Handler {
 }
 
 impl Handler {
+    /// Read the Activity-destroy signal and, the first time it is seen, end this
+    /// generation for good (v2.4).
+    ///
+    /// Returns `true` while the generation is dead, so every caller turns it into
+    /// the right action (exit the loop, drop a frame, refuse a build). The signal
+    /// is `nativeActivityDestroyed`, which `MainActivity.onDestroy` calls *before*
+    /// `super.onDestroy` — i.e. while the native glue and the window are still
+    /// valid — so this is the earliest moment the process can know.
+    ///
+    /// This is deliberately *not* fed by `surfaceDestroyed`: that one is a suspend
+    /// (the same Activity resumes later) and the v2.2 gate already owns it.
+    /// Conflating them would leave a Home → return session permanently dead.
+    fn note_destroyed(&mut self) -> bool {
+        if self.lifecycle.is_destroyed() {
+            return true;
+        }
+        if !platform::activity_destroyed(self.generation) {
+            return false;
+        }
+        let report = self.lifecycle.on_destroyed();
+        let dropped = self.gpu.take().is_some();
+        diag::set_phase(diag::Phase::Destroying);
+        log::warn!(
+            "destroy gate: activity generation {} is being destroyed — epoch {} ended (had generation: \
+             {}, gpu dropped: {dropped}, window already gone: {}); nothing is built, adopted or drawn \
+             again in this generation",
+            self.generation,
+            report.epoch,
+            report.had_generation,
+            platform::window_gone()
+        );
+        self.next_gpu_retry = None;
+        true
+    }
+
     /// Take the Kotlin `surfaceDestroyed` signal and close the epoch with it.
     ///
     /// winit's `Suspended` is derived from android-activity's
@@ -464,6 +544,15 @@ impl Handler {
     /// is refused here even if a caller forgot to check (the 3.40s raced init:
     /// counted, named, never executed).
     fn build_gpu(&mut self, reason: &str) {
+        // v2.4: a build requested after the destroy is refused before it looks
+        // at the window at all — the terminal half of the gate.
+        if self.note_destroyed() {
+            log::warn!(
+                "gpu: build refused (reason={reason}) — the Activity is being destroyed; no surface is \
+                 created, nothing is configured"
+            );
+            return;
+        }
         let Some(window) = self.window.clone() else {
             return;
         };
@@ -483,13 +572,21 @@ impl Handler {
         self.gpu_attempts = self.gpu_attempts.saturating_add(1);
         let attempt = self.gpu_attempts;
         let started = Instant::now();
+        // v2.4: one latch per build. `Gpu::new` asks it before every stage; a
+        // destroy or a `surfaceDestroyed` that lands mid-build (which the event
+        // loop cannot see, because it is not pumping) aborts the build there
+        // instead of letting `surface.configure` run on a window the platform
+        // already released.
+        let generation = self.generation;
+        let mut kill = KillLatch::new();
         // `Gpu::new` ends in `surface.configure`, and configuring a surface
         // whose native window died mid-build is exactly the Mali panic the field
         // report carries. A build therefore gets the same boundary a frame has:
         // a panic becomes a recorded init failure, not an unwind through winit
         // (which would finish the Activity).
-        let built =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Gpu::new(window, ticket)));
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Gpu::new(window, ticket, &mut kill, generation)
+        }));
         match built {
             Ok(Ok(gpu)) => {
                 // The epoch can only close while a build runs if the build
@@ -529,8 +626,29 @@ impl Handler {
                 }
                 self.next_gpu_retry = None;
                 self.gpu = Some(gpu);
+                diag::set_phase(diag::Phase::Frame);
             }
-            Ok(Err(err)) => {
+            Ok(Err(GpuInitError::Killed(stage))) => {
+                // The build stopped itself: a signal arrived that the event loop
+                // has not seen yet. There is nothing to retry — either the
+                // Activity is gone (the loop exits on the next turn) or the
+                // window is (the next resume owns the rebuild).
+                log::warn!(
+                    "gpu: init aborted at stage '{}' — the Activity or the window went away mid-build \
+                     (activity destroyed: {}, window gone: {}, stages refused: {}); nothing was \
+                     configured and nothing is adopted",
+                    stage.as_str(),
+                    platform::activity_destroyed(generation),
+                    platform::window_gone(),
+                    kill.refusals()
+                );
+                lock_state().gpu_error = Some(format!(
+                    "gpu init aborted at '{}' — the Activity/window went away (rotation or suspend)",
+                    stage.as_str()
+                ));
+                self.next_gpu_retry = None;
+            }
+            Ok(Err(GpuInitError::Failed(err))) => {
                 log::error!("gpu init failed ({reason}, attempt {attempt}): {err}");
                 let mut state = lock_state();
                 state.gpu_error = Some(format!("{reason}: {err}"));
@@ -561,6 +679,11 @@ impl Handler {
             return;
         }
         if self.gpu_attempts >= GPU_ATTEMPTS {
+            return;
+        }
+        // v2.4: a retry must not fire into a destroyed generation either — the
+        // destroy signal can arrive on the UI thread between two turns here.
+        if self.note_destroyed() {
             return;
         }
         // The gate the v2.1 trace walked through: the retry must not start while
@@ -624,8 +747,19 @@ impl Handler {
 
     fn redraw(&mut self) {
         // The Java `surfaceDestroyed` signal first (it can precede winit's
-        // `Suspended`), then the gate.
+        // `Suspended`), then the gates.
         self.poll_surface_destroyed_hint();
+
+        // v2.4: the destroy gate comes before the suspend gate. A redraw that
+        // arrives after `nativeActivityDestroyed` must never reach the gpu — the
+        // v2.3 rotation kill was exactly a frame/init against a window the
+        // platform had already released. Counted separately from `frames_gated`
+        // so the device log tells "backgrounded" apart from "destroyed".
+        if self.note_destroyed() {
+            let mut state = lock_state();
+            state.frames_after_destroy = state.frames_after_destroy.saturating_add(1);
+            return;
+        }
 
         // The frame gate (v2.2) — the first act of every frame, before timing,
         // before the input drain, before any gpu work. A redraw that arrives
@@ -888,8 +1022,56 @@ fn surface_fault(err: &wgpu::SurfaceError) -> Option<SurfaceFault> {
     }
 }
 
+/// Why [`Gpu::new`] returned nothing.
+///
+/// Two causes on purpose. `Failed` is a driver/format/window failure the frame
+/// loop retries; `Killed` is the v2.4 gate — a destroy or a `surfaceDestroyed`
+/// arrived while the build was running, so the build stopped at `InitStage` and
+/// must **not** be retried (the epoch is over, or the next resume owns it).
+#[derive(Debug)]
+enum GpuInitError {
+    Failed(String),
+    Killed(InitStage),
+}
+
+impl std::fmt::Display for GpuInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed(message) => f.write_str(message),
+            Self::Killed(stage) => write!(
+                f,
+                "aborted at '{}' — the Activity/window went away",
+                stage.as_str()
+            ),
+        }
+    }
+}
+
+impl From<String> for GpuInitError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
 impl Gpu {
-    fn new(window: Arc<Window>, ticket: BuildTicket) -> Result<Self, String> {
+    fn new(
+        window: Arc<Window>,
+        ticket: BuildTicket,
+        kill: &mut KillLatch,
+        generation: u32,
+    ) -> Result<Self, GpuInitError> {
+        // The v2.4 gate, inside the build. Each call reads two atomics that the
+        // JNI exports (which run on the UI thread) set — no looper turn, no
+        // event, no lock. `Err` means a destroy or a `surfaceDestroyed` is
+        // pending: return *before* the next window call rather than configuring a
+        // surface the platform has already torn down.
+        let mut stage = |stage: InitStage| -> Result<(), GpuInitError> {
+            kill.allow(stage, platform::kill_pending(generation))
+                .map_err(GpuInitError::Killed)
+        };
+
+        stage(InitStage::Surface)?;
+        diag::set_phase(diag::Phase::GpuSurface);
         // Built here, dropped with `self`: the context is part of the GPU
         // generation, not of the app (see the module docs).
         let egui_ctx = gpu_context::new_context();
@@ -910,6 +1092,8 @@ impl Gpu {
             ticket.epoch
         );
 
+        stage(InitStage::Adapter)?;
+        diag::set_phase(diag::Phase::GpuAdapter);
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
@@ -925,9 +1109,13 @@ impl Gpu {
         }))
         .map_err(|err| format!("request_device: {err}"))?;
 
+        stage(InitStage::Device)?;
+        diag::set_phase(diag::Phase::GpuDevice);
         let caps = surface.get_capabilities(&adapter);
         if caps.formats.is_empty() {
-            return Err("surface reported no texture formats".to_owned());
+            return Err(GpuInitError::Failed(
+                "surface reported no texture formats".to_owned(),
+            ));
         }
         let format = caps
             .formats
@@ -946,6 +1134,12 @@ impl Gpu {
             alpha_mode: caps.alpha_modes[0],
             view_formats: Vec::new(),
         };
+        // The call the v2.3 kill is suspected to be: `configure` against a buffer
+        // queue the platform already disconnected. Everything above is
+        // re-checked here, and the phase is published immediately before it, so
+        // a SIGSEGV inside `vkCreateSwapchainKHR` names this stage in the dump.
+        stage(InitStage::Configure)?;
+        diag::set_phase(diag::Phase::GpuConfigure);
         surface.configure(&device, &config);
 
         let renderer =

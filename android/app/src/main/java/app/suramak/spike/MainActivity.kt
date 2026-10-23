@@ -30,7 +30,7 @@ import com.google.androidgamesdk.GameActivity
 import com.google.androidgamesdk.gametextinput.State
 
 /**
- * M13b shell spike v2.3 — the entire Kotlin surface.
+ * M13b shell spike v2.4 — the entire Kotlin surface.
  *
  * Extends the androidx `GameActivity` (AGDK), which is what gives the Rust side
  * `GameTextInput` (the soft-keyboard path egui's IME support needs). This class
@@ -48,8 +48,23 @@ import com.google.androidgamesdk.gametextinput.State
  *   Kotlin -> Rust   nativeImeText(text, selectionStart, selectionEnd)     [UTF-16 indices]
  *   Kotlin -> Rust   nativeLogLine(line)        [lifecycle lines for the on-screen ring]
  *   Kotlin -> Rust   nativeActivityDestroyed()  [stop the event loop]
+ *   Kotlin -> Rust   nativeSaveProbe(): String? [state for onSaveInstanceState]
+ *   Kotlin -> Rust   nativeRestoreProbe(payload) [the same payload back on onCreate]
  *   Rust -> Kotlin   postPushInsets()           [re-read + re-push the window insets]
  *   Rust -> Kotlin   postShowCrashOverlay()     [re-read the crash file, show it now]
+ *
+ * **v2.4: rotation.** The manifest deliberately does not swallow orientation, so
+ * a rotate destroys and recreates this Activity. Two mechanisms make that
+ * survivable:
+ *
+ *  * the Rust side latches `nativeActivityDestroyed` (called below, *before*
+ *    `super.onDestroy`) and refuses every later gpu build/frame for that
+ *    generation, so the destroy cannot land inside an init against a dead
+ *    window (see `docs/reports/M13b6-spike-v2.4.md`);
+ *  * [onSaveInstanceState] stores the probe payload in the instance state and
+ *    [onCreate] hands it back, so the text survives a rotation *and* a process
+ *    kill — the platform keeps the Bundle for this Activity record even across
+ *    a fresh process.
  *
  * **There is deliberately no recreate entry point.** v2, v2.1 and v2.2 all
  * reached this class through `ndk_context`'s handle to call `postRecreate()`;
@@ -112,6 +127,16 @@ class MainActivity : GameActivity() {
     private external fun nativeActivityDestroyed()
 
     /**
+     * v2.4 — the instance-state payload (see `probe_state.rs`). Called from
+     * [onSaveInstanceState]; returns null when there is nothing to store, never
+     * throws into the lifecycle callback.
+     */
+    private external fun nativeSaveProbe(): String?
+
+    /** v2.4 — hand a payload from a previous [onSaveInstanceState] back to Rust. */
+    private external fun nativeRestoreProbe(payload: String)
+
+    /**
      * The soft keyboard's editing state, straight from GameTextInput.
      *
      * `super.stateChanged` keeps GameActivity's own native mirror in sync (the
@@ -141,6 +166,13 @@ class MainActivity : GameActivity() {
          * some OEM builds; within this window it is one press.
          */
         private const val BACK_DEDUPE_MS = 250L
+
+        /**
+         * The `Bundle` key the probe payload lives under (v2.4). The *key* is
+         * Kotlin's business — Rust owns the payload format, and the two meet only
+         * in `nativeSaveProbe` / `nativeRestoreProbe`.
+         */
+        private const val KEY_PROBE = "app.suramak.spike.probe"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -162,6 +194,23 @@ class MainActivity : GameActivity() {
             Log.i(TAG, "crash files: ${dir.absolutePath} (external=${CrashFiles.isExternal(this)})")
         } catch (t: Throwable) {
             Log.e(TAG, "nativeInit failed", t)
+        }
+
+        // v2.4: the instance state comes back *before* `super.onCreate` starts the
+        // native thread, so the restored text is already in SpikeState when
+        // `android_main` for this Activity runs. Same process for a rotation, a
+        // brand-new process after a kill — the Bundle is the platform's, not ours.
+        val savedProbe = savedInstanceState?.getString(KEY_PROBE)
+        if (savedProbe != null) {
+            try {
+                nativeRestoreProbe(savedProbe)
+                logToRust("instance state: handed ${savedProbe.length} payload chars back to Rust")
+            } catch (t: Throwable) {
+                logToRust("instance state: restore failed (${t.javaClass.simpleName})")
+                Log.e(TAG, "nativeRestoreProbe failed", t)
+            }
+        } else {
+            logToRust("instance state: none (cold start, or nothing was saved)")
         }
 
         super.onCreate(savedInstanceState)
@@ -208,6 +257,33 @@ class MainActivity : GameActivity() {
         logSettle("onStop")
         CrashFiles.endSession(this)
         super.onStop()
+    }
+
+    /**
+     * v2.4 — the state that survives a rotation *and* a process kill.
+     *
+     * Called for a configuration change (the manifest does not swallow
+     * orientation) and before the process can be killed in the background. The
+     * system keeps this `Bundle` for the Activity's record: a rotation in this
+     * process gets it back on `onCreate`, and a process the OS killed gets a
+     * fresh Activity with the same `Bundle`. Rust owns the payload's shape
+     * (`probe_state.rs`); this method only stores the one string.
+     */
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        try {
+            val payload = nativeSaveProbe()
+            if (payload == null) {
+                logToRust("instance state: save returned nothing — no payload stored")
+                return
+            }
+            outState.putString(KEY_PROBE, payload)
+            logToRust("instance state: saved ${payload.length} payload chars")
+        } catch (t: Throwable) {
+            // A lifecycle callback must never throw over a diagnostics path.
+            logToRust("instance state: save failed (${t.javaClass.simpleName})")
+            Log.e(TAG, "nativeSaveProbe failed", t)
+        }
     }
 
     override fun onDestroy() {

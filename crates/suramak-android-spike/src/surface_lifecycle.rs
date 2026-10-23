@@ -36,6 +36,29 @@
 //! [`MAX_AUTO_REBUILDS_PER_EVENT`] per lifecycle event so a repeatable fault
 //! cannot spin.
 //!
+//! **v2.4: destruction is a third phase, and it gates the init path.** The
+//! owner's v2.3 field run rotated within ~1 s of launch and the process died
+//! natively — no Rust panic, no Java exception, never reached `onStop`. The
+//! window between launch and the first frame is the one the v2.2 gate could not
+//! cover, because the gate is fed by `resumed`/`suspended` events and the event
+//! loop is not pumping while it *is* the init path: a `surfaceDestroyed` or an
+//! Activity destroy that lands in that gap is only read after the gpu call that
+//! faults. So:
+//!
+//! * [`Phase::Destroying`] is a **terminal** phase for one Activity generation
+//!   ([`SurfaceLifecycle::on_destroyed`]); every later build is refused, every
+//!   frame is gated, and an adoption from an earlier epoch can never happen.
+//! * [`KillLatch`] + [`InitStage`] are the *inside* of one build: the init path
+//!   asks the latch between stages (`surface` → `adapter` → `device` →
+//!   `configure` → `present`) and aborts at the first one that sees the
+//!   destroy/window-gone flag set. The latch is one-way, so a signal that
+//!   arrives mid-build cannot be lost by a later stage's "it looks fine now".
+//!
+//! Together they turn "a destroy arrived while the init path was running" into
+//! a logged, adopted-nothing, exited loop instead of a driver call against a
+//! window the platform already tore down. What no host test can prove is the
+//! driver's own behaviour; that is the owner's device pass (report §9).
+//!
 //! **Why a separate module.** `app.rs` is `#![cfg(target_os = "android")]`, so
 //! nothing in it can be unit-tested on this host: the wgpu dependency is
 //! Android-only and `android-activity` refuses to compile off-device. The policy
@@ -61,11 +84,15 @@ pub const MAX_AUTO_REBUILDS_PER_EVENT: u32 = 2;
 
 /// `Suspended` is `surfaceDestroyed .. resumed`; `Running` is `resumed ..
 /// suspended`. Before the first `resumed` the surface does not exist either, so
-/// a fresh [`SurfaceLifecycle`] starts suspended.
+/// a fresh [`SurfaceLifecycle`] starts suspended. `Destroying` is terminal for
+/// one Activity generation: the Activity (not merely its window) is going away,
+/// so `android_main` is about to return and nothing may be built, adopted or
+/// drawn again (v2.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     Suspended,
     Running,
+    Destroying,
 }
 
 impl Phase {
@@ -73,12 +100,123 @@ impl Phase {
         match self {
             Self::Suspended => "SUSPENDED",
             Self::Running => "RUNNING",
+            Self::Destroying => "DESTROYED",
         }
     }
 
     pub fn is_running(self) -> bool {
         self == Self::Running
     }
+
+    pub fn is_destroying(self) -> bool {
+        self == Self::Destroying
+    }
+}
+
+/// The ordered stages of one GPU build, as the init path walks them.
+///
+/// The names are what the log line and the signal dump quote, so they are part
+/// of the contract, not cosmetics: `gpu init aborted at 'adapter'` on the device
+/// is the sentence that says the rotation landed inside the adapter request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum InitStage {
+    /// `create_surface` from the window handle.
+    Surface,
+    /// `request_adapter`.
+    Adapter,
+    /// `request_device`.
+    Device,
+    /// `surface.configure` + renderer/egui construction.
+    Configure,
+    /// The first frame of the new generation.
+    Present,
+}
+
+impl InitStage {
+    /// In order. `app.rs` asks the latch before each of these, and the order is
+    /// the whole point: `Configure` is the call that faults on a dead window, so
+    /// every signal must be checked before it.
+    pub const ALL: [InitStage; 5] = [
+        InitStage::Surface,
+        InitStage::Adapter,
+        InitStage::Device,
+        InitStage::Configure,
+        InitStage::Present,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InitStage::Surface => "surface",
+            InitStage::Adapter => "adapter",
+            InitStage::Device => "device",
+            InitStage::Configure => "configure",
+            InitStage::Present => "present",
+        }
+    }
+}
+
+/// A one-way latch the init path consults between stages (v2.4).
+///
+/// Fed by the two signals that can arrive while the event loop is *not*
+/// pumping, i.e. during init: the Kotlin `surfaceDestroyed` line (which the shim
+/// emits before `super.surfaceDestroyed`, so it is the earliest in-process word
+/// that the native window is going away) and `nativeActivityDestroyed` (before
+/// `super.onDestroy`). Both are read as atomics by the caller; this type owns
+/// only the decision and the counters, which is what makes it host-testable.
+///
+/// One-way on purpose: once a stage has seen the signal, a later stage's "it
+/// looks fine now" cannot resurrect the build. That is the difference between a
+/// gate and a poll.
+#[derive(Debug, Default)]
+pub struct KillLatch {
+    tripped_at: Option<InitStage>,
+    refusals: u32,
+}
+
+impl KillLatch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// May the build enter `stage`? `tripped` is the caller's read of the
+    /// platform signals. The first `Err` names the stage that saw it; every
+    /// later call is refused at the same stage and counted.
+    pub fn allow(&mut self, stage: InitStage, tripped: bool) -> Result<(), InitStage> {
+        if let Some(first) = self.tripped_at {
+            self.refusals = self.refusals.saturating_add(1);
+            return Err(first);
+        }
+        if tripped {
+            self.tripped_at = Some(stage);
+            self.refusals = 1;
+            return Err(stage);
+        }
+        Ok(())
+    }
+
+    pub fn is_tripped(&self) -> bool {
+        self.tripped_at.is_some()
+    }
+
+    /// The stage the signal was first seen at — the one the log names.
+    pub fn tripped_at(&self) -> Option<InitStage> {
+        self.tripped_at
+    }
+
+    /// Stages refused after (and including) the one that tripped it.
+    pub fn refusals(&self) -> u32 {
+        self.refusals
+    }
+}
+
+/// What an `on_destroyed` transition released.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DestroyReport {
+    /// `true` when a generation was still live at destroy time — it is dropped
+    /// by the caller, and the log says so.
+    pub had_generation: bool,
+    /// The epoch that ended.
+    pub epoch: u64,
 }
 
 /// The right to build one GPU generation, handed out by
@@ -175,6 +313,11 @@ pub struct SurfaceLifecycle {
     stale_builds: u32,
     builds: u32,
     suspends: u32,
+    /// `on_destroyed` transitions (one per Activity generation, at most).
+    destroys: u32,
+    /// `resumed` events refused because the Activity was already being
+    /// destroyed — a queued winit event that must not reopen a dead epoch.
+    refused_resumes: u32,
 }
 
 impl Default for SurfaceLifecycle {
@@ -200,6 +343,8 @@ impl SurfaceLifecycle {
             stale_builds: 0,
             builds: 0,
             suspends: 0,
+            destroys: 0,
+            refused_resumes: 0,
         }
     }
 
@@ -260,7 +405,18 @@ impl SurfaceLifecycle {
     /// handler still holds is invalid from this moment — the caller drops it and
     /// rebuilds through [`Self::begin_build`], which is why this cannot be a
     /// no-op when `self.live` is `None`.
+    ///
+    /// After [`Self::on_destroyed`] this is a **refusal**, not a reopen: the
+    /// epoch belongs to an Activity that is gone, and a `Resumed` still queued
+    /// in the looper must not hand the dying generation a fresh window.
     pub fn on_resumed(&mut self) -> ResumeTicket {
+        if self.phase.is_destroying() {
+            self.refused_resumes = self.refused_resumes.saturating_add(1);
+            return ResumeTicket {
+                epoch: self.epoch,
+                invalidated: self.live.take(),
+            };
+        }
         let invalidated = self.live.take();
         self.epoch = self.epoch.saturating_add(1);
         self.phase = Phase::Running;
@@ -271,6 +427,41 @@ impl SurfaceLifecycle {
             epoch: self.epoch,
             invalidated,
         }
+    }
+
+    /// `nativeActivityDestroyed`: the Activity is going away, so this
+    /// generation's epoch ends for good (v2.4).
+    ///
+    /// Distinct from `suspended` on purpose. A suspend is followed by a resume
+    /// *in the same Activity*, and the gate reopens. A destroy is followed by a
+    /// new `android_main` with a **new** [`SurfaceLifecycle`]; nothing that
+    /// happens to this instance may build, adopt or draw again, and the caller
+    /// drops whatever generation it still held.
+    pub fn on_destroyed(&mut self) -> DestroyReport {
+        let had_generation = self.live.take().is_some();
+        if !self.phase.is_destroying() {
+            self.phase = Phase::Destroying;
+            self.destroys = self.destroys.saturating_add(1);
+        }
+        DestroyReport {
+            had_generation,
+            epoch: self.epoch,
+        }
+    }
+
+    /// Has this generation's Activity been destroyed?
+    pub fn is_destroyed(&self) -> bool {
+        self.phase.is_destroying()
+    }
+
+    /// `on_destroyed` transitions (at most one per instance).
+    pub fn destroys(&self) -> u32 {
+        self.destroys
+    }
+
+    /// `resumed` events refused after the destroy.
+    pub fn refused_resumes(&self) -> u32 {
+        self.refused_resumes
     }
 
     /// `suspended`: nothing may be built or drawn until the next `resumed`.
@@ -616,5 +807,135 @@ mod tests {
             0,
             "invalidating is not a stale build"
         );
+    }
+
+    // --- v2.4: the destroy gate and the init latch -------------------------
+
+    /// Contract (4): `nativeActivityDestroyed` ends the epoch for good. The
+    /// field shape this encodes is v2.3's rotation kill — the destroy arrives
+    /// while the init path is running, so the *first* thing that must be true is
+    /// that nothing can be built, adopted or drawn afterwards.
+    #[test]
+    fn a_destroy_ends_the_epoch_for_good_and_refuses_builds_frames_and_resumes() {
+        let mut lifecycle = SurfaceLifecycle::new();
+        let ticket = running_with_generation(&mut lifecycle);
+        assert_eq!(lifecycle.gate_frame(), None);
+
+        let report = lifecycle.on_destroyed();
+        assert!(
+            report.had_generation,
+            "the live generation must be reported"
+        );
+        assert_eq!(report.epoch, ticket.epoch);
+        assert!(lifecycle.is_destroyed());
+        assert_eq!(lifecycle.destroys(), 1);
+        assert_eq!(lifecycle.live(), None, "the generation is gone");
+
+        // Build: refused, and the refusal names the phase the device log prints.
+        assert!(!lifecycle.retry_allowed());
+        let refusal = lifecycle
+            .begin_build()
+            .expect_err("a destroyed epoch refuses");
+        assert_eq!(refusal.phase, Phase::Destroying);
+        assert_eq!(refusal.phase.as_str(), "DESTROYED");
+
+        // Frames: gated and counted, exactly like a suspend — never a gpu call.
+        assert_eq!(lifecycle.gate_frame(), Some(1));
+        assert_eq!(lifecycle.gate_frame(), Some(2));
+
+        // Adoption: a ticket issued in the dead epoch can never become live.
+        assert!(!lifecycle.adopt(ticket));
+        assert_eq!(lifecycle.stale_builds(), 1);
+
+        // A `Resumed` still queued in the looper must not reopen anything.
+        let resume = lifecycle.on_resumed();
+        assert_eq!(resume.epoch, ticket.epoch, "the epoch must not advance");
+        assert!(lifecycle.is_destroyed());
+        assert_eq!(lifecycle.refused_resumes(), 1);
+        assert!(lifecycle.begin_build().is_err());
+
+        // A suspend after the destroy is a non-event: destroy is not a suspend.
+        let suspend = lifecycle.on_suspended();
+        assert!(!suspend.had_generation);
+        assert_eq!(lifecycle.suspends(), 0);
+        // Idempotent: the second destroy reports nothing new.
+        assert!(!lifecycle.on_destroyed().had_generation);
+        assert_eq!(lifecycle.destroys(), 1);
+    }
+
+    /// Contract (5): the latch inside one build. A signal seen at a stage aborts
+    /// the build *there*, names that stage, and stays latched — a later stage's
+    /// "the flag looks clear now" cannot resurrect it.
+    #[test]
+    fn the_kill_latch_stops_an_init_at_the_first_stage_that_saw_it() {
+        // A clean build: every stage allowed while both signals are clear.
+        let mut clean = KillLatch::new();
+        for stage in InitStage::ALL {
+            assert_eq!(clean.allow(stage, false), Ok(()), "{}", stage.as_str());
+        }
+        assert!(!clean.is_tripped());
+        assert_eq!(clean.tripped_at(), None);
+        assert_eq!(clean.refusals(), 0);
+
+        // The signal lands during `adapter` — the v2.3 field shape (rotate
+        // inside the adapter/device request).
+        let mut latch = KillLatch::new();
+        assert_eq!(latch.allow(InitStage::Surface, false), Ok(()));
+        assert_eq!(
+            latch.allow(InitStage::Adapter, true),
+            Err(InitStage::Adapter)
+        );
+        assert!(latch.is_tripped());
+        assert_eq!(latch.tripped_at(), Some(InitStage::Adapter));
+        // `configure` is the call that would have touched the dead window.
+        assert_eq!(
+            latch.allow(InitStage::Device, false),
+            Err(InitStage::Adapter)
+        );
+        assert_eq!(
+            latch.allow(InitStage::Configure, false),
+            Err(InitStage::Adapter)
+        );
+        assert_eq!(latch.refusals(), 3);
+        // One-way, even after the flag clears.
+        assert_eq!(
+            latch.allow(InitStage::Present, false),
+            Err(InitStage::Adapter)
+        );
+    }
+
+    /// Every stage is reachable and every stage can be the one that names the
+    /// abort; `configure` always sorts after the three calls that precede it, so
+    /// a signal that arrives before it is always checked before it.
+    #[test]
+    fn every_init_stage_can_trip_the_latch_and_configure_sorts_after_the_rest() {
+        for (index, stage) in InitStage::ALL.iter().copied().enumerate() {
+            let mut latch = KillLatch::new();
+            for earlier in InitStage::ALL.iter().copied().take(index) {
+                assert_eq!(
+                    latch.allow(earlier, false),
+                    Ok(()),
+                    "{} must be allowed before {}",
+                    earlier.as_str(),
+                    stage.as_str()
+                );
+            }
+            assert_eq!(latch.allow(stage, true), Err(stage));
+            assert_eq!(latch.tripped_at(), Some(stage));
+            assert_eq!(latch.refusals(), 1);
+        }
+
+        assert_eq!(InitStage::ALL.len(), 5);
+        assert!(InitStage::Surface < InitStage::Adapter);
+        assert!(InitStage::Adapter < InitStage::Device);
+        assert!(InitStage::Device < InitStage::Configure);
+        assert!(InitStage::Configure < InitStage::Present);
+        assert_eq!(InitStage::ALL.last(), Some(&InitStage::Present));
+        // The names are the log contract; none is empty or duplicated.
+        let mut names: Vec<&str> = InitStage::ALL.iter().map(|stage| stage.as_str()).collect();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count);
     }
 }

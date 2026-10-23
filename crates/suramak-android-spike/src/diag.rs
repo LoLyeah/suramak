@@ -23,6 +23,28 @@
 //! * `clear`, which the on-screen **Clear crash** button calls — nothing else
 //!   deletes the record.
 //!
+//! **v2.4: the native signal.** Everything above is in-process, so it dies with
+//! the process — and the owner's v2.3 run produced exactly the failure that
+//! leaves nothing: a rotation within the first second of launch killed the
+//! process natively (SIGSEGV/SIGABRT class), no Rust panic, no Java exception,
+//! never reached `onStop`, and the ring (which only lived in memory) went with
+//! it. The next launch could only *infer* it from the session marker.
+//!
+//! So a POSIX handler for `SIGSEGV`/`SIGABRT`/`SIGBUS` is installed as early as
+//! the library allows ([`init_signal_handlers`], called from `android_main` and
+//! from `nativeInit`), and it writes **the same ring, plus the phase the app
+//! was in**, to `spike-last-crash.txt` before re-raising the signal so Android
+//! still writes its tombstone. The constraints are the usual ones and they
+//! shape the code below: nothing in the handler allocates, formats, locks or
+//! calls the logger — it does `open`/`write`/`fsync`/`close` on a pre-rendered
+//! byte buffer, a static per-signal line, then `signal(SIG_DFL)` + `raise`.
+//!
+//! The pre-rendered buffer ([`SignalSnapshot`]) is refreshed by the *normal*
+//! thread on every event and on every [`set_phase`], which is what makes the
+//! write a single `memcpy`-shaped operation the handler can trust. A crash
+//! inside the refresh itself can leave a mixed snapshot; that is still better
+//! than an empty file, and it is named in `docs/reports/M13b6-spike-v2.4.md`.
+//!
 //! Nothing in here allocates in a panic path beyond the message itself, takes a
 //! lock twice, or calls the logger from the hook (a panic inside the logger's
 //! lock would abort). File I/O errors are ignored on purpose: a diagnostic that
@@ -34,7 +56,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::panic::PanicHookInfo;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -55,6 +77,99 @@ const MAX_CRASH_READ: u64 = 32 * 1024;
 /// Roll the append-only history over at this size, keeping the newest part.
 const MAX_HISTORY_BYTES: u64 = 256 * 1024;
 const KEEP_HISTORY_BYTES: u64 = 48 * 1024;
+
+/// Longest snapshot the signal handler can write: the 40-line ring at its
+/// per-line ceiling plus the header, with room to spare. A `static` byte array,
+/// because the handler may not allocate and a stack buffer is exactly what a
+/// stack-related fault cannot afford.
+const SIGNAL_SNAPSHOT_CAP: usize = 16 * 1024;
+/// The snapshot line that opens the file and identifies what wrote it.
+const SIGNAL_HEADER: &[u8] = b"=== Suramak spike NATIVE SIGNAL ===\n";
+/// Signals the handler covers. The field's failure class is
+/// `SIGSEGV`/`SIGABRT`; `SIGBUS` is the third native-kill shape ARM produces
+/// (misaligned/absent device memory). `SIGILL`/`SIGFPE` are left to the
+/// tombstone on purpose — see `docs/reports/M13b6-spike-v2.4.md` §9.
+const SIGABRT: i32 = 6;
+const SIGBUS: i32 = 7;
+const SIGSEGV: i32 = 11;
+/// `signal(2)`'s "restore the default action" value.
+const SIG_DFL: usize = 0;
+/// `open(2)` flags, from the Linux generic `fcntl.h` (same values on Android
+/// and on the host this is tested on). `O_CLOEXEC` keeps the fd out of any
+/// child; `O_APPEND` is used for the history file only.
+const O_WRONLY: i32 = 1;
+const O_CREAT: i32 = 0o100;
+const O_TRUNC: i32 = 0o1000;
+const O_APPEND: i32 = 0o2000;
+
+/// What the app was doing when a native signal arrives.
+///
+/// This is the "in-flight event" half of the dump: the ring says what already
+/// happened, the phase says what was happening *now*. The variants are the
+/// stages of the exact path the v2.3 kill went through — launch → event loop →
+/// gpu init (surface, adapter, device, configure) → frame — plus the two
+/// lifecycle states, so a rotation kill names the stage it died in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Phase {
+    /// Library loaded, `android_main` not entered yet.
+    Boot = 0,
+    /// Building/entering the winit event loop.
+    EventLoop = 1,
+    /// `create_surface` — the window handle's first use.
+    GpuSurface = 2,
+    /// `request_adapter`.
+    GpuAdapter = 3,
+    /// `request_device`.
+    GpuDevice = 4,
+    /// `surface.configure` + renderer/egui construction.
+    GpuConfigure = 5,
+    /// Drawing/presenting a frame.
+    Frame = 6,
+    /// Suspended: no window, nothing may be built or drawn.
+    Suspended = 7,
+    /// The Activity is being destroyed (this generation is over).
+    Destroying = 8,
+    /// Between events.
+    Idle = 9,
+}
+
+impl Phase {
+    pub const ALL: [Phase; 10] = [
+        Phase::Boot,
+        Phase::EventLoop,
+        Phase::GpuSurface,
+        Phase::GpuAdapter,
+        Phase::GpuDevice,
+        Phase::GpuConfigure,
+        Phase::Frame,
+        Phase::Suspended,
+        Phase::Destroying,
+        Phase::Idle,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Phase::Boot => "boot",
+            Phase::EventLoop => "event loop",
+            Phase::GpuSurface => "gpu init: surface",
+            Phase::GpuAdapter => "gpu init: adapter",
+            Phase::GpuDevice => "gpu init: device",
+            Phase::GpuConfigure => "gpu init: configure",
+            Phase::Frame => "frame",
+            Phase::Suspended => "suspended",
+            Phase::Destroying => "destroying (activity)",
+            Phase::Idle => "idle",
+        }
+    }
+
+    fn from_u8(value: u8) -> Phase {
+        Phase::ALL
+            .get(value as usize)
+            .copied()
+            .unwrap_or(Phase::Idle)
+    }
+}
 
 /// Severity of one event line. Ordered so `>=` reads naturally.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -174,6 +289,13 @@ pub fn push(level: Level, text: impl Into<String>) {
     diag.ring_rev = diag.ring_rev.wrapping_add(1);
     let at = diag.started.elapsed().as_secs_f64();
     diag.ring.push_back(LogLine { at, level, text });
+    // Keep the signal dump current while the ring is locked: a native kill at
+    // the next stage must be able to name this line. The render is a few KiB of
+    // formatting per event, and the spike logs tens per second — cheap next to
+    // the value of the file existing at all.
+    let snapshot = render_signal_snapshot(&diag);
+    drop(diag);
+    SIGNAL_SNAPSHOT.store(&snapshot);
 }
 
 /// Convenience wrappers so call sites read like `log::info!`.
@@ -240,14 +362,295 @@ pub fn set_files_dir(dir: &str) {
         return;
     }
     let loaded = read_crash_file(&PathBuf::from(dir));
-    let mut diag = lock();
-    diag.loaded_crash = loaded;
-    diag.crash_rev = diag.crash_rev.wrapping_add(1);
+    {
+        let mut diag = lock();
+        diag.loaded_crash = loaded;
+        diag.crash_rev = diag.crash_rev.wrapping_add(1);
+    }
+    // The signal dump needs the path *before* it can be armed, and Kotlin calls
+    // this before `super.onCreate` — the earliest point in the process the
+    // spike gets. `nativeInit` calls `init_signal_handlers` again; idempotent.
+    init_signal_handlers();
 }
 
 /// The files dir, when Kotlin has told us about it.
 pub fn files_dir() -> Option<&'static Path> {
     FILES_DIR.get().map(PathBuf::as_path)
+}
+
+// --- the native-signal dump ------------------------------------------------
+
+/// The libc calls the handler is allowed to make, declared here instead of
+/// adding `libc` as a dependency (the workorder forbids new ones). All of them
+/// are exported by bionic on every Android version this spike supports and by the
+/// host libc the subprocess test runs against, and none of them allocates.
+mod sys {
+    use core::ffi::{c_char, c_int, c_long, c_void};
+
+    extern "C" {
+        pub fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
+        pub fn fsync(fd: c_int) -> c_int;
+        pub fn close(fd: c_int) -> c_int;
+        /// Installs `handler` (a function pointer) or `SIG_DFL`; returns the
+        /// previous handler. Simpler than `sigaction`, whose struct layout is
+        /// per-arch — see the report for why the loss of `SA_SIGINFO` is
+        /// acceptable here.
+        pub fn signal(signum: c_int, handler: usize) -> usize;
+        pub fn raise(sig: c_int) -> c_int;
+        /// The raw syscall entry point. `open` is deliberately **not** declared
+        /// directly: it is variadic in glibc and Rust reserves the name as a
+        /// runtime symbol (a plain `extern "C" { fn open(..) }` is rejected at
+        /// compile time on the host), so the file is opened through the
+        /// `openat` syscall instead — same operation, one extra `AT_FDCWD`.
+        pub fn syscall(num: c_long, ...) -> c_long;
+    }
+
+    /// `openat(dirfd, path, flags, mode)`.
+    ///
+    /// The numbers are the Linux syscall table for the two targets this code
+    /// builds for (aarch64 Android, x86_64 for the host test).
+    #[cfg(target_arch = "aarch64")]
+    const SYS_OPENAT: c_long = 56;
+    #[cfg(not(target_arch = "aarch64"))]
+    const SYS_OPENAT: c_long = 257;
+    /// The "paths are relative to the process' cwd" dirfd.
+    const AT_FDCWD: c_int = -100;
+
+    /// `open(2)`, through `openat`. Returns the fd, or a negative errno.
+    ///
+    /// # Safety
+    /// `path` must be a NUL-terminated string that stays valid for the call.
+    pub unsafe fn open_path(path: *const c_char, flags: c_int) -> c_int {
+        syscall(
+            SYS_OPENAT,
+            AT_FDCWD,
+            path,
+            flags | 0o2000000, // O_CLOEXEC
+            0o644,             // mode, only used with O_CREAT
+        ) as c_int
+    }
+}
+
+/// A pre-rendered crash block the signal handler can `write` without touching
+/// the allocator or the diag lock.
+///
+/// Single-writer (the app thread) / single-reader (the handler, on whichever
+/// thread faulted). `seq` is a seqlock: odd while a refresh is copying, even
+/// when the buffer is stable. The handler does not spin on it — if it catches
+/// an odd value it writes the previous content, which is the right trade for a
+/// diagnostics path (never block a dying process on a writer that may be the
+/// one that died).
+struct SignalSnapshot {
+    seq: AtomicU64,
+    len: AtomicUsize,
+    bytes: std::cell::UnsafeCell<[u8; SIGNAL_SNAPSHOT_CAP]>,
+}
+
+// SAFETY: the only writer is the thread that owns the diag lock (every call
+// site holds it), and the reader only reads `len` then copies `bytes` through a
+// raw pointer into `write(2)`. A torn read yields a mixed snapshot, never
+// undefined behaviour: the buffer is plain bytes and `len` is bounded by the
+// array size.
+unsafe impl Sync for SignalSnapshot {}
+
+impl SignalSnapshot {
+    fn store(&self, text: &str) {
+        let seq = self.seq.load(Ordering::Relaxed);
+        // Odd: a refresh is in progress.
+        self.seq.store(seq.wrapping_add(1), Ordering::Release);
+        let mut len = text.len().min(SIGNAL_SNAPSHOT_CAP);
+        // Never cut a UTF-8 sequence in half: the reader lossy-decodes, but a
+        // whole character is nicer to look at on a phone.
+        while len > 0 && !text.is_char_boundary(len) {
+            len -= 1;
+        }
+        // SAFETY: `bytes` is SIGNAL_SNAPSHOT_CAP long and `len` is clamped to it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(text.as_ptr(), self.bytes.get().cast::<u8>(), len);
+        }
+        self.len.store(len, Ordering::Release);
+        // Even: stable again.
+        self.seq.store(seq.wrapping_add(2), Ordering::Release);
+    }
+}
+
+static SIGNAL_SNAPSHOT: SignalSnapshot = SignalSnapshot {
+    seq: AtomicU64::new(0),
+    len: AtomicUsize::new(0),
+    bytes: std::cell::UnsafeCell::new([0; SIGNAL_SNAPSHOT_CAP]),
+};
+/// The phase, readable without the diag lock — that is its whole purpose.
+static PHASE: AtomicU8 = AtomicU8::new(Phase::Boot as u8);
+/// `spike-last-crash.txt`, NUL-terminated, resolved once at install time: the
+/// handler may not build a `Path`.
+static SIGNAL_LAST_PATH: OnceLock<Vec<u8>> = OnceLock::new();
+/// `spike-crash-log.txt`, same shape, appended so consecutive native kills all
+/// survive instead of overwriting each other.
+static SIGNAL_LOG_PATH: OnceLock<Vec<u8>> = OnceLock::new();
+static SIGNAL_HANDLERS: AtomicBool = AtomicBool::new(false);
+
+/// What the app is doing right now, as the signal dump will report it.
+pub fn phase() -> Phase {
+    Phase::from_u8(PHASE.load(Ordering::Relaxed))
+}
+
+/// Record the phase and refresh the snapshot.
+///
+/// Called by `app.rs` at every boundary the v2.3 kill could have landed in
+/// (before/after each gpu-init stage, per frame, on suspend, on destroy), so a
+/// native signal names the stage it interrupted rather than "something in
+/// android_main".
+pub fn set_phase(phase: Phase) {
+    PHASE.store(phase as u8, Ordering::Relaxed);
+    let snapshot = {
+        let diag = lock();
+        render_signal_snapshot(&diag)
+    };
+    SIGNAL_SNAPSHOT.store(&snapshot);
+}
+
+/// The body of `spike-last-crash.txt` as the handler writes it.
+///
+/// Deliberately the same shape as [`crash_block`] — `when`/`where`/`panic`
+/// lines plus the ring — so the on-screen banner, the Kotlin overlay and this
+/// file all read alike. There is no `panic:` line here: no Rust panic happened,
+/// which is exactly why the file has to exist.
+fn render_signal_snapshot(diag: &Diag) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // SAFETY-free: `process::id()` is a cached read of the pid.
+    let pid = std::process::id();
+    let mut out = String::with_capacity(2048);
+    let _ = writeln!(
+        out,
+        "when:   {} (uptime {:.2}s)",
+        utc_stamp(now),
+        diag.started.elapsed().as_secs_f64()
+    );
+    let _ = writeln!(out, "pid:    {pid}");
+    let _ = writeln!(out, "phase:  {}", phase().as_str());
+    let _ = writeln!(
+        out,
+        "--- last {} platform events (oldest first) ---",
+        diag.ring.len()
+    );
+    if diag.ring.is_empty() {
+        let _ = writeln!(out, "(no events recorded)");
+    }
+    for line in &diag.ring {
+        let _ = writeln!(out, "[{:8.2}s] {} {}", line.at, line.level.tag(), line.text);
+    }
+    out
+}
+
+/// The per-signal line that closes the dump. Pre-formatted so the handler does
+/// no formatting at all.
+fn signal_line(sig: i32) -> &'static [u8] {
+    match sig {
+        SIGSEGV => {
+            b"SIGNAL: SIGSEGV (11) - the process faulted and is dying now.\n\
+                     This file is the last in-process state; no Rust panic was raised.\n"
+        }
+        SIGABRT => {
+            b"SIGNAL: SIGABRT (6) - the process aborted and is dying now.\n\
+                     This file is the last in-process state; no Rust panic was raised.\n"
+        }
+        SIGBUS => {
+            b"SIGNAL: SIGBUS (7) - the process hit a bus error and is dying now.\n\
+                     This file is the last in-process state; no Rust panic was raised.\n"
+        }
+        _ => b"SIGNAL: unexpected signal - the process is dying now.\n",
+    }
+}
+
+/// The handler. Async-signal-safe by construction: no allocation, no locks, no
+/// formatting, no logging — `open`/`write`/`fsync`/`close` on static bytes,
+/// then the default action restored and the signal re-raised so Android's
+/// tombstone still records the fault at the real address.
+extern "C" fn on_fatal_signal(sig: i32) {
+    let len = SIGNAL_SNAPSHOT.len.load(Ordering::Acquire);
+    let bytes = SIGNAL_SNAPSHOT.bytes.get().cast::<u8>();
+    let line = signal_line(sig);
+
+    // SAFETY: every call is a plain libc syscall wrapper; all arguments point
+    // at `'static`/stack-free memory valid for the duration of the call.
+    unsafe {
+        if let Some(path) = SIGNAL_LAST_PATH.get() {
+            let fd = sys::open_path(path.as_ptr().cast(), O_WRONLY | O_CREAT | O_TRUNC);
+            if fd >= 0 {
+                let _ = sys::write(fd, SIGNAL_HEADER.as_ptr().cast(), SIGNAL_HEADER.len());
+                let _ = sys::write(fd, bytes.cast(), len);
+                let _ = sys::write(fd, line.as_ptr().cast(), line.len());
+                let _ = sys::fsync(fd);
+                let _ = sys::close(fd);
+            }
+        }
+        // The history keeps every native kill, not just the newest.
+        if let Some(path) = SIGNAL_LOG_PATH.get() {
+            let fd = sys::open_path(path.as_ptr().cast(), O_WRONLY | O_CREAT | O_APPEND);
+            if fd >= 0 {
+                let _ = sys::write(fd, SIGNAL_HEADER.as_ptr().cast(), SIGNAL_HEADER.len());
+                let _ = sys::write(fd, bytes.cast(), len);
+                let _ = sys::write(fd, line.as_ptr().cast(), line.len());
+                let _ = sys::write(fd, b"\n".as_ptr().cast(), 1);
+                let _ = sys::fsync(fd);
+                let _ = sys::close(fd);
+            }
+        }
+        // Re-raise with the default action so the process still dies of the
+        // original signal, at the original fault, for the tombstone to be right.
+        //
+        // The signal is blocked for the duration of its own handler, so this
+        // `raise` becomes *pending* and is delivered the moment the handler
+        // returns — with `SIG_DFL` now installed, which is what kills the
+        // process here. Calling `_exit` before returning would swallow that
+        // delivery (the first version did exactly that: exit code 139 instead of
+        // a real SIGSEGV), so there is deliberately nothing after this line.
+        sys::signal(sig, SIG_DFL);
+        sys::raise(sig);
+    }
+}
+
+/// Arm the native-signal dump. Idempotent; call from `nativeInit` (earliest)
+/// and again from `android_main` so a library loaded without `onCreate` is
+/// still covered.
+///
+/// Requires [`set_files_dir`] to have run, otherwise there is nowhere to write
+/// and the handler is installed anyway (it simply finds no path and re-raises).
+pub fn init_signal_handlers() {
+    if SIGNAL_HANDLERS.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Some(dir) = files_dir() {
+        for name in [LAST_CRASH_FILE, CRASH_LOG_FILE] {
+            let mut bytes = dir.join(name).to_string_lossy().into_owned().into_bytes();
+            bytes.push(0);
+            let slot = if name == LAST_CRASH_FILE {
+                &SIGNAL_LAST_PATH
+            } else {
+                &SIGNAL_LOG_PATH
+            };
+            let _ = slot.set(bytes);
+        }
+    } else {
+        info("native signal handler: no files dir yet — the dump will re-raise without a file");
+    }
+    // One snapshot before any event: a crash during the first gpu call still
+    // names its phase.
+    SIGNAL_SNAPSHOT.store(&{
+        let diag = lock();
+        render_signal_snapshot(&diag)
+    });
+    for sig in [SIGSEGV, SIGABRT, SIGBUS] {
+        // SAFETY: `on_fatal_signal` has the `extern "C" fn(c_int)` shape
+        // `signal(2)` expects; it never unwinds.
+        unsafe {
+            sys::signal(sig, on_fatal_signal as *const () as usize);
+        }
+    }
+    info("native signal handler installed (SIGSEGV/SIGABRT/SIGBUS -> spike-last-crash.txt)");
 }
 
 /// Delete the crash record (both files) and forget it in memory. Only the
@@ -682,5 +1085,118 @@ mod tests {
         assert_eq!(payload_text(owned), "owned");
         let other: &(dyn std::any::Any + Send) = &7u32;
         assert!(payload_text(other).contains("not a string"));
+    }
+
+    // --- v2.4: the native-signal dump -------------------------------------
+
+    /// Read the pre-rendered buffer exactly as `on_fatal_signal` does.
+    fn snapshot_text() -> String {
+        let len = SIGNAL_SNAPSHOT.len.load(Ordering::Acquire);
+        assert!(len <= SIGNAL_SNAPSHOT_CAP);
+        // SAFETY: `len` is bounded by the array size by `SignalSnapshot::store`.
+        let slice =
+            unsafe { std::slice::from_raw_parts(SIGNAL_SNAPSHOT.bytes.get().cast::<u8>(), len) };
+        String::from_utf8_lossy(slice).into_owned()
+    }
+
+    #[test]
+    fn the_signal_snapshot_is_a_whole_crash_block_with_phase_and_pid() {
+        set_phase(Phase::GpuAdapter);
+        let text = snapshot_text();
+        // The header is written by the handler, not the snapshot: the file
+        // opens with it so a truncated snapshot can never look like a whole one.
+        assert!(!text.starts_with("=== "), "{text}");
+        assert!(text.contains("when:   "), "{text}");
+        assert!(text.contains("Z (uptime "), "{text}");
+        assert!(text.contains("pid:    "), "{text}");
+        assert!(text.contains("phase:  gpu init: adapter"), "{text}");
+        assert!(
+            text.contains("--- last "),
+            "the ring header must name the block: {text}"
+        );
+        assert!(text.contains("platform events (oldest first) ---"));
+        assert_eq!(phase(), Phase::GpuAdapter);
+        // Every phase has a distinct, non-empty name — the dump is only useful
+        // if that line identifies a stage.
+        let mut names: Vec<&str> = Phase::ALL.iter().map(|phase| phase.as_str()).collect();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count);
+        assert!(Phase::ALL.iter().all(|phase| !phase.as_str().is_empty()));
+    }
+
+    /// The handler's persistence is proven in a **child process**, because the
+    /// only honest test of a fatal-signal handler is a process that dies of the
+    /// signal. The child is this same test binary, filtered to
+    /// [`signal_child_raises_sigsegv`]; the parent asserts three things a mock
+    /// cannot: the child really died of SIGSEGV (`ExitStatus::signal`), the
+    /// file exists anyway, and it carries the ring + the phase + the signal.
+    #[test]
+    fn the_signal_handler_writes_the_ring_then_re_raises_sigsegv() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let dir = temp_dir("signal");
+        let exe = std::env::current_exe().expect("the test binary's own path");
+        let output = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                "diag::tests::signal_child_raises_sigsegv",
+                "--nocapture",
+            ])
+            .env("SURAMAK_SIGNAL_CHILD_DIR", &dir)
+            .output()
+            .expect("spawn the signal child");
+
+        assert_eq!(
+            output.status.signal(),
+            Some(SIGSEGV),
+            "the child did not die of SIGSEGV (status {:?}); the handler must \
+             re-raise, not swallow. stderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let path = dir.join(LAST_CRASH_FILE);
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("no crash file at {}: {err}", path.display()));
+        assert!(
+            text.starts_with("=== Suramak spike NATIVE SIGNAL ==="),
+            "{text}"
+        );
+        assert!(text.contains("phase:  gpu init: device"), "{text}");
+        assert!(
+            text.contains("in-flight: request_device returned; about to configure"),
+            "{text}"
+        );
+        assert!(text.contains("SIGSEGV (11)"), "{text}");
+        assert!(text.contains("no Rust panic was raised"), "{text}");
+        // The history keeps the same block, so repeated kills are all readable.
+        let history = fs::read_to_string(dir.join(CRASH_LOG_FILE)).unwrap_or_default();
+        assert!(history.contains("NATIVE SIGNAL"), "{history}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Not a test in its own right: it is the child body the test above spawns.
+    /// Without the environment variable it returns immediately, so a normal
+    /// `cargo test` run counts it as a pass and nothing is raised.
+    #[test]
+    fn signal_child_raises_sigsegv() {
+        let Ok(dir) = std::env::var("SURAMAK_SIGNAL_CHILD_DIR") else {
+            return;
+        };
+        set_files_dir(&dir);
+        // Exactly the state the v2.3 field kill would have left: a phase, and a
+        // last event describing the step in flight.
+        set_phase(Phase::GpuDevice);
+        info("in-flight: request_device returned; about to configure");
+        init_signal_handlers();
+        // SAFETY: the handler is installed immediately above and this is the
+        // child process whose only job is to die here.
+        unsafe {
+            sys::raise(SIGSEGV);
+        }
+        panic!("raise(SIGSEGV) returned — the handler is not installed");
     }
 }
