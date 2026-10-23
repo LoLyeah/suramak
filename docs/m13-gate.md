@@ -203,11 +203,20 @@ Device (Vivo X300 / Android 16) on `0.3.0-m13b.2.1`:
 - The stale-Surface crash re-fired each resume (`Surface::configure queue family`,
   + one `egui_core:3703` variant) — contained every time; `rebuilds bounded 2`.
 
-v2.2 (`794fe22`, release `android-spike-m13b-v2.2`, versionCode 4,
-`0.3.0-m13b.2.2`) fixes the surface layer: drop + fresh-create from the CURRENT
-window each resume, no gpu work while suspended, Outdated/Lost → rebuild capped
-at 2 per lifecycle event. If v2.2 on device shows zero banners + four GO lines,
-M13 is unblocked and the real IME bridge (M13c) starts.
+v2.3 (`17437be`, release `android-spike-m13b-v2.3`, versionCode 5,
+`0.3.0-m13b.2.3`) closes it by SOURCE root-cause, not hypothesis: android-activity
+0.6.1 (init.rs:281) hands ndk-context the **Application** handle, so the shim's
+Rust→Kotlin call ran MainActivity methods on SpikeApp — NoSuchMethodError
+surfaced as the 'Java exception'. `Activity.recreate()` was **never entered** in
+any build; no relaunch machinery was ever armed; the ANR-kill belongs to the
+OS/Vivo background-kill class. The button now renders `RECREATE_UNAVAILABLE`
+with its evidence, no Java call by construction; `logSettle()` proves clean
+settle on device. M13c caveat: the same call_activity defect silently breaks the
+two remaining Rust→Kotlin calls (will be fixed in the bridge work).
+
+**Remaining criterion: rotation** — the only relaunch path the shim can still
+experience; owner's next pass (v2.3: tap Recreate → outcome line → Home → same
+live pid / Vivo fresh-relaunch without a banner → rotate landscape↔portrait ×2).
 
 ## 10. v2 — the diagnostics build (`0.3.0-m13b.2`)
 
