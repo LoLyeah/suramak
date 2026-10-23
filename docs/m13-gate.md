@@ -190,6 +190,25 @@ recreate path, back dispatch, insets continuity → **all four fixed in v2.1**
 **Decisive pass**: v2.1 on the device — zero red banners + the four GO lines = M13
 unblocked, real IME bridge work starts. Any red that still appears names itself.
 
+---
+
+## 10.1. v2.1 field pass — 3 of 4 checks GO, the shim's last layer exposed
+
+Device (Vivo X300 / Android 16) on `0.3.0-m13b.2.1`:
+- **TEXT GO** (129 chars / 112 IME updates, autocorrect + emoji correct)
+- **MOTION GO** (90.5 fps avg)
+- **INSETS/BACK GO** (19/19 back presses intercepted via OnBackPressed, app never
+  exited; insets 12 updates)
+- **LIFECYCLE still WAIT** (Restart-surface / Recreate / Home round-trip not yet run)
+- The stale-Surface crash re-fired each resume (`Surface::configure queue family`,
+  + one `egui_core:3703` variant) — contained every time; `rebuilds bounded 2`.
+
+v2.2 (`794fe22`, release `android-spike-m13b-v2.2`, versionCode 4,
+`0.3.0-m13b.2.2`) fixes the surface layer: drop + fresh-create from the CURRENT
+window each resume, no gpu work while suspended, Outdated/Lost → rebuild capped
+at 2 per lifecycle event. If v2.2 on device shows zero banners + four GO lines,
+M13 is unblocked and the real IME bridge (M13c) starts.
+
 ## 10. v2 — the diagnostics build (`0.3.0-m13b.2`)
 
 v2 is the same four checks with the blindfold off: it records its own crashes
