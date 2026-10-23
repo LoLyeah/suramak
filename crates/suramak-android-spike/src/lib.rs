@@ -16,6 +16,12 @@
 //! `egui::Context` to the GPU generation ([`gpu_context`]) and makes the crash
 //! files reachable from the phone (external files dir + a Kotlin share sheet).
 //!
+//! v2.2 (`docs/WORKORDER-M13B4.md`) puts the `wgpu::Surface` in that same
+//! generation and binds it to exactly one lifecycle epoch
+//! ([`surface_lifecycle`]): nothing may be built or drawn while suspended, and a
+//! dead surface is replaced (fresh surface + fresh egui context), never
+//! `configure()`d across a `surfaceDestroyed`.
+//!
 //! Nothing here is shared with `suramak-ui`: the spike exists to answer four
 //! questions on a real device before M13 commits to option A
 //! (`docs/PLAN-M13-ANDROID.md` §2.1).
@@ -24,6 +30,7 @@
 
 pub mod diag;
 pub mod gpu_context;
+pub mod surface_lifecycle;
 pub mod ui;
 
 #[cfg(target_os = "android")]

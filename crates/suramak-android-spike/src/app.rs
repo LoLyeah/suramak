@@ -38,6 +38,38 @@
 //! not the spike's, which is app-owned in [`SpikeState`]. See
 //! `docs/reports/M13b3-spike-v2.1.md` §2.
 //!
+//! **v2.2: the surface belongs to the same generation — for one epoch only.**
+//! The owner's next pass killed the texture panic and exposed the surface one
+//! (`wgpu_core.rs:3793 Surface::configure: Surface does not support the
+//! adapter's queue family`, on resume). The trace is in
+//! `docs/WORKORDER-M13B4.md`: a retry pass at `3.40s` built a *new* gpu from the
+//! window that `surfaceDestroyed` had just killed (`3.32s`), the resume at
+//! `11.91s` found `self.gpu` already `Some` and kept it, and the outdated
+//! handler then `configure()`d that stale `Surface`. Three rules now hold, and
+//! they are enforced by [`crate::surface_lifecycle`] rather than by comment:
+//!
+//! 1. `suspended` drops the whole generation, **surface included** (`Gpu::drop`
+//!    logs the release), and every `resumed` opens a new epoch and rebuilds
+//!    through the single [`Handler::build_gpu`] entry — never by adopting a gpu
+//!    that outlived a suspend. `Gpu::new` creates its surface from the
+//!    `ANativeWindow` current *at that moment*, inside that resume.
+//! 2. No gpu work while suspended: [`Handler::redraw`]'s first act is the frame
+//!    gate, and a refused frame is counted, named and dropped before any input,
+//!    timing or build; the retry loop asks the same policy before it starts.
+//!    The gate closes on whichever surface signal lands first — Kotlin's
+//!    `surfaceDestroyed` line (the Java callback runs ~80 ms before
+//!    android-activity's looper hands winit its `Suspended`, and the field
+//!    trace's raced init lived in that gap) or winit's `Suspended` itself. The
+//!    `3.40s` raced init is unrepresentable, and if a path ever tries, the log
+//!    says `build refused`. `Gpu::new` ends in `surface.configure`, so the build
+//!    itself runs inside a panic boundary too: a configure against a window that
+//!    died mid-build is recorded as an init failure, never an unwind that
+//!    finishes the Activity.
+//! 3. A dead surface (`Outdated`/`Lost`/`Timeout`) is **never** reconfigured:
+//!    it is dropped and rebuilt exactly like a resume (fresh surface, fresh egui
+//!    context), capped at [`MAX_AUTO_REBUILDS_PER_EVENT`] per lifecycle event,
+//!    logged `rebuild (outdated) — fresh surface from the current window`.
+//!
 //! Every failure here is recorded, not fatal: GPU init failures are retried and
 //! surfaced, a panic inside the frame is caught at the frame boundary, and the
 //! surface can be rebuilt on demand from the UI ("Restart surface").
@@ -55,6 +87,9 @@ use winit::window::{Window, WindowId};
 use crate::diag;
 use crate::gpu_context;
 use crate::platform;
+use crate::surface_lifecycle::{
+    BuildTicket, SurfaceAction, SurfaceFault, SurfaceLifecycle, MAX_AUTO_REBUILDS_PER_EVENT,
+};
 use crate::ui::{self, SpikeState};
 
 static STATE: OnceLock<Mutex<SpikeState>> = OnceLock::new();
@@ -72,6 +107,11 @@ const INSETS_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 /// How many automatic "drop everything, draw one clean frame" rebuilds a
 /// contained frame panic gets before the app waits for the button.
 const MAX_POST_PANIC_REPAINTS: u32 = 2;
+/// The name the lifecycle gate goes by in the log (WORKORDER-M13B4, fix 2: "add
+/// a startup-log line naming the gate when it trips"). It is a constant so the
+/// report and the device log quote the same words.
+const SURFACE_GATE: &str =
+    "surface-gate: suspended (no ANativeWindow; the next resume owns the rebuild)";
 
 /// The spike's single source of truth (see the module docs).
 pub fn state() -> &'static Mutex<SpikeState> {
@@ -105,6 +145,7 @@ pub fn run(app: android_activity::AndroidApp, generation: u32) {
     let mut handler = Handler {
         window: None,
         gpu: None,
+        lifecycle: SurfaceLifecycle::new(),
         last_frame: Instant::now(),
         gpu_attempts: 0,
         next_gpu_retry: None,
@@ -173,6 +214,10 @@ struct Handler {
     /// **and the `egui::Context`** (see the module docs). `None` while suspended
     /// or after a failed build.
     gpu: Option<Gpu>,
+    /// The surface lifecycle policy: which epoch the gpu belongs to, whether a
+    /// build or a frame may start at all, and the per-event rebuild budget. Every
+    /// decision below goes through it (see [`crate::surface_lifecycle`]).
+    lifecycle: SurfaceLifecycle,
     last_frame: Instant,
     /// GPU init attempts in this `android_main` (0 = never tried).
     gpu_attempts: u32,
@@ -194,12 +239,44 @@ impl ApplicationHandler for Handler {
             state.resumes = state.resumes.saturating_add(1);
             state.resumes
         };
-        log::info!("event: resumed (#{resumes})");
+        // A resume opens a new surface epoch. Any generation built before this
+        // event is bound to the `ANativeWindow` that just went away, so it is
+        // dropped here **even when it looks healthy** — that is precisely the
+        // v2.1 bug: a gpu built during the suspend path survived into the next
+        // resume and was configured across a `surfaceDestroyed`.
+        let ticket = self.lifecycle.on_resumed();
+        // A hint that arrived with (or after) the resume describes the surface
+        // that just came back: the epoch opened above is the authority, and a
+        // stale hint would close the gate for the whole session.
+        let _ = platform::take_surface_destroyed_hint();
+        let had_gpu = self.gpu.take().is_some();
+        if let Some(invalidated) = ticket.invalidated {
+            log::warn!(
+                "resume: gpu generation #{} (epoch {}) was still live at resume — invalidated; its \
+                 surface belongs to the pre-resume window",
+                invalidated.serial,
+                invalidated.epoch
+            );
+        }
+        if had_gpu {
+            log::info!(
+                "resume: previous gpu generation dropped before the rebuild (a surface is only valid \
+                 for the epoch that created it)"
+            );
+        }
+        log::info!(
+            "event: resumed (#{resumes}) — surface epoch {} open, frame gate open",
+            ticket.epoch
+        );
         // Back to a frame-per-vsync loop: `suspended` parked it on `Wait`.
         event_loop.set_control_flow(ControlFlow::Poll);
         // A resume after a suspend gap must not feed a multi-second dt into the
         // frame-time window.
         self.last_frame = Instant::now();
+        // Each lifecycle event gets its own init/retry budget: three attempts
+        // spent an hour ago must not make this resume's build unretryable.
+        self.gpu_attempts = 0;
+        self.next_gpu_retry = None;
 
         if self.window.is_none() {
             match event_loop.create_window(Window::default_attributes().with_title("Suramak Spike"))
@@ -220,27 +297,34 @@ impl ApplicationHandler for Handler {
             return;
         };
 
-        if self.gpu.is_none() {
-            self.build_gpu("resume");
-        }
+        // Unconditional: the generation that would let us skip this is exactly
+        // the one whose surface cannot be trusted. `build_gpu` is the same entry
+        // the surface-fault path and the button use.
+        self.build_gpu("resume");
         window.request_redraw();
     }
 
     fn suspended(&mut self, event_loop: &ActiveEventLoop) {
         // The ANativeWindow behind the surface is going away; drop every wgpu
-        // object that references it — and the `egui::Context` with them. The
-        // context owns the texture *bookkeeping* for the renderer being
-        // dropped; keeping it would make the next generation patch ids it never
-        // allocated (`renderer.rs:657`, see the module docs).
-        let had_gpu = self.gpu.is_some();
-        log::info!("event: suspended — releasing wgpu objects (had gpu: {had_gpu})");
-        self.gpu = None;
-        if had_gpu {
+        // object that references it — surface, device, queue, renderer and the
+        // `egui::Context` with them (the context owns the texture bookkeeping
+        // for the renderer being dropped). `Gpu::drop` logs the inventory; the
+        // lifecycle's report is what proves nothing is left behind.
+        let report = self.lifecycle.on_suspended();
+        let had_gpu = self.gpu.take().is_some();
+        log::info!(
+            "event: suspended — surface epoch {} closed, frame gate closed (had gpu: {had_gpu})",
+            report.epoch
+        );
+        if report.had_generation {
             log::info!(
-                "event: suspended — surface/device/queue/renderer/egui context dropped \
-                 (next resume rebuilds all of them)"
+                "event: suspended — dropped {} (the whole generation; the next resume builds a \
+                 fresh surface from the window that is current then)",
+                report.dropped_list()
             );
         }
+        // A retry scheduled before the suspend must not fire into a dead window.
+        self.next_gpu_retry = None;
         // There is nothing to draw while suspended, and `ControlFlow::Poll`
         // would spin a core for the whole time the app is in the background
         // (v1 did exactly that). Park on `Wait`; `resumed` restores Poll.
@@ -286,7 +370,11 @@ impl ApplicationHandler for Handler {
             }
         }
         if let (Some(gpu), WindowEvent::Resized(size)) = (self.gpu.as_mut(), &event) {
-            gpu.resize(*size);
+            // Only record it: the size is applied at the top of the next frame,
+            // inside the frame's panic boundary. Configuring here would be a
+            // second `surface.configure` call reachable outside that boundary —
+            // the shape of the v2.1 panic.
+            gpu.pending_size = Some(*size);
         }
         if let Some(gpu) = self.gpu.as_mut() {
             let response = gpu.egui_state.on_window_event(&gpu.window, &event);
@@ -305,7 +393,17 @@ impl ApplicationHandler for Handler {
             event_loop.exit();
             return;
         }
+        // The Java surface signal first: it is the earliest word that the window
+        // behind the surface is gone (see `poll_surface_destroyed_hint`), and it
+        // must close the gate before the retry loop below is consulted.
+        self.poll_surface_destroyed_hint();
         self.maybe_retry_gpu(event_loop);
+        // No redraw requests while suspended: there is no surface, and asking for
+        // one would only feed the gate. v2.1's 3.40s raced init came from this
+        // event-loop turn.
+        if !self.lifecycle.phase().is_running() {
+            return;
+        }
         if let Some(gpu) = self.gpu.as_ref() {
             gpu.window.request_redraw();
         }
@@ -313,22 +411,98 @@ impl ApplicationHandler for Handler {
 }
 
 impl Handler {
+    /// Take the Kotlin `surfaceDestroyed` signal and close the epoch with it.
+    ///
+    /// winit's `Suspended` is derived from android-activity's
+    /// `APP_CMD_TERM_WINDOW`, which the looper processes *after* the Java
+    /// callback ran — 80 ms in the owner's v2.1 trace, with the raced gpu init
+    /// inside that gap. Acting on the Java line closes the gate one turn
+    /// earlier; winit's own `suspended` then finds nothing left to drop and is
+    /// the same transition (see `surface_lifecycle`).
+    fn poll_surface_destroyed_hint(&mut self) {
+        if !platform::take_surface_destroyed_hint() {
+            return;
+        }
+        let was_running = self.lifecycle.phase().is_running();
+        let report = self.lifecycle.on_surface_destroyed_hint();
+        let had_gpu = self.gpu.take().is_some();
+        if !was_running && !had_gpu {
+            // A late duplicate of a transition already handled (winit's
+            // `suspended` can land before the Kotlin line): nothing changed.
+            return;
+        }
+        log::info!(
+            "event: surfaceDestroyed (Kotlin) — surface epoch {} closed early, frame gate closed \
+             (had gpu: {had_gpu}); winit's suspended may still be a turn away",
+            report.epoch
+        );
+        if report.had_generation {
+            log::info!(
+                "event: surfaceDestroyed — dropped {} (the whole generation)",
+                report.dropped_list()
+            );
+        }
+        self.next_gpu_retry = None;
+    }
+
     /// Build (or rebuild) one GPU generation: surface, device, queue, renderer,
     /// egui state **and a fresh `egui::Context`**.
+    ///
+    /// This is the *only* place that constructs a [`Gpu`], for every path —
+    /// `resumed`, the retry loop, "Restart surface", a surface fault and the
+    /// post-panic repaint — and the build only starts with a ticket from the
+    /// lifecycle, which is issued only while an epoch is open. A suspended build
+    /// is refused here even if a caller forgot to check (the 3.40s raced init:
+    /// counted, named, never executed).
     fn build_gpu(&mut self, reason: &str) {
         let Some(window) = self.window.clone() else {
             return;
         };
+        let ticket = match self.lifecycle.begin_build() {
+            Ok(ticket) => ticket,
+            Err(refusal) => {
+                log::warn!(
+                    "gpu: build refused (reason={reason}) — frame gate [{SURFACE_GATE}] is closed \
+                     (lifecycle={}, refused builds: {}); no surface is created from a destroyed \
+                     window",
+                    refusal.phase.as_str(),
+                    self.lifecycle.refused_builds()
+                );
+                return;
+            }
+        };
         self.gpu_attempts = self.gpu_attempts.saturating_add(1);
         let attempt = self.gpu_attempts;
         let started = Instant::now();
-        match Gpu::new(window) {
-            Ok(gpu) => {
+        // `Gpu::new` ends in `surface.configure`, and configuring a surface
+        // whose native window died mid-build is exactly the Mali panic the field
+        // report carries. A build therefore gets the same boundary a frame has:
+        // a panic becomes a recorded init failure, not an unwind through winit
+        // (which would finish the Activity).
+        let built =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Gpu::new(window, ticket)));
+        match built {
+            Ok(Ok(gpu)) => {
+                // The epoch can only close while a build runs if the build
+                // somehow spans a lifecycle event; refuse to adopt rather than
+                // hand out a surface from a dead epoch.
+                if !self.lifecycle.adopt(ticket) {
+                    log::error!(
+                        "gpu: generation #{} built for epoch {} but that epoch is closed — dropped \
+                         instead of adopted",
+                        ticket.serial,
+                        ticket.epoch
+                    );
+                    return;
+                }
                 let adapter = gpu.adapter_info.clone();
                 let previous_builds = GPU_BUILDS.fetch_add(1, Ordering::SeqCst);
                 log::info!(
-                    "gpu ready ({reason}, attempt {attempt}, {:.0} ms): {adapter}",
-                    started.elapsed().as_secs_f64() * 1000.0
+                    "gpu ready ({reason}, attempt {attempt}, {:.0} ms, generation #{}, epoch {}): \
+                     {adapter}",
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    ticket.serial,
+                    ticket.epoch
                 );
                 log::info!(
                     "egui context rebuilt with it (fresh texture registry: every id re-registers \
@@ -347,11 +521,23 @@ impl Handler {
                 self.next_gpu_retry = None;
                 self.gpu = Some(gpu);
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 log::error!("gpu init failed ({reason}, attempt {attempt}): {err}");
                 let mut state = lock_state();
                 state.gpu_error = Some(format!("{reason}: {err}"));
                 drop(state);
+                self.next_gpu_retry = Some(Instant::now() + GPU_RETRY_DELAY);
+            }
+            Err(payload) => {
+                // Contained, not fatal: the surface is gone/being replaced and
+                // the retry (or the next resume) is the recovery.
+                let text = diag::payload_text(payload.as_ref());
+                diag::note_contained("gpu init (surface)");
+                log::error!(
+                    "gpu init panicked ({reason}, attempt {attempt}): {text} — contained; no \
+                     generation was adopted"
+                );
+                lock_state().gpu_error = Some(format!("{reason}: gpu init panicked: {text}"));
                 self.next_gpu_retry = Some(Instant::now() + GPU_RETRY_DELAY);
             }
         }
@@ -366,6 +552,13 @@ impl Handler {
             return;
         }
         if self.gpu_attempts >= GPU_ATTEMPTS {
+            return;
+        }
+        // The gate the v2.1 trace walked through: the retry must not start while
+        // suspended (no window), and it must not restart the loop after the
+        // surface-fault budget ran out. `begin_build` would refuse the first
+        // case anyway; checking here keeps the timer from even being consulted.
+        if !self.lifecycle.retry_allowed() {
             return;
         }
         let now = Instant::now();
@@ -396,14 +589,22 @@ impl Handler {
             log::warn!("surface restart requested ({reason}) but there is no window");
             return;
         };
+        // A human asking for a rebuild is new information: restore the automatic
+        // budget so a session that spent it can recover on its own again.
+        self.lifecycle.reset_auto_budget();
         let restarts = {
             let mut state = lock_state();
             state.surface_restarts = state.surface_restarts.saturating_add(1);
             state.surface_restarts
         };
-        log::info!("surface restart #{restarts} requested ({reason}) — dropping wgpu objects");
+        log::info!(
+            "surface restart #{restarts} requested ({reason}) — dropping the whole gpu generation"
+        );
         let dropped = self.gpu.take().is_some();
-        log::info!("surface restart #{restarts}: gpu dropped = {dropped}, rebuilding");
+        self.lifecycle.release();
+        log::info!(
+            "surface restart #{restarts}: gpu dropped = {dropped}, rebuilding from the current window"
+        );
         self.build_gpu("restart");
         match &self.gpu {
             Some(_) => log::info!("surface restart #{restarts}: complete"),
@@ -413,6 +614,30 @@ impl Handler {
     }
 
     fn redraw(&mut self) {
+        // The Java `surfaceDestroyed` signal first (it can precede winit's
+        // `Suspended`), then the gate.
+        self.poll_surface_destroyed_hint();
+
+        // The frame gate (v2.2) — the first act of every frame, before timing,
+        // before the input drain, before any gpu work. A redraw that arrives
+        // between `suspended` and the next `resumed` is a resume-in-waiting, not
+        // a new gpu: v2.1's `3.40s gpu: retrying surface init (attempt 2 of 3)`
+        // came from this turn, and the surface it built is the one the next
+        // resume could not configure.
+        if let Some(gated) = self.lifecycle.gate_frame() {
+            let total = self.lifecycle.gated_frames();
+            lock_state().frames_gated = total;
+            // Name the gate on the first trip of a suspend (and sparsely after,
+            // so a wedged loop stays visible without flooding the ring).
+            if gated == 1 || gated % 120 == 0 {
+                log::info!(
+                    "frame gate tripped: [{SURFACE_GATE}] — redraw dropped ({gated} this suspend, \
+                     {total} total); no gpu init or retry can start while suspended"
+                );
+            }
+            return;
+        }
+
         let now = Instant::now();
         let dt = now.saturating_duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -470,40 +695,51 @@ impl Handler {
             // finish the Activity and the app would close with no visible
             // reason. Contain it here, drop the poisoned generation (context
             // included), and let "Restart surface" (or the retry path) rebuild.
+            //
+            // The frame also *reports* a dead surface (`Outdated`/`Lost`/
+            // `Timeout`) instead of handling it: `wgpu::Surface` is only valid
+            // for the window it was created from, so the answer is a new
+            // generation, never another `configure()`.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut state = lock_state();
-                gpu.frame(&mut state);
+                let fault = gpu.frame(&mut state);
                 state.observe_text();
+                fault
             }));
-            if let Err(payload) = outcome {
-                let text = diag::payload_text(payload.as_ref());
-                diag::note_contained("frame (egui/wgpu)");
-                log::error!(
-                    "frame panicked: {text} — dropping the whole gpu generation (egui context \
-                     included); the rebuild draws one clean full repaint"
-                );
-                lock_state().gpu_error = Some(format!("frame panic: {text}"));
-                self.gpu = None;
-                // One clean repaint, immediately: rebuild the generation (which
-                // drops the old context, its stale texture ids and the half-
-                // rendered frame) and let the next redraw present from scratch.
-                // Bounded, so a repeatable panic cannot spin here.
-                if self.panic_rebuilds < MAX_POST_PANIC_REPAINTS {
-                    self.panic_rebuilds = self.panic_rebuilds.saturating_add(1);
-                    log::warn!(
-                        "frame: post-panic repaint {} of {MAX_POST_PANIC_REPAINTS} — rebuilding \
-                         a fresh gpu generation now",
-                        self.panic_rebuilds
-                    );
-                    self.build_gpu("post-panic repaint");
-                } else {
+            match outcome {
+                Ok(None) => {}
+                Ok(Some(fault)) => self.on_surface_fault(fault),
+                Err(payload) => {
+                    let text = diag::payload_text(payload.as_ref());
+                    diag::note_contained("frame (egui/wgpu)");
                     log::error!(
-                        "frame: {MAX_POST_PANIC_REPAINTS} post-panic repaints already spent — \
-                         tap Restart surface once the cause is understood"
+                        "frame panicked: {text} — dropping the whole gpu generation (egui context \
+                         included); the rebuild draws one clean full repaint"
                     );
-                    lock_state().gpu_error =
-                        Some(format!("frame panic: {text} — tap Restart surface"));
-                    self.next_gpu_retry = Some(Instant::now() + GPU_RETRY_DELAY);
+                    lock_state().gpu_error = Some(format!("frame panic: {text}"));
+                    self.gpu = None;
+                    self.lifecycle.release();
+                    // One clean repaint, immediately: rebuild the generation
+                    // (which drops the old context, its stale texture ids and the
+                    // half-rendered frame) and let the next redraw present from
+                    // scratch. Bounded, so a repeatable panic cannot spin here.
+                    if self.panic_rebuilds < MAX_POST_PANIC_REPAINTS {
+                        self.panic_rebuilds = self.panic_rebuilds.saturating_add(1);
+                        log::warn!(
+                            "frame: post-panic repaint {} of {MAX_POST_PANIC_REPAINTS} — rebuilding \
+                             a fresh gpu generation now",
+                            self.panic_rebuilds
+                        );
+                        self.build_gpu("post-panic repaint");
+                    } else {
+                        log::error!(
+                            "frame: {MAX_POST_PANIC_REPAINTS} post-panic repaints already spent — \
+                             tap Restart surface once the cause is understood"
+                        );
+                        lock_state().gpu_error =
+                            Some(format!("frame panic: {text} — tap Restart surface"));
+                        self.next_gpu_retry = Some(Instant::now() + GPU_RETRY_DELAY);
+                    }
                 }
             }
         }
@@ -529,6 +765,50 @@ impl Handler {
         }
 
         self.maybe_request_insets();
+    }
+
+    /// A frame's surface is unusable (`Outdated`, `Lost`, `Timeout`).
+    ///
+    /// v2.1 answered this by calling `configure()` on the same `wgpu::Surface`.
+    /// That object is bound to the `ANativeWindow` it was created from, so once
+    /// that window is gone the call is not a recovery — it is the panic the
+    /// owner's phone hit (`Surface does not support the adapter's queue
+    /// family`). Here the generation is dropped and rebuilt through the same
+    /// entry a resume uses, which creates the surface from the window that is
+    /// current *now* and a fresh egui context with it.
+    fn on_surface_fault(&mut self, fault: SurfaceFault) {
+        match self.lifecycle.on_surface_fault(fault) {
+            SurfaceAction::Rebuild { attempt } => {
+                log::warn!(
+                    "rebuild (outdated) — fresh surface from the current window (surface {}, \
+                     auto rebuild {attempt} of {MAX_AUTO_REBUILDS_PER_EVENT}, epoch {}); the dead \
+                     surface is never configured",
+                    fault.as_str(),
+                    self.lifecycle.epoch()
+                );
+                self.gpu = None;
+                self.build_gpu("surface fault");
+                if self.gpu.is_some() {
+                    log::info!(
+                        "rebuild (outdated): fresh surface + fresh egui context ready — first frame \
+                         of the new generation presents a full repaint"
+                    );
+                }
+            }
+            SurfaceAction::Contained { attempts } => {
+                log::error!(
+                    "surface {} — {attempts} automatic rebuilds already spent in this lifecycle \
+                     event; contained instead of spinning. Tap Restart surface.",
+                    fault.as_str()
+                );
+                self.gpu = None;
+                lock_state().gpu_error = Some(format!(
+                    "surface {}: automatic rebuild budget spent ({attempts} of \
+                     {MAX_AUTO_REBUILDS_PER_EVENT}) — tap Restart surface",
+                    fault.as_str()
+                ));
+            }
+        }
     }
 
     /// Ask Kotlin to re-push the window insets when the state says its values are
@@ -559,11 +839,23 @@ impl Handler {
 }
 
 struct Gpu {
+    /// Which lifecycle epoch this generation belongs to, and its process-local
+    /// build serial. The surface below is only valid for `ticket.epoch` — that
+    /// is the whole v2.2 invariant, and it is checked at adoption rather than
+    /// trusted.
+    ticket: BuildTicket,
     window: Arc<Window>,
+    /// Created inside [`Gpu::new`] from the window handle current at that
+    /// moment. Dropped with the rest of the generation on suspend (see
+    /// [`impl Drop for Gpu`]).
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    /// The size a `Resized` event reported and no frame has applied yet. Kept
+    /// out of the event handler so `surface.configure` has exactly two call
+    /// sites, both inside the frame's panic boundary.
+    pending_size: Option<winit::dpi::PhysicalSize<u32>>,
     /// The egui context *this* renderer serves. Owned here, deliberately: egui
     /// keeps the texture bookkeeping, `renderer` keeps the GPU textures, and a
     /// context that outlives its renderer emits patches for unallocated ids
@@ -579,8 +871,34 @@ struct Gpu {
     adapter_info: String,
 }
 
+impl Drop for Gpu {
+    /// One line per generation death, naming the inventory. This is the
+    /// device-visible half of the "the surface joins the generation" contract:
+    /// every suspend, fault and rebuild prints exactly what it released, so a
+    /// surface left behind would be a missing word in the log.
+    fn drop(&mut self) {
+        log::info!(
+            "gpu generation #{} (epoch {}) dropped — surface, device, queue, renderer and egui \
+             context released",
+            self.ticket.serial,
+            self.ticket.epoch
+        );
+    }
+}
+
+/// Map the three lifecycle `SurfaceError` variants; `OutOfMemory`/`Other` are
+/// not lifecycle statements and stay on the log-and-retry path.
+fn surface_fault(err: &wgpu::SurfaceError) -> Option<SurfaceFault> {
+    match err {
+        wgpu::SurfaceError::Outdated => Some(SurfaceFault::Outdated),
+        wgpu::SurfaceError::Lost => Some(SurfaceFault::Lost),
+        wgpu::SurfaceError::Timeout => Some(SurfaceFault::Timeout),
+        _ => None,
+    }
+}
+
 impl Gpu {
-    fn new(window: Arc<Window>) -> Result<Self, String> {
+    fn new(window: Arc<Window>, ticket: BuildTicket) -> Result<Self, String> {
         // Built here, dropped with `self`: the context is part of the GPU
         // generation, not of the app (see the module docs).
         let egui_ctx = gpu_context::new_context();
@@ -588,9 +906,18 @@ impl Gpu {
             backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
             ..Default::default()
         });
+        // The one line that binds a generation to a native window. It runs only
+        // inside a `resumed`-owned build (the lifecycle issues the ticket), so
+        // the `ANativeWindow` winit hands over here is the current one — never
+        // the window a previous generation was created from.
         let surface = instance
             .create_surface(window.clone())
             .map_err(|err| format!("create_surface: {err}"))?;
+        log::info!(
+            "surface created for generation #{} (epoch {}) from the current window handle",
+            ticket.serial,
+            ticket.epoch
+        );
 
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -647,11 +974,13 @@ impl Gpu {
         );
 
         Ok(Self {
+            ticket,
             window,
             surface,
             device,
             queue,
             config,
+            pending_size: None,
             egui_ctx,
             renderer,
             egui_state,
@@ -669,11 +998,18 @@ impl Gpu {
         self.surface.configure(&self.device, &self.config);
     }
 
-    fn frame(&mut self, state: &mut SpikeState) {
+    /// Draw and present one frame. `Some(fault)` means the surface itself is
+    /// unusable and the *caller* must replace this whole generation — the frame
+    /// deliberately does not touch a dying surface (v2.1's `configure()` on it
+    /// is the field crash).
+    fn frame(&mut self, state: &mut SpikeState) -> Option<SurfaceFault> {
         // Some Android paths (first frame after a resume, or a rotation that
         // does not deliver `Resized` before the redraw) leave the surface at a
-        // stale size; syncing here keeps the viewport correct either way.
-        let size = self.window.inner_size();
+        // stale size; syncing here keeps the viewport correct either way. This
+        // is the only place a live generation reconfigures, and it runs inside
+        // the caller's panic boundary.
+        let pending = self.pending_size.take();
+        let size = pending.unwrap_or_else(|| self.window.inner_size());
         if size.width > 0
             && size.height > 0
             && (size.width != self.config.width || size.height != self.config.height)
@@ -724,14 +1060,15 @@ impl Gpu {
 
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
-            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
-                log::warn!("surface outdated/lost — reconfiguring");
-                self.surface.configure(&self.device, &self.config);
-                return;
-            }
             Err(err) => {
+                if let Some(fault) = surface_fault(&err) {
+                    // No configure() here, by contract: report it and let the
+                    // handler replace the generation (fresh surface, fresh egui
+                    // context) the way a resume would.
+                    return Some(fault);
+                }
                 log::error!("get_current_texture: {err}");
-                return;
+                return None;
             }
         };
         let view = frame
@@ -775,5 +1112,6 @@ impl Gpu {
                  fresh texture registry, no stale ids)"
             );
         }
+        None
     }
 }

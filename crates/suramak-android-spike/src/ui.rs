@@ -135,6 +135,11 @@ pub struct SpikeState {
     pub recreate_requests: u32,
     /// "Restart surface" presses (the suspend/resume path, on demand).
     pub surface_restarts: u32,
+    /// Redraws the surface gate dropped while the Activity was suspended (v2.2).
+    /// Cumulative for the process: v2.1 turned one of these into a gpu init
+    /// against a destroyed window, so this counter being non-zero *without* a
+    /// rebuild is the fix working.
+    pub frames_gated: u64,
     /// Set by the button, consumed by the frame loop.
     pub restart_surface: bool,
     /// Outcome of the last "Recreate activity now" request (v2.1).
@@ -190,6 +195,7 @@ impl Default for SpikeState {
             surface_recreates: 0,
             recreate_requests: 0,
             surface_restarts: 0,
+            frames_gated: 0,
             restart_surface: false,
             recreate_status: None,
             anim_seconds: 0.0,
@@ -376,6 +382,7 @@ impl SpikeState {
         self.surface_recreates = 0;
         self.recreate_requests = 0;
         self.surface_restarts = 0;
+        self.frames_gated = 0;
         self.recreate_status = None;
         self.frame_times.clear();
         self.frames = 0;
@@ -403,6 +410,7 @@ impl SpikeState {
                 self.probe.clear();
                 self.recreate_requests = 0;
                 self.surface_restarts = 0;
+                self.frames_gated = 0;
                 self.recreate_status = None;
             }
             Tab::Motion => {
@@ -459,7 +467,7 @@ fn draw_header(ctx: &egui::Context, state: &mut SpikeState) {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new("M13B v2.1 DIAGNOSTICS")
+                egui::RichText::new("M13B v2.2 DIAGNOSTICS")
                     .size(24.0)
                     .strong()
                     .color(egui::Color32::from_rgb(120, 190, 255)),
@@ -486,9 +494,11 @@ fn draw_header(ctx: &egui::Context, state: &mut SpikeState) {
             }
         });
         ui.label(
-            egui::RichText::new("build 0.3.0-m13b.2.1 · crash text survives a restart")
-                .size(10.0)
-                .color(egui::Color32::from_gray(120)),
+            egui::RichText::new(
+                "build 0.3.0-m13b.2.2 · surface per epoch: no configure across a destroy",
+            )
+            .size(10.0)
+            .color(egui::Color32::from_gray(120)),
         );
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -915,6 +925,14 @@ fn draw_lifecycle_check(ui: &mut egui::Ui, state: &mut SpikeState) {
         egui::RichText::new(format!(
             "surface restarts (button): {}",
             state.surface_restarts
+        ))
+        .size(17.0)
+        .monospace(),
+    );
+    ui.label(
+        egui::RichText::new(format!(
+            "frames gated while suspended: {}",
+            state.frames_gated
         ))
         .size(17.0)
         .monospace(),

@@ -73,6 +73,22 @@ static EVENTS: Mutex<PlatformEvents> = Mutex::new(PlatformEvents {
 /// Latest IME state; only the newest matters (the IME sends full buffers).
 static IME_TEXT: Mutex<Option<ImeState>> = Mutex::new(None);
 
+/// `surfaceDestroyed` arrived from the Activity and no one has acted on it yet.
+///
+/// The Java callback runs before android-activity's looper processes
+/// `APP_CMD_TERM_WINDOW`, and winit only turns *that* into `Event::Suspended`.
+/// In the owner's v2.1 trace the gap was 80 ms (`3.32s surfaceDestroyed` →
+/// `3.40s suspended`) and the raced gpu init lived inside it. This flag lets the
+/// event loop close its gate on the Java signal instead of waiting for winit,
+/// without changing the Kotlin shim: it is set from the `nativeLogLine` the shim
+/// already sends.
+static SURFACE_DESTROYED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Take the pending `surfaceDestroyed` signal (edge-triggered).
+pub fn take_surface_destroyed_hint() -> bool {
+    SURFACE_DESTROYED.swap(false, Ordering::SeqCst)
+}
+
 /// Which Activity instance this process is serving. Bumped on every
 /// `android_main` entry, so a "destroyed" flag left by a *previous* Activity can
 /// never stop the next one — the flag records which generation was destroyed,
@@ -221,6 +237,13 @@ pub extern "system" fn Java_app_suramak_spike_MainActivity_nativeLogLine(
     jni_guard("nativeLogLine", || {
         if let Some(text) = read_jstring(env, line, "nativeLogLine") {
             diag::info(format!("kotlin: {text}"));
+            // The surface half of the suspend, ~1 event-loop turn before
+            // winit's `Suspended` (see `SURFACE_DESTROYED`). A log line is the
+            // only channel the shim already has for it, and adding a JNI export
+            // would mean touching Kotlin, which this workorder does not.
+            if text == "surfaceDestroyed" {
+                SURFACE_DESTROYED.store(true, Ordering::SeqCst);
+            }
         }
     });
 }

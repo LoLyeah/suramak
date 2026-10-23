@@ -140,13 +140,13 @@ if [ -x "$AAPT" ]; then
   # Same SIGPIPE reasoning as above: match in the shell, not through a pipe.
   BADGING="$("$AAPT" dump badging "$APK")"
   case "$BADGING" in
-    *"package: name='app.suramak.spike' versionCode='3' versionName='0.3.0-m13b.2.1'"*) ;;
+    *"package: name='app.suramak.spike' versionCode='4' versionName='0.3.0-m13b.2.2'"*) ;;
     *)
       # Fall back to a narrower match so a future versionCode bump does not
       # hide a real versionName regression.
       case "$BADGING" in
-        *"package: name='app.suramak.spike'"*"versionName='0.3.0-m13b.2.1'"*) ;;
-        *) fail "APK versionName is not 0.3.0-m13b.2.1 (see aapt output below)" ;;
+        *"package: name='app.suramak.spike'"*"versionName='0.3.0-m13b.2.2'"*) ;;
+        *) fail "APK versionName is not 0.3.0-m13b.2.2 (see aapt output below)" ;;
       esac
       ;;
   esac
