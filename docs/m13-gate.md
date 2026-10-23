@@ -214,9 +214,17 @@ with its evidence, no Java call by construction; `logSettle()` proves clean
 settle on device. M13c caveat: the same call_activity defect silently breaks the
 two remaining Rust→Kotlin calls (will be fixed in the bridge work).
 
-**Remaining criterion: rotation** — the only relaunch path the shim can still
-experience; owner's next pass (v2.3: tap Recreate → outcome line → Home → same
-live pid / Vivo fresh-relaunch without a banner → rotate landscape↔portrait ×2).
+**Remaining criterion: rotation** — v2.4 (`fcc4144`, release
+`android-spike-m13b-v2.4`, versionCode 6, `0.3.0-m13b.2.4`) gates it by
+construction: a destroy arriving during gpu init cannot fault (terminal
+`Phase::Destroying` + kill-latch checks before every window call — the v2.2
+suspend-gate discipline, extended to destroy), every native kill
+(SIGSEGV/SIGABRT/SIGBUS) now WRITES the last state to the crash file before
+dying (proven by a subprocess test), and the probe text survives rotation AND
+process kill via the Android Bundle (save/restore logged). Owner pass:
+rotate within 1 s of launch ×3 + mid-session ×3 → zero native kills + probe
+restore logged = **4/4 GO, M13 gate CLOSED**, real IME bridge work (M13c)
+starts.
 
 ## 10. v2 — the diagnostics build (`0.3.0-m13b.2`)
 
