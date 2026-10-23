@@ -8,11 +8,26 @@
 //!   * `nativeImeText(text, selectionStart, selectionEnd)` — the soft keyboard's
 //!     editing state from `GameActivity.stateChanged`;
 //!   * `nativeLogLine(line)` — a plain lifecycle line (onCreate, surfaceCreated,
-//!     `Activity.recreate()` …) for the on-screen event ring;
+//!     `recreate:`/`settle:` …) for the on-screen event ring;
 //!   * `nativeActivityDestroyed()` — the Activity is going away, stop the loop.
 //!
-//! Rust → Kotlin: [`request_activity_recreate`] calls `MainActivity.postRecreate()`
-//! over JNI, which posts `Activity.recreate()` onto the UI thread.
+//! Rust → Kotlin: [`request_insets_push`] and [`request_crash_overlay`] call
+//! `MainActivity.postPushInsets()` / `postShowCrashOverlay()` over JNI.
+//!
+//! **v2.3: the recreate call is gone, and here is why it could never work.**
+//! `android-activity` 0.6.1 initialises `ndk_context` with
+//! `activity.getApplication()` (`src/init.rs:281`), and `ndk-context` only
+//! promises a handle that is "in most cases … an `Activity`, but this isn't
+//! guaranteed". Every `call_method` in this file therefore addresses the
+//! **Application** (`SpikeApp`), not `MainActivity`: `main`'s methods are not on
+//! it, so `GetMethodID` raises `NoSuchMethodError` and `jni` 0.21.1 reports the
+//! pending exception as `Error::JavaException` — the exact
+//! `Java exception was thrown` the owner's phone printed for three builds. No
+//! Kotlin line ran, no `Activity.recreate()` was ever called, and no relaunch
+//! could have been armed by it. v2.3 removes the recreate path outright instead
+//! of repairing it (a working call is exactly what this pass must not have); the
+//! other two calls are best-effort as before and are named as a known limitation
+//! in `docs/reports/M13b5-spike-v2.3.md` §3.4 — the real bridge is M13c's.
 //!
 //! **Every export is panic-proof.** A panic that unwinds out of an `extern
 //! "system"` function is undefined behaviour, and Rust ≥1.81 aborts the process
@@ -350,23 +365,18 @@ pub extern "system" fn Java_app_suramak_spike_MainActivity_nativeImeText(
     });
 }
 
-/// Ask the Activity to recreate itself (the lifecycle check's trigger).
-///
-/// `Activity.recreate()` must run on the UI thread, so this calls the Kotlin
-/// helper `postRecreate()`, which posts the call; we never touch a View from
-/// this (android_main) thread. Since v2.1 the helper is exception-proof: a
-/// failure comes back as `Err` (and lands on the lifecycle tab's status line),
-/// instead of v2's silent `Java exception was thrown`.
-pub fn request_activity_recreate() -> Result<(), String> {
-    call_activity("postRecreate")
-}
-
 /// Ask Kotlin to re-read the window insets and push them again. Used when the
 /// UI knows its inset values are stale: a reset button zeroes the counters, and
 /// before v2.1 nothing ever pushed them again (the panel sat at 0/0 for the rest
 /// of the session).
+///
+/// Best-effort by contract: see the module docs — the object `call_shim` reaches
+/// is the Application, so this cannot succeed as written. The spike's inset
+/// panel does not depend on it (Kotlin re-pushes on resume, focus gain, layout
+/// and every dispatch); it stays so the retry loop's behaviour is unchanged and
+/// the defect is visible in the log rather than silent.
 pub fn request_insets_push() -> Result<(), String> {
-    call_activity("postPushInsets")
+    call_shim("postPushInsets")
 }
 
 /// Ask Kotlin to (re)read `spike-last-crash.txt` and put it on screen. Used on
@@ -376,26 +386,44 @@ pub fn request_crash_overlay() {
     // This runs *after* a panic: nothing here may panic again, and a missing
     // ndk-context (init failed early) must not turn one failure into two.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = call_activity("postShowCrashOverlay");
+        let _ = call_shim("postShowCrashOverlay");
     }));
 }
 
-/// Call a no-argument `MainActivity` method on the UI thread (each Kotlin helper
-/// posts itself). Shared by the recreate trigger and the crash overlay.
-fn call_activity(method: &str) -> Result<(), String> {
+/// Call a no-argument method on the context `ndk_context` holds.
+///
+/// **That object is the Application, not the Activity.** `android-activity`
+/// 0.6.1 initialises ndk-context with `activity.getApplication()`
+/// (`src/init.rs:281`), and `ndk-context` itself only promises "in most cases …
+/// an `Activity`, but this isn't guaranteed" — so a `MainActivity` method is not
+/// reachable through this handle. `jni` 0.21.1 reports the resulting
+/// `NoSuchMethodError` from `GetMethodID` as `Error::JavaException`
+/// (`jni_non_null_call! → check_exception!`), whose Display is the
+/// `Java exception was thrown` the field reports carry.
+///
+/// The function is named `call_shim` rather than `call_activity` because the
+/// old name asserted the one thing that is false here. Repairing the handle
+/// belongs to the milestone that owns the real bridge (M13c): obtaining the
+/// Activity means going through `AndroidApp::activity_as_ptr()`, which this
+/// module deliberately does not hold. v2.3's subject is the recreate edge, and
+/// the fix there is that **nothing calls this for recreate at all**.
+fn call_shim(method: &str) -> Result<(), String> {
     let context = ndk_context::android_context();
     // SAFETY: android-activity initialised ndk-context with the process' JavaVM
-    // and a global ref to the Activity (`ndk_context::initialize_android_context`
-    // in its init path), and both stay valid for the process lifetime.
+    // and a **global** ref to the Application (`ndk_context::initialize_android_context`
+    // in `init.rs:281`), and both stay valid for the process lifetime.
     let vm = unsafe { jni::JavaVM::from_raw(context.vm().cast()) }
         .map_err(|err| format!("JavaVM::from_raw: {err}"))?;
     let mut env = vm
         .attach_current_thread()
         .map_err(|err| format!("attach_current_thread: {err}"))?;
-    let activity = unsafe { jni::objects::JObject::from_raw(context.context().cast()) };
-    env.call_method(&activity, method, "()V", &[])
+    let app = unsafe { jni::objects::JObject::from_raw(context.context().cast()) };
+    // The error text names the object it really called: `SpikeApp`, not
+    // `MainActivity`. Naming it `MainActivity` is what hid this for three
+    // builds — the message read like a method failure *on the Activity*.
+    env.call_method(&app, method, "()V", &[])
         .map(|_| ())
-        .map_err(|err| format!("MainActivity.{method}(): {err}"))
+        .map_err(|err| format!("SpikeApp(application).{method}(): {err}"))
 }
 
 #[cfg(test)]

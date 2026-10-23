@@ -25,6 +25,14 @@
 //! v2.1 changes no check: the banner's file path follows the crash files to the
 //! app's external files dir, and the **Share log** route lives on the Kotlin
 //! overlay (it has to work when this module cannot draw at all).
+//!
+//! v2.3 (`docs/WORKORDER-M13B5.md`) makes the "Recreate activity" button a
+//! **named limitation instead of an action**: [`RECREATE_UNAVAILABLE`] is the
+//! one line it shows, [`RECREATE_EVIDENCE`] is why, and `SpikeState` has no flag
+//! left for the frame loop to act on — the tap cannot reach Java, so it cannot
+//! arm a relaunch (see `docs/reports/M13b5-spike-v2.3.md`). This module is pure
+//! egui with no `platform` import, which is what makes that structural rather
+//! than a promise: on the host, JNI does not even exist here.
 
 use std::collections::VecDeque;
 
@@ -97,14 +105,54 @@ pub struct Insets {
     pub updates: u32,
 }
 
-/// What the "Recreate activity now" button last did, shown under it. `failed`
-/// means the JNI/Java call itself refused (v2's `View.post` path did exactly
-/// that on the owner's phone), not merely "nothing visible happened yet".
+/// What the "Recreate activity" button last did, shown under it.
+///
+/// `failed` keeps its v2.1 meaning — *the requested action did not happen* —
+/// but the reason is no longer a Java exception: since v2.3 the button makes no
+/// Java call at all, so the one thing it can report is [`RECREATE_UNAVAILABLE`].
+/// `java_call` is the invariant made visible: the name of the Java method this
+/// request invoked, or `None`. In v2.3 nothing can set it to `Some`, because
+/// `platform::request_activity_recreate` no longer exists (the compiler, not a
+/// test, is the primary guard — the tests pin the words).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecreateStatus {
     pub text: String,
     pub failed: bool,
+    /// The Java method invoked for this request, if any. Always `None` here.
+    pub java_call: Option<&'static str>,
 }
+
+/// The single line the "Recreate activity" button reports (v2.3).
+///
+/// It has to do three jobs at once: say the capability is not available, say
+/// that **no Java call was made** (the whole point of the pass), and name the
+/// evidence for why the call could never have worked. It must never read like a
+/// VM failure — `Java exception was thrown` is exactly the sentence this pass
+/// retires.
+pub const RECREATE_UNAVAILABLE: &str =
+    "recreate: not available — no Java call, nothing relaunched. The shim has no Activity \
+     handle: ndk-context gives android-activity's Application, so MainActivity.postRecreate() \
+     can only fail its method lookup and no Activity code ever ran.";
+
+/// The evidence behind [`RECREATE_UNAVAILABLE`], shown under the button.
+///
+/// These are quotes and file:line facts, not a summary: the owner's device pass
+/// has to be able to check the claim from the phone's own screen.
+pub const RECREATE_EVIDENCE: [&str; 4] = [
+    "v2.2 field: the button reported `MainActivity.postRecreate(): Java exception was thrown`, \
+     and the session that tapped it was later ANR-killed after backgrounding (pid 1554, \
+     Android 16).",
+    "That sentence is jni 0.21.1's Display for *any* pending exception, and a failed \
+     `GetMethodID` raises one (NoSuchMethodError) before a single Kotlin line runs — which is \
+     why v2.1's exception-proof Kotlin body changed the message not at all.",
+    "android-activity 0.6.1 initialises ndk-context with `activity.getApplication()` \
+     (`src/init.rs:281`); ndk-context promises only \"in most cases … an Activity, but this \
+     isn't guaranteed\". `postRecreate` on an Application is a lookup that cannot succeed.",
+    "So no Activity code ran, and no relaunch was armed by that call. v2.3 does not swap in \
+     another relaunch route: the tap now makes no JNI call (no attach, no lookup, no pending \
+     exception, no relaunch). Whether that removes the ANR is the owner's device pass — the \
+     click is the only place it could have come from.",
+];
 
 /// Everything the spike counts. Lives in a `static` on Android so it survives
 /// the activity/surface being destroyed and recreated.
@@ -142,7 +190,8 @@ pub struct SpikeState {
     pub frames_gated: u64,
     /// Set by the button, consumed by the frame loop.
     pub restart_surface: bool,
-    /// Outcome of the last "Recreate activity now" request (v2.1).
+    /// Outcome of the last "Recreate activity" press (v2.1; re-purposed in v2.3
+    /// as the *named limitation* — see [`RECREATE_UNAVAILABLE`]).
     pub recreate_status: Option<RecreateStatus>,
     // (3) motion
     pub anim_seconds: f64,
@@ -157,7 +206,6 @@ pub struct SpikeState {
     /// the platform only dispatches insets when they *change*.
     pub insets_stale: bool,
     pub back_presses: u32,
-    pub recreate_requested: bool,
     // diagnostics
     pub backend: String,
     pub gpu_error: Option<String>,
@@ -204,7 +252,6 @@ impl Default for SpikeState {
             insets: Insets::default(),
             insets_stale: true,
             back_presses: 0,
-            recreate_requested: false,
             backend: "not initialised".to_owned(),
             gpu_error: None,
             tab_errors: [None, None, None, None],
@@ -281,21 +328,20 @@ impl SpikeState {
         self.insets_stale = false;
     }
 
-    /// Record the outcome of the last "Recreate activity now" press for the
-    /// button's status line. `Err` carries the JNI/Java reason verbatim: v2's
-    /// `MainActivity.postRecreate()` surfaced as
-    /// `Java exception was thrown` and nothing on screen said so.
-    pub fn note_recreate(&mut self, outcome: Result<(), &str>) {
-        self.recreate_status = Some(match outcome {
-            Ok(()) => RecreateStatus {
-                text: "recreate requested — watch the LOG for `kotlin: recreate` then onDestroy/onCreate"
-                    .to_owned(),
-                failed: false,
-            },
-            Err(err) => RecreateStatus {
-                text: format!("recreate failed: {err}"),
-                failed: true,
-            },
+    /// The "Recreate activity" button, v2.3: record the named limitation.
+    ///
+    /// This is the button's *entire* effect. There is no Java call to make (see
+    /// [`RECREATE_UNAVAILABLE`]) and no flag for the frame loop to consume, so a
+    /// tap cannot reach Android's relaunch machinery at all — the property this
+    /// pass is built on. `failed` is `true` because the requested action does not
+    /// happen; the line says why, in the same place v2.1's error line lived, so
+    /// the legibility contract survives even though the exception is gone.
+    pub fn tap_recreate(&mut self) {
+        self.recreate_requests = self.recreate_requests.saturating_add(1);
+        self.recreate_status = Some(RecreateStatus {
+            text: RECREATE_UNAVAILABLE.to_owned(),
+            failed: true,
+            java_call: None,
         });
     }
 
@@ -467,7 +513,7 @@ fn draw_header(ctx: &egui::Context, state: &mut SpikeState) {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new("M13B v2.2 DIAGNOSTICS")
+                egui::RichText::new("M13B v2.3 DIAGNOSTICS")
                     .size(24.0)
                     .strong()
                     .color(egui::Color32::from_rgb(120, 190, 255)),
@@ -495,7 +541,7 @@ fn draw_header(ctx: &egui::Context, state: &mut SpikeState) {
         });
         ui.label(
             egui::RichText::new(
-                "build 0.3.0-m13b.2.2 · surface per epoch: no configure across a destroy",
+                "build 0.3.0-m13b.2.3 · recreate: named unavailable, no Java call · surface per epoch",
             )
             .size(10.0)
             .color(egui::Color32::from_gray(120)),
@@ -898,7 +944,8 @@ fn draw_lifecycle_check(ui: &mut egui::Ui, state: &mut SpikeState) {
         "(2) Lifecycle",
         "Type a marker into the probe, send the app to the background (Home / app switch), then \
          bring it back. The probe text and the resume counter must both survive the surface \
-         destroy/recreate. \"Recreate activity\" calls Activity.recreate() through the shim.",
+         destroy/recreate. \"Recreate activity\" is NOT available in this shim and makes no Java \
+         call at all — see the evidence under the button.",
     );
 
     ui.horizontal(|ui| {
@@ -942,33 +989,76 @@ fn draw_lifecycle_check(ui: &mut egui::Ui, state: &mut SpikeState) {
             .size(17.0)
             .monospace(),
     );
+    ui.label(
+        egui::RichText::new("recreate java calls: 0 — the button has no Java path (v2.3)")
+            .size(12.0)
+            .monospace()
+            .color(egui::Color32::from_gray(150)),
+    );
 
     ui.add_space(10.0);
+    // v2.3: the capability is gone, the *report* is not. The button stays
+    // tappable because the owner's pass taps exactly this control, and a
+    // greyed-out widget would swallow the tap and leave nothing to read; what
+    // changed is the action: `SpikeState::tap_recreate` only writes the reason
+    // into the state below. There is no `recreate_requested` flag any more, so
+    // even a future edit to the frame loop has nothing to consume.
     if ui
         .add_sized(
             [ui.available_width(), 52.0],
-            egui::Button::new("Recreate activity now"),
+            egui::Button::new("Recreate activity — NOT AVAILABLE (no Java call)"),
         )
         .clicked()
     {
-        state.recreate_requested = true;
-        state.recreate_requests += 1;
+        state.tap_recreate();
+        diag::info(
+            "recreate: not available — the button made no JNI/Java call (no Activity handle in \
+             ndk-context; Activity.recreate() is not attempted on this path)",
+        );
     }
-    // The outcome as the JNI call reported it. v2 said nothing here and the
-    // button looked like it worked while the shim was throwing.
+    // The outcome, in the same place v2.1's error line lived. v2 said nothing
+    // here while the shim was throwing; v2.3 says exactly what did not happen
+    // and why — with no exception to quote, because no Java call is made.
     if let Some(status) = &state.recreate_status {
         ui.label(
             egui::RichText::new(&status.text)
                 .size(11.5)
                 .color(if status.failed { RED } else { AMBER }),
         );
+        ui.label(
+            egui::RichText::new(match status.java_call {
+                Some(method) => format!("java call: {method}"),
+                None => "java call: none".to_owned(),
+            })
+            .size(11.0)
+            .monospace()
+            .color(egui::Color32::from_gray(150)),
+        );
+    }
+    ui.add_space(6.0);
+    for (index, line) in RECREATE_EVIDENCE.iter().enumerate() {
+        ui.label(
+            egui::RichText::new(format!("{}. {line}", index + 1))
+                .size(11.0)
+                .color(egui::Color32::from_gray(150)),
+        );
+        ui.add_space(2.0);
     }
     ui.label(
         egui::RichText::new(
-            "Recreate goes through MainActivity.postRecreate() → Activity.recreate() on the UI thread. \
-             If it fails, the reason is on the line above; if the Activity does not come back, Home → \
-             return and \"Restart surface\" exercise the same surface rebuild without asking Android to \
-             relaunch the Activity.",
+            "What replaces it is the path the device already verified: Home → return (resumes +1, \
+             same live process) and \"Restart surface\" (drop + rebuild the whole gpu generation on \
+             demand). Neither asks Android to relaunch the Activity.",
+        )
+        .size(11.5)
+        .color(egui::Color32::from_gray(150)),
+    );
+    ui.label(
+        egui::RichText::new(
+            "v2.3 removed the call rather than dressing it up: there is no `postRecreate` left in \
+             the Kotlin shim and no `request_activity_recreate` left in Rust, so the button cannot \
+             reach Android's relaunch machinery even by accident. The recreate path is a documented \
+             shim limitation — later milestones never need Activity.recreate on Android.",
         )
         .size(11.5)
         .color(egui::Color32::from_gray(150)),
@@ -998,8 +1088,8 @@ fn draw_lifecycle_check(ui: &mut egui::Ui, state: &mut SpikeState) {
     ui.add_space(8.0);
     ui.label(
         egui::RichText::new(
-            "Go if: the probe text is still there after Home → return AND after the recreate \
-             button, with the resume counter at 2 or more.",
+            "Go if: the probe text is still there after Home → return, with the resume counter at 2 \
+             or more and the app still the same live process (no fresh start, no crash banner).",
         )
         .size(12.0)
         .color(egui::Color32::from_gray(150)),
@@ -1310,32 +1400,71 @@ mod tests {
         assert_eq!(state.probe, "lifecycle-123");
     }
 
-    /// The lifecycle tab's status line is the only thing that made v2's broken
-    /// recreate visible; it must carry the reason and be cleared by a reset.
+    /// v2.3: the recreate button is a *named limitation*, not an action. What
+    /// must never come back is the Java call — and with it the sentence
+    /// `Java exception was thrown`, which was a method-lookup failure dressed up
+    /// as an Activity failure. This is the v2.1 legibility test, extended: the
+    /// line still has to say why, the reset still has to clear it.
     #[test]
-    fn a_failed_recreate_is_surfaced_and_cleared_by_reset() {
+    fn a_recreate_tap_names_the_limitation_and_records_no_java_call() {
         let mut state = SpikeState::default();
-        state.note_recreate(Err(
-            "MainActivity.postRecreate(): Java exception was thrown",
-        ));
-        let status = state.recreate_status.clone().expect("a status line");
-        assert!(status.failed, "a JNI failure must read as a failure");
-        assert!(status.text.contains("Java exception"), "{}", status.text);
-
-        state.note_recreate(Ok(()));
-        let status = state.recreate_status.clone().unwrap();
-        assert!(!status.failed);
         assert!(
-            status.text.contains("recreate requested"),
-            "{}",
+            state.recreate_status.is_none(),
+            "nothing is claimed before the button is pressed"
+        );
+
+        state.tap_recreate();
+        let status = state.recreate_status.clone().expect("a status line");
+        assert!(status.failed, "the requested recreate did not happen");
+        assert_eq!(
+            status.java_call, None,
+            "v2.3 makes no Java call for this button"
+        );
+        assert!(status.text.contains("no Java call"), "{}", status.text);
+        assert!(
+            status.text.contains("ndk-context"),
+            "the line must name the evidence, not just the verdict: {}",
             status.text
         );
+        // The v2.1/v2.2 wording is retired: there is no VM exception to quote,
+        // and quoting one would claim a call that never happened.
+        assert!(!status.text.contains("Java exception"), "{}", status.text);
+        assert!(!status.text.contains("recreate failed:"), "{}", status.text);
+        assert_eq!(state.recreate_requests, 1, "the tap is still counted");
+
+        // Pressing twice counts twice and says the same thing.
+        state.tap_recreate();
+        assert_eq!(state.recreate_requests, 2);
+        assert_eq!(state.recreate_status.as_ref().unwrap().java_call, None);
 
         state.reset_tab(Tab::Lifecycle);
         assert!(
             state.recreate_status.is_none(),
             "reset clears the status line"
         );
+        assert_eq!(state.recreate_requests, 0);
+    }
+
+    /// The tap's only effects are the two it documents. Anything else would mean
+    /// an "unavailable" button had started an action — the exact shape of the
+    /// v2.2 defect this pass removes.
+    #[test]
+    fn a_recreate_tap_touches_nothing_the_frame_loop_consumes() {
+        let mut state = SpikeState {
+            probe: "lifecycle-123".to_owned(),
+            resumes: 4,
+            frames_gated: 7,
+            ..Default::default()
+        };
+        state.tap_recreate();
+        assert!(
+            !state.restart_surface,
+            "a recreate tap must not start a surface restart"
+        );
+        assert_eq!(state.probe, "lifecycle-123", "the probe is app state");
+        assert_eq!(state.resumes, 4);
+        assert_eq!(state.frames_gated, 7);
+        assert_eq!(state.text, "");
     }
 
     #[test]
@@ -1389,9 +1518,10 @@ mod tests {
         state.observe_text();
         state.set_insets(64, 48, 0, 0, 0);
         state.back_presses = 2;
-        // Exercise the v2.1 status lines too: a failed recreate (lifecycle tab)
-        // and a stale-insets hint (insets tab) are draw paths like any other.
-        state.note_recreate(Err("java.lang.IllegalStateException: recreate refused"));
+        // Exercise the v2.3 status line too: an unavailable recreate is a draw
+        // path like any other, and its evidence block is the longest text on the
+        // lifecycle tab.
+        state.tap_recreate();
         for _ in 0..30 {
             state.tick(1.0 / 60.0);
         }

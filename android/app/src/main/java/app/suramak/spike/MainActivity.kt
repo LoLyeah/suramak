@@ -30,7 +30,7 @@ import com.google.androidgamesdk.GameActivity
 import com.google.androidgamesdk.gametextinput.State
 
 /**
- * M13b shell spike v2.1 — the entire Kotlin surface.
+ * M13b shell spike v2.3 — the entire Kotlin surface.
  *
  * Extends the androidx `GameActivity` (AGDK), which is what gives the Rust side
  * `GameTextInput` (the soft-keyboard path egui's IME support needs). This class
@@ -48,8 +48,20 @@ import com.google.androidgamesdk.gametextinput.State
  *   Kotlin -> Rust   nativeImeText(text, selectionStart, selectionEnd)     [UTF-16 indices]
  *   Kotlin -> Rust   nativeLogLine(line)        [lifecycle lines for the on-screen ring]
  *   Kotlin -> Rust   nativeActivityDestroyed()  [stop the event loop]
- *   Rust -> Kotlin   postRecreate()             [posts Activity.recreate()]
+ *   Rust -> Kotlin   postPushInsets()           [re-read + re-push the window insets]
  *   Rust -> Kotlin   postShowCrashOverlay()     [re-read the crash file, show it now]
+ *
+ * **There is deliberately no recreate entry point.** v2, v2.1 and v2.2 all
+ * reached this class through `ndk_context`'s handle to call `postRecreate()`;
+ * `android-activity` 0.6.1 initialises that handle with
+ * `activity.getApplication()` (`src/init.rs:281`), i.e. with the Application —
+ * so the `postRecreate` method looked up on it could only fail
+ * (`NoSuchMethodError`, which `jni` reports as `Java exception was thrown`) and
+ * `Activity.recreate()` was never called by any build. v2.3 removes the method
+ * instead of repairing the handle: the spike must not be able to ask Android to
+ * relaunch the Activity, and with no method here a future Rust call has nothing
+ * to reach. The button is a named limitation in the egui UI
+ * (`docs/reports/M13b5-spike-v2.3.md`).
  *
  * `filesDir` above is `CrashFiles.dir(this)` — the app's *external* files dir
  * since v2.1 (`Android/data/app.suramak.spike/files`), not the private one.
@@ -167,6 +179,11 @@ class MainActivity : GameActivity() {
     override fun onResume() {
         super.onResume()
         logToRust("onResume")
+        // v2.3: print the Activity's relaunch-relevant state at every resume.
+        // Nothing in this app can arm a relaunch any more (there is no recreate
+        // entry point), so this line is how the device pass *sees* that the
+        // Activity comes back clean instead of half-relaunched.
+        logSettle("onResume")
         // Mark the session as visible again (onStop removes the marker) so a
         // native crash in the foreground still leaves a trace.
         CrashFiles.beginSession(this)
@@ -188,6 +205,7 @@ class MainActivity : GameActivity() {
 
     override fun onStop() {
         logToRust("onStop")
+        logSettle("onStop")
         CrashFiles.endSession(this)
         super.onStop()
     }
@@ -371,37 +389,13 @@ class MainActivity : GameActivity() {
         }
     }
 
-    /**
-     * Called from Rust over JNI (on the `android_main` thread). Everything that
-     * touches the Activity or a View hops to the main looper first.
-     *
-     * v2 built this on `root?.post { recreate() }`, and on the owner's phone the
-     * call came back as `Java exception was thrown` — the button incremented its
-     * counter and nothing else happened, with no reason on screen. Three changes:
-     * an explicit main-looper `Handler` (no dependence on the decor view being
-     * attached, which is what `View.post` was doing from a non-UI thread), a
-     * state guard, and a `try/catch` that reports the *real* exception into the
-     * event ring. The JNI export can no longer see a Java exception, and the
-     * lifecycle tab shows the outcome (see `ui.rs` `RecreateStatus`).
-     */
-    @Suppress("unused") // referenced from platform.rs via JNI
-    fun postRecreate() {
-        Handler(Looper.getMainLooper()).post {
-            try {
-                if (isFinishing || isDestroyed) {
-                    logToRust("recreate: skipped — the Activity is finishing/destroyed")
-                    return@post
-                }
-                logToRust("recreate: Activity.recreate() on the UI thread")
-                recreate()
-            } catch (t: Throwable) {
-                // Recreate can legitimately refuse (state loss, a parent
-                // Activity, a vendor ROM). Say so instead of vanishing.
-                logToRust("recreate FAILED on the UI thread: ${t.javaClass.name}: ${t.message}")
-                Log.e(TAG, "Activity.recreate() failed", t)
-            }
-        }
-    }
+    // v2.3 removed postRecreate() from here. If a future milestone ever needs an
+    // Activity restart it is finish() + an explicit relaunch intent — a teardown
+    // the system actually performs — never Activity.recreate(), which on this
+    // stack would be a framework relaunch racing android-activity's unconditional
+    // GameActivity_finish() when android_main returns. See
+    // docs/reports/M13b5-spike-v2.3.md §4, and §6 for why the absence of a call
+    // here is the whole disarm.
 
     /**
      * Called from Rust after a panic escaped `android_main`: the surface will
@@ -579,6 +573,25 @@ class MainActivity : GameActivity() {
             Log.e(TAG, "share failed for ${file.absolutePath}", t)
             Toast.makeText(this, "Could not share: ${t.message}", Toast.LENGTH_LONG).show()
         }
+    }
+
+    /**
+     * v2.3 — the recreate disarm, made observable.
+     *
+     * The framework has no public `isRecreating()`: the relaunch flag lives in
+     * `ActivityThread`'s client record, not on `Activity`. What *is* readable is
+     * every state a pending or half-finished relaunch would show up in — a
+     * configuration change in progress, a finishing Activity, a destroyed one.
+     * Printing them at each resume/stop means the device log can show the
+     * Activity comes back clean after a "recreate" tap, which is the only
+     * on-device evidence this class can offer (the tap itself makes no Java
+     * call: there is no recreate entry point at all).
+     */
+    private fun logSettle(tag: String) {
+        logToRust(
+            "settle ($tag): changingConfigurations=$isChangingConfigurations " +
+                "finishing=$isFinishing destroyed=$isDestroyed"
+        )
     }
 
     /**

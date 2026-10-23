@@ -14,13 +14,13 @@ android {
         // compileSdk avoids the "targetSdk > compileSdk" AGP refusal.
         minSdk = 29
         targetSdk = 35
-        // v2.2: the surface lifecycle fix — the surface is dropped with the gpu
-        // generation and rebuilt from the window current at resume
-        // (WORKORDER-M13B4). `scripts/android/build-apk.sh` asserts this exact
+        // v2.3: the recreate edge — the button is a named limitation and makes
+        // no Java call, so nothing can arm Android's relaunch machinery
+        // (WORKORDER-M13B5). `scripts/android/build-apk.sh` asserts this exact
         // versionName with `aapt dump badging`, which is what the owner checks
         // before installing.
-        versionCode = 4
-        versionName = "0.3.0-m13b.2.2"
+        versionCode = 5
+        versionName = "0.3.0-m13b.2.3"
 
         // Only the phone ABI: this APK exists to be installed by the owner.
         ndk {

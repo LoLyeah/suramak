@@ -3,8 +3,9 @@
 //! A **cdylib-only** Android app: a `GameActivity` (androidx `games-activity`)
 //! hosts a winit window, wgpu draws with the Vulkan backend, and egui owns the
 //! entire UI. The Kotlin side is a thin shim (`android/app/src/main/java/…`)
-//! that loads this library and forwards window insets, back presses, IME text,
-//! lifecycle lines and a recreate trigger over JNI (Rust -> Kotlin).
+//! that loads this library and forwards window insets, back presses, IME text
+//! and lifecycle lines over JNI (Kotlin -> Rust), plus two best-effort helpers
+//! in the other direction (insets push, crash overlay).
 //!
 //! v2 (`docs/WORKORDER-M13B2.md`) turns the spike into a self-diagnostics rig:
 //! [`diag`] owns a panic hook, a crash file that survives the process and an
@@ -21,6 +22,14 @@
 //! ([`surface_lifecycle`]): nothing may be built or drawn while suspended, and a
 //! dead surface is replaced (fresh surface + fresh egui context), never
 //! `configure()`d across a `surfaceDestroyed`.
+//!
+//! v2.3 (`docs/WORKORDER-M13B5.md`) closes the recreate edge: the
+//! "Recreate activity" button no longer reaches Java at all. The shim's
+//! Rust → Kotlin handle is `ndk_context`'s, which `android-activity` 0.6.1
+//! initialises with the **Application** — so the old `postRecreate()` call could
+//! only fail its method lookup (`Java exception was thrown`) and no Activity
+//! code ever ran. The button is now a named limitation rendered by [`ui`], with
+//! no flag for the frame loop and no Kotlin method to reach.
 //!
 //! Nothing here is shared with `suramak-ui`: the spike exists to answer four
 //! questions on a real device before M13 commits to option A

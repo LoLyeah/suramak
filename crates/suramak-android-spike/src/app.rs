@@ -73,6 +73,15 @@
 //! Every failure here is recorded, not fatal: GPU init failures are retried and
 //! surfaced, a panic inside the frame is caught at the frame boundary, and the
 //! surface can be rebuilt on demand from the UI ("Restart surface").
+//!
+//! **v2.3: no Activity relaunch from here.** The frame loop used to carry a
+//! `recreate_requested` flag to a `platform::request_activity_recreate()` call.
+//! That is gone: the flag, the call, and the Kotlin method it addressed no
+//! longer exist, so nothing this loop draws can ask Android to relaunch the
+//! Activity. The evidence for why (the JNI context is the Application, not the
+//! Activity, so the old call could only fail its method lookup) is in
+//! `docs/reports/M13b5-spike-v2.3.md` §3; the button now reports the limitation
+//! from [`crate::ui`] alone.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -642,7 +651,7 @@ impl Handler {
         let dt = now.saturating_duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
 
-        let (restart, recreate, ime_caret) = {
+        let (restart, ime_caret) = {
             let mut state = lock_state();
             state.tick(dt);
             let (insets, back_presses) = platform::drain();
@@ -670,11 +679,7 @@ impl Handler {
                 let _ = platform::take_ime_text();
             }
 
-            (
-                std::mem::take(&mut state.restart_surface),
-                std::mem::take(&mut state.recreate_requested),
-                caret,
-            )
+            (std::mem::take(&mut state.restart_surface), caret)
         };
 
         // The caret position is egui *per-context* widget state, so it has to go
@@ -744,25 +749,11 @@ impl Handler {
             }
         }
 
-        // Outside the state lock while the JNI call runs: it can block on the UI
-        // thread. The outcome goes to the lifecycle tab's status line, because a
-        // recreate that fails only in the log is indistinguishable from one that
-        // worked (v2's did exactly that: `Java exception was thrown`, nothing on
-        // screen, no recreate).
-        if recreate {
-            let outcome = platform::request_activity_recreate();
-            let mut state = lock_state();
-            match outcome {
-                Ok(()) => {
-                    log::info!("activity recreate requested — Kotlin posts Activity.recreate()");
-                    state.note_recreate(Ok(()));
-                }
-                Err(err) => {
-                    log::error!("activity recreate failed: {err}");
-                    state.note_recreate(Err(&err));
-                }
-            }
-        }
+        // v2.3: there is deliberately no recreate branch here. The button's
+        // whole effect happens in `ui` (a status line in `SpikeState`); the
+        // frame loop has no flag to consume and `platform` has no
+        // `request_activity_recreate` to call, so no frame can reach Android's
+        // relaunch machinery. See `docs/reports/M13b5-spike-v2.3.md` §4.
 
         self.maybe_request_insets();
     }
