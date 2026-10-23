@@ -8,8 +8,8 @@
 #   2. cross-builds the Rust cdylib for arm64-v8a with cargo-ndk, dropping
 #      libsuramak_android_spike.so into android/app/src/main/jniLibs/;
 #   3. runs ./gradlew assembleDebug (Kotlin shim + manifest + jniLibs → APK);
-#   4. asserts the APK exists and really contains the .so, then prints its
-#      path, size and sha256.
+#   4. asserts the APK exists and really contains the .so, the right version
+#      and the crash-log FileProvider, then prints its path, size and sha256.
 #
 # It installs nothing and needs no sudo. Environment (all optional):
 #   ANDROID_HOME / ANDROID_SDK_ROOT   SDK root (default ~/android-sdk)
@@ -140,13 +140,13 @@ if [ -x "$AAPT" ]; then
   # Same SIGPIPE reasoning as above: match in the shell, not through a pipe.
   BADGING="$("$AAPT" dump badging "$APK")"
   case "$BADGING" in
-    *"package: name='app.suramak.spike' versionCode='2' versionName='0.3.0-m13b.2'"*) ;;
+    *"package: name='app.suramak.spike' versionCode='3' versionName='0.3.0-m13b.2.1'"*) ;;
     *)
       # Fall back to a narrower match so a future versionCode bump does not
       # hide a real versionName regression.
       case "$BADGING" in
-        *"package: name='app.suramak.spike'"*"versionName='0.3.0-m13b.2'"*) ;;
-        *) fail "APK versionName is not 0.3.0-m13b.2 (see aapt output below)" ;;
+        *"package: name='app.suramak.spike'"*"versionName='0.3.0-m13b.2.1'"*) ;;
+        *) fail "APK versionName is not 0.3.0-m13b.2.1 (see aapt output below)" ;;
       esac
       ;;
   esac
@@ -157,6 +157,24 @@ if [ -x "$AAPT" ]; then
   case "$BADGING" in
     *"launchable-activity: name='app.suramak.spike.MainActivity'"*) ;;
     *) fail "APK has no launchable app.suramak.spike.MainActivity" ;;
+  esac
+  # v2.1: the crash banner's "Share log" route has to be in the *packaged*
+  # manifest — a missing provider turns the button into an exception on the
+  # phone, which is the one place it cannot be debugged.
+  MANIFEST_TREE="$("$AAPT" dump xmltree "$APK" AndroidManifest.xml)"
+  case "$MANIFEST_TREE" in
+    *"androidx.core.content.FileProvider"*) ;;
+    *) fail "APK manifest declares no FileProvider (Share log would fail on the phone)" ;;
+  esac
+  case "$MANIFEST_TREE" in
+    *"app.suramak.spike.fileprovider"*) ;;
+    *) fail "APK manifest has no app.suramak.spike.fileprovider authority" ;;
+  esac
+  # v2.1: back is intercepted through the platform dispatcher (see the back
+  # handler); without this flag Android 16 keeps the gesture on the system path.
+  case "$MANIFEST_TREE" in
+    *"enableOnBackInvokedCallback"*) ;;
+    *) fail "APK manifest does not enable the OnBackInvoked (predictive back) dispatcher" ;;
   esac
   printf '%s\n' "$BADGING" | grep -E "^(package|sdkVersion|targetSdkVersion|launchable-activity|native-code)" || true
 fi

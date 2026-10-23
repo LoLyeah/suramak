@@ -12,7 +12,10 @@
 //!
 //! * a **panic hook** that records message, location, thread and timestamp, the
 //!   last [`RING_CAPACITY`] platform events (the run-up to the failure) and
-//!   writes them to two files in the app's private files dir;
+//!   writes them to two files in the directory Kotlin hands over — the app's
+//!   external files dir since v2.1 (`Android/data/app.suramak.spike/files`), so
+//!   the phone's own file manager and the banner's **Share log** button can
+//!   reach them;
 //! * a **live crash buffer** so a panic contained by `catch_unwind` is visible
 //!   on screen in the same session, not only after a relaunch;
 //! * an **event ring** of the last [`RING_CAPACITY`] timestamped lines, fed by
@@ -226,7 +229,9 @@ pub fn crash_for_display() -> Option<CrashView> {
     })
 }
 
-/// Point the diagnostics at the app's private files dir. Called once from
+/// Point the diagnostics at the directory Kotlin chose for the crash files —
+/// the app's *external* files dir since v2.1 (`CrashFiles.dir`, browseable and
+/// shareable), with the private dir only as its fallback. Called once from
 /// `MainActivity.onCreate` (before `super.onCreate`, i.e. before `android_main`
 /// exists), which is also when the persisted crash record is loaded.
 pub fn set_files_dir(dir: &str) {

@@ -14,11 +14,12 @@ android {
         // compileSdk avoids the "targetSdk > compileSdk" AGP refusal.
         minSdk = 29
         targetSdk = 35
-        // v2: the self-diagnostics rig (WORKORDER-M13B2). `scripts/android/
-        // build-apk.sh` asserts this exact versionName with `aapt dump badging`,
-        // which is what the owner checks before installing.
-        versionCode = 2
-        versionName = "0.3.0-m13b.2"
+        // v2.1: the resume texture-rebuild fix + crash-log reachability
+        // (WORKORDER-M13B3). `scripts/android/build-apk.sh` asserts this exact
+        // versionName with `aapt dump badging`, which is what the owner checks
+        // before installing.
+        versionCode = 3
+        versionName = "0.3.0-m13b.2.1"
 
         // Only the phone ABI: this APK exists to be installed by the owner.
         ndk {

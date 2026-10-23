@@ -12,6 +12,10 @@
 //! crash banner and a collapsible log panel ([`ui`]). Nothing here changes the
 //! four checks' intent — it instruments them.
 //!
+//! v2.1 (`docs/WORKORDER-M13B3.md`) fixes the resume texture panic by tying the
+//! `egui::Context` to the GPU generation ([`gpu_context`]) and makes the crash
+//! files reachable from the phone (external files dir + a Kotlin share sheet).
+//!
 //! Nothing here is shared with `suramak-ui`: the spike exists to answer four
 //! questions on a real device before M13 commits to option A
 //! (`docs/PLAN-M13-ANDROID.md` §2.1).
@@ -19,6 +23,7 @@
 //! Build: `scripts/android/build-apk.sh` (cargo-ndk → Gradle).
 
 pub mod diag;
+pub mod gpu_context;
 pub mod ui;
 
 #[cfg(target_os = "android")]

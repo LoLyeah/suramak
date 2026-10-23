@@ -21,6 +21,10 @@
 //! drawing is disabled on its own, with the panic text on screen and a retry
 //! button, instead of taking the whole surface (and the other three checks)
 //! down with it.
+//!
+//! v2.1 changes no check: the banner's file path follows the crash files to the
+//! app's external files dir, and the **Share log** route lives on the Kotlin
+//! overlay (it has to work when this module cannot draw at all).
 
 use std::collections::VecDeque;
 
@@ -93,6 +97,15 @@ pub struct Insets {
     pub updates: u32,
 }
 
+/// What the "Recreate activity now" button last did, shown under it. `failed`
+/// means the JNI/Java call itself refused (v2's `View.post` path did exactly
+/// that on the owner's phone), not merely "nothing visible happened yet".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecreateStatus {
+    pub text: String,
+    pub failed: bool,
+}
+
 /// Everything the spike counts. Lives in a `static` on Android so it survives
 /// the activity/surface being destroyed and recreated.
 #[derive(Debug)]
@@ -124,12 +137,20 @@ pub struct SpikeState {
     pub surface_restarts: u32,
     /// Set by the button, consumed by the frame loop.
     pub restart_surface: bool,
+    /// Outcome of the last "Recreate activity now" request (v2.1).
+    pub recreate_status: Option<RecreateStatus>,
     // (3) motion
     pub anim_seconds: f64,
     frame_times: VecDeque<f32>,
     pub frames: u64,
     // (4) insets + back
     pub insets: Insets,
+    /// `true` while the inset values on screen are known to be stale — set at
+    /// start and by both reset buttons (which zero the counters). `app.rs` sees
+    /// it and asks Kotlin to push a fresh set (`postPushInsets`); `set_insets`
+    /// clears it. Without this, a reset left the panel at 0/0 forever, because
+    /// the platform only dispatches insets when they *change*.
+    pub insets_stale: bool,
     pub back_presses: u32,
     pub recreate_requested: bool,
     // diagnostics
@@ -170,10 +191,12 @@ impl Default for SpikeState {
             recreate_requests: 0,
             surface_restarts: 0,
             restart_surface: false,
+            recreate_status: None,
             anim_seconds: 0.0,
             frame_times: VecDeque::with_capacity(MAX_FRAME_SAMPLES),
             frames: 0,
             insets: Insets::default(),
+            insets_stale: true,
             back_presses: 0,
             recreate_requested: false,
             backend: "not initialised".to_owned(),
@@ -249,6 +272,25 @@ impl SpikeState {
             ime_bottom,
             updates: self.insets.updates.saturating_add(1),
         };
+        self.insets_stale = false;
+    }
+
+    /// Record the outcome of the last "Recreate activity now" press for the
+    /// button's status line. `Err` carries the JNI/Java reason verbatim: v2's
+    /// `MainActivity.postRecreate()` surfaced as
+    /// `Java exception was thrown` and nothing on screen said so.
+    pub fn note_recreate(&mut self, outcome: Result<(), &str>) {
+        self.recreate_status = Some(match outcome {
+            Ok(()) => RecreateStatus {
+                text: "recreate requested — watch the LOG for `kotlin: recreate` then onDestroy/onCreate"
+                    .to_owned(),
+                failed: false,
+            },
+            Err(err) => RecreateStatus {
+                text: format!("recreate failed: {err}"),
+                failed: true,
+            },
+        });
     }
 
     /// Pull the crash record and the event ring only when they changed.
@@ -334,10 +376,12 @@ impl SpikeState {
         self.surface_recreates = 0;
         self.recreate_requests = 0;
         self.surface_restarts = 0;
+        self.recreate_status = None;
         self.frame_times.clear();
         self.frames = 0;
         self.back_presses = 0;
         self.insets = Insets::default();
+        self.insets_stale = true;
         self.anim_seconds = 0.0;
         self.tab_errors = [None, None, None, None];
     }
@@ -359,6 +403,7 @@ impl SpikeState {
                 self.probe.clear();
                 self.recreate_requests = 0;
                 self.surface_restarts = 0;
+                self.recreate_status = None;
             }
             Tab::Motion => {
                 self.frame_times.clear();
@@ -367,6 +412,7 @@ impl SpikeState {
             }
             Tab::Insets => {
                 self.insets = Insets::default();
+                self.insets_stale = true;
                 self.back_presses = 0;
             }
         }
@@ -413,7 +459,7 @@ fn draw_header(ctx: &egui::Context, state: &mut SpikeState) {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new("M13B v2 DIAGNOSTICS")
+                egui::RichText::new("M13B v2.1 DIAGNOSTICS")
                     .size(24.0)
                     .strong()
                     .color(egui::Color32::from_rgb(120, 190, 255)),
@@ -440,7 +486,7 @@ fn draw_header(ctx: &egui::Context, state: &mut SpikeState) {
             }
         });
         ui.label(
-            egui::RichText::new("build 0.3.0-m13b.2 · crash text survives a restart")
+            egui::RichText::new("build 0.3.0-m13b.2.1 · crash text survives a restart")
                 .size(10.0)
                 .color(egui::Color32::from_gray(120)),
         );
@@ -509,9 +555,12 @@ fn draw_crash_banner(ctx: &egui::Context, state: &mut SpikeState) {
                     }
                 }
                 ui.label(
-                    egui::RichText::new("deletes files/spike-last-crash.txt + the history log")
-                        .size(10.0)
-                        .color(DIM),
+                    egui::RichText::new(
+                        "deletes spike-last-crash.txt + the history log (Android/data/\
+                         app.suramak.spike/files — share it from the Kotlin banner)",
+                    )
+                    .size(10.0)
+                    .color(DIM),
                 );
             });
             egui::ScrollArea::vertical()
@@ -887,6 +936,25 @@ fn draw_lifecycle_check(ui: &mut egui::Ui, state: &mut SpikeState) {
         state.recreate_requested = true;
         state.recreate_requests += 1;
     }
+    // The outcome as the JNI call reported it. v2 said nothing here and the
+    // button looked like it worked while the shim was throwing.
+    if let Some(status) = &state.recreate_status {
+        ui.label(
+            egui::RichText::new(&status.text)
+                .size(11.5)
+                .color(if status.failed { RED } else { AMBER }),
+        );
+    }
+    ui.label(
+        egui::RichText::new(
+            "Recreate goes through MainActivity.postRecreate() → Activity.recreate() on the UI thread. \
+             If it fails, the reason is on the line above; if the Activity does not come back, Home → \
+             return and \"Restart surface\" exercise the same surface rebuild without asking Android to \
+             relaunch the Activity.",
+        )
+        .size(11.5)
+        .color(egui::Color32::from_gray(150)),
+    );
     ui.add_space(6.0);
     if ui
         .add_sized(
@@ -899,9 +967,11 @@ fn draw_lifecycle_check(ui: &mut egui::Ui, state: &mut SpikeState) {
     }
     ui.label(
         egui::RichText::new(
-            "Restart surface drops the wgpu surface, device, queue and renderer and rebuilds them \
-             against the current window — the same path a suspend/resume takes, on demand. If it \
-             fails, the reason is in the log line and the gpu error above.",
+            "Restart surface drops the wgpu surface, device, queue, renderer and egui context and \
+             rebuilds them against the current window — the same path a suspend/resume takes, on \
+             demand. The context goes with the renderer on purpose: a kept context patches texture \
+             ids the new renderer never allocated (the v2 crash). If it fails, the reason is in the \
+             log line and the gpu error above.",
         )
         .size(11.5)
         .color(egui::Color32::from_gray(150)),
@@ -1029,6 +1099,16 @@ fn draw_insets_check(ui: &mut egui::Ui, state: &mut SpikeState) {
             .size(15.0)
             .monospace(),
     );
+    if state.insets_stale && state.insets.updates == 0 {
+        ui.label(
+            egui::RichText::new(
+                "no push yet — asked Kotlin for one; it also re-pushes on resume, focus gain and \
+                 every insets dispatch",
+            )
+            .size(11.0)
+            .color(AMBER),
+        );
+    }
     ui.label(
         egui::RichText::new(format!("back presses intercepted: {}", state.back_presses))
             .size(20.0)
@@ -1048,7 +1128,9 @@ fn draw_insets_check(ui: &mut egui::Ui, state: &mut SpikeState) {
     ui.label(
         egui::RichText::new(
             "Go if: top/bottom are non-zero with the system bars visible, the keyboard raises \
-             \"ime bottom\", and the back gesture only increments the counter.",
+             \"ime bottom\", and the back gesture only increments the counter. Back is intercepted \
+             on all three Android paths (OnBackInvokedCallback, OnBackPressedDispatcher, back key \
+             events) — every press must count once and the app must never leave.",
         )
         .size(12.0)
         .color(egui::Color32::from_gray(150)),
@@ -1152,10 +1234,14 @@ mod tests {
         };
         state.observe_text();
         state.back_presses = 2;
+        state.set_insets(64, 48, 0, 0, 0);
         state.reset_counters();
         assert_eq!(state.tab, Tab::Insets);
         assert_eq!(state.chars_received, 0);
         assert_eq!(state.back_presses, 0);
+        // The reset zeroed the insets, so they are stale until Kotlin pushes
+        // again — that is what keeps the panel from sitting at 0/0.
+        assert!(state.insets_stale);
     }
 
     #[test]
@@ -1181,6 +1267,7 @@ mod tests {
         };
         state.observe_text();
         state.set_insets(64, 48, 0, 0, 0);
+        assert!(!state.insets_stale, "a push must clear the stale flag");
 
         state.reset_tab(Tab::Text);
         assert_eq!(state.chars_received, 0);
@@ -1195,7 +1282,42 @@ mod tests {
         state.reset_tab(Tab::Insets);
         assert_eq!(state.back_presses, 0);
         assert_eq!(state.insets.top, 0);
+        // The zeroed values are stale by definition: the frame loop must ask
+        // Kotlin for a fresh push, or the panel stays 0/0 forever (v2.1 field
+        // report).
+        assert!(
+            state.insets_stale,
+            "an insets reset must ask for a fresh push"
+        );
         assert_eq!(state.probe, "lifecycle-123");
+    }
+
+    /// The lifecycle tab's status line is the only thing that made v2's broken
+    /// recreate visible; it must carry the reason and be cleared by a reset.
+    #[test]
+    fn a_failed_recreate_is_surfaced_and_cleared_by_reset() {
+        let mut state = SpikeState::default();
+        state.note_recreate(Err(
+            "MainActivity.postRecreate(): Java exception was thrown",
+        ));
+        let status = state.recreate_status.clone().expect("a status line");
+        assert!(status.failed, "a JNI failure must read as a failure");
+        assert!(status.text.contains("Java exception"), "{}", status.text);
+
+        state.note_recreate(Ok(()));
+        let status = state.recreate_status.clone().unwrap();
+        assert!(!status.failed);
+        assert!(
+            status.text.contains("recreate requested"),
+            "{}",
+            status.text
+        );
+
+        state.reset_tab(Tab::Lifecycle);
+        assert!(
+            state.recreate_status.is_none(),
+            "reset clears the status line"
+        );
     }
 
     #[test]
@@ -1249,6 +1371,9 @@ mod tests {
         state.observe_text();
         state.set_insets(64, 48, 0, 0, 0);
         state.back_presses = 2;
+        // Exercise the v2.1 status lines too: a failed recreate (lifecycle tab)
+        // and a stale-insets hint (insets tab) are draw paths like any other.
+        state.note_recreate(Err("java.lang.IllegalStateException: recreate refused"));
         for _ in 0..30 {
             state.tick(1.0 / 60.0);
         }

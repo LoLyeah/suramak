@@ -1,7 +1,8 @@
 //! The JNI surface between the Kotlin shim and the Rust UI thread.
 //!
 //! Kotlin → Rust (exported here, called from `MainActivity`):
-//!   * `nativeInit(filesDir)` — where the crash files live; first call wins.
+//!   * `nativeInit(filesDir)` — where the crash files live (the app's external
+//!     files dir since v2.1); first call wins.
 //!   * `nativeSetInsets(top, bottom, left, right, imeBottom)` — window insets in px;
 //!   * `nativeBackPressed()` — a back gesture/button was intercepted;
 //!   * `nativeImeText(text, selectionStart, selectionEnd)` — the soft keyboard's
@@ -330,9 +331,19 @@ pub extern "system" fn Java_app_suramak_spike_MainActivity_nativeImeText(
 ///
 /// `Activity.recreate()` must run on the UI thread, so this calls the Kotlin
 /// helper `postRecreate()`, which posts the call; we never touch a View from
-/// this (android_main) thread.
+/// this (android_main) thread. Since v2.1 the helper is exception-proof: a
+/// failure comes back as `Err` (and lands on the lifecycle tab's status line),
+/// instead of v2's silent `Java exception was thrown`.
 pub fn request_activity_recreate() -> Result<(), String> {
     call_activity("postRecreate")
+}
+
+/// Ask Kotlin to re-read the window insets and push them again. Used when the
+/// UI knows its inset values are stale: a reset button zeroes the counters, and
+/// before v2.1 nothing ever pushed them again (the panel sat at 0/0 for the rest
+/// of the session).
+pub fn request_insets_push() -> Result<(), String> {
+    call_activity("postPushInsets")
 }
 
 /// Ask Kotlin to (re)read `spike-last-crash.txt` and put it on screen. Used on

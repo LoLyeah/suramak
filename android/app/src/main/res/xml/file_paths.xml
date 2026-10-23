@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  What the crash banner's "Share log" button (MainActivity.shareCrashLog) may
+  hand to another app through the FileProvider declared in AndroidManifest.xml.
+
+  Both roots are the app's own files dirs, because CrashFiles writes to the
+  external one and falls back to the private one when external storage is not
+  mounted. `path="."` covers the whole directory; the only files in it are the
+  spike's crash record, history and session marker.
+-->
+<paths>
+    <external-files-path name="crash_external" path="." />
+    <files-path name="crash_internal" path="." />
+</paths>

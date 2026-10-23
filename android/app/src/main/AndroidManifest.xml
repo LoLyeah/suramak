@@ -8,7 +8,13 @@
     needs to observe.
   * screenOrientation="unspecified": the owner can rotate the phone; the
     recreation is part of the test.
-  * No permissions: this spike does no I/O.
+  * No permissions: this spike does no I/O beyond its own files dirs. The crash
+    files moved to app-specific external storage in v2.1, which needs no
+    permission either.
+  * The FileProvider is the crash banner's "Share log" route: it hands
+    spike-last-crash.txt to the share sheet as a content:// URI with a one-shot
+    read grant. `androidx.core.content.FileProvider` ships in androidx.core
+    (already on the classpath through appcompat), so no dependency was added.
 
   The activity extends com.google.androidgamesdk.GameActivity, so the theme must
   be an AppCompat descendant (GameActivity extends AppCompatActivity).
@@ -18,6 +24,7 @@
     <application
         android:name=".SpikeApp"
         android:allowBackup="false"
+        android:enableOnBackInvokedCallback="true"
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@style/Theme.SuramakSpike">
@@ -33,6 +40,16 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 
 </manifest>

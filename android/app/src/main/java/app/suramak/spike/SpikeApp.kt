@@ -18,6 +18,10 @@ import android.util.Log
 class SpikeApp : Application() {
     override fun onCreate() {
         super.onCreate()
+        // v2 → v2.1: get the crash files out of /data/data/…/files (invisible to
+        // every file manager) and into Android/data/…/files, before any Activity
+        // or native init can read or write them.
+        CrashFiles.migrate(this)?.let { Log.i(TAG, it) }
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, error ->
             try {

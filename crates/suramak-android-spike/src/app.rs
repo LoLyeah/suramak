@@ -4,11 +4,12 @@
 //! an `EventLoop` bound to the `AndroidApp`, an `ApplicationHandler` creates the
 //! window on `resumed`, and a `ControlFlow::Poll` loop draws every vsync.
 //!
-//! Lifecycle (v2, audited): the counters live in a process-wide
+//! Lifecycle (v2.1, audited): the counters live in a process-wide
 //! `OnceLock<Mutex<_>>` ([`state`]), *not* in this handler, because
-//! `android_main` runs again after an Activity recreation. The GPU objects
-//! (surface, device, queue, renderer, `egui_winit::State`) are dropped on
-//! `suspended` and rebuilt on `resumed`; the `Window` is kept, because winit's
+//! `android_main` runs again after an Activity recreation. The whole **GPU
+//! generation** — surface, device, queue, `egui_wgpu::Renderer`,
+//! `egui_winit::State` **and the `egui::Context`** — is dropped on `suspended`
+//! and rebuilt from scratch on `resumed`; the `Window` is kept, because winit's
 //! Android window is a *logical* handle (`{ AndroidApp, redraw_requester }`) that
 //! re-reads the current `ANativeWindow` from the `AndroidApp` on every
 //! `raw_window_handle` call, and returns `HandleError::Unavailable` while
@@ -18,6 +19,24 @@
 //! `Poll` loop ran forever after the Activity died, holding an `AndroidApp` (and
 //! its JNI global ref) per recreation. `MainActivity.onDestroy` now tells us
 //! through `platform::activity_destroyed()`, and `about_to_wait` exits.
+//!
+//! **Why the context goes with the renderer (v2.1 fix).** v2 kept the
+//! `egui::Context` on the handler and rebuilt only the GPU objects, which made
+//! the resume path emit texture *updates* for ids the fresh renderer had never
+//! allocated: `egui-wgpu-0.33.3/src/renderer.rs:657` panics with "Tried to update
+//! a texture that has not been allocated yet." on the first frame after every
+//! successful resume-rebuild (field report: crash #4, `thread <unnamed>`, first
+//! frame after a resume). egui's context owns the texture *bookkeeping* and the
+//! renderer owns the GPU copies: they are one pair, so the context now lives in
+//! [`Gpu`] and is built by [`gpu_context::new_context`] on every build. No
+//! `egui::Context` exists outside this module and [`crate::ui`]'s `&Context`
+//! parameters, so "a context that outlives its renderer" is unrepresentable
+//! rather than merely discouraged. The alternative — keeping the context and
+//! teaching egui to re-send full texture state — needs API that does not exist
+//! (a context cannot be told to forget its textures), so this is a full rebuild
+//! by choice; the cost is egui's per-context UI state (caret, scroll, hover),
+//! not the spike's, which is app-owned in [`SpikeState`]. See
+//! `docs/reports/M13b3-spike-v2.1.md` §2.
 //!
 //! Every failure here is recorded, not fatal: GPU init failures are retried and
 //! surfaced, a panic inside the frame is caught at the frame boundary, and the
@@ -34,6 +53,7 @@ use winit::platform::android::EventLoopBuilderExtAndroid;
 use winit::window::{Window, WindowId};
 
 use crate::diag;
+use crate::gpu_context;
 use crate::platform;
 use crate::ui::{self, SpikeState};
 
@@ -46,6 +66,12 @@ static MAIN_ENTRIES: AtomicU32 = AtomicU32::new(0);
 /// Attempts at GPU init per `android_main`, and the pause between them.
 const GPU_ATTEMPTS: u32 = 3;
 const GPU_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// How often the UI may ask Kotlin for a fresh insets push while its values are
+/// known to be stale (see [`Handler::maybe_request_insets`]).
+const INSETS_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
+/// How many automatic "drop everything, draw one clean frame" rebuilds a
+/// contained frame panic gets before the app waits for the button.
+const MAX_POST_PANIC_REPAINTS: u32 = 2;
 
 /// The spike's single source of truth (see the module docs).
 pub fn state() -> &'static Mutex<SpikeState> {
@@ -79,10 +105,11 @@ pub fn run(app: android_activity::AndroidApp, generation: u32) {
     let mut handler = Handler {
         window: None,
         gpu: None,
-        egui_ctx: egui_context(),
         last_frame: Instant::now(),
         gpu_attempts: 0,
         next_gpu_retry: None,
+        next_insets_request: None,
+        panic_rebuilds: 0,
         generation,
     };
     if let Err(err) = event_loop.run_app(&mut handler) {
@@ -140,37 +167,21 @@ impl log::Log for SpikeLogger {
     fn flush(&self) {}
 }
 
-fn egui_context() -> egui::Context {
-    let ctx = egui::Context::default();
-    ctx.set_visuals(egui::Visuals::dark());
-    // Phone-sized defaults: the spike is read at arm's length.
-    ctx.style_mut(|style| {
-        style
-            .text_styles
-            .insert(egui::TextStyle::Body, egui::FontId::proportional(17.0));
-        style
-            .text_styles
-            .insert(egui::TextStyle::Button, egui::FontId::proportional(16.0));
-        style
-            .text_styles
-            .insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
-        style
-            .text_styles
-            .insert(egui::TextStyle::Heading, egui::FontId::proportional(24.0));
-        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-        style.spacing.button_padding = egui::vec2(12.0, 10.0);
-    });
-    ctx
-}
-
 struct Handler {
     window: Option<Arc<Window>>,
+    /// The current GPU generation: surface, device, queue, renderer, egui state
+    /// **and the `egui::Context`** (see the module docs). `None` while suspended
+    /// or after a failed build.
     gpu: Option<Gpu>,
-    egui_ctx: egui::Context,
     last_frame: Instant,
     /// GPU init attempts in this `android_main` (0 = never tried).
     gpu_attempts: u32,
     next_gpu_retry: Option<Instant>,
+    /// Earliest time the UI may ask Kotlin for a fresh insets push.
+    next_insets_request: Option<Instant>,
+    /// Automatic clean repaints after a contained frame panic (bounded by
+    /// [`MAX_POST_PANIC_REPAINTS`]).
+    panic_rebuilds: u32,
     /// Which Activity instance this loop belongs to (see
     /// [`platform::activity_destroyed`]).
     generation: u32,
@@ -217,14 +228,18 @@ impl ApplicationHandler for Handler {
 
     fn suspended(&mut self, event_loop: &ActiveEventLoop) {
         // The ANativeWindow behind the surface is going away; drop every wgpu
-        // object that references it. The `Window` itself is kept: it is a
-        // logical handle over `AndroidApp` and re-reads the native window on the
-        // next `raw_window_handle` (see the module docs).
+        // object that references it — and the `egui::Context` with them. The
+        // context owns the texture *bookkeeping* for the renderer being
+        // dropped; keeping it would make the next generation patch ids it never
+        // allocated (`renderer.rs:657`, see the module docs).
         let had_gpu = self.gpu.is_some();
         log::info!("event: suspended — releasing wgpu objects (had gpu: {had_gpu})");
         self.gpu = None;
         if had_gpu {
-            log::info!("event: suspended — surface/device/queue/renderer dropped");
+            log::info!(
+                "event: suspended — surface/device/queue/renderer/egui context dropped \
+                 (next resume rebuilds all of them)"
+            );
         }
         // There is nothing to draw while suspended, and `ControlFlow::Poll`
         // would spin a core for the whole time the app is in the background
@@ -298,7 +313,8 @@ impl ApplicationHandler for Handler {
 }
 
 impl Handler {
-    /// Build (or rebuild) the wgpu surface and renderer.
+    /// Build (or rebuild) one GPU generation: surface, device, queue, renderer,
+    /// egui state **and a fresh `egui::Context`**.
     fn build_gpu(&mut self, reason: &str) {
         let Some(window) = self.window.clone() else {
             return;
@@ -306,13 +322,17 @@ impl Handler {
         self.gpu_attempts = self.gpu_attempts.saturating_add(1);
         let attempt = self.gpu_attempts;
         let started = Instant::now();
-        match Gpu::new(window, self.egui_ctx.clone()) {
+        match Gpu::new(window) {
             Ok(gpu) => {
                 let adapter = gpu.adapter_info.clone();
                 let previous_builds = GPU_BUILDS.fetch_add(1, Ordering::SeqCst);
                 log::info!(
                     "gpu ready ({reason}, attempt {attempt}, {:.0} ms): {adapter}",
                     started.elapsed().as_secs_f64() * 1000.0
+                );
+                log::info!(
+                    "egui context rebuilt with it (fresh texture registry: every id re-registers \
+                     through a full-image create)"
                 );
                 {
                     let mut state = lock_state();
@@ -367,10 +387,10 @@ impl Handler {
         }
     }
 
-    /// Drop the wgpu surface and everything that depends on it, then rebuild
-    /// against the current `ANativeWindow`. This is the suspend/resume path made
-    /// user-triggerable, so check (2) can be repeated on demand instead of
-    /// requiring an app switch.
+    /// Drop the wgpu surface and everything that depends on it — the egui
+    /// context included — then rebuild against the current `ANativeWindow`.
+    /// This is the suspend/resume path made user-triggerable, so check (2) can
+    /// be repeated on demand instead of requiring an app switch.
     fn restart_surface(&mut self, reason: &str) {
         let Some(window) = self.window.clone() else {
             log::warn!("surface restart requested ({reason}) but there is no window");
@@ -397,7 +417,7 @@ impl Handler {
         let dt = now.saturating_duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
 
-        let (restart, recreate) = {
+        let (restart, recreate, ime_caret) = {
             let mut state = lock_state();
             state.tick(dt);
             let (insets, back_presses) = platform::drain();
@@ -408,15 +428,16 @@ impl Handler {
 
             // The IME's editing state is authoritative for the text field: it
             // arrives from the Kotlin `stateChanged` listener because winit
-            // drops android-activity's text events. Apply it *before* the
-            // widgets run, and move egui's caret to the IME's selection, so the
-            // next keystroke lands where the user sees the cursor.
+            // drops android-activity's text events. The buffer is app state, so
+            // it is applied whether or not a surface exists; the caret can only
+            // move inside a live egui context (see below).
+            let mut caret = None;
             if state.ime_bridge {
                 if let Some(ime) = platform::take_ime_text() {
                     state.ime_updates = state.ime_updates.saturating_add(1);
                     state.text = ime.text;
                     state.ime_cursor = Some((ime.selection_start, ime.selection_end));
-                    ui::set_text_cursor(&self.egui_ctx, ime.selection_start, ime.selection_end);
+                    caret = Some((ime.selection_start, ime.selection_end));
                 }
             } else {
                 // Keep the channel from replaying a stale buffer if the bridge
@@ -427,41 +448,112 @@ impl Handler {
             (
                 std::mem::take(&mut state.restart_surface),
                 std::mem::take(&mut state.recreate_requested),
+                caret,
             )
         };
+
+        // The caret position is egui *per-context* widget state, so it has to go
+        // through the context that will draw the next frame. After a rebuild
+        // that state is empty (documented cost); the next IME callback re-pushes
+        // it, and `ui::set_text_cursor` is a no-op until the field has state.
+        if let (Some((start, end)), Some(gpu)) = (ime_caret, self.gpu.as_ref()) {
+            ui::set_text_cursor(&gpu.egui_ctx, start, end);
+        }
 
         if restart {
             self.restart_surface("button");
         }
 
         if let Some(gpu) = self.gpu.as_mut() {
-            let egui_ctx = self.egui_ctx.clone();
             // A panic while laying out or submitting a frame must not unwind
             // through winit into `android_main`: android-activity would then
             // finish the Activity and the app would close with no visible
-            // reason. Contain it here, drop the poisoned surface, and let
-            // "Restart surface" (or the retry path) rebuild.
+            // reason. Contain it here, drop the poisoned generation (context
+            // included), and let "Restart surface" (or the retry path) rebuild.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut state = lock_state();
-                gpu.frame(&egui_ctx, &mut state);
+                gpu.frame(&mut state);
                 state.observe_text();
             }));
             if let Err(payload) = outcome {
                 let text = diag::payload_text(payload.as_ref());
                 diag::note_contained("frame (egui/wgpu)");
-                log::error!("frame panicked: {text}");
-                lock_state().gpu_error = Some(format!("frame panic: {text} — tap Restart surface"));
+                log::error!(
+                    "frame panicked: {text} — dropping the whole gpu generation (egui context \
+                     included); the rebuild draws one clean full repaint"
+                );
+                lock_state().gpu_error = Some(format!("frame panic: {text}"));
                 self.gpu = None;
-                self.next_gpu_retry = Some(Instant::now() + GPU_RETRY_DELAY);
+                // One clean repaint, immediately: rebuild the generation (which
+                // drops the old context, its stale texture ids and the half-
+                // rendered frame) and let the next redraw present from scratch.
+                // Bounded, so a repeatable panic cannot spin here.
+                if self.panic_rebuilds < MAX_POST_PANIC_REPAINTS {
+                    self.panic_rebuilds = self.panic_rebuilds.saturating_add(1);
+                    log::warn!(
+                        "frame: post-panic repaint {} of {MAX_POST_PANIC_REPAINTS} — rebuilding \
+                         a fresh gpu generation now",
+                        self.panic_rebuilds
+                    );
+                    self.build_gpu("post-panic repaint");
+                } else {
+                    log::error!(
+                        "frame: {MAX_POST_PANIC_REPAINTS} post-panic repaints already spent — \
+                         tap Restart surface once the cause is understood"
+                    );
+                    lock_state().gpu_error =
+                        Some(format!("frame panic: {text} — tap Restart surface"));
+                    self.next_gpu_retry = Some(Instant::now() + GPU_RETRY_DELAY);
+                }
             }
         }
 
-        // Outside the state lock: the JNI call can block on the UI thread.
+        // Outside the state lock while the JNI call runs: it can block on the UI
+        // thread. The outcome goes to the lifecycle tab's status line, because a
+        // recreate that fails only in the log is indistinguishable from one that
+        // worked (v2's did exactly that: `Java exception was thrown`, nothing on
+        // screen, no recreate).
         if recreate {
-            match platform::request_activity_recreate() {
-                Ok(()) => log::info!("activity recreate requested"),
-                Err(err) => log::error!("activity recreate failed: {err}"),
+            let outcome = platform::request_activity_recreate();
+            let mut state = lock_state();
+            match outcome {
+                Ok(()) => {
+                    log::info!("activity recreate requested — Kotlin posts Activity.recreate()");
+                    state.note_recreate(Ok(()));
+                }
+                Err(err) => {
+                    log::error!("activity recreate failed: {err}");
+                    state.note_recreate(Err(&err));
+                }
             }
+        }
+
+        self.maybe_request_insets();
+    }
+
+    /// Ask Kotlin to re-push the window insets when the state says its values are
+    /// stale (a reset, or a first push that never arrived).
+    ///
+    /// The platform only dispatches insets when they *change*, so a reset that
+    /// zeroes the counters would otherwise leave the panel at 0/0 for the rest of
+    /// the session — the v2.1 field report. At most one request per second, and
+    /// the flag only clears when a real push arrives (`SpikeState::set_insets`),
+    /// so a missed request retries instead of giving up.
+    fn maybe_request_insets(&mut self) {
+        let stale = lock_state().insets_stale;
+        if !stale {
+            return;
+        }
+        let now = Instant::now();
+        if let Some(at) = self.next_insets_request {
+            if now < at {
+                return;
+            }
+        }
+        self.next_insets_request = Some(now + INSETS_REQUEST_INTERVAL);
+        match platform::request_insets_push() {
+            Ok(()) => log::info!("insets: stale — asked Kotlin for a fresh push"),
+            Err(err) => log::warn!("insets: stale and the push request failed: {err}"),
         }
     }
 }
@@ -472,13 +564,26 @@ struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    /// The egui context *this* renderer serves. Owned here, deliberately: egui
+    /// keeps the texture bookkeeping, `renderer` keeps the GPU textures, and a
+    /// context that outlives its renderer emits patches for unallocated ids
+    /// (`egui-wgpu` `renderer.rs:657`). One `Gpu` = one context = one registry.
+    egui_ctx: egui::Context,
     renderer: egui_wgpu::Renderer,
     egui_state: egui_winit::State,
+    /// The generation's first presented frame still owes a *clean* full repaint
+    /// (see the module docs and `docs/reports/M13b3-spike-v2.1.md` §2.4). It is
+    /// logged once, so the device log proves the repaint happened after a
+    /// suspend or a contained panic — the frames that used to ghost.
+    first_frame: bool,
     adapter_info: String,
 }
 
 impl Gpu {
-    fn new(window: Arc<Window>, egui_ctx: egui::Context) -> Result<Self, String> {
+    fn new(window: Arc<Window>) -> Result<Self, String> {
+        // Built here, dropped with `self`: the context is part of the GPU
+        // generation, not of the app (see the module docs).
+        let egui_ctx = gpu_context::new_context();
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
             ..Default::default()
@@ -528,7 +633,7 @@ impl Gpu {
         let renderer =
             egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
         let egui_state = egui_winit::State::new(
-            egui_ctx,
+            egui_ctx.clone(),
             egui::ViewportId::ROOT,
             window.as_ref(),
             Some(window.scale_factor() as f32),
@@ -547,8 +652,10 @@ impl Gpu {
             device,
             queue,
             config,
+            egui_ctx,
             renderer,
             egui_state,
+            first_frame: true,
             adapter_info,
         })
     }
@@ -562,7 +669,7 @@ impl Gpu {
         self.surface.configure(&self.device, &self.config);
     }
 
-    fn frame(&mut self, egui_ctx: &egui::Context, state: &mut SpikeState) {
+    fn frame(&mut self, state: &mut SpikeState) {
         // Some Android paths (first frame after a resume, or a rotation that
         // does not deliver `Resized` before the redraw) leave the surface at a
         // stale size; syncing here keeps the viewport correct either way.
@@ -575,11 +682,13 @@ impl Gpu {
         }
 
         let raw_input = self.egui_state.take_egui_input(&self.window);
-        let full_output = egui_ctx.run(raw_input, |ctx| ui::draw(ctx, state));
+        let full_output = self.egui_ctx.run(raw_input, |ctx| ui::draw(ctx, state));
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
         let pixels_per_point = full_output.pixels_per_point;
-        let paint_jobs = egui_ctx.tessellate(full_output.shapes, pixels_per_point);
+        let paint_jobs = self
+            .egui_ctx
+            .tessellate(full_output.shapes, pixels_per_point);
 
         for (id, image_delta) in &full_output.textures_delta.set {
             self.renderer
@@ -653,5 +762,18 @@ impl Gpu {
             .submit(user_commands.into_iter().chain(Some(encoder.finish())));
         self.window.pre_present_notify();
         frame.present();
+
+        if self.first_frame {
+            self.first_frame = false;
+            // The one clean repaint every generation owes: the pass cleared the
+            // surface, the renderer allocated every texture from a full image and
+            // the context had no stale ids to patch. This is the frame that used
+            // to ghost (double-rendered glyphs) when a rebuild reused the old
+            // context's atlas.
+            log::info!(
+                "first frame of this gpu generation presented — full repaint (cleared surface, \
+                 fresh texture registry, no stale ids)"
+            );
+        }
     }
 }

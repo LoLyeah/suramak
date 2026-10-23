@@ -1,10 +1,17 @@
 package app.suramak.spike
 
+import android.content.ClipData
+import android.content.Intent
 import android.graphics.Typeface
+import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.SurfaceHolder
 import android.view.View
 import android.view.ViewGroup
@@ -13,21 +20,26 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
+import android.window.OnBackInvokedDispatcher
 import androidx.activity.OnBackPressedCallback
+import androidx.core.content.FileProvider
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import com.google.androidgamesdk.GameActivity
 import com.google.androidgamesdk.gametextinput.State
 
 /**
- * M13b shell spike v2 — the entire Kotlin surface.
+ * M13b shell spike v2.1 — the entire Kotlin surface.
  *
  * Extends the androidx `GameActivity` (AGDK), which is what gives the Rust side
  * `GameTextInput` (the soft-keyboard path egui's IME support needs). This class
  * owns almost nothing visual: the UI is egui, drawn by
  * `libsuramak_android_spike.so`. The one exception is the crash overlay — a
  * plain `TextView` stack added over the surface, because it has to survive the
- * Rust side dying.
+ * Rust side dying. Since v2.1 that overlay also carries a **Share log** button
+ * (`FileProvider` + `ACTION_SEND`), so the crash record can leave the phone
+ * without a PC even when the Rust surface is dead.
  *
  * The JNI contract:
  *   Kotlin -> Rust   nativeInit(filesDir)                         [once, pre-super]
@@ -38,6 +50,9 @@ import com.google.androidgamesdk.gametextinput.State
  *   Kotlin -> Rust   nativeActivityDestroyed()  [stop the event loop]
  *   Rust -> Kotlin   postRecreate()             [posts Activity.recreate()]
  *   Rust -> Kotlin   postShowCrashOverlay()     [re-read the crash file, show it now]
+ *
+ * `filesDir` above is `CrashFiles.dir(this)` — the app's *external* files dir
+ * since v2.1 (`Android/data/app.suramak.spike/files`), not the private one.
  */
 class MainActivity : GameActivity() {
 
@@ -56,6 +71,15 @@ class MainActivity : GameActivity() {
      */
     @Volatile
     private var nativePanicked = false
+
+    /**
+     * Last IME height pushed, so `dispatchKeyEvent` can let back close the
+     * keyboard instead of swallowing the gesture that belongs to the IME.
+     */
+    private var lastImeBottom = 0
+
+    /** Uptime of the last counted back press, for cross-path dedupe. */
+    private var lastBackAtMs = 0L
 
     private external fun nativeInit(filesDir: String)
 
@@ -99,6 +123,12 @@ class MainActivity : GameActivity() {
         }
 
         private const val TAG = "SuramakSpike"
+
+        /**
+         * One physical back press can reach two of the three dispatch paths on
+         * some OEM builds; within this window it is one press.
+         */
+        private const val BACK_DEDUPE_MS = 250L
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -111,9 +141,13 @@ class MainActivity : GameActivity() {
 
         // One small bridge addition: the files dir, so the Rust panic hook can
         // persist a crash before `android_main` exists. Called before
-        // `super.onCreate`, which is what starts the native thread.
+        // `super.onCreate`, which is what starts the native thread. Since v2.1
+        // this is the *external* files dir (browseable, shareable) — the same
+        // one CrashFiles migrates into and reads from.
         try {
-            nativeInit(filesDir.absolutePath)
+            val dir = CrashFiles.dir(this)
+            nativeInit(dir.absolutePath)
+            Log.i(TAG, "crash files: ${dir.absolutePath} (external=${CrashFiles.isExternal(this)})")
         } catch (t: Throwable) {
             Log.e(TAG, "nativeInit failed", t)
         }
@@ -138,6 +172,9 @@ class MainActivity : GameActivity() {
         CrashFiles.beginSession(this)
         // The insets listener only fires when insets change; re-push on resume so
         // the Rust side always has a value after a surface/activity recreate.
+        // v2.1 also *asks* for a dispatch: after a reset (or a missed first push)
+        // nothing would ever change, and the panel sat at zeroes.
+        root?.let { ViewCompat.requestApplyInsets(it) }
         pushCurrentInsets()
         // A crash recorded by Rust while the surface was dead only becomes
         // readable here if the overlay missed it.
@@ -192,6 +229,13 @@ class MainActivity : GameActivity() {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         logToRust("onWindowFocusChanged $hasFocus")
+        // Focus changes are a cheap, reliable moment to re-read the window
+        // insets: system bars, gesture handles and cutouts can change while the
+        // app is backgrounded without any inset dispatch reaching us.
+        if (hasFocus) {
+            root?.let { ViewCompat.requestApplyInsets(it) }
+            pushCurrentInsets()
+        }
     }
 
     private fun installInsetsListener() {
@@ -201,11 +245,29 @@ class MainActivity : GameActivity() {
             insets
         }
         ViewCompat.requestApplyInsets(view)
+        // The first dispatch can arrive before the decor view is laid out, and
+        // `ViewCompat.getRootWindowInsets` is null until it is. v2 asked once and
+        // then depended on the platform to dispatch a *change*: if the first ask
+        // was early, the panel sat at zeroes forever. Ask on the next frame and
+        // once more after layout — cheap, and it makes the panel populate at
+        // launch without a configuration change.
+        view.post { pushCurrentInsets() }
+        view.postDelayed({ pushCurrentInsets() }, 300L)
     }
 
+    /**
+     * Push the current insets from wherever they are available now. Called on
+     * every dispatch, on resume, on focus gain, after layout, and on Rust's
+     * request (`postPushInsets`). Never throws: a missing window-insets object
+     * means "ask for a dispatch", not "leave the panel at zero".
+     */
     private fun pushCurrentInsets() {
         val view = root ?: return
-        val insets = ViewCompat.getRootWindowInsets(view) ?: return
+        val insets = ViewCompat.getRootWindowInsets(view)
+        if (insets == null) {
+            ViewCompat.requestApplyInsets(view)
+            return
+        }
         pushInsets(insets)
     }
 
@@ -214,32 +276,131 @@ class MainActivity : GameActivity() {
             WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
         )
         val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+        lastImeBottom = ime.bottom
         nativeSetInsets(bars.top, bars.bottom, bars.left, bars.right, ime.bottom)
     }
 
+    /**
+     * Called from Rust over JNI when the UI notices its inset values are stale
+     * (a reset button, or a first push that never arrived). The Rust thread must
+     * not touch a View, so this hops to the UI thread first.
+     */
+    @Suppress("unused") // referenced from platform.rs via JNI
+    fun postPushInsets() {
+        Handler(Looper.getMainLooper()).post { pushCurrentInsets() }
+    }
+
     private fun installBackHandler() {
-        // Enabled for the whole lifetime of this Activity: back must never exit
-        // the spike while the checks are on screen — unless the native side is
-        // dead, in which case leaving is the only useful thing back can do.
+        // Three dispatch paths, one funnel — because "back" is not one code path
+        // on Android any more:
+        //
+        //  1. `OnBackPressedDispatcher` (androidx): the legacy path, used below
+        //     API 33 and by the 3-button bar when predictive back is off.
+        //  2. `OnBackInvokedCallback` (API 33+): the predictive-back path. When
+        //     `android:enableOnBackInvokedCallback="true"` is in the manifest the
+        //     platform asks the *window's* dispatcher and never synthesises a
+        //     KEYCODE_BACK — without this registration the system's default
+        //     callback ("finish the Activity") wins, which is exactly what the
+        //     owner saw: first press swallowed, second press landed on the
+        //     launcher.
+        //  3. `dispatchKeyEvent`: a platform/OEM that still delivers a legacy
+        //     KEYCODE_BACK (or a hardware keyboard's back key) must not fall
+        //     through to `finish()` either.
+        //
+        // `handleBack` dedupes, so a press that reaches two of these paths is
+        // still counted once. Back never leaves the app while the checks are on
+        // screen; the crash overlay's "Close app" is the way out after a native
+        // death.
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (nativePanicked) {
-                    logToRust("back: native side is dead → finish()")
-                    finish()
-                } else {
-                    nativeBackPressed()
-                }
+                handleBack("OnBackPressed")
             }
         })
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            try {
+                window.onBackInvokedDispatcher.registerOnBackInvokedCallback(
+                    OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+                ) { handleBack("OnBackInvoked") }
+            } catch (t: Throwable) {
+                logToRust("back: could not register OnBackInvokedCallback (${t.javaClass.simpleName})")
+                Log.e(TAG, "OnBackInvokedCallback registration failed", t)
+            }
+        }
     }
 
     /**
-     * Called from Rust over JNI (on the android_main thread). `View.post` is
-     * thread-safe, so the Activity itself is only touched on the UI thread.
+     * A legacy back key event. Consumed on both edges so the platform's default
+     * `finish()` never sees it — except while the soft keyboard is up, where
+     * back is supposed to close the keyboard and the IME owns the gesture.
+     */
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.keyCode == KeyEvent.KEYCODE_BACK) {
+            if (lastImeBottom > 0) {
+                return super.dispatchKeyEvent(event)
+            }
+            if (event.action == KeyEvent.ACTION_DOWN) {
+                handleBack("key")
+            }
+            return true
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    /**
+     * Count one back press. Called from whichever dispatch path fired; a press
+     * that reaches two paths inside [BACK_DEDUPE_MS] is counted once. Nothing
+     * here may throw: a failing JNI call must leave the counter (and the app)
+     * alone rather than closing it.
+     */
+    private fun handleBack(source: String) {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastBackAtMs < BACK_DEDUPE_MS) {
+            logToRust("back ($source): same press already counted — ignored")
+            return
+        }
+        lastBackAtMs = now
+        try {
+            nativeBackPressed()
+            logToRust(
+                "back ($source): intercepted, counted" +
+                    if (nativePanicked) " (native side is dead — counted locally)" else "",
+            )
+        } catch (t: Throwable) {
+            logToRust("back ($source): nativeBackPressed failed (${t.javaClass.simpleName})")
+            Log.e(TAG, "nativeBackPressed failed", t)
+        }
+    }
+
+    /**
+     * Called from Rust over JNI (on the `android_main` thread). Everything that
+     * touches the Activity or a View hops to the main looper first.
+     *
+     * v2 built this on `root?.post { recreate() }`, and on the owner's phone the
+     * call came back as `Java exception was thrown` — the button incremented its
+     * counter and nothing else happened, with no reason on screen. Three changes:
+     * an explicit main-looper `Handler` (no dependence on the decor view being
+     * attached, which is what `View.post` was doing from a non-UI thread), a
+     * state guard, and a `try/catch` that reports the *real* exception into the
+     * event ring. The JNI export can no longer see a Java exception, and the
+     * lifecycle tab shows the outcome (see `ui.rs` `RecreateStatus`).
      */
     @Suppress("unused") // referenced from platform.rs via JNI
     fun postRecreate() {
-        root?.post { recreate() }
+        Handler(Looper.getMainLooper()).post {
+            try {
+                if (isFinishing || isDestroyed) {
+                    logToRust("recreate: skipped — the Activity is finishing/destroyed")
+                    return@post
+                }
+                logToRust("recreate: Activity.recreate() on the UI thread")
+                recreate()
+            } catch (t: Throwable) {
+                // Recreate can legitimately refuse (state loss, a parent
+                // Activity, a vendor ROM). Say so instead of vanishing.
+                logToRust("recreate FAILED on the UI thread: ${t.javaClass.name}: ${t.message}")
+                Log.e(TAG, "Activity.recreate() failed", t)
+            }
+        }
     }
 
     /**
@@ -319,8 +480,10 @@ class MainActivity : GameActivity() {
         container.addView(
             TextView(this).apply {
                 this.text =
-                    "files/${CrashFiles.LAST_CRASH} (history: files/${CrashFiles.HISTORY}).\n" +
-                        "Clear it with the app's \"Clear crash\" button. Screenshot this."
+                    "${CrashFiles.location(this@MainActivity)}/${CrashFiles.LAST_CRASH}\n" +
+                        "history: ${CrashFiles.HISTORY}. \"Share log\" sends it to any app; " +
+                        "\"Close app\" leaves the app. Clear it with the app's \"Clear crash\" " +
+                        "button. Screenshot this."
                 setTextColor(0xFFB9B9C0.toInt())
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
             }
@@ -350,6 +513,15 @@ class MainActivity : GameActivity() {
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         row.addView(
             Button(this).apply {
+                this.text = "Share log"
+                // Pure Kotlin: it reads the same file the overlay was built
+                // from, so it works exactly when the Rust surface does not.
+                setOnClickListener { shareCrashLog() }
+            },
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
+        )
+        row.addView(
+            Button(this).apply {
                 this.text = "Close app"
                 setOnClickListener {
                     logToRust("crash overlay: close requested")
@@ -367,6 +539,46 @@ class MainActivity : GameActivity() {
         )
         container.addView(row)
         return container to body
+    }
+
+    /**
+     * Hand the crash file to the system share sheet.
+     *
+     * `FileProvider` + `ACTION_SEND`: the file is app-private storage, so a
+     * `file://` URI would be refused by the platform (FileUriExposedException);
+     * a content URI with a one-shot read grant is the supported route, and it
+     * needs no permission and no extra dependency (the provider ships in
+     * `androidx.core`, which appcompat already brings in).
+     *
+     * Everything here is best-effort: a missing file, a missing provider or a
+     * device with no share target must leave the banner usable, so each failure
+     * becomes a toast plus a line in the event ring rather than an exception.
+     */
+    private fun shareCrashLog() {
+        val file = CrashFiles.shareableFile(this)
+        if (file == null) {
+            logToRust("share: no crash file to share")
+            Toast.makeText(this, "No crash file to share", Toast.LENGTH_SHORT).show()
+            return
+        }
+        try {
+            val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_SUBJECT, "Suramak spike crash log")
+                clipData = ClipData.newRawUri("Suramak crash log", uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            val chooser = Intent.createChooser(send, "Share crash log")
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            startActivity(chooser)
+            logToRust("share: ${file.name} (${file.length()} bytes) → share sheet")
+        } catch (t: Throwable) {
+            logToRust("share failed: ${t.javaClass.simpleName}: ${t.message}")
+            Log.e(TAG, "share failed for ${file.absolutePath}", t)
+            Toast.makeText(this, "Could not share: ${t.message}", Toast.LENGTH_LONG).show()
+        }
     }
 
     /**
