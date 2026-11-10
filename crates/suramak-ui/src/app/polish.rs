@@ -704,7 +704,9 @@ mod tests {
     // same pattern as `suramak-core/tests/polish.rs`. The environment is
     // process-global, so every test that sets it holds this lock.
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// Serialized on the app-wide [`crate::app::TEST_ENV_LOCK`]: every mock
+    /// suite in this test process mutates the same process-global variables.
+    use crate::app::TEST_ENV_LOCK as ENV_LOCK;
 
     fn read_request(stream: &mut TcpStream) -> String {
         // Reads the full request — headers + the Content-Length body (M11's

@@ -40,11 +40,20 @@
 //! with a newline. The multiset of provenance is preserved in either direction —
 //! no inference text is ever lost, only duplicated across a split or joined
 //! across a merge. `derived` records how the row's `text` came to be.
+//!
+//! **Opt-in translations (M15.8)** — a row's derived bilingual text travels with
+//! it through structural edits, always **stale-marked** because the source text
+//! it described has been repartitioned: a split duplicates the parent's record
+//! onto both halves, a merge joins the parts' derived lines and unions their
+//! source-id sets (the model is kept only when every part agrees). Nothing is
+//! deleted and nothing is silently re-blessed; only a fresh translation run
+//! clears the marker (the store's restore path preserves it too).
 
 use std::collections::VecDeque;
 use std::fmt;
 
 use crate::export::{ZeroDuration, ASS_ONE_FRAME_MS};
+use crate::translate::TranslationRecord;
 
 /// The largest number of rows one merge may join. A bound, not a rule of the
 /// format: it keeps a single transaction's in-memory snapshot small enough to
@@ -72,6 +81,10 @@ pub struct SegmentRow {
     /// `merge`, `manual`, …). Free-form so a later slice can add kinds without
     /// a migration.
     pub derived: String,
+    /// M15.8: the derived bilingual text and its provenance, when the user
+    /// asked for a translation of this row. Never touched by the ordinary text
+    /// edit path — it is stale-marked instead (see the module docs).
+    pub translation: Option<TranslationRecord>,
 }
 
 impl SegmentRow {
@@ -84,6 +97,14 @@ impl SegmentRow {
             source_text: Some(text.clone()),
             derived: String::new(),
             text,
+            translation: None,
+        }
+    }
+
+    /// Marks this row's translation stale (no-op without one).
+    pub fn stale_translation(&mut self) {
+        if let Some(translation) = &mut self.translation {
+            translation.mark_stale();
         }
     }
 }
@@ -259,6 +280,14 @@ pub fn split_rows(
 
     let mut out = Vec::with_capacity(rows.len() + 1);
     out.extend_from_slice(&rows[..position]);
+    // M15.8: the parent's translation covers the parent's audio, so both halves
+    // carry it — but the text has been repartitioned, so neither half's line is
+    // a trustworthy translation of its new text any more. Both are marked stale
+    // (the badge is visible; nothing is dropped, nothing is silently rewritten).
+    let translation = parent.translation.clone().map(|mut record| {
+        record.mark_stale();
+        record
+    });
     out.push(SegmentRow {
         idx,
         start_ms: span.left_start,
@@ -266,6 +295,7 @@ pub fn split_rows(
         text: left_text,
         source_text: parent.source_text.clone(),
         derived: "split".to_string(),
+        translation: translation.clone(),
     });
     out.push(SegmentRow {
         idx: idx + 1,
@@ -274,6 +304,7 @@ pub fn split_rows(
         text: right_text,
         source_text: parent.source_text.clone(),
         derived: "split".to_string(),
+        translation,
     });
     out.extend_from_slice(&rows[position + 1..]);
     renumber(out).ok_or(EditError::OutOfRange)
@@ -334,6 +365,7 @@ pub fn merge_rows(
     } else {
         Some(provenance.join("\n"))
     };
+    let translation = merge_translations(parts, separator);
 
     let mut out = Vec::with_capacity(rows.len() - count as usize + 1);
     out.extend_from_slice(&rows[..start]);
@@ -344,9 +376,62 @@ pub fn merge_rows(
         text,
         source_text,
         derived: "merge".to_string(),
+        translation,
     });
     out.extend_from_slice(&rows[end..]);
     renumber(out).ok_or(EditError::OutOfRange)
+}
+
+/// Combines the parts' translations for a merge (M15.8).
+///
+/// The joined derived line is **new text** from parts that each carried their
+/// own provenance, so the result is always marked stale: it must be reviewed
+/// (or re-translated) before anyone trusts it as the merged cue's translation.
+/// Models are kept only when every part agrees; otherwise the record says
+/// `mixed models` rather than picking one and implying it produced the join.
+fn merge_translations(parts: &[SegmentRow], separator: &str) -> Option<TranslationRecord> {
+    let translations: Vec<&TranslationRecord> = parts
+        .iter()
+        .filter_map(|row| row.translation.as_ref())
+        .collect();
+    if translations.is_empty() {
+        return None;
+    }
+    let text = translations
+        .iter()
+        .map(|record| record.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(separator);
+    if text.is_empty() {
+        return None;
+    }
+    let first_model = translations[0].model.as_str();
+    let uniform = translations
+        .iter()
+        .all(|record| record.model == first_model);
+    let model = if uniform {
+        first_model.to_string()
+    } else {
+        "mixed models".to_string()
+    };
+    let translated_at = translations
+        .iter()
+        .map(|record| record.translated_at.as_str())
+        .max()
+        .unwrap_or_default()
+        .to_string();
+    let mut source_ids: Vec<u32> = Vec::new();
+    for record in &translations {
+        for id in &record.source_ids {
+            if !source_ids.contains(id) {
+                source_ids.push(*id);
+            }
+        }
+    }
+    let mut record = TranslationRecord::new(text, model, translated_at, source_ids);
+    record.mark_stale();
+    Some(record)
 }
 
 /// Rewrites `idx` as `0..len` in place. Ordering is the transcript's, never a
@@ -615,7 +700,52 @@ mod tests {
     }
 
     #[test]
-    fn a_split_duplicates_the_parents_inference_text_on_both_halves() {
+    fn a_split_duplicates_and_stales_the_parents_translation() {
+        let mut rows = rows();
+        rows[0].translation = Some(TranslationRecord::new(
+            "hello world",
+            "mock-model",
+            "2026-11-10T10:00:00+00:00",
+            vec![0],
+        ));
+        let out = split_rows(&rows, 0, 4, Some(400), ZeroDuration::OneFrame).unwrap();
+        assert_eq!(out.len(), 4);
+        for row in &out[..2] {
+            let record = row.translation.as_ref().expect("both halves keep it");
+            assert_eq!(record.text, "hello world");
+            assert!(record.stale);
+            assert_eq!(record.source_ids, vec![0]);
+        }
+        // The untouched row keeps its own (absent) translation.
+        assert!(out[3].translation.is_none());
+    }
+
+    #[test]
+    fn a_merge_joins_translations_and_marks_the_result_stale() {
+        let mut rows = rows();
+        rows[0].translation = Some(TranslationRecord::new(
+            "one",
+            "model-a",
+            "2026-11-10T10:00:00+00:00",
+            vec![0],
+        ));
+        rows[1].translation = Some(TranslationRecord::new(
+            "two",
+            "model-b",
+            "2026-11-10T11:00:00+00:00",
+            vec![1],
+        ));
+        let out = merge_rows(&rows, 0, 2, " ").unwrap();
+        let record = out[0].translation.as_ref().unwrap();
+        assert_eq!(record.text, "one two");
+        assert!(record.stale);
+        assert_eq!(record.model, "mixed models", "two models cannot be one");
+        assert_eq!(record.translated_at, "2026-11-10T11:00:00+00:00");
+        assert_eq!(record.source_ids, vec![0, 1]);
+    }
+
+    #[test]
+    fn split_duplicates_the_parents_inference_text_on_both_halves() {
         let out = split_rows(&rows(), 1, 7, Some(1_500), ZeroDuration::OneFrame).unwrap();
         assert_eq!(out[1].source_text.as_deref(), Some("selamat pagi semua"));
         assert_eq!(out[2].source_text.as_deref(), Some("selamat pagi semua"));

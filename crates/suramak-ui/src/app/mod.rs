@@ -24,6 +24,7 @@ use suramak_core::textrules::{
     CleanOptions, ExportPreview, PromptBudget, PromptMeasurement, TextSettings,
 };
 use suramak_core::transcript::{Segment, Transcript};
+use suramak_core::translate::{TargetLanguage, TranslationRecord};
 use suramak_playback::{
     resolve_playback_source, transcript_duration_ms, Command as PlaybackCommand, Peaks, Playback,
     Status as PlaybackStatus,
@@ -36,6 +37,14 @@ use self::model_manager::{ModelManager, ModelRow};
 use self::polish::{PolishState, PolishUndo};
 use self::settings_form::SettingsForm;
 
+/// Serializes every test that mutates the process-global environment
+/// (`XDG_DATA_HOME` / `SURAMAK_OPENAI_API_KEY`). Each mock-endpoint suite used
+/// to own a private lock; two modules doing that in one test process still race
+/// on the same variables, so the lock is shared here (M15.8).
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub mod bilingual;
 pub mod bounds;
 pub mod controls;
 pub mod copy;
@@ -540,12 +549,25 @@ pub struct Editor {
     /// thing that reads it; `None` when no row has focus, in which case the
     /// split acts on the row's midpoint boundary.
     pub caret: Option<(u32, usize)>,
+    /// M15.8: the derived bilingual column, parallel to `buffers`. Empty
+    /// strings are rows without a translation (never fabricate one).
+    pub translations: Vec<String>,
+    /// The provenance behind each translation (model, timestamp, source ids,
+    /// stale marker), parallel to `buffers`.
+    pub translation_meta: Vec<Option<TranslationRecord>>,
+    /// A derived-text edit is waiting for the autosave debounce.
+    pub translation_dirty: bool,
+    /// Last translation keystroke (its own debounce clock).
+    pub translation_last_edit: Option<Instant>,
+    /// Last derived-text save failure (shown in the row caption, retried).
+    pub translation_save_error: Option<String>,
 }
 
 impl Editor {
     /// Opens a transcript: buffers start as a copy of the stored segment text.
     pub fn open(transcript: Transcript) -> Self {
         let buffers = transcript.segments.iter().map(|s| s.text.clone()).collect();
+        let count = transcript.segments.len();
         Self {
             transcript,
             buffers,
@@ -555,6 +577,11 @@ impl Editor {
             save_error: None,
             confirm_delete: false,
             caret: None,
+            translations: vec![String::new(); count],
+            translation_meta: vec![None; count],
+            translation_dirty: false,
+            translation_last_edit: None,
+            translation_save_error: None,
         }
     }
 
@@ -563,13 +590,20 @@ impl Editor {
     ///
     /// The persisted rows are the source of truth: any text the user had typed
     /// but not yet saved is flushed *before* the structural edit is requested,
-    /// so rebuilding here cannot lose an edit.
+    /// so rebuilding here cannot lose an edit. The derived column is rebuilt by
+    /// the runtime from the store right after (`on_translations_loaded`) —
+    /// rows shifted, so the old parallel vectors must not be reused.
     pub fn on_segments_changed(&mut self, transcript: Transcript) {
         self.buffers = transcript
             .segments
             .iter()
             .map(|segment| segment.text.clone())
             .collect();
+        let count = transcript.segments.len();
+        self.translations = vec![String::new(); count];
+        self.translation_meta = vec![None; count];
+        self.translation_dirty = false;
+        self.translation_last_edit = None;
         self.transcript = transcript;
         self.dirty = false;
         self.last_edit = None;
@@ -587,12 +621,20 @@ impl Editor {
     /// The `TextEdit` widget writes into the buffer directly, so dirtiness is
     /// derived by comparing the buffers against the stored segment text — which
     /// also makes reverting an edit clear the dirty flag again.
+    ///
+    /// M15.8: a real text change marks the row's translation stale **now**, so
+    /// the badge appears while typing — the store's rule (on save) is the
+    /// durable half of the same invariant.
     pub fn edit(&mut self, idx: u32, text: String, now: Instant) {
         let Some(buffer) = self.buffers.get_mut(idx as usize) else {
             return;
         };
-        if *buffer != text {
+        let changed_text = *buffer != text;
+        if changed_text {
             *buffer = text;
+            if let Some(Some(record)) = self.translation_meta.get_mut(idx as usize) {
+                record.mark_stale();
+            }
         }
         let changed = !self.pending_updates().is_empty();
         self.dirty = changed;
@@ -600,6 +642,80 @@ impl Editor {
             self.last_edit = Some(now);
             self.save_error = None;
         }
+    }
+
+    /// Records an edit of the **derived** translation text (the second column).
+    ///
+    /// This never marks the translation stale: the user is correcting the
+    /// derived line, not changing the source it was produced from. The
+    /// provenance record stays exactly as the endpoint returned it.
+    pub fn edit_translation(&mut self, idx: u32, text: String, now: Instant) {
+        let Some(buffer) = self.translations.get_mut(idx as usize) else {
+            return;
+        };
+        if self
+            .translation_meta
+            .get(idx as usize)
+            .is_none_or(Option::is_none)
+        {
+            return;
+        }
+        if *buffer != text {
+            *buffer = text;
+            self.translation_dirty = true;
+            self.translation_last_edit = Some(now);
+            self.translation_save_error = None;
+        }
+    }
+
+    /// Copies the edited derived text into the provenance records (after a
+    /// successful save), so the debounce cannot save it twice.
+    pub fn apply_translation_buffers(&mut self) {
+        for (index, meta) in self.translation_meta.iter_mut().enumerate() {
+            if let Some(record) = meta {
+                if let Some(buffer) = self.translations.get(index) {
+                    record.text = buffer.clone();
+                }
+            }
+        }
+    }
+
+    /// The edited derived rows with their provenance, ready to persist.
+    ///
+    /// Only rows whose buffer differs from the stored record are returned, so a
+    /// no-op debounce writes nothing.
+    pub fn translation_records(&self) -> Vec<(u32, TranslationRecord)> {
+        self.transcript
+            .segments
+            .iter()
+            .enumerate()
+            .filter_map(|(index, segment)| {
+                let mut record = self.translation_meta.get(index)?.clone()?;
+                let buffer = self.translations.get(index)?;
+                if *buffer == record.text {
+                    return None;
+                }
+                record.text = buffer.clone();
+                Some((segment.idx, record))
+            })
+            .collect()
+    }
+
+    /// Every stored translation for the export renderers (including rows the
+    /// user has not touched), with buffers applied.
+    pub fn translation_records_for_export(&self) -> Vec<(u32, TranslationRecord)> {
+        self.transcript
+            .segments
+            .iter()
+            .enumerate()
+            .filter_map(|(index, segment)| {
+                let mut record = self.translation_meta.get(index)?.clone()?;
+                if let Some(buffer) = self.translations.get(index) {
+                    record.text = buffer.clone();
+                }
+                Some((segment.idx, record))
+            })
+            .collect()
     }
 
     /// Buffers that differ from the stored segment text (what a save must write).
@@ -698,6 +814,40 @@ impl ExportFormat {
         };
         rendered.map_err(|err| err.to_string())
     }
+
+    /// M15.8: whether this format has a stacked bilingual variant.
+    pub fn supports_bilingual(self) -> bool {
+        matches!(
+            self,
+            ExportFormat::Srt | ExportFormat::Vtt | ExportFormat::Ass
+        )
+    }
+
+    /// Renders the **stacked bilingual** variant (SRT/VTT/ASS only). The
+    /// ordinary Markdown/TXT/JSON paths have no second-line slot, so the
+    /// caller is told rather than silently exporting only one language.
+    pub fn render_bilingual(
+        self,
+        transcript: &Transcript,
+        translations: &[(u32, TranslationRecord)],
+    ) -> Result<String, String> {
+        let rendered = match self {
+            ExportFormat::Srt => core_export::to_srt_bilingual(transcript, translations),
+            ExportFormat::Vtt => core_export::to_vtt_bilingual(transcript, translations),
+            ExportFormat::Ass => core_export::to_ass_bilingual(
+                transcript,
+                translations,
+                &core_export::AssOptions::default(),
+            ),
+            ExportFormat::Md | ExportFormat::Txt | ExportFormat::Json => {
+                return Err(format!(
+                    "{} has no bilingual variant — choose SRT, VTT or ASS",
+                    self.label()
+                ))
+            }
+        };
+        rendered.map_err(|err| err.to_string())
+    }
 }
 
 /// Export panel state.
@@ -722,6 +872,10 @@ pub struct ExportState {
     /// cleared whenever the text it described changed — a preview can never
     /// describe a transcript that no longer exists.
     pub preview: Option<ExportPreview>,
+    /// M15.8: include the stored translation as the second line of an SRT/VTT/
+    /// ASS export. Off by default (the ordinary export path is unchanged), and
+    /// inert for Markdown/TXT/JSON.
+    pub bilingual: bool,
 }
 
 /// How an export treats the text (M15.5).
@@ -745,6 +899,7 @@ impl Default for ExportState {
             mode: ExportTextMode::Verbatim,
             clean: CleanOptions::default(),
             preview: None,
+            bilingual: false,
         }
     }
 }
@@ -891,6 +1046,17 @@ pub struct AppState {
     /// only after the save lands, so a split never partitions stale text and a
     /// failed save never silently discards what the reader typed.
     pub pending_structural: Option<Effect>,
+    /// M15.8: the opt-in bilingual run lifecycle (see `app::bilingual`).
+    pub bilingual: bilingual::BilingualState,
+    /// M15.8: the target chosen on the export sheet (seeded from the
+    /// transcript's own language when it opens).
+    pub bilingual_target: TargetLanguage,
+    /// M15.8: `None` when the endpoint gate resolves, else the human reason the
+    /// Translate action is disabled. Seeded by the runtime, refreshed after a
+    /// settings save — a field so the gate is testable headless.
+    pub translation_gate_reason: Option<String>,
+    /// M15.8: a translation run waiting for the dirty text to save first.
+    pub pending_translation: Option<(TargetLanguage, Option<Vec<u32>>)>,
 }
 
 /// Which way an undo/redo row-set write moves the history cursor.
@@ -918,6 +1084,11 @@ pub enum Effect {
         transcript: Box<Transcript>,
         format: ExportFormat,
         dest: PathBuf,
+        /// M15.8: the stored translations (idx + provenance) the stacked
+        /// bilingual renderers read; empty on the ordinary path.
+        translations: Vec<(u32, TranslationRecord)>,
+        /// M15.8: render the stacked SRT/VTT/ASS variant.
+        bilingual: bool,
     },
     /// Open the microphone / system-audio tap (runtime owns the cpal session).
     StartCapture,
@@ -949,6 +1120,22 @@ pub enum Effect {
     /// Run the polish call for this transcript on a background thread
     /// (core's client is blocking HTTP; never the ASR worker). M4.
     PolishTranscript { transcript: Box<Transcript> },
+    /// M15.8: run the opt-in translation for these segments on a background
+    /// thread. `only` restricts the run to a retry's failed ids. Emitted **only**
+    /// by the export sheet's Translate action — never by a panel open.
+    TranslateTranscript {
+        transcript: Box<Transcript>,
+        target: TargetLanguage,
+        only: Option<Vec<u32>>,
+    },
+    /// M15.8: set the translation run's cooperative cancel token (observed
+    /// between batches; completed batches are kept).
+    CancelTranslation,
+    /// M15.8: persist the derived translation rows with their provenance.
+    SaveTranslations {
+        transcript: Uuid,
+        records: Vec<(u32, TranslationRecord)>,
+    },
     /// Execute a playback transport command (M8). `source` is set on `Play` so
     /// the runtime opens (or replaces) the engine for exactly this file;
     /// pause/resume/seek/stop go to the engine it already owns.
@@ -1060,6 +1247,12 @@ impl AppState {
             prompt_base: None,
             search: search::SearchState::default(),
             pending_structural: None,
+            bilingual: bilingual::BilingualState::Idle,
+            bilingual_target: TargetLanguage::Indonesian,
+            // Seeded by the runtime at startup (`Runtime::translation_gate_reason`);
+            // `Some` until then so the disabled surface always has a reason.
+            translation_gate_reason: Some(bilingual::BILINGUAL_SETUP_NOTE.to_string()),
+            pending_translation: None,
         }
     }
 
@@ -1069,12 +1262,14 @@ impl AppState {
     }
 
     /// Whether the UI wants the periodic tick (job running / dirty edits /
-    /// recording / a polish run polling for its result / the playhead moving).
+    /// recording / a polish run polling for its result / the playhead moving /
+    /// a translation run waiting for its batches).
     pub fn busy(&self) -> bool {
         matches!(self.job, Job::Running(_))
             || self.editor.as_ref().is_some_and(|e| e.dirty)
             || matches!(self.record, RecordState::Recording(_))
             || self.polish.is_running()
+            || self.bilingual.is_running()
             || self.playback.is_playing()
     }
 
@@ -2101,6 +2296,24 @@ impl AppState {
         let Some(editor) = &mut self.editor else {
             return effects;
         };
+        // M15.8: the derived column has its own debounce clock — editing a
+        // translation must not be tied to the source text's dirty flag.
+        if editor.translation_dirty {
+            if let Some(last_edit) = editor.translation_last_edit {
+                if now.duration_since(last_edit) >= AUTOSAVE_DEBOUNCE {
+                    let records = editor.translation_records();
+                    if records.is_empty() {
+                        editor.translation_dirty = false;
+                    } else {
+                        editor.translation_last_edit = Some(now);
+                        effects.push(Effect::SaveTranslations {
+                            transcript: editor.transcript.id,
+                            records,
+                        });
+                    }
+                }
+            }
+        }
         if !editor.dirty {
             return effects;
         }
@@ -2128,6 +2341,9 @@ impl AppState {
         self.search.invalidate();
         // M15.3: a structural edit requested while the text was dirty waits here.
         let pending = self.pending_structural.take();
+        // M15.8: a translation run parked behind the dirty text save.
+        let pending_translation = self.pending_translation.take();
+        let translation_was_pending = pending_translation.is_some();
         let on_editor = self.route == Route::Editor;
         let dropped = {
             let Some(editor) = self.editor.as_mut() else {
@@ -2145,18 +2361,28 @@ impl AppState {
                     if !on_editor {
                         return Vec::new();
                     }
-                    return pending.into_iter().collect();
+                    let mut effects: Vec<Effect> = pending.into_iter().collect();
+                    if let Some((target, only)) = pending_translation {
+                        // The save landed; the run can now describe the stored
+                        // text instead of a buffer that was about to change.
+                        effects.extend(self.start_translation_now(target, only));
+                    }
+                    return effects;
                 }
                 Err(err) => {
                     editor.save_error = Some(err);
                     editor.last_edit = Some(at);
-                    pending.is_some()
+                    pending.is_some() || pending_translation.is_some()
                 }
             }
         };
         if dropped {
             self.set_status(
-                "the text could not be saved — the split/merge was not applied",
+                if translation_was_pending {
+                    "the text could not be saved — the split/merge or translation was not started"
+                } else {
+                    "the text could not be saved — the split/merge was not applied"
+                },
                 true,
             );
         }
@@ -2222,11 +2448,34 @@ impl AppState {
             },
         };
         self.export.result = None;
+        // M15.8: read the bilingual inputs before the flushes (they borrow
+        // `self` mutably); the flush effects come first so the export reads the
+        // just-saved text.
+        let has_translation = editor.translation_meta.iter().any(Option::is_some);
+        let translations = editor.translation_records_for_export();
+        let bilingual =
+            self.export.bilingual && self.export.format.supports_bilingual() && has_translation;
         let mut effects = self.flush_edits();
+        effects.extend(self.flush_translation_edits());
+        if self.export.bilingual && !self.export.format.supports_bilingual() {
+            self.export.result = Some(Err(format!(
+                "{} has no bilingual variant — choose SRT, VTT or ASS",
+                self.export.format.label()
+            )));
+            return effects;
+        }
+        if self.export.bilingual && !has_translation {
+            self.export.result = Some(Err(
+                "no translation to include — press Translate for export first".to_string(),
+            ));
+            return effects;
+        }
         effects.push(Effect::Export {
             transcript: Box::new(transcript),
             format: self.export.format,
             dest: PathBuf::from(dest),
+            translations,
+            bilingual,
         });
         effects
     }
@@ -2577,10 +2826,37 @@ impl AppState {
         vec![Effect::SaveEdits { updates }]
     }
 
+    /// M15.8: flushes an edited derived column immediately (same call sites as
+    /// [`AppState::flush_edits`] — a translation edit must land before an export
+    /// or a transcript switch reads it).
+    fn flush_translation_edits(&mut self) -> Vec<Effect> {
+        let Some(editor) = &mut self.editor else {
+            return Vec::new();
+        };
+        if !editor.translation_dirty {
+            return Vec::new();
+        }
+        let records = editor.translation_records();
+        if records.is_empty() {
+            editor.translation_dirty = false;
+            return Vec::new();
+        }
+        editor.translation_last_edit = Some(Instant::now());
+        vec![Effect::SaveTranslations {
+            transcript: editor.transcript.id,
+            records,
+        }]
+    }
+
     /// Opens a transcript in the editor and switches the route. Returns the
     /// effects the open produced (M9b: the waveform peaks job).
     fn open_editor(&mut self, transcript: Transcript) -> Vec<Effect> {
         let id = transcript.id;
+        let target = TargetLanguage::for_source(transcript.language.as_deref());
+        // M15.8: a run that belongs to the transcript being replaced is
+        // cancelled at its next batch boundary; its late result is ignored
+        // (the state below resets to Idle), so it can never land on the new one.
+        let cancel_running = self.bilingual.is_running();
         self.export.dest = default_dest(&transcript.title, self.export.format);
         self.export.follows_default = true;
         self.export.result = None;
@@ -2597,6 +2873,11 @@ impl AppState {
         self.segment_history.clear();
         self.export.preview = None;
         self.pending_structural = None;
+        // M15.8: a run belongs to the transcript that started it — a different
+        // transcript never inherits progress, failures or the target choice.
+        self.bilingual = bilingual::BilingualState::Idle;
+        self.pending_translation = None;
+        self.bilingual_target = target;
         self.route = Route::Editor;
         // M8: the transport is rebuilt for this transcript's source (a previous
         // transcript's playback never leaks across).
@@ -2606,6 +2887,9 @@ impl AppState {
         // flat baseline instead (never fake data).
         self.peaks = EditorPeaks::default();
         let mut effects = Vec::new();
+        if cancel_running {
+            effects.push(Effect::CancelTranslation);
+        }
         if let Some(path) = self.playback.ready_path().map(Path::to_path_buf) {
             self.peaks.transcript = Some(id);
             effects.push(Effect::LoadPeaks {
@@ -3195,6 +3479,7 @@ mod tests {
                 transcript,
                 format,
                 dest,
+                ..
             } => {
                 assert_eq!(*format, ExportFormat::Srt);
                 assert_eq!(dest, &PathBuf::from("/tmp/carry.srt"));
@@ -5188,5 +5473,85 @@ mod tests {
         );
         assert_eq!(plan.included.len() + plan.dropped.len(), 64);
         assert!(plan.feedback().is_some());
+    }
+
+    // ---- M15.8: the bilingual export effect --------------------------------
+
+    #[test]
+    fn the_bilingual_switch_renders_the_stacked_srt_through_the_export_effect() {
+        let mut state = AppState::new();
+        state.on_transcript_loaded(transcript("bilingual.wav"));
+        let id = state.editor.as_ref().unwrap().transcript.id;
+        let records = vec![
+            (
+                0,
+                TranslationRecord::new(
+                    "rubah cokelat cepat",
+                    "mock-model",
+                    "2026-11-10T10:00:00+00:00",
+                    vec![0],
+                ),
+            ),
+            (
+                1,
+                TranslationRecord::new(
+                    "suramak tetap lokal",
+                    "mock-model",
+                    "2026-11-10T10:00:00+00:00",
+                    vec![1],
+                ),
+            ),
+        ];
+        state.on_translations_loaded(id, &records);
+        state.set_export_format(ExportFormat::Srt);
+        state.export.bilingual = true;
+        let effects = state.start_export();
+        match effects.last() {
+            Some(Effect::Export {
+                format,
+                bilingual,
+                translations,
+                ..
+            }) => {
+                assert_eq!(*format, ExportFormat::Srt);
+                assert!(*bilingual);
+                assert_eq!(translations.len(), 2);
+                let rendered = format
+                    .render_bilingual(&state.editor.as_ref().unwrap().snapshot(), translations)
+                    .unwrap();
+                assert!(
+                    rendered.contains("the quick brown fox\nrubah cokelat cepat"),
+                    "{rendered}"
+                );
+                assert!(
+                    rendered.contains("suramak keeps it local\nsuramak tetap lokal"),
+                    "{rendered}"
+                );
+            }
+            other => panic!("expected an export effect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_bilingual_switch_refuses_formats_without_a_second_line() {
+        let mut state = AppState::new();
+        state.on_transcript_loaded(transcript("plain.wav"));
+        state.set_export_format(ExportFormat::Md);
+        state.export.bilingual = true;
+        let effects = state.start_export();
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, Effect::Export { .. })),
+            "no file may be written"
+        );
+        assert!(state
+            .export
+            .result
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap_err()
+            .contains("no bilingual variant"));
     }
 }

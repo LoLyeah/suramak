@@ -44,13 +44,16 @@ use suramak_core::textrules::{
     build_prompt, EstimatedTokens, PromptBudget, PromptMeasurement, TextSettings,
 };
 use suramak_core::transcript::Transcript;
+use suramak_core::translate::{
+    run_translation, OpenAiCompatTranslate, TargetLanguage, TranslationProgress, TranslationRun,
+};
 use suramak_playback::{
     peaks, Command as PlaybackCommand, Engine, Peaks, Status as PlaybackStatus,
 };
 use uuid::Uuid;
 
 use crate::app::{
-    self, model_manager, polish, record_source_label, settings_form, AppState, Effect,
+    self, bilingual, model_manager, polish, record_source_label, settings_form, AppState, Effect,
     ExportFormat, RecordState,
 };
 use crate::pending_transcription::{self, PendingTranscription};
@@ -104,6 +107,19 @@ pub struct Runtime {
     prompt_budget: PromptBudget,
     /// M15.5: a measurement running on a detached thread (the UI polls it).
     prompt_job: Option<PromptJob>,
+    /// M15.8: the opt-in translation run (one at a time), its latest progress/
+    /// terminal event, and the cooperative token the Cancel effect sets.
+    translation: Option<TranslationJob>,
+}
+
+/// A translation run on a detached thread (`suramak-translate`); the UI polls
+/// its latest [`TranslationEvent`]. Same shape as the polish job: blocking HTTP
+/// never touches the UI thread or the ASR worker.
+struct TranslationJob {
+    /// The latest event (progress overwritten; `Done` terminal and consumed by
+    /// [`Runtime::translation_status`]).
+    event: Arc<Mutex<Option<bilingual::TranslationEvent>>>,
+    cancel: CancelToken,
 }
 
 /// A prompt-budget measurement on a detached thread; the UI polls it.
@@ -233,6 +249,7 @@ impl Runtime {
             text_settings,
             prompt_budget,
             prompt_job: None,
+            translation: None,
         }
     }
 
@@ -303,6 +320,36 @@ impl Runtime {
             self.polish = None;
         }
         result
+    }
+
+    /// M15.8: `None` when the bilingual action may run, else the resolved
+    /// reason it is disabled (the same base-URL + API-key gate as polish).
+    pub fn translation_gate_reason(&self) -> Option<String> {
+        bilingual::bilingual_gate(&self.settings, key_present()).err()
+    }
+
+    /// M15.8: the latest translation progress, or the terminal outcome exactly
+    /// once. A `Done` event clears the job and its cancel token.
+    pub fn translation_status(&mut self) -> Option<bilingual::TranslationEvent> {
+        let job = self.translation.as_ref()?;
+        let event = job.event.lock().ok().and_then(|mut guard| guard.take());
+        if matches!(event, Some(bilingual::TranslationEvent::Done(_))) {
+            self.translation = None;
+        }
+        event
+    }
+
+    /// M15.8: sets the translation run's cooperative token. The worker observes
+    /// it before/after each batch — never mid-request (the same stage-boundary
+    /// rule as [`Runtime::cancel_job`]).
+    pub fn cancel_translation(&mut self) {
+        match self.translation.as_ref() {
+            Some(job) => {
+                job.cancel.cancel();
+                tracing::info!("translation cancel requested — observed between batches");
+            }
+            None => tracing::debug!("translation cancel with no run in flight — ignored"),
+        }
     }
 
     /// Drains worker events queued by the bridge thread (non-blocking).
@@ -559,7 +606,12 @@ impl Runtime {
                     queue.extend(state.on_edits_saved(Instant::now(), result));
                 }
                 Effect::LoadTranscript(header) => match self.load(&header) {
-                    Ok(transcript) => queue.extend(state.on_transcript_loaded(transcript)),
+                    Ok(transcript) => {
+                        let id = transcript.id;
+                        let translations = self.translations_of(id);
+                        queue.extend(state.on_transcript_loaded(transcript));
+                        state.on_translations_loaded(id, &translations);
+                    }
                     Err(err) => state.set_status(err, true),
                 },
                 Effect::RefreshLibrary => {
@@ -582,8 +634,10 @@ impl Runtime {
                     transcript,
                     format,
                     dest,
+                    translations,
+                    bilingual,
                 } => {
-                    let result = write_export(&transcript, format, &dest);
+                    let result = write_export(&transcript, format, &dest, &translations, bilingual);
                     state.on_export_done(&dest, result);
                 }
                 Effect::StartCapture => self.start_capture(state),
@@ -648,11 +702,15 @@ impl Runtime {
                         });
                     match outcome {
                         Ok(snapshot) => match self.transcript(transcript) {
-                            Ok(loaded) => state.on_segment_edit(
-                                snapshot,
-                                suramak_core::segment_edit::EditKind::Split,
-                                loaded,
-                            ),
+                            Ok(loaded) => {
+                                state.on_segment_edit(
+                                    snapshot,
+                                    suramak_core::segment_edit::EditKind::Split,
+                                    loaded,
+                                );
+                                let translations = self.translations_of(transcript);
+                                state.on_translations_loaded(transcript, &translations);
+                            }
                             Err(err) => state.on_segment_edit_failed(err),
                         },
                         Err(err) => state.on_segment_edit_failed(err),
@@ -675,11 +733,15 @@ impl Runtime {
                         });
                     match outcome {
                         Ok(snapshot) => match self.transcript(transcript) {
-                            Ok(loaded) => state.on_segment_edit(
-                                snapshot,
-                                suramak_core::segment_edit::EditKind::Merge,
-                                loaded,
-                            ),
+                            Ok(loaded) => {
+                                state.on_segment_edit(
+                                    snapshot,
+                                    suramak_core::segment_edit::EditKind::Merge,
+                                    loaded,
+                                );
+                                let translations = self.translations_of(transcript);
+                                state.on_translations_loaded(transcript, &translations);
+                            }
                             Err(err) => state.on_segment_edit_failed(err),
                         },
                         Err(err) => state.on_segment_edit_failed(err),
@@ -701,7 +763,11 @@ impl Runtime {
                         });
                     match outcome {
                         Ok(()) => match self.transcript(transcript) {
-                            Ok(loaded) => state.on_segments_restored(step, loaded),
+                            Ok(loaded) => {
+                                state.on_segments_restored(step, loaded);
+                                let translations = self.translations_of(transcript);
+                                state.on_translations_loaded(transcript, &translations);
+                            }
                             Err(err) => state.set_status(err, true),
                         },
                         Err(err) => state.set_status(format!("undo failed: {err}"), true),
@@ -763,6 +829,9 @@ impl Runtime {
                     // The form may have changed the polish base URL/key note —
                     // refresh the action's enable from the new snapshot.
                     state.polish_configured = self.polish_configured();
+                    // M15.8: the bilingual action shares the same gate; its
+                    // disabled reason must follow a settings change too.
+                    state.translation_gate_reason = self.translation_gate_reason();
                     // M15.5: a new default model has its own measured budget (or
                     // none — then the documented fallback, which says so).
                     self.prompt_budget = self
@@ -786,6 +855,31 @@ impl Runtime {
                     if let Err(err) = self.start_polish(*transcript) {
                         queue.extend(state.on_polish_done(Err(err)));
                     }
+                }
+                Effect::TranslateTranscript {
+                    transcript,
+                    target,
+                    only,
+                } => {
+                    if let Err(err) = self.start_translation(*transcript, target, only) {
+                        queue.extend(
+                            state.on_translation_event(bilingual::TranslationEvent::Done(Err(err))),
+                        );
+                    }
+                }
+                Effect::CancelTranslation => self.cancel_translation(),
+                Effect::SaveTranslations {
+                    transcript,
+                    records,
+                } => {
+                    let result = match &self.store {
+                        Some(store) => store
+                            .set_translations(transcript, &records)
+                            .map(|_| ())
+                            .map_err(|err| err.to_string()),
+                        None => Err("library database unavailable".to_string()),
+                    };
+                    queue.extend(state.on_translations_saved(result));
                 }
                 Effect::Playback { source, command } => self.playback_command(source, command),
                 Effect::LoadPeaks { transcript, path } => self.start_peaks(transcript, path),
@@ -870,6 +964,102 @@ impl Runtime {
             }
             Err(err) => Err(format!("cannot start the polish thread: {err}")),
         }
+    }
+
+    /// M15.8: runs the opt-in translation on a detached `suramak-translate`
+    /// thread. The gate is re-checked here (a stale UI flag can never fire a
+    /// request); progress and the terminal outcome land in the job's event
+    /// slot, drained by [`Runtime::translation_status`].
+    fn start_translation(
+        &mut self,
+        transcript: Transcript,
+        target: TargetLanguage,
+        only: Option<Vec<u32>>,
+    ) -> Result<(), String> {
+        if self.translation.is_some() {
+            return Err("a translation run is already in progress".to_string());
+        }
+        let config = polish::polish_config(&self.settings, key_present())?;
+        let cfg = PolishSettings {
+            base_url: config.base_url,
+            model: config.model,
+            send_audio: false,
+        };
+        let segments: Vec<_> = match &only {
+            Some(ids) => transcript
+                .segments
+                .iter()
+                .filter(|segment| ids.contains(&segment.idx))
+                .cloned()
+                .collect(),
+            None => transcript.segments.clone(),
+        };
+        if segments.is_empty() {
+            return Err("nothing to translate in the selected segments".to_string());
+        }
+        let event: Arc<Mutex<Option<bilingual::TranslationEvent>>> = Arc::new(Mutex::new(None));
+        let cancel = CancelToken::new();
+        let thread_cancel = cancel.clone();
+        let thread_event = Arc::clone(&event);
+        let ctx = self.ctx.clone();
+        tracing::info!(
+            endpoint = %cfg.base_url,
+            model = %cfg.model,
+            target = target.code(),
+            segments = segments.len(),
+            retry = only.is_some(),
+            "translation: starting the background run"
+        );
+        let spawned = thread::Builder::new()
+            .name("suramak-translate".to_string())
+            .spawn(move || {
+                let run = (|| -> Result<TranslationRun, String> {
+                    let backend = OpenAiCompatTranslate::new().map_err(|err| error_chain(&err))?;
+                    Ok(run_translation(
+                        &segments,
+                        &cfg,
+                        target,
+                        &backend,
+                        || thread_cancel.is_cancelled(),
+                        |progress: TranslationProgress| {
+                            if let Ok(mut guard) = thread_event.lock() {
+                                *guard = Some(bilingual::TranslationEvent::Progress(progress));
+                            }
+                            ctx.request_repaint();
+                        },
+                    ))
+                })();
+                match &run {
+                    Ok(run) => tracing::info!(
+                        translated = run.translated.len(),
+                        failed = run.failed.len(),
+                        cancelled = run.cancelled,
+                        batches = run.batches_done,
+                        "translation: run finished"
+                    ),
+                    Err(err) => tracing::warn!(error = %err, "translation: run failed"),
+                }
+                if let Ok(mut guard) = thread_event.lock() {
+                    *guard = Some(bilingual::TranslationEvent::Done(run));
+                }
+                ctx.request_repaint();
+            });
+        match spawned {
+            Ok(_handle) => {
+                self.translation = Some(TranslationJob { event, cancel });
+                Ok(())
+            }
+            Err(err) => Err(format!("cannot start the translation thread: {err}")),
+        }
+    }
+
+    /// M15.8: the store's translation rows for one transcript (a load, a
+    /// structural edit or an undo rebuilds the editable derived column from it).
+    fn translations_of(&self, id: Uuid) -> Vec<(u32, suramak_core::translate::TranslationRecord)> {
+        self.store
+            .as_ref()
+            .and_then(|store| store.segment_translations(id).ok())
+            .unwrap_or_default()
     }
 
     /// Opens the capture session(s) on this thread (cpal streams are `!Send`):
@@ -1770,8 +1960,18 @@ fn error_chain(err: &dyn std::error::Error) -> String {
     text
 }
 
-fn write_export(transcript: &Transcript, format: ExportFormat, dest: &Path) -> Result<(), String> {
-    let text = format.render(transcript)?;
+fn write_export(
+    transcript: &Transcript,
+    format: ExportFormat,
+    dest: &Path,
+    translations: &[(u32, suramak_core::translate::TranslationRecord)],
+    bilingual: bool,
+) -> Result<(), String> {
+    let text = if bilingual {
+        format.render_bilingual(transcript, translations)?
+    } else {
+        format.render(transcript)?
+    };
     if let Some(parent) = dest.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;

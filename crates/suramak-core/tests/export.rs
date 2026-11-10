@@ -1,9 +1,12 @@
 use chrono::DateTime;
+use suramak_core::diagnostics::SubtitleLimits;
 use suramak_core::export::{
-    to_ass, to_ass_with, to_json, to_markdown, to_srt, to_txt, to_vtt, AssOptions, ZeroDuration,
-    ASS_ONE_FRAME_MS,
+    bilingual_advisories, bilingual_cues, to_ass, to_ass_bilingual, to_ass_with, to_json,
+    to_markdown, to_srt, to_srt_bilingual, to_txt, to_vtt, to_vtt_bilingual, AssOptions,
+    ZeroDuration, ASS_ONE_FRAME_MS, BILINGUAL_LINE_BUDGET_CPL,
 };
 use suramak_core::transcript::{Segment, Source, Transcript};
+use suramak_core::translate::TranslationRecord;
 use uuid::Uuid;
 
 /// Returns a fixed 3-segment transcript for golden-string tests.
@@ -345,4 +348,213 @@ fn ass_timestamps_round_to_centiseconds_and_cover_hours() {
     let events = parse_ass(&out);
     assert_eq!(events[0].0, 3_723_460);
     assert_eq!(events[0].1, 3_724_000);
+}
+
+// ---- M15.8: stacked bilingual outputs ------------------------------------
+
+/// A translation record for `idx` (the store shape the exporters read).
+fn translation(idx: u32, text: &str) -> (u32, TranslationRecord) {
+    (
+        idx,
+        TranslationRecord::new(text, "mock-model", "2026-11-10T10:00:00+00:00", vec![idx]),
+    )
+}
+
+#[test]
+fn bilingual_srt_stacks_the_translation_under_the_source_line() {
+    let t = fixed_transcript();
+    let translations = vec![
+        translation(0, "Halo dunia."),
+        translation(1, "Ini adalah ujian."),
+    ];
+    let out = to_srt_bilingual(&t, &translations).unwrap();
+    let expected = "\
+1
+00:00:00,000 --> 00:00:02,400
+Hello world.
+Halo dunia.
+
+2
+00:00:02,400 --> 00:00:05,000
+This is a test.
+Ini adalah ujian.
+
+3
+00:00:05,000 --> 00:00:08,500
+Goodbye.
+
+";
+    assert_eq!(out, expected, "the untranslated cue stays single-line");
+    // No blank line ever sits inside a cue payload: that would terminate it.
+    assert!(
+        !out.contains("Hello world.\n\n") && !out.contains("Halo dunia.\nHalo"),
+        "{out}"
+    );
+}
+
+#[test]
+fn bilingual_cues_align_by_segment_id_not_by_list_order() {
+    let t = fixed_transcript();
+    // Out of order, with one id that no longer exists (a stale row after an
+    // edit) — the transcript's order and timing win.
+    let translations = vec![
+        translation(2, "Selamat tinggal."),
+        translation(9, "orphan"),
+        translation(0, "Halo dunia."),
+    ];
+    let cues = bilingual_cues(&t, &translations);
+    assert_eq!(cues.len(), 3);
+    assert_eq!(
+        (cues[0].idx, cues[0].translation.as_str()),
+        (0, "Halo dunia.")
+    );
+    assert_eq!(cues[1].translation, "");
+    assert_eq!(
+        (cues[2].idx, cues[2].translation.as_str()),
+        (2, "Selamat tinggal.")
+    );
+    assert!(cues.iter().all(|cue| cue.idx != 9), "orphans are ignored");
+}
+
+#[test]
+fn bilingual_vtt_escapes_entities_and_keeps_both_lines() {
+    let t = transcript_with(&[(0, 2_000, "Use <i>this</i> & that")]);
+    let translations = vec![translation(0, "Pakai <i>ini</i> & itu > semua")];
+    let out = to_vtt_bilingual(&t, &translations).unwrap();
+    assert!(out.starts_with("WEBVTT\n\n"), "{out}");
+    assert!(
+        out.contains("Use &lt;i&gt;this&lt;/i&gt; &amp; that"),
+        "the source line is escaped too: {out}"
+    );
+    assert!(
+        out.contains("Pakai &lt;i&gt;ini&lt;/i&gt; &amp; itu &gt; semua"),
+        "the translated line is escaped: {out}"
+    );
+    // The escaping is text-only: the cue timing is untouched.
+    assert!(out.contains("00:00:00.000 --> 00:00:02.000"));
+}
+
+#[test]
+fn bilingual_ass_writes_the_top_bottom_style_pair_and_two_events_per_cue() {
+    let t = transcript_with(&[(0, 2_000, "Hello world."), (2_000, 4_000, "Goodbye.")]);
+    let translations = vec![
+        translation(0, "Halo dunia."),
+        translation(1, "Selamat tinggal."),
+    ];
+    let out = to_ass_bilingual(&t, &translations, &AssOptions::default()).unwrap();
+
+    // The style pair: bottom-centre primary, top-centre secondary.
+    assert!(
+        out.contains("Style: Primary,Arial,48,&H00FFFFFF"),
+        "primary style missing: {out}"
+    );
+    assert!(
+        out.contains("Style: Secondary,Arial,42,&H00FFFFFF"),
+        "secondary style missing: {out}"
+    );
+    let secondary = out
+        .lines()
+        .find(|line| line.starts_with("Style: Secondary"))
+        .unwrap();
+    let fields: Vec<&str> = secondary.split(',').collect();
+    assert_eq!(fields[18], "8", "Secondary is top-centre (Alignment 8)");
+    let primary = out
+        .lines()
+        .find(|line| line.starts_with("Style: Primary"))
+        .unwrap();
+    let fields: Vec<&str> = primary.split(',').collect();
+    assert_eq!(fields[18], "2", "Primary is bottom-centre (Alignment 2)");
+
+    // Two events per cue, same timing, one per style.
+    let dialogues: Vec<&str> = out
+        .lines()
+        .filter(|line| line.starts_with("Dialogue: "))
+        .collect();
+    assert_eq!(dialogues.len(), 4);
+    assert!(dialogues[0].contains(",Primary,"));
+    assert!(dialogues[0].ends_with("Hello world."));
+    assert!(dialogues[1].contains(",Secondary,"));
+    assert!(dialogues[1].ends_with("Halo dunia."));
+    assert!(dialogues[0].contains("0:00:00.00,0:00:02.00"));
+    assert!(dialogues[1].contains("0:00:00.00,0:00:02.00"));
+}
+
+#[test]
+fn bilingual_ass_escapes_both_lines_and_honours_the_zero_duration_policy() {
+    let t = transcript_with(&[
+        (0, 2_000, "A {tag} & a comma, here"),
+        (3_000, 3_000, "instant"),
+        (4_000, 5_000, "normal"),
+    ]);
+    let translations = vec![
+        translation(0, "Sebuah {tag} & koma, di sini"),
+        translation(1, "seketika"),
+        translation(2, "biasa"),
+    ];
+
+    let out = to_ass_bilingual(&t, &translations, &AssOptions::default()).unwrap();
+    let events = parse_ass(&out);
+    assert_eq!(events.len(), 6, "three cues × two languages");
+    assert_eq!(events[0].2, "A {tag} & a comma, here");
+    assert_eq!(events[1].2, "Sebuah {tag} & koma, di sini");
+    assert_eq!(
+        events[2],
+        (3_000, 3_000 + ASS_ONE_FRAME_MS, "instant".to_string())
+    );
+    assert_eq!(
+        events[3],
+        (3_000, 3_000 + ASS_ONE_FRAME_MS, "seketika".to_string())
+    );
+
+    // Skip drops the pair as a unit, never half of it.
+    let skipped = to_ass_bilingual(
+        &t,
+        &translations,
+        &AssOptions {
+            zero_duration: ZeroDuration::Skip,
+        },
+    )
+    .unwrap();
+    let events = parse_ass(&skipped);
+    assert_eq!(events.len(), 4);
+    assert!(events
+        .iter()
+        .all(|(_, _, text)| text != "instant" && text != "seketika"));
+}
+
+#[test]
+fn bilingual_advisories_measure_both_lines_against_the_same_limits() {
+    let t = transcript_with(&[(0, 1_000, "short source")]);
+    let translations = vec![translation(
+        0,
+        "terjemahan yang jauh lebih panjang daripada baris sumbernya dan melewati batas",
+    )];
+    let advisories = bilingual_advisories(&t, &translations, &SubtitleLimits::default());
+    assert_eq!(advisories.len(), 1);
+    assert_eq!(
+        advisories[0].primary_badge(),
+        None,
+        "the source line is fine"
+    );
+    let badge = advisories[0]
+        .translation_badge()
+        .expect("the translation is long");
+    assert!(badge.starts_with("CPL "), "{badge}");
+    // The documented budget is the error threshold of the same ladder.
+    assert_eq!(BILINGUAL_LINE_BUDGET_CPL, 42);
+
+    // An untranslated cue measures as empty: never a badge.
+    let empty = bilingual_advisories(&t, &[], &SubtitleLimits::default());
+    assert_eq!(empty[0].translation_badge(), None);
+}
+
+#[test]
+fn bilingual_exporters_never_drop_a_zero_duration_cue_from_srt_or_vtt() {
+    let t = transcript_with(&[(1_000, 1_000, "instant")]);
+    let translations = vec![translation(0, "seketika")];
+    let srt = to_srt_bilingual(&t, &translations).unwrap();
+    assert!(srt.contains("instant\nseketika"), "{srt}");
+    assert!(srt.contains("00:00:01,000 --> 00:00:01,000"));
+    let vtt = to_vtt_bilingual(&t, &translations).unwrap();
+    assert!(vtt.contains("instant\nseketika"), "{vtt}");
 }

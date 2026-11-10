@@ -19,5 +19,6 @@ pub mod store;
 pub mod textrules;
 pub mod time;
 pub mod transcript;
+pub mod translate;
 
 pub use error::SuramakError;

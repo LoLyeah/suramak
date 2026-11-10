@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::fmt::Write;
 
+use crate::diagnostics::{diagnose, SegmentDiagnostics, SubtitleLimits};
 use crate::time::{fmt_ms, fmt_plain, fmt_srt, fmt_vtt};
 use crate::transcript::{Source, Transcript};
+use crate::translate::TranslationRecord;
 use crate::SuramakError;
 
 /// Exports a transcript to Markdown.
@@ -168,38 +171,7 @@ pub fn to_ass(t: &Transcript) -> Result<String, SuramakError> {
 /// - Commas need no escaping: `Text` is the last field in a `Dialogue` line.
 pub fn to_ass_with(t: &Transcript, opts: &AssOptions) -> Result<String, SuramakError> {
     let mut out = String::new();
-    writeln!(out, "[Script Info]").unwrap();
-    writeln!(out, "; Exported by Suramak").unwrap();
-    writeln!(out, "Title: {}", script_title(&t.title)).unwrap();
-    writeln!(out, "ScriptType: v4.00+").unwrap();
-    writeln!(out, "WrapStyle: 2").unwrap();
-    writeln!(out, "PlayResX: 1920").unwrap();
-    writeln!(out, "PlayResY: 1080").unwrap();
-    writeln!(out, "ScaledBorderAndShadow: yes").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "[V4+ Styles]").unwrap();
-    writeln!(
-        out,
-        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, \
-         BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, \
-         BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding"
-    )
-    .unwrap();
-    // White fill, black outline, bottom-centre, generous side margins at 1080p.
-    // Arial is a family name: a renderer without it falls back to its sans face.
-    writeln!(
-        out,
-        "Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,\
-         0,0,0,0,100,100,0,0,1,2,1,2,48,48,64,1"
-    )
-    .unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "[Events]").unwrap();
-    writeln!(
-        out,
-        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
-    )
-    .unwrap();
+    write_ass_preamble(&mut out, &t.title, &[ASS_PRIMARY_STYLE]);
 
     for seg in &t.segments {
         let start = seg.start_ms.max(0);
@@ -221,6 +193,56 @@ pub fn to_ass_with(t: &Transcript, opts: &AssOptions) -> Result<String, SuramakE
         .unwrap();
     }
     Ok(out)
+}
+
+/// The bottom-centre style `to_ass` has always written.
+const ASS_PRIMARY_STYLE: &str =
+    "Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,\
+     0,0,0,0,100,100,0,0,1,2,1,2,48,48,64,1";
+
+/// The bilingual pair's bottom line (the transcript's own language).
+const ASS_BILINGUAL_PRIMARY_STYLE: &str =
+    "Style: Primary,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,\
+     0,0,0,0,100,100,0,0,1,2,1,2,48,48,64,1";
+
+/// The bilingual pair's top line (the translation). Same face and outline,
+/// slightly smaller, top-centre (`Alignment: 8`) with a wider top margin so the
+/// two lines never collide at 1080p; the pair is the "new style pair" M15-A's
+/// serializer reserved room for.
+const ASS_BILINGUAL_SECONDARY_STYLE: &str =
+    "Style: Secondary,Arial,42,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,\
+     0,0,0,0,100,100,0,0,1,2,1,8,48,48,96,1";
+
+/// Writes `[Script Info]`, the style table (one `Style:` line per entry) and
+/// the `[Events]` header. `Title:` is sanitized to one line.
+fn write_ass_preamble(out: &mut String, title: &str, styles: &[&str]) {
+    writeln!(out, "[Script Info]").unwrap();
+    writeln!(out, "; Exported by Suramak").unwrap();
+    writeln!(out, "Title: {}", script_title(title)).unwrap();
+    writeln!(out, "ScriptType: v4.00+").unwrap();
+    writeln!(out, "WrapStyle: 2").unwrap();
+    writeln!(out, "PlayResX: 1920").unwrap();
+    writeln!(out, "PlayResY: 1080").unwrap();
+    writeln!(out, "ScaledBorderAndShadow: yes").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "[V4+ Styles]").unwrap();
+    writeln!(
+        out,
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, \
+         BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, \
+         BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding"
+    )
+    .unwrap();
+    for style in styles {
+        writeln!(out, "{style}").unwrap();
+    }
+    writeln!(out).unwrap();
+    writeln!(out, "[Events]").unwrap();
+    writeln!(
+        out,
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
+    )
+    .unwrap();
 }
 
 /// ASS timestamps: `H:MM:SS.cc` (centiseconds, nearest).
@@ -277,6 +299,249 @@ fn escape_ass_line(line: &str) -> String {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// M15.8: stacked bilingual outputs
+// ---------------------------------------------------------------------------
+
+/// The honest per-line budget for a stacked bilingual cue (M15.8).
+///
+/// A bilingual row doubles the text in the same time window, so each of the two
+/// lines gets the same advisory ceiling the single-language rows use — the
+/// error threshold of the documented CPL ladder (`42`). Nothing is shortened or
+/// wrapped by the exporter: the number is what the advisory badges and the
+/// report measure against (see [`bilingual_advisories`]), exactly like the
+/// editor's M15.4 badges. A translation longer than this is shown in full, with
+/// a badge, because cutting a machine translation mid-sentence would be worse
+/// than an over-long line.
+pub const BILINGUAL_LINE_BUDGET_CPL: usize = 42;
+
+/// One cue of a bilingual export: the transcript's own line and its opt-in
+/// translation, sharing the cue's timing (cue alignment is by segment id, never
+/// by array position).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BilingualCue {
+    pub idx: u32,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    /// The transcript's text for this cue (the language the user transcribed).
+    pub primary: String,
+    /// The translated line; empty when this cue has no translation (a partial
+    /// run still exports, with the untranslated cues carrying one line).
+    pub translation: String,
+}
+
+/// Pairs each segment with its stored translation, in transcript order.
+///
+/// A translation whose idx has no segment (a stale row after a structural edit)
+/// is ignored — the transcript is the authority for cue order and timing.
+pub fn bilingual_cues(
+    t: &Transcript,
+    translations: &[(u32, TranslationRecord)],
+) -> Vec<BilingualCue> {
+    let by_idx: HashMap<u32, &TranslationRecord> = translations
+        .iter()
+        .map(|(idx, record)| (*idx, record))
+        .collect();
+    t.segments
+        .iter()
+        .map(|segment| BilingualCue {
+            idx: segment.idx,
+            start_ms: segment.start_ms,
+            end_ms: segment.end_ms,
+            primary: segment.text.trim().to_string(),
+            translation: by_idx
+                .get(&segment.idx)
+                .map(|record| record.text.trim().to_string())
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Normalizes a cue's text into the lines a subtitle block may carry: CRLF/CR
+/// become `\n`, each line is trimmed, blank lines are dropped (a blank line
+/// terminates an SRT/VTT cue — it can never be part of the payload).
+fn subtitle_lines(text: &str) -> Vec<String> {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .split('\n')
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The payload of one stacked SRT/VTT cue: primary line(s) then translation
+/// line(s), with no blank separator (see [`to_srt_bilingual`]).
+fn stacked_payload(cue: &BilingualCue) -> Vec<String> {
+    let mut lines = subtitle_lines(&cue.primary);
+    lines.extend(subtitle_lines(&cue.translation));
+    lines
+}
+
+/// Exports a transcript as a **stacked bilingual SRT**: one cue per segment,
+/// the transcript's line first and the translation directly beneath it.
+///
+/// Format note (documented in the report): the workorder's "EN line / blank /
+/// ID line" schematic is rendered as two adjacent lines here. An empty line
+/// inside an SRT cue is the cue terminator in the format grammar, so writing
+/// one would split every cue into two and break the timing alignment; the
+/// "blank" is the vertical separation the ASS style pair provides, and it is a
+/// deliberate omission in SRT/VTT rather than an oversight.
+///
+/// Escaping: SRT has no markup of its own, so text is written literally after
+/// newline normalization. A cue with no translation remains a one-line cue.
+pub fn to_srt_bilingual(
+    t: &Transcript,
+    translations: &[(u32, TranslationRecord)],
+) -> Result<String, SuramakError> {
+    let mut out = String::new();
+    for cue in bilingual_cues(t, translations) {
+        writeln!(out, "{}", cue.idx + 1).unwrap();
+        writeln!(out, "{} --> {}", fmt_srt(cue.start_ms), fmt_srt(cue.end_ms)).unwrap();
+        for line in stacked_payload(&cue) {
+            writeln!(out, "{line}").unwrap();
+        }
+        writeln!(out).unwrap();
+    }
+    Ok(out)
+}
+
+/// Exports a transcript as a **stacked bilingual WebVTT**: same layout as
+/// [`to_srt_bilingual`], with the text escaped for cue payloads (`&`, `<`, `>`
+/// become entities — WebVTT would otherwise read `<…>` as a tag and a bare `&`
+/// as the start of an entity reference).
+pub fn to_vtt_bilingual(
+    t: &Transcript,
+    translations: &[(u32, TranslationRecord)],
+) -> Result<String, SuramakError> {
+    let mut out = String::new();
+    writeln!(out, "WEBVTT").unwrap();
+    writeln!(out).unwrap();
+    for cue in bilingual_cues(t, translations) {
+        writeln!(out, "{} --> {}", fmt_vtt(cue.start_ms), fmt_vtt(cue.end_ms)).unwrap();
+        for line in stacked_payload(&cue) {
+            writeln!(out, "{}", escape_vtt_text(&line)).unwrap();
+        }
+        writeln!(out).unwrap();
+    }
+    Ok(out)
+}
+
+/// Escapes one WebVTT cue-payload line (the three characters with syntactic
+/// meaning in cue text).
+fn escape_vtt_text(line: &str) -> String {
+    line.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Exports a transcript as a **bilingual ASS** with the M15-A serializer's new
+/// style pair: `Primary` (the transcript's line, bottom-centre) and `Secondary`
+/// (the translation, top-centre). Each cue is two `Dialogue` events sharing one
+/// timing, so the pair cannot drift out of sync and the renderer does the
+/// vertical separation (no blank text line is needed).
+///
+/// The zero-duration policy applies to the pair as a unit: `Skip` drops both
+/// events, `OneFrame` widens both to the same 25 fps frame. Text escaping is
+/// the same as the single-language ASS path (braces, hard breaks, literal
+/// `\N`/`\n`/`\h` sequences).
+pub fn to_ass_bilingual(
+    t: &Transcript,
+    translations: &[(u32, TranslationRecord)],
+    opts: &AssOptions,
+) -> Result<String, SuramakError> {
+    let mut out = String::new();
+    write_ass_preamble(
+        &mut out,
+        &t.title,
+        &[ASS_BILINGUAL_PRIMARY_STYLE, ASS_BILINGUAL_SECONDARY_STYLE],
+    );
+
+    for cue in bilingual_cues(t, translations) {
+        let start = cue.start_ms.max(0);
+        let end = if cue.end_ms > start {
+            cue.end_ms
+        } else {
+            match opts.zero_duration {
+                ZeroDuration::Skip => continue,
+                ZeroDuration::OneFrame => start + ASS_ONE_FRAME_MS,
+            }
+        };
+        let primary = sub_ass_text(&cue.primary);
+        if !primary.is_empty() {
+            writeln!(
+                out,
+                "Dialogue: 0,{},{},Primary,,0,0,0,,{}",
+                fmt_ass(start),
+                fmt_ass(end),
+                primary
+            )
+            .unwrap();
+        }
+        let translation = sub_ass_text(&cue.translation);
+        if !translation.is_empty() {
+            writeln!(
+                out,
+                "Dialogue: 0,{},{},Secondary,,0,0,0,,{}",
+                fmt_ass(start),
+                fmt_ass(end),
+                translation
+            )
+            .unwrap();
+        }
+    }
+    Ok(out)
+}
+
+/// Escapes a bilingual cue line for ASS; an empty line is dropped (the other
+/// half of the pair still renders).
+fn sub_ass_text(text: &str) -> String {
+    escape_ass_text(text)
+}
+
+/// One cue's advisory diagnostics for **both** lines (M15.8).
+///
+/// The badges the editor paints come from here: each line is measured on its
+/// own against the same [`SubtitleLimits`] and the same cue timing, so a
+/// translation that is too long or too fast is visible even when the source
+/// line is comfortable.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BilingualAdvice {
+    pub idx: u32,
+    pub primary: SegmentDiagnostics,
+    pub translation: SegmentDiagnostics,
+}
+
+impl BilingualAdvice {
+    /// The primary line's badge (`None` when comfortable).
+    pub fn primary_badge(&self) -> Option<String> {
+        self.primary.badge()
+    }
+
+    /// The translated line's badge (`None` when comfortable or absent).
+    pub fn translation_badge(&self) -> Option<String> {
+        self.translation.badge()
+    }
+}
+
+/// Measures both lines of every bilingual cue. `translation` diagnostics on an
+/// untranslated cue are the empty-text diagnostics (no badge), so callers can
+/// render the pair unconditionally.
+pub fn bilingual_advisories(
+    t: &Transcript,
+    translations: &[(u32, TranslationRecord)],
+    limits: &SubtitleLimits,
+) -> Vec<BilingualAdvice> {
+    bilingual_cues(t, translations)
+        .into_iter()
+        .map(|cue| BilingualAdvice {
+            idx: cue.idx,
+            primary: diagnose(&cue.primary, cue.start_ms, cue.end_ms, limits),
+            translation: diagnose(&cue.translation, cue.start_ms, cue.end_ms, limits),
+        })
+        .collect()
 }
 
 fn source_label(source: &Source) -> String {

@@ -165,6 +165,9 @@ fn contents(
     }
 
     ui.add_space(tokens.space.m);
+    bilingual_section(ui, tokens, motion, state, effects);
+
+    ui.add_space(tokens.space.m);
 
     // ---- destination --------------------------------------------------------
     ui.label(
@@ -358,6 +361,193 @@ fn clean_section(ui: &mut egui::Ui, tokens: &Tokens, motion: &Motion, state: &mu
                 .color(tokens.ink_soft),
             );
         }
+    }
+}
+
+/// The opt-in bilingual export section (M15.8).
+///
+/// Always drawn — a user without an endpoint sees the surface and the resolved
+/// reason it is disabled, not a vanished feature. The action is the **only**
+/// thing that can start a run; opening this sheet sends nothing.
+fn bilingual_section(
+    ui: &mut egui::Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    state: &mut AppState,
+    effects: &mut Vec<Effect>,
+) {
+    use crate::app::bilingual::{BilingualState, BILINGUAL_ACTION_LABEL};
+
+    ui.label(
+        egui::RichText::new("Bilingual export (opt-in)")
+            .size(12.0)
+            .color(tokens.ink_soft),
+    );
+    ui.add_space(tokens.space.xs);
+
+    // The target control stays editable even while the action is gated: the
+    // surface shows exactly what a click would ask for.
+    let mut target = state.bilingual_target();
+    let options = [
+        (
+            suramak_core::translate::TargetLanguage::Indonesian,
+            "Indonesian",
+        ),
+        (suramak_core::translate::TargetLanguage::English, "English"),
+    ];
+    if controls::segmented(
+        ui,
+        tokens,
+        motion,
+        "bilingual-target",
+        &mut target,
+        &options,
+    ) {
+        state.set_bilingual_target(target);
+    }
+
+    ui.add_space(tokens.space.xs);
+    let can = state.can_translate();
+    let translate = controls::button(
+        ui,
+        tokens,
+        motion,
+        "bilingual-translate",
+        BILINGUAL_ACTION_LABEL,
+        Tier::Secondary,
+        can,
+    )
+    .on_hover_text(
+        "Translate every segment with the configured endpoint, in bounded batches. \
+         Results land in the transcript's translation column and are editable.",
+    );
+    if translate.clicked() {
+        effects.extend(state.start_translation(None));
+    }
+
+    ui.add_space(tokens.space.xs);
+    let snapshot = state.bilingual.clone();
+    match snapshot {
+        BilingualState::Running { progress, .. } => {
+            ui.horizontal(|ui| {
+                let cancel = controls::button(
+                    ui,
+                    tokens,
+                    motion,
+                    "bilingual-cancel",
+                    "Cancel",
+                    Tier::Tertiary,
+                    true,
+                );
+                if cancel.clicked() {
+                    effects.extend(state.cancel_translation());
+                }
+                ui.label(
+                    egui::RichText::new(format!(
+                        "batch {}/{} · {} translated · {} failed",
+                        progress.batch.max(1),
+                        progress.total.max(1),
+                        progress.translated,
+                        progress.failed
+                    ))
+                    .size(11.0)
+                    .color(tokens.ink_soft),
+                );
+            });
+        }
+        BilingualState::Finished { run, .. } => {
+            ui.label(
+                egui::RichText::new(run.summary())
+                    .size(11.0)
+                    .color(tokens.ink_soft),
+            );
+            if !run.failed.is_empty() {
+                for failure in run.failed.iter().take(5) {
+                    ui.label(
+                        egui::RichText::new(failure.label())
+                            .size(10.5)
+                            .color(tokens.record_red_text),
+                    );
+                }
+                if run.failed.len() > 5 {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "and {} more failed segments",
+                            run.failed.len() - 5
+                        ))
+                        .size(10.5)
+                        .color(tokens.record_red_text),
+                    );
+                }
+                let retry = controls::button(
+                    ui,
+                    tokens,
+                    motion,
+                    "bilingual-retry",
+                    "Retry failed",
+                    Tier::Secondary,
+                    true,
+                )
+                .on_hover_text("Re-sends only the failed segment ids");
+                if retry.clicked() {
+                    effects.extend(state.retry_failed_translations());
+                }
+            }
+        }
+        BilingualState::Failed { message, .. } => {
+            ui.label(
+                egui::RichText::new(message)
+                    .size(11.0)
+                    .color(tokens.record_red_text),
+            );
+            let retry = controls::button(
+                ui,
+                tokens,
+                motion,
+                "bilingual-retry-run",
+                "Retry",
+                Tier::Secondary,
+                true,
+            );
+            if retry.clicked() {
+                effects.extend(state.start_translation(None));
+            }
+        }
+        BilingualState::Idle => {}
+    }
+
+    // The status/gate line: the disabled reason for a user without an endpoint,
+    // otherwise how many cues carry a translation and how many are stale.
+    ui.label(
+        egui::RichText::new(state.bilingual_status_line())
+            .size(10.5)
+            .color(tokens.ink_soft),
+    );
+
+    // The export switch: only meaningful for the stacked subtitle formats.
+    let has_translation = state
+        .editor
+        .as_ref()
+        .is_some_and(|editor| editor.translation_meta.iter().any(Option::is_some));
+    let mut bilingual = state.export.bilingual;
+    let toggle = ui
+        .add_enabled(
+            has_translation && state.export.format.supports_bilingual(),
+            egui::Checkbox::new(&mut bilingual, "Include the translation in SRT/VTT/ASS"),
+        )
+        .on_hover_text(
+            "Stacked output: the transcript's line first, the translation directly beneath \
+             (ASS uses the top/bottom style pair). Nothing is written until Export.",
+        );
+    if toggle.changed() {
+        state.export.bilingual = bilingual;
+    }
+    if !state.export.format.supports_bilingual() {
+        ui.label(
+            egui::RichText::new("choose SRT, VTT or ASS to include the translation")
+                .size(10.5)
+                .color(tokens.ink_soft),
+        );
     }
 }
 

@@ -9,7 +9,22 @@ use crate::search::{self, HitKind, SearchHit, SearchOptions, SearchResults};
 use crate::segment_edit::{merge_rows, split_rows, EditError, SegmentRow, SegmentSnapshot};
 use crate::textrules::{Correction, Dictionary, Glossary, PromptMeasurement, TextSettings};
 use crate::transcript::{Segment, Transcript};
+use crate::translate::TranslationRecord;
 use crate::SuramakError;
+
+/// Encodes a translation's source-id set for its one `TEXT` column (M15.8).
+/// A JSON array keeps the set ordered and extensible without a join table.
+fn encode_source_ids(ids: &[u32]) -> String {
+    serde_json::to_string(ids).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Decodes [`encode_source_ids`]; a malformed legacy value reads as an empty
+/// set (the provenance line then says "no source ids") instead of failing the
+/// whole transcript load.
+fn decode_source_ids(raw: Option<String>) -> Vec<u32> {
+    raw.and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
 
 /// How many documents one backfill/rebuild transaction writes. A 100k-segment
 /// library is indexed as ~200 bounded transactions instead of one giant write,
@@ -54,7 +69,11 @@ const SEARCH_DOCS_DDL: &str = "CREATE TABLE IF NOT EXISTS search_docs (
 /// - **v4** — M15.7, additive only: `search_fts` (the FTS5 index) and
 ///   `search_docs` (its document map). Existing tables are untouched; the index
 ///   is backfilled in bounded chunks and can be rebuilt deterministically.
-pub const SCHEMA_VERSION: i64 = 4;
+/// - **v5** — M15.8, additive only: `segments.translation*` — the opt-in
+///   derived bilingual text, its provenance (model, timestamp, source segment
+///   id set) and the sticky stale marker. Existing rows keep `NULL`/`0`; no
+///   table is dropped or rebuilt.
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// SQLite-backed transcript library with WAL mode.
 pub struct Store {
@@ -135,6 +154,13 @@ impl Store {
                  text          TEXT    NOT NULL,
                  source_text   TEXT,
                  derived       TEXT    NOT NULL DEFAULT '',
+                 -- M15.8: the opt-in bilingual derived text + provenance. NULL
+                 -- translation = never asked for one.
+                 translation        TEXT,
+                 translation_model  TEXT,
+                 translation_at     TEXT,
+                 translation_sources TEXT,
+                 translation_stale  INTEGER NOT NULL DEFAULT 0,
                  PRIMARY KEY (transcript_id, idx)
              );
              -- M15.5: the user's own data. Additive; nothing here is derived
@@ -225,6 +251,9 @@ impl Store {
         }
         if version < 4 {
             self.upgrade_to_v4()?;
+        }
+        if version < 5 {
+            self.upgrade_to_v5()?;
         }
         Ok(())
     }
@@ -318,6 +347,47 @@ impl Store {
             "DELETE FROM meta WHERE key IN ('search_backfill_segments', 'search_backfill_titles')",
             [],
         )?;
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// v4 → v5, one transaction, additive only: the opt-in bilingual derived
+    /// columns (M15.8). Existing rows read back exactly as before (`NULL`
+    /// translation, `0` stale); a re-run is a no-op, which matters because the
+    /// DDL above may already have created the columns on a fresh database.
+    fn upgrade_to_v5(&self) -> Result<(), SuramakError> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (column, ddl) in [
+            (
+                "translation",
+                "ALTER TABLE segments ADD COLUMN translation TEXT",
+            ),
+            (
+                "translation_model",
+                "ALTER TABLE segments ADD COLUMN translation_model TEXT",
+            ),
+            (
+                "translation_at",
+                "ALTER TABLE segments ADD COLUMN translation_at TEXT",
+            ),
+            (
+                "translation_sources",
+                "ALTER TABLE segments ADD COLUMN translation_sources TEXT",
+            ),
+            (
+                "translation_stale",
+                "ALTER TABLE segments ADD COLUMN translation_stale INTEGER NOT NULL DEFAULT 0",
+            ),
+        ] {
+            if !Self::column_exists(&tx, "segments", column)? {
+                tx.execute_batch(ddl)?;
+            }
+        }
         tx.execute(
             "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -974,6 +1044,10 @@ impl Store {
     /// never overwritten afterwards (`COALESCE(segments.source_text, …)`): a
     /// polish pass or an editor save rewrites `text`, while the first stored
     /// text — the inference output — stays readable as provenance.
+    ///
+    /// M15.8: a wholesale text rewrite through this path (a re-polish) also
+    /// marks an existing translation stale in the same statement — the derived
+    /// text no longer describes what the row says, and the badge must say so.
     fn write_segments(&self, id: Uuid, segments: &[Segment]) -> Result<(), SuramakError> {
         for seg in segments {
             self.conn.execute(
@@ -983,7 +1057,11 @@ impl Store {
                      start_ms    = excluded.start_ms,
                      end_ms      = excluded.end_ms,
                      text        = excluded.text,
-                     source_text = COALESCE(segments.source_text, excluded.source_text)",
+                     source_text = COALESCE(segments.source_text, excluded.source_text),
+                     translation_stale = CASE
+                         WHEN segments.translation IS NOT NULL
+                              AND segments.text IS NOT excluded.text
+                         THEN 1 ELSE segments.translation_stale END",
                 params![id.to_string(), seg.idx, seg.start_ms, seg.end_ms, seg.text],
             )?;
             // M15.7: read the row back — `source_text` is COALESCE-preserved,
@@ -1056,6 +1134,10 @@ impl Store {
     /// constraint, a crash) must not leave the row rewritten while the
     /// transcript still claims its old `updated_at`. The caller's text is the
     /// *current* text; `source_text` is deliberately not touched (M15.1).
+    ///
+    /// M15.8: when the row carries an opt-in translation, any real text change
+    /// marks it stale in the same transaction — the badge and the re-translate
+    /// affordance are the user's, never a silent overwrite.
     pub fn update_segment_text(
         &self,
         transcript_id: Uuid,
@@ -1066,7 +1148,12 @@ impl Store {
         self.conn.execute_batch("SAVEPOINT update_segment_text")?;
         let written = (|| -> Result<(), SuramakError> {
             self.conn.execute(
-                "UPDATE segments SET text = ?1 WHERE transcript_id = ?2 AND idx = ?3",
+                "UPDATE segments SET
+                     translation_stale = CASE
+                         WHEN translation IS NOT NULL AND text IS NOT ?1 THEN 1
+                         ELSE translation_stale END,
+                     text = ?1
+                 WHERE transcript_id = ?2 AND idx = ?3",
                 params![text, transcript_id.to_string(), idx],
             )?;
             // M15.7: the index follows the same transaction — an edit that
@@ -1101,10 +1188,23 @@ impl Store {
 
     fn read_rows(conn: &Connection, id: Uuid) -> Result<Vec<SegmentRow>, SuramakError> {
         let mut stmt = conn.prepare(
-            "SELECT idx, start_ms, end_ms, text, source_text, derived FROM segments
-             WHERE transcript_id = ?1 ORDER BY idx",
+            "SELECT idx, start_ms, end_ms, text, source_text, derived,
+                    translation, translation_model, translation_at,
+                    translation_sources, translation_stale
+             FROM segments WHERE transcript_id = ?1 ORDER BY idx",
         )?;
         let rows = stmt.query_map(params![id.to_string()], |row| {
+            let translation: Option<String> = row.get(6)?;
+            let translation = match translation {
+                Some(text) => Some(TranslationRecord {
+                    text,
+                    model: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                    translated_at: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
+                    source_ids: decode_source_ids(row.get::<_, Option<String>>(9)?),
+                    stale: row.get::<_, i64>(10)? != 0,
+                }),
+                None => None,
+            };
             Ok(SegmentRow {
                 idx: row.get(0)?,
                 start_ms: row.get(1)?,
@@ -1112,6 +1212,7 @@ impl Store {
                 text: row.get(3)?,
                 source_text: row.get(4)?,
                 derived: row.get(5)?,
+                translation,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -1133,10 +1234,22 @@ impl Store {
         // title document is untouched (same id, same title).
         Self::delete_all_segment_docs(conn, id)?;
         let mut stmt = conn.prepare(
-            "INSERT INTO segments(transcript_id, idx, start_ms, end_ms, text, source_text, derived)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO segments(transcript_id, idx, start_ms, end_ms, text, source_text, derived,
+                                  translation, translation_model, translation_at,
+                                  translation_sources, translation_stale)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )?;
         for row in rows {
+            let (translation, model, at, sources, stale) = match &row.translation {
+                Some(record) => (
+                    Some(record.text.as_str()),
+                    Some(record.model.as_str()),
+                    Some(record.translated_at.as_str()),
+                    Some(encode_source_ids(&record.source_ids)),
+                    if record.stale { 1 } else { 0 },
+                ),
+                None => (None, None, None, None, 0),
+            };
             stmt.execute(params![
                 id.to_string(),
                 row.idx,
@@ -1145,6 +1258,11 @@ impl Store {
                 row.text,
                 row.source_text,
                 row.derived,
+                translation,
+                model,
+                at,
+                sources,
+                stale,
             ])?;
             if !Self::has_searchable_text(&row.text) {
                 continue;
@@ -1240,15 +1358,164 @@ impl Store {
         self.transact_rows(id, |rows| merge_rows(rows, first, count, separator))
     }
 
+    // ---- M15.8: the opt-in bilingual derived text --------------------------
+
+    /// Writes one translation run's records (one `(idx, record)` per row) in a
+    /// single savepoint, touching `updated_at` once.
+    ///
+    /// The record carries its own provenance; the store never invents a model
+    /// or a timestamp. A row that no longer exists is skipped rather than
+    /// resurrected (the transcript may have been restructured while the run was
+    /// in flight); the returned count is what actually landed.
+    pub fn set_translations(
+        &self,
+        id: Uuid,
+        records: &[(u32, TranslationRecord)],
+    ) -> Result<usize, SuramakError> {
+        self.conn.execute_batch("SAVEPOINT set_translations")?;
+        let written = (|| -> Result<usize, SuramakError> {
+            let mut stmt = self.conn.prepare(
+                "UPDATE segments SET
+                     translation = ?1,
+                     translation_model = ?2,
+                     translation_at = ?3,
+                     translation_sources = ?4,
+                     translation_stale = ?5
+                 WHERE transcript_id = ?6 AND idx = ?7",
+            )?;
+            let mut written = 0usize;
+            for (idx, record) in records {
+                written += stmt.execute(params![
+                    record.text,
+                    record.model,
+                    record.translated_at,
+                    encode_source_ids(&record.source_ids),
+                    if record.stale { 1 } else { 0 },
+                    id.to_string(),
+                    idx,
+                ])?;
+            }
+            self.conn.execute(
+                "UPDATE transcripts SET updated_at = ?1 WHERE id = ?2",
+                params![Utc::now().to_rfc3339(), id.to_string()],
+            )?;
+            Ok(written)
+        })();
+        match written {
+            Ok(written) => {
+                self.conn.execute_batch("RELEASE set_translations")?;
+                Ok(written)
+            }
+            Err(err) => {
+                let _ = self
+                    .conn
+                    .execute_batch("ROLLBACK TO set_translations; RELEASE set_translations");
+                Err(err)
+            }
+        }
+    }
+
+    /// Rewrites one row's **derived** text (the editable translation column)
+    /// without touching the source text, the provenance or the stale flag.
+    ///
+    /// Editing a translation is not an event that invalidates itself; the
+    /// provenance stays exactly the model/timestamp/ids that produced the row,
+    /// and a stale row stays visibly stale until the user re-translates it.
+    pub fn update_segment_translation(
+        &self,
+        id: Uuid,
+        idx: u32,
+        text: &str,
+    ) -> Result<(), SuramakError> {
+        self.conn.execute_batch("SAVEPOINT update_translation")?;
+        let written = (|| -> Result<(), SuramakError> {
+            let changed = self.conn.execute(
+                "UPDATE segments SET translation = ?1
+                 WHERE transcript_id = ?2 AND idx = ?3 AND translation IS NOT NULL",
+                params![text, id.to_string(), idx],
+            )?;
+            if changed == 0 {
+                return Err(SuramakError::TranscriptNotFound(format!(
+                    "no translation for segment {idx}"
+                )));
+            }
+            self.conn.execute(
+                "UPDATE transcripts SET updated_at = ?1 WHERE id = ?2",
+                params![Utc::now().to_rfc3339(), id.to_string()],
+            )?;
+            Ok(())
+        })();
+        match written {
+            Ok(()) => {
+                self.conn.execute_batch("RELEASE update_translation")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self
+                    .conn
+                    .execute_batch("ROLLBACK TO update_translation; RELEASE update_translation");
+                Err(err)
+            }
+        }
+    }
+
+    /// Every stored translation for a transcript, in `idx` order.
+    pub fn segment_translations(
+        &self,
+        id: Uuid,
+    ) -> Result<Vec<(u32, TranslationRecord)>, SuramakError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT idx, translation, translation_model, translation_at,
+                    translation_sources, translation_stale
+             FROM segments
+             WHERE transcript_id = ?1 AND translation IS NOT NULL
+             ORDER BY idx",
+        )?;
+        let rows = stmt.query_map(params![id.to_string()], |row| {
+            Ok((
+                row.get::<_, u32>(0)?,
+                TranslationRecord {
+                    text: row.get(1)?,
+                    model: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    translated_at: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    source_ids: decode_source_ids(row.get::<_, Option<String>>(4)?),
+                    stale: row.get::<_, i64>(5)? != 0,
+                },
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(SuramakError::Sqlite)
+    }
+
     /// Writes a row set back verbatim (undo/redo of a [`SegmentSnapshot`]).
     ///
     /// This is the exact inverse of a structural edit: the rows are the ones the
     /// transaction recorded, so no re-derivation can drift. One savepoint,
     /// `updated_at` touched like any other modification.
+    ///
+    /// M15.8: stale markers **survive the restore**. A row position that is
+    /// currently stale stays stale even when the restored snapshot predates the
+    /// edit that made it stale; re-translation is the only thing that clears a
+    /// marker. The restore can therefore only be conservative (it may keep a
+    /// badge that a strict history replay would drop), never silently vouch for
+    /// derived text it did not re-check.
     pub fn restore_segment_rows(&self, id: Uuid, rows: &[SegmentRow]) -> Result<(), SuramakError> {
+        // The stale flags in the *current* row set, read before the replace.
+        let current: std::collections::HashMap<u32, bool> = Self::read_rows(&self.conn, id)?
+            .into_iter()
+            .filter_map(|row| row.translation.map(|record| (row.idx, record.stale)))
+            .collect();
+        let mut rows = rows.to_vec();
+        for row in &mut rows {
+            if let Some(record) = &mut row.translation {
+                if current.get(&row.idx).copied().unwrap_or(false) {
+                    record.stale = true;
+                }
+            }
+        }
         self.conn.execute_batch("SAVEPOINT segment_restore")?;
         let written = (|| -> Result<(), SuramakError> {
-            Self::replace_rows(&self.conn, id, rows)?;
+            Self::replace_rows(&self.conn, id, &rows)?;
             self.conn.execute(
                 "UPDATE transcripts SET updated_at = ?1 WHERE id = ?2",
                 params![Utc::now().to_rfc3339(), id.to_string()],
@@ -2539,5 +2806,244 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM prompt_budgets", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    // ---- M15.8: the opt-in bilingual derived text ---------------------------
+
+    fn translated(idx: u32, text: &str) -> (u32, TranslationRecord) {
+        (
+            idx,
+            TranslationRecord::new(text, "mock-model", "2026-11-10T10:00:00+00:00", vec![idx]),
+        )
+    }
+
+    #[test]
+    fn translations_round_trip_with_their_provenance() {
+        let store = Store::open_in_memory().unwrap();
+        let t = sample("bilingual");
+        let id = t.id;
+        store.insert_transcript(&t).unwrap();
+        assert!(store.segment_translations(id).unwrap().is_empty());
+
+        let written = store
+            .set_translations(id, &[translated(0, "pertama"), translated(1, "kedua")])
+            .unwrap();
+        assert_eq!(written, 2);
+        let rows = store.segment_translations(id).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 0);
+        assert_eq!(rows[0].1.text, "pertama");
+        assert_eq!(rows[0].1.model, "mock-model");
+        assert_eq!(rows[0].1.translated_at, "2026-11-10T10:00:00+00:00");
+        assert_eq!(rows[0].1.source_ids, vec![0]);
+        assert!(!rows[0].1.stale);
+
+        // A fresh read through the row path sees the same record.
+        let row = &store.segment_rows(id).unwrap()[0];
+        assert_eq!(row.translation.as_ref().unwrap().text, "pertama");
+        assert_eq!(row.translation.as_ref().unwrap().source_ids, vec![0]);
+    }
+
+    #[test]
+    fn editing_the_source_marks_the_translation_stale_but_editing_the_translation_does_not() {
+        let store = Store::open_in_memory().unwrap();
+        let t = sample("stale");
+        let id = t.id;
+        store.insert_transcript(&t).unwrap();
+        store
+            .set_translations(id, &[translated(0, "pertama")])
+            .unwrap();
+
+        store
+            .update_segment_text(id, 0, "first, corrected")
+            .unwrap();
+        let rows = store.segment_translations(id).unwrap();
+        assert!(
+            rows[0].1.stale,
+            "a source edit marks the derived text stale"
+        );
+
+        // Editing the derived text itself keeps provenance and the stale flag
+        // (it is still the same machine translation, just user-corrected).
+        store
+            .update_segment_translation(id, 0, "pertama (edited)")
+            .unwrap();
+        let rows = store.segment_translations(id).unwrap();
+        assert_eq!(rows[0].1.text, "pertama (edited)");
+        assert!(
+            rows[0].1.stale,
+            "editing the translation does not clear stale"
+        );
+        assert_eq!(rows[0].1.model, "mock-model");
+
+        // A re-translate clears it and replaces the text + provenance.
+        store
+            .set_translations(
+                id,
+                &[(
+                    0,
+                    TranslationRecord::new(
+                        "pertama lagi",
+                        "mock-model-2",
+                        "2026-11-10T11:00:00+00:00",
+                        vec![0],
+                    ),
+                )],
+            )
+            .unwrap();
+        let rows = store.segment_translations(id).unwrap();
+        assert!(!rows[0].1.stale);
+        assert_eq!(rows[0].1.text, "pertama lagi");
+        assert_eq!(rows[0].1.model, "mock-model-2");
+    }
+
+    #[test]
+    fn a_no_op_text_save_does_not_mark_a_translation_stale() {
+        let store = Store::open_in_memory().unwrap();
+        let t = sample("noop");
+        let id = t.id;
+        store.insert_transcript(&t).unwrap();
+        store
+            .set_translations(id, &[translated(0, "pertama")])
+            .unwrap();
+        // Saving the same text (the autosave can race a no-op) must not badge.
+        store.update_segment_text(id, 0, "first").unwrap();
+        assert!(!store.segment_translations(id).unwrap()[0].1.stale);
+
+        // Neither does a wholesale upsert that leaves the text byte-identical.
+        let mut t = store.get_transcript(id).unwrap();
+        store.upsert_segments(id, &t.segments).unwrap();
+        assert!(!store.segment_translations(id).unwrap()[0].1.stale);
+        // …but a rewritten one does.
+        t.segments[0].text = "changed".to_string();
+        store.upsert_segments(id, &t.segments).unwrap();
+        assert!(store.segment_translations(id).unwrap()[0].1.stale);
+    }
+
+    #[test]
+    fn split_duplicates_the_translation_and_marks_both_halves_stale() {
+        let store = Store::open_in_memory().unwrap();
+        let mut t = sample("split");
+        t.segments[0].text = "halo dunia".to_string();
+        let id = t.id;
+        store.insert_transcript(&t).unwrap();
+        store
+            .set_translations(id, &[translated(0, "hello world")])
+            .unwrap();
+
+        store
+            .split_segment(id, 0, 4, Some(400), ZeroDuration::OneFrame)
+            .unwrap();
+        let rows = store.segment_rows(id).unwrap();
+        assert_eq!(rows.len(), 3);
+        for row in &rows[..2] {
+            let record = row.translation.as_ref().expect("both halves keep it");
+            assert_eq!(record.text, "hello world");
+            assert!(record.stale, "a split invalidates the alignment");
+            assert_eq!(record.source_ids, vec![0], "provenance is the parent's");
+        }
+        assert!(rows[2].translation.is_none());
+    }
+
+    #[test]
+    fn merge_joins_translations_and_marks_the_result_stale() {
+        let store = Store::open_in_memory().unwrap();
+        let t = sample("merge");
+        let id = t.id;
+        store.insert_transcript(&t).unwrap();
+        store
+            .set_translations(id, &[translated(0, "pertama"), translated(1, "kedua")])
+            .unwrap();
+
+        store.merge_segments(id, 0, 2, " ").unwrap();
+        let rows = store.segment_rows(id).unwrap();
+        assert_eq!(rows.len(), 1);
+        let record = rows[0].translation.as_ref().unwrap();
+        assert_eq!(record.text, "pertama kedua");
+        assert!(record.stale);
+        assert_eq!(record.model, "mock-model");
+        assert_eq!(record.source_ids, vec![0, 1]);
+    }
+
+    #[test]
+    fn the_stale_marker_survives_restore_and_is_only_cleared_by_retranslation() {
+        let store = Store::open_in_memory().unwrap();
+        let mut t = sample("restore");
+        t.segments[0].text = "halo dunia".to_string();
+        let id = t.id;
+        store.insert_transcript(&t).unwrap();
+        store
+            .set_translations(id, &[translated(0, "hello world")])
+            .unwrap();
+
+        let before = store.segment_rows(id).unwrap();
+        let snapshot = store
+            .split_segment(id, 0, 4, Some(400), ZeroDuration::OneFrame)
+            .unwrap();
+        assert!(
+            store.segment_rows(id).unwrap()[0]
+                .translation
+                .as_ref()
+                .unwrap()
+                .stale
+        );
+
+        // Undo writes the pre-split rows back, but the stale badge survives:
+        // the marker is monotonic across a restore.
+        store.restore_segment_rows(id, &before).unwrap();
+        let restored = store.segment_rows(id).unwrap();
+        assert_eq!(restored.len(), 2);
+        let record = restored[0].translation.as_ref().unwrap();
+        assert_eq!(record.text, "hello world");
+        assert!(record.stale, "the stale marker survives restore");
+        let _ = snapshot;
+
+        // Re-translation is the one action that clears it.
+        store
+            .set_translations(id, &[translated(0, "hello world")])
+            .unwrap();
+        assert!(!store.segment_translations(id).unwrap()[0].1.stale);
+    }
+
+    #[test]
+    fn a_v4_database_upgrades_to_v5_additively() {
+        let dir = std::env::temp_dir().join(format!("suramak-v5-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("suramak.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE transcripts (
+                     id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at TEXT NOT NULL,
+                     updated_at TEXT NOT NULL, source_json TEXT NOT NULL, model TEXT NOT NULL,
+                     language TEXT, audio_path TEXT);
+                 CREATE TABLE segments (
+                     transcript_id TEXT NOT NULL, idx INTEGER NOT NULL, start_ms INTEGER NOT NULL,
+                     end_ms INTEGER NOT NULL, text TEXT NOT NULL, source_text TEXT,
+                     derived TEXT NOT NULL DEFAULT '',
+                     PRIMARY KEY (transcript_id, idx));
+                 INSERT INTO meta(key, value) VALUES ('schema_version', '4');
+                 INSERT INTO transcripts VALUES (
+                     '00000000-0000-0000-0000-000000000001', 'old', '2024-01-01T00:00:00Z',
+                     '2024-01-01T00:00:00Z', '{\"type\":\"file\",\"name\":\"old.wav\"}', 'tiny', 'en', NULL);
+                 INSERT INTO segments VALUES (
+                     '00000000-0000-0000-0000-000000000001', 0, 0, 1000, 'halo', 'halo', '');",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).expect("upgrade");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        assert!(store.segment_translations(id).unwrap().is_empty());
+        let rows = store.segment_rows(id).unwrap();
+        assert_eq!(rows[0].text, "halo");
+        assert!(rows[0].translation.is_none());
+        drop(store);
+        let again = Store::open(&path).expect("reopen");
+        assert_eq!(again.schema_version().unwrap(), SCHEMA_VERSION);
+        drop(again);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

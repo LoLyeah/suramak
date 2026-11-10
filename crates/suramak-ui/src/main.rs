@@ -510,6 +510,22 @@ impl App {
             self.apply(effects);
         }
 
+        // M15.8: translation progress / terminal outcome (its own thread; the
+        // event slot is drained here so a cancelled or partial run lands in the
+        // UI even if the user navigated away mid-run).
+        let translation = self
+            .runtime
+            .as_mut()
+            .and_then(|runtime| runtime.translation_status());
+        if let Some(event) = translation {
+            changed = true;
+            let effects = match self.shell.as_mut() {
+                Some(shell) => shell.app.on_translation_event(event),
+                None => Vec::new(),
+            };
+            self.apply(effects);
+        }
+
         // M15.5: the prompt-budget measurement (a model load on its own thread).
         let measured = self
             .runtime
@@ -905,6 +921,9 @@ impl ApplicationHandler<UserEvent> for App {
                 shell.sync_appearance(runtime.appearance());
                 // Polish availability is derived from the settings + key policy (M4).
                 shell.app.polish_configured = runtime.polish_configured();
+                // M15.8: the bilingual action's gate is the same endpoint; the
+                // disabled reason is seeded here (never a live check per frame).
+                shell.app.translation_gate_reason = runtime.translation_gate_reason();
                 // M15.5: the stored glossary/dictionary/opt-ins and the model's
                 // cached prompt measurement seed the settings surface; the plan
                 // they produce is what the truncation feedback shows.

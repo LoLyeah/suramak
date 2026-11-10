@@ -18,6 +18,7 @@
 //! never a bottom band: the old fixed export panel collided with the floating
 //! record pill (critique H8/P1), and the pill's position is an M8.5 contract.
 
+use std::collections::HashSet;
 use std::time::Instant;
 
 use egui::{pos2, vec2, Align2, CornerRadius, FontFamily, FontId, Rect, Stroke, StrokeKind, Vec2};
@@ -888,6 +889,16 @@ fn transcript_rows(
     // M15.4: the advisory thresholds are app state (defaults 37/42 CPL,
     // 17/20 CPS), so the badge and a future settings surface share one value.
     let limits = state.subtitle_limits;
+    let target_label = state.bilingual_target.label();
+    // M15.8: the failed segment ids of the last run, so a row the endpoint
+    // could not translate carries its own retry pointer even though it has no
+    // derived text to show.
+    let failed_translations: HashSet<u32> = match &state.bilingual {
+        super::bilingual::BilingualState::Finished { run, .. } => {
+            run.failed_ids().into_iter().collect()
+        }
+        _ => HashSet::new(),
+    };
 
     // M8: the active segment is the one containing the playhead, and the list
     // only follows it **while playing** — a paused playhead never yanks the
@@ -906,6 +917,7 @@ fn transcript_rows(
     let mut caret_update: Option<(u32, usize)> = None;
     let mut row_action: Option<RowAction> = None;
     let mut edited_out: Option<(u32, String)> = None;
+    let mut translation_edited_out: Option<(u32, String)> = None;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -1070,6 +1082,111 @@ fn transcript_rows(
                     row_focused = response.has_focus();
                 });
 
+                // M15.8: the editable derived column. It renders beneath the
+                // source line, guttered to the same measure, with its own
+                // provenance/stale caption and its own CPL/CPS badge — both
+                // lines of the bilingual row are measured, never just one.
+                let mut translation_edited: Option<(u32, String)> = None;
+                if editor.translation_meta[index].is_some() {
+                    let mut derived_bottom = content_rect.bottom();
+                    ui.horizontal_top(|ui| {
+                        ui.add_space(PANE_PAD_X - 8.0 + gutter_w);
+                        ui.vertical(|ui| {
+                            ui.set_max_width(text_w);
+                            if let Some(record) = &editor.translation_meta[index] {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{target_label} · {}",
+                                            record.provenance_line()
+                                        ))
+                                        .font(FontId::new(10.0, FontFamily::Proportional))
+                                        .color(tokens.ink_soft),
+                                    );
+                                    if record.stale {
+                                        ui.label(
+                                            egui::RichText::new("stale — source changed")
+                                                .font(FontId::new(10.0, FontFamily::Proportional))
+                                                .color(tokens.warn),
+                                        )
+                                        .on_hover_text(
+                                            "The transcript text changed after this translation. \
+                                             The text is kept; re-translate to refresh it.",
+                                        );
+                                    }
+                                });
+                            }
+                            let response = ui.add(
+                                egui::TextEdit::multiline(&mut editor.translations[index])
+                                    .id_salt(("translation", *idx))
+                                    .desired_width(text_w)
+                                    .desired_rows(1)
+                                    .frame(false)
+                                    .font(FontId::new(14.0, crate::theme::serif_family()))
+                                    .text_color(tokens.ink_soft),
+                            );
+                            if response.changed() {
+                                translation_edited =
+                                    Some((*idx, editor.translations[index].clone()));
+                            }
+                            ui.horizontal(|ui| {
+                                if let Some((label, level)) = segment_badge(
+                                    &editor.translations[index],
+                                    *start_ms,
+                                    *end_ms,
+                                    &limits,
+                                ) {
+                                    ui.label(
+                                        egui::RichText::new(label)
+                                            .font(FontId::new(10.5, FontFamily::Proportional))
+                                            .color(badge_color(level, tokens)),
+                                    )
+                                    .on_hover_text(
+                                        "Advisory pace of the translated line — measured \
+                                         separately from the source line.",
+                                    );
+                                }
+                                if let Some(error) = &editor.translation_save_error {
+                                    ui.label(
+                                        egui::RichText::new(error)
+                                            .font(FontId::new(10.0, FontFamily::Proportional))
+                                            .color(tokens.record_red_text),
+                                    );
+                                }
+                            });
+                            derived_bottom = response.rect.bottom();
+                        });
+                    });
+                    content_rect = Rect::from_min_max(
+                        content_rect.min,
+                        pos2(content_rect.max.x, derived_bottom),
+                    );
+                } else if failed_translations.contains(idx) {
+                    // The endpoint failed this segment: no derived text exists,
+                    // so the row shows what happened and where the retry lives.
+                    let mut failed_bottom = content_rect.bottom();
+                    ui.horizontal(|ui| {
+                        ui.add_space(PANE_PAD_X - 8.0 + gutter_w);
+                        let response = ui
+                            .label(
+                                egui::RichText::new("translation failed — retry in Export…")
+                                    .font(FontId::new(10.5, FontFamily::Proportional))
+                                    .color(tokens.record_red_text),
+                            )
+                            .on_hover_text(
+                                "The export sheet names the reason and resends only the failed ids.",
+                            );
+                        failed_bottom = response.rect.bottom();
+                    });
+                    content_rect = Rect::from_min_max(
+                        content_rect.min,
+                        pos2(content_rect.max.x, failed_bottom),
+                    );
+                }
+                if let Some((idx, text)) = translation_edited {
+                    translation_edited_out = Some((idx, text));
+                }
+
                 // The row surface: full-width, padded around the content.
                 let row_rect = Rect::from_min_max(
                     pos2(row_max.left() + PANE_PAD_X - 10.0, content_rect.top() - 4.0),
@@ -1142,6 +1259,13 @@ fn transcript_rows(
     // editor borrow ended.
     if let Some((idx, text)) = edited_out {
         state.edit_segment(idx, text, Instant::now());
+    }
+    // M15.8: derived-text edits go through their own path (they never dirty the
+    // source text and never mark the translation stale).
+    if let Some((idx, text)) = translation_edited_out {
+        if let Some(editor) = state.editor.as_mut() {
+            editor.edit_translation(idx, text, Instant::now());
+        }
     }
     if let Some(caret) = caret_update {
         if let Some(editor) = state.editor.as_mut() {

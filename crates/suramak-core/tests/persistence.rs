@@ -176,8 +176,9 @@ fn opening_a_populated_v1_library_upgrades_it_in_place_without_losing_text() {
     let store = Store::open(&path).expect("v1 must open");
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     // v1 → v2 (source_text + backfill) → v3 (derived marker, M15.5 tables) →
-    // v4 (the FTS5 search index): the upgrade walks the whole chain in one open.
-    assert_eq!(SCHEMA_VERSION, 4);
+    // v4 (the FTS5 search index) → v5 (the M15.8 bilingual columns): the
+    // upgrade walks the whole chain in one open.
+    assert_eq!(SCHEMA_VERSION, 5);
     assert_eq!(store.integrity_check().unwrap(), "ok");
     // v4 backfilled the search index for the rows the fixture carried.
     let stats = store.search_index_stats().expect("stats");
