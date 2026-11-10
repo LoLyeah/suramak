@@ -1133,6 +1133,7 @@ mod tests {
     /// cannot: the child really died of SIGSEGV (`ExitStatus::signal`), the
     /// file exists anyway, and it carries the ring + the phase + the signal.
     #[test]
+    #[cfg(target_family = "unix")]
     fn the_signal_handler_writes_the_ring_then_re_raises_sigsegv() {
         use std::os::unix::process::ExitStatusExt;
 

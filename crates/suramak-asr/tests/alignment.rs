@@ -62,9 +62,20 @@ fn model_path() -> Option<PathBuf> {
         let path = PathBuf::from(path);
         return path.is_file().then_some(path);
     }
-    let home = std::env::var_os("HOME")?;
-    let path = PathBuf::from(home).join(".local/share/suramak/models/ggml-tiny.bin");
-    path.is_file().then_some(path)
+    // The models dir is per-OS (suramak_core::paths decides it); a hand-rolled
+    // Linux-only lookup is what broke the macos CI job in v0.4.0's first run.
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    let home = PathBuf::from(home);
+    let local_app = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.clone());
+    [
+        home.join(".local/share/suramak/models/ggml-tiny.bin"),
+        home.join("Library/Application Support/dev.suramak.Suramak/models/ggml-tiny.bin"),
+        local_app.join("Suramak/models/ggml-tiny.bin"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
 }
 
 /// Normalizes a word for the lexical comparison: lowercase, no surrounding
