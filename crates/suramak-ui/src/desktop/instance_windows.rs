@@ -22,7 +22,7 @@
 //!
 //! Every call here is `unsafe` Win32 via the `windows` crate. The *rules* — the
 //! object names, the SID's string form, and the exists→signal→exit decision —
-//! are pure and live in [`crate::instance::protocol`], unit-tested on every host;
+//! are pure and live in [`crate::desktop::instance::protocol`], unit-tested on every host;
 //! the Win32 half is unit-tested on the CI `windows` job (see the tests at the
 //! bottom: a real second `CreateMutexW` in the same process takes the
 //! `ERROR_ALREADY_EXISTS` path, and the event round-trips through the watcher).
@@ -51,7 +51,9 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, ASFW_ANY};
 
-pub(crate) use crate::instance::protocol::{event_name, mutex_name, secondary_plan, Claim};
+pub(crate) use crate::desktop::instance::protocol::{
+    event_name, mutex_name, secondary_plan, Claim,
+};
 
 /// How many times (and how far apart) the second launch looks for the running
 /// instance's activation event before giving up on the raise — the bounded race
@@ -68,7 +70,7 @@ pub(crate) struct ActivationReport {
     /// be swallowed by the foreground lock, so the caller logs when it is false.
     pub(crate) foreground_granted: bool,
     /// The exit code the second launch uses — from
-    /// [`crate::instance::protocol::secondary_plan`], so the tested contract is
+    /// [`crate::desktop::instance::protocol::secondary_plan`], so the tested contract is
     /// the one executed (0: the app is up and in front).
     pub(crate) exit_code: i32,
 }
@@ -76,7 +78,7 @@ pub(crate) struct ActivationReport {
 /// This logon's user SID as `S-1-5-21-…`, read from the process token.
 ///
 /// `OpenProcessToken` + `GetTokenInformation(TokenUser)`; the SID bytes are
-/// formatted by [`crate::instance::protocol::format_sid`] (pure, host-tested), so
+/// formatted by [`crate::desktop::instance::protocol::format_sid`] (pure, host-tested), so
 /// no `ConvertSidToStringSidW` allocation is needed.
 pub(crate) fn user_sid() -> io::Result<String> {
     let mut token = HANDLE::default();
@@ -155,7 +157,7 @@ unsafe fn read_sid(sid: *const u8) -> String {
             u32::from_le_bytes([*base, *base.add(1), *base.add(2), *base.add(3)])
         })
         .collect();
-    crate::instance::protocol::format_sid(revision, authority, &sub_authorities)
+    crate::desktop::instance::protocol::format_sid(revision, authority, &sub_authorities)
 }
 
 /// Claims the single-instance mutex for this logon.
@@ -175,7 +177,7 @@ pub(crate) fn claim() -> io::Result<Claim> {
     // generated wrapper does not call anything in between.
     let already_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
     // Everything after the API calls is the pure decision.
-    match crate::instance::protocol::claim_from(already_exists) {
+    match crate::desktop::instance::protocol::claim_from(already_exists) {
         Claim::Primary => {
             // Hold the mutex for the process lifetime — the OS releases it on
             // exit, including a crash. `Box::leak` is the explicit "keep
