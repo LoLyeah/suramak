@@ -170,13 +170,13 @@ if [ -x "$AAPT" ]; then
   # Same SIGPIPE reasoning as above: match in the shell, not through a pipe.
   BADGING="$("$AAPT" dump badging "$APK")"
   case "$BADGING" in
-    *"package: name='app.suramak.spike' versionCode='7' versionName='0.4.0-m13e.1'"*) ;;
+    *"package: name='app.suramak.spike' versionCode='8' versionName='0.4.0-m13f.1'"*) ;;
     *)
       # Fall back to a narrower match so a future versionCode bump does not
       # hide a real versionName regression.
       case "$BADGING" in
-        *"package: name='app.suramak.spike'"*"versionName='0.4.0-m13e.1'"*) ;;
-        *) fail "APK versionName is not 0.4.0-m13e.1 (see aapt output below)" ;;
+        *"package: name='app.suramak.spike'"*"versionName='0.4.0-m13f.1'"*) ;;
+        *) fail "APK versionName is not 0.4.0-m13f.1 (see aapt output below)" ;;
       esac
       ;;
   esac
@@ -274,6 +274,26 @@ if [ -x "$AAPT" ]; then
     *"android.app.shortcuts"*) ;;
     *) fail "APK manifest does not register the launcher shortcuts (SAF import entry)" ;;
   esac
+  # M13F: the microphone permission, its foreground service with the
+  # `microphone` type, and the FOREGROUND_SERVICE_MICROPHONE permission. A
+  # missing type is a startForeground SecurityException on Android 14+; a
+  # missing RECORD_AUDIO is a permission dialog that can never be satisfied.
+  case "$MANIFEST_TREE" in
+    *"android.permission.RECORD_AUDIO"*) ;;
+    *) fail "APK manifest does not declare RECORD_AUDIO" ;;
+  esac
+  case "$MANIFEST_TREE" in
+    *"android.permission.FOREGROUND_SERVICE_MICROPHONE"*) ;;
+    *) fail "APK manifest does not declare FOREGROUND_SERVICE_MICROPHONE" ;;
+  esac
+  case "$MANIFEST_TREE" in
+    *"app.suramak.mic.RecordingService"*) ;;
+    *) fail "APK manifest declares no app.suramak.mic.RecordingService" ;;
+  esac
+  case "$MANIFEST_TREE" in
+    *"foregroundServiceType"*"0x80"*) ;;
+    *) fail "the recording service does not declare the microphone foreground type (0x80)" ;;
+  esac
 
   # M13e: the JNI symbols both JobServices call. A missing symbol is an
   # UnsatisfiedLinkError the first time a job starts, on the phone only.
@@ -288,8 +308,49 @@ if [ -x "$AAPT" ]; then
       *"Java_app_suramak_transcribe_TranscribeBridge_nativeCommand"*) ;;
       *) fail "$APP_SO exports no TranscribeBridge.nativeCommand symbol" ;;
     esac
+    # M13F: the mic bridge's JNI entry point.
+    case "$SYMBOLS" in
+      *"Java_app_suramak_mic_MicBridge_nativeCommand"*) ;;
+      *) fail "$APP_SO exports no MicBridge.nativeCommand symbol" ;;
+    esac
   else
     fail "no llvm-nm at $LLVM_NM (cannot verify the JNI symbols)"
+  fi
+
+  # M13F: the notification channel and the mic classes are runtime objects, not
+  # manifest entries — aapt cannot see them. Assert them in the packaged dex:
+  # the channel id string, the channel creation call, and the three classes the
+  # record flow depends on.
+  DEXDUMP="$SDK/build-tools/35.0.0/dexdump"
+  if [ -x "$DEXDUMP" ]; then
+    TMPDEX="$(mktemp -d)"
+    # D8/AGP split the app across classes.dex … classesN.dex; the mic classes
+    # and the channel id can land in different files, so assert across all of
+    # them rather than per file.
+    for DEX_NAME in $(unzip -Z1 "$APK" | grep -E '^classes[0-9]*\.dex$'); do
+      unzip -p "$APK" "$DEX_NAME" > "$TMPDEX/$DEX_NAME"
+    done
+    FOUND_BRIDGE=0
+    FOUND_SERVICE=0
+    FOUND_BAR=0
+    FOUND_CHANNEL_CALL=0
+    FOUND_CHANNEL_ID=0
+    for DEX in "$TMPDEX"/*.dex; do
+      "$DEXDUMP" "$DEX" > "$TMPDEX/dump.txt" || true
+      grep -q "app/suramak/mic/MicBridge" "$TMPDEX/dump.txt" && FOUND_BRIDGE=1
+      grep -q "app/suramak/mic/RecordingService" "$TMPDEX/dump.txt" && FOUND_SERVICE=1
+      grep -q "app/suramak/mic/RecordBar" "$TMPDEX/dump.txt" && FOUND_BAR=1
+      grep -q "createNotificationChannel" "$TMPDEX/dump.txt" && FOUND_CHANNEL_CALL=1
+      grep -q "'recording'" "$TMPDEX/dump.txt" && FOUND_CHANNEL_ID=1
+    done
+    rm -rf "$TMPDEX"
+    [ "$FOUND_BRIDGE" = 1 ] || fail "the packaged dex is missing app.suramak.mic.MicBridge"
+    [ "$FOUND_SERVICE" = 1 ] || fail "the packaged dex is missing app.suramak.mic.RecordingService"
+    [ "$FOUND_BAR" = 1 ] || fail "the packaged dex is missing app.suramak.mic.RecordBar"
+    [ "$FOUND_CHANNEL_CALL" = 1 ] || fail "the packaged dex never calls createNotificationChannel"
+    [ "$FOUND_CHANNEL_ID" = 1 ] || fail "the packaged dex has no 'recording' notification-channel id"
+  else
+    fail "no dexdump at $DEXDUMP (cannot verify the recording notification channel)"
   fi
   printf '%s\n' "$BADGING" | grep -E "^(package|sdkVersion|targetSdkVersion|launchable-activity|native-code)" || true
 fi

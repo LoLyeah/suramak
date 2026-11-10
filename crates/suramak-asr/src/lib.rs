@@ -18,6 +18,15 @@
 
 pub mod cancel;
 pub mod capture;
+// M13F: the streaming 16 kHz WAV tail the Android capture path uses. Always
+// compiled (no cpal): the resample/WAV math is host-tested against the desktop
+// writer, and the desktop capture path itself is untouched.
+pub mod capture_stream;
+// M13F: the AAudio capture session. Android-only and only with `capture`
+// (cpal), so desktop builds never see it and the desktop capture path keeps its
+// exact behaviour.
+#[cfg(all(feature = "capture", target_os = "android"))]
+pub mod capture_android;
 // M14B2: the RT-safe half of capture (SPSC ring + consumer thread); crate-private
 // so the public `capture` surface is unchanged. Without the `capture` feature only
 // the unit tests exercise it, hence the dead-code allowance there.

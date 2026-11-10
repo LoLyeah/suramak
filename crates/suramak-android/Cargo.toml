@@ -28,3 +28,8 @@ uuid = { workspace = true }
 # Android build graph (the M13b spike crate uses the same version), so this adds
 # no package and no version bump.
 jni = "0.21"
+# M13F: the microphone. Enabling `suramak-asr/capture` only for the Android
+# target turns on cpal's Oboe/AAudio backend (cpal 0.15.3 pulls `oboe 0.6`
+# unconditionally on this target — no feature flip exists to make). Desktop
+# builds keep the same feature set as before, so no ALSA requirement leaks in.
+suramak-asr = { path = "../suramak-asr", features = ["capture"] }

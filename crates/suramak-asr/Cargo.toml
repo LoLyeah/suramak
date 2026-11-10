@@ -17,6 +17,10 @@ serde_json = { workspace = true }
 # M14B2: the SPSC ring under the capture callback (no_std, no dependencies of
 # its own; attacks SUR-HIGH-03).
 rtrb = { workspace = true }
+# M13F: the streaming resampler in `capture_stream` (the Android capture tail).
+# The same crate `suramak-core`'s `to_16khz_mono` uses; this is an edge, not a
+# new package.
+rubato = { workspace = true }
 
 [features]
 # Microphone capture (cpal). OFF by default so Linux builds never need ALSA headers.

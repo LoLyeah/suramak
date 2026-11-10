@@ -14,12 +14,12 @@ android {
         // compileSdk avoids the "targetSdk > compileSdk" AGP refusal.
         minSdk = 29
         targetSdk = 35
-        // M13e: the same single Gradle module now carries the share/SAF import
-        // and the transcription job host. `scripts/android/build-apk.sh`
-        // asserts this exact versionName with `aapt dump badging`, which is what
-        // the owner checks before installing.
-        versionCode = 7
-        versionName = "0.4.0-m13e.1"
+        // M13f: the same single Gradle module now carries mic recording (the
+        // RECORD_AUDIO flow, the microphone FGS and the record bar).
+        // `scripts/android/build-apk.sh` asserts this exact versionName with
+        // `aapt dump badging`, which is what the owner checks before installing.
+        versionCode = 8
+        versionName = "0.4.0-m13f.1"
 
         // Only the phone ABI: this APK exists to be installed by the owner.
         ndk {

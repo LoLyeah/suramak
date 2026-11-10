@@ -49,6 +49,14 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING" />
 
+    <!-- M13F: the microphone. RECORD_AUDIO is the runtime permission the
+         Activity requests once; FOREGROUND_SERVICE_MICROPHONE is the normal
+         permission the `microphone`-typed service needs from API 34. The
+         service is started only while the app is visible (Android 14+
+         while-in-use rule). -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
     <application
         android:name=".SpikeApp"
         android:allowBackup="false"
@@ -176,6 +184,18 @@
         <receiver
             android:name="app.suramak.transcribe.CancelTranscriptionReceiver"
             android:exported="false" />
+
+        <!-- M13F: the microphone foreground service. `microphone` is the only
+             valid type for a service that records from the mic; it requires
+             RECORD_AUDIO to be granted and (from API 34) the
+             FOREGROUND_SERVICE_MICROPHONE permission. The service is a plain
+             started Service, not a JobService: a recording is user-initiated
+             and must start immediately, and it stops itself when the take
+             stops. -->
+        <service
+            android:name="app.suramak.mic.RecordingService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
     </application>
 
 </manifest>

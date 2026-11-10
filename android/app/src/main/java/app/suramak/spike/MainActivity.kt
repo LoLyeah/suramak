@@ -31,6 +31,9 @@ import androidx.appcompat.app.AlertDialog
 import androidx.core.content.FileProvider
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import app.suramak.mic.MicBridge
+import app.suramak.mic.RecordBar
+import app.suramak.mic.RecordingService
 import app.suramak.transcribe.ImportSource
 import app.suramak.transcribe.ModelChoice
 import app.suramak.transcribe.Notify
@@ -39,6 +42,7 @@ import app.suramak.transcribe.TranscriptionJobService
 import com.google.androidgamesdk.GameActivity
 import com.google.androidgamesdk.gametextinput.State
 import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * M13b shell spike v2.4 — the entire Kotlin surface.
@@ -92,7 +96,7 @@ import org.json.JSONArray
  * `filesDir` above is `CrashFiles.dir(this)` — the app's *external* files dir
  * since v2.1 (`Android/data/app.suramak.spike/files`), not the private one.
  */
-class MainActivity : GameActivity() {
+class MainActivity : GameActivity(), RecordBar.Listener {
 
     /** Cached so Rust's recreate request never touches a View off the UI thread. */
     private var root: View? = null
@@ -131,6 +135,12 @@ class MainActivity : GameActivity() {
 
     /** One recovery prompt per Activity instance (a rotation would repeat it). */
     private var recoveryShown = false
+
+    /**
+     * M13F — the pre-compact-UI record bar. It reads the Rust host's status;
+     * it is deliberately not a second source of recording state.
+     */
+    private var recordBar: RecordBar? = null
 
     private external fun nativeInit(filesDir: String)
 
@@ -203,6 +213,13 @@ class MainActivity : GameActivity() {
 
         /** M13e — the POST_NOTIFICATIONS request code. */
         private const val REQUEST_NOTIFICATIONS = 4301
+
+        /** M13F — the RECORD_AUDIO runtime request code. */
+        private const val REQUEST_RECORD_AUDIO = 4302
+
+        /** M13F — the one-shot permission-request marker (request once, then Settings). */
+        private const val PREFS_MIC = "mic"
+        private const val KEY_MIC_REQUESTED = "permission_requested"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -250,13 +267,20 @@ class MainActivity : GameActivity() {
         showCrashOverlayIfPresent("launch", force = false)
 
         // M13e: the job host needs `filesDir` before any job command, and the
-        // share/SAF landing has to be handled on the launch intent.
-        try {
+        // share/SAF landing has to be handled on the launch intent. M13F adds
+        // the mic host **after** the job host: a stopped take hands its WAV to
+        // the M13E inbox.
+        val micStatus = try {
             TranscribeBridge.init(this)
+            val status = MicBridge.init(this)
             Notify.ensureChannels(this)
+            status
         } catch (t: Throwable) {
-            Log.e(TAG, "the transcription host did not initialise", t)
+            Log.e(TAG, "the transcription/microphone host did not initialise", t)
+            null
         }
+        installRecordBar()
+        micStatus?.let { showRecoveredRecording(it) }
         requestNotificationPermission()
         handleLaunchIntent(intent)
         offerRecovery()
@@ -294,6 +318,10 @@ class MainActivity : GameActivity() {
         // nothing would ever change, and the panel sat at zeroes.
         root?.let { ViewCompat.requestApplyInsets(it) }
         pushCurrentInsets()
+        // A recording may have been stopped by the notification, an
+        // interruption or a process recovery while this Activity was away.
+        recordBar?.refresh()
+        recordBar?.startTicker()
         // A crash recorded by Rust while the surface was dead only becomes
         // readable here if the overlay missed it.
         showCrashOverlayIfPresent("resume", force = false)
@@ -301,6 +329,10 @@ class MainActivity : GameActivity() {
 
     override fun onPause() {
         logToRust("onPause")
+        // Stop the record bar's status poll: with the screen locked the
+        // service (and its wake lock) owns the recording, and a UI timer would
+        // keep waking the process for nothing.
+        recordBar?.stopTicker()
         super.onPause()
     }
 
@@ -381,6 +413,7 @@ class MainActivity : GameActivity() {
                 val id = intent.getStringExtra(Notify.EXTRA_TRANSCRIPT_ID)
                 if (id != null) showTranscript(id)
             }
+            Notify.ACTION_OPEN_RECORDING -> recordBar?.refresh()
         }
     }
 
@@ -520,6 +553,185 @@ class MainActivity : GameActivity() {
             return
         }
         requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICATIONS)
+    }
+
+    // --- M13F: microphone ----------------------------------------------------
+
+    /** Adds the stopgap record bar above the egui surface (M13G replaces it). */
+    private fun installRecordBar() {
+        if (recordBar != null) return
+        val decor = window.decorView as? ViewGroup ?: return
+        val bar = RecordBar(this, this)
+        decor.addView(
+            bar,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM,
+            ),
+        )
+        recordBar = bar
+        logToRust("mic: record bar installed")
+    }
+
+    /**
+     * Surfaces a take the journal replayed after a process kill. The service
+     * cannot post this itself (it died with the process); the recovery notice
+     * is the "abrupt end" the workorder asks for on the next launch, alongside
+     * the record bar's line.
+     */
+    private fun showRecoveredRecording(status: JSONObject) {
+        val recovered = status.optJSONArray("recovered") ?: return
+        val first = recovered.optJSONObject(0) ?: return
+        val title = first.optString("title").ifEmpty { getString(R.string.transcribe_unnamed) }
+        val queued = first.optBoolean("handed_off")
+        val frames = first.optLong("frames", 0L)
+        val body = when {
+            frames == 0L -> getString(R.string.mic_recovered_notification_empty, title)
+            queued -> getString(R.string.mic_recovered_notification_queued, title)
+            else -> getString(R.string.mic_recovered_notification, title)
+        }
+        Notify.show(
+            this,
+            Notify.STATUS_ID,
+            Notify.micStatus(this, getString(R.string.mic_recovered_title), body),
+        )
+        logToRust("mic: replayed ${recovered.length()} recovered take(s) from the journal")
+    }
+
+    /**
+     * Record was tapped. The permission is requested **once**; after a refusal
+     * the button states the truth and the only way forward is the system app
+     * page — no repeated prompts, no silent failure.
+     */
+    override fun onRecord() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            startRecordingFromForeground()
+            return
+        }
+        val prefs = getSharedPreferences(PREFS_MIC, MODE_PRIVATE)
+        if (prefs.getBoolean(KEY_MIC_REQUESTED, false)) {
+            Toast.makeText(this, getString(R.string.mic_permission_settings), Toast.LENGTH_LONG)
+                .show()
+            logToRust("mic: RECORD_AUDIO already refused once — opening Settings")
+            openMicSettings()
+            return
+        }
+        prefs.edit().putBoolean(KEY_MIC_REQUESTED, true).apply()
+        logToRust("mic: requesting RECORD_AUDIO (once)")
+        requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_RECORD_AUDIO)
+    }
+
+    override fun onStopRecording() {
+        RecordingService.stop(this)
+        logToRust("mic: stop requested from the record bar")
+        recordBar?.postDelayed({ recordBar?.refresh() }, 300L)
+    }
+
+    override fun onOpenSettings() = openMicSettings()
+
+    override fun onQuit() = confirmQuit()
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != REQUEST_RECORD_AUDIO) return
+        val granted = grantResults.isNotEmpty() &&
+            grantResults[0] == PackageManager.PERMISSION_GRANTED
+        recordBar?.refresh()
+        if (granted) {
+            logToRust("mic: RECORD_AUDIO granted")
+            startRecordingFromForeground()
+        } else {
+            val permanent = !shouldShowRequestPermissionRationale(
+                Manifest.permission.RECORD_AUDIO,
+            )
+            val message = if (permanent) {
+                R.string.mic_permission_settings
+            } else {
+                R.string.mic_permission_denied
+            }
+            Toast.makeText(this, getString(message), Toast.LENGTH_LONG).show()
+            logToRust("mic: RECORD_AUDIO denied (permanent=$permanent)")
+        }
+    }
+
+    /**
+     * Starts the microphone service. Only from the foreground: Android 14+
+     * refuses a `microphone` FGS started while the app is not visible, and the
+     * Rust host independently refuses a start without the foreground claim.
+     */
+    private fun startRecordingFromForeground() {
+        if (!hasWindowFocus()) {
+            Toast.makeText(this, getString(R.string.mic_foreground_required), Toast.LENGTH_LONG)
+                .show()
+            logToRust("mic: start refused — the Activity does not have window focus")
+            return
+        }
+        val model = ModelChoice.forJob(this, "auto")
+        if (model == null) {
+            Toast.makeText(this, getString(R.string.transcribe_no_model_body), Toast.LENGTH_LONG)
+                .show()
+            logToRust("mic: no model installed")
+            return
+        }
+        if (RecordingService.isRunning()) {
+            Toast.makeText(this, getString(R.string.mic_already_recording), Toast.LENGTH_LONG)
+                .show()
+            return
+        }
+        if (!RecordingService.start(this, foreground = true)) {
+            Toast.makeText(this, getString(R.string.mic_unavailable_body), Toast.LENGTH_LONG)
+                .show()
+            logToRust("mic: the platform refused to start the service")
+            return
+        }
+        logToRust("mic: recording service started with $model")
+        recordBar?.postDelayed({ recordBar?.refresh() }, 400L)
+    }
+
+    private fun openMicSettings() {
+        val intent = Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+            .setData(Uri.parse("package:$packageName"))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        try {
+            startActivity(intent)
+        } catch (t: Throwable) {
+            Log.e(TAG, "could not open the app's Settings page", t)
+            Toast.makeText(this, getString(R.string.mic_permission_settings), Toast.LENGTH_LONG)
+                .show()
+        }
+    }
+
+    private fun confirmQuit() {
+        AlertDialog.Builder(this)
+            .setTitle(getString(R.string.mic_quit_title))
+            .setMessage(getString(R.string.mic_quit_body))
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(getString(R.string.mic_quit)) { _, _ -> quitApp() }
+            .show()
+    }
+
+    /**
+     * **The owner's Quit invariant:** capture first, service second, exit
+     * third. `MicBridge.quit()` stops the stream, finalizes the WAV, journals
+     * the reason and hands the take to the M13E inbox synchronously; only after
+     * it returns does the service stop and the Activity leave.
+     */
+    private fun quitApp() {
+        val reply = MicBridge.quit()
+        val quit = reply.optJSONObject("quit")
+        logToRust(
+            "quit: capture stopped=" + (quit?.optBoolean("was_recording") ?: false) +
+                ", next=" + (quit?.optJSONArray("next")?.toString() ?: "[]"),
+        )
+        stopService(Intent(this, RecordingService::class.java))
+        finishAndRemoveTask()
     }
 
     // --- Android surface timeline -------------------------------------------

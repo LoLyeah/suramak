@@ -24,9 +24,11 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 pub mod jobs;
+pub mod mic;
 pub mod model_host;
 
 use jobs::{AndroidJobHost, HostDirs};
+use mic::MicHost;
 use model_host::ModelHost;
 
 /// The crate version (the workspace version, e.g. `0.4.0`).
@@ -55,6 +57,51 @@ pub fn jobs_host() -> Option<&'static AndroidJobHost> {
 
 /// The one process-wide job host; `init` fills it, every other command reads it.
 static JOBS_HOST: OnceLock<AndroidJobHost> = OnceLock::new();
+
+/// The process-wide microphone host (M13F).
+///
+/// Created by `mic_init` after the job host exists, because stopping a take
+/// hands its WAV to the M13E inbox. A mic command before init fails closed.
+pub fn mic_host() -> Option<&'static MicHost> {
+    MIC_HOST.get()
+}
+
+static MIC_HOST: OnceLock<MicHost> = OnceLock::new();
+
+/// Handles the mic protocol, including the one command that runs before the
+/// host exists (`init`).
+pub fn dispatch_mic(request: &str) -> String {
+    let value = match serde_json::from_str::<serde_json::Value>(request) {
+        Ok(value) => value,
+        Err(_) => return r#"{"ok":false,"error":"invalid JSON request"}"#.to_string(),
+    };
+    let op = value.get("op").and_then(|v| v.as_str()).unwrap_or_default();
+    if op == "init" {
+        let root = value
+            .get("root")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if root.is_empty() {
+            return r#"{"ok":false,"error":"mic init needs the app files directory"}"#.to_string();
+        }
+        #[cfg(target_os = "android")]
+        {
+            let host = MIC_HOST.get_or_init(|| MicHost::production(std::path::Path::new(root)));
+            return host.dispatch(r#"{"op":"status"}"#);
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = root;
+            return r#"{"ok":false,"error":"microphone capture is only available on Android"}"#
+                .to_string();
+        }
+    }
+    match mic_host() {
+        Some(host) => host.dispatch(request),
+        None => r#"{"ok":false,"error":"the microphone host has not been initialised (send init first)"}"#
+            .to_string(),
+    }
+}
 
 /// Handles the job protocol, including the one command that runs before the
 /// host exists (`init`).
@@ -186,6 +233,47 @@ mod jni_transcribe {
         }))
         .unwrap_or_else(|_| {
             "{\"ok\":false,\"error\":\"internal error in the job host\"}".to_string()
+        });
+
+        match env.new_string(reply) {
+            Ok(string) => string.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+}
+
+/// The M13F JNI surface: one function, the same shape as the other bridges.
+///
+/// Kotlin (`app.suramak.mic.MicBridge`) declares
+/// `private external fun nativeCommand(request: String): String`. Every call
+/// goes through [`crate::dispatch_mic`], which owns the `init` special case.
+#[cfg(target_os = "android")]
+mod jni_mic {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    use jni::objects::{JObject, JString};
+    use jni::sys::jstring;
+    use jni::JNIEnv;
+
+    /// `MicBridge.nativeCommand(String): String`.
+    #[no_mangle]
+    pub extern "system" fn Java_app_suramak_mic_MicBridge_nativeCommand<'local>(
+        mut env: JNIEnv<'local>,
+        _this: JObject<'local>,
+        request: JString<'local>,
+    ) -> jstring {
+        let reply = catch_unwind(AssertUnwindSafe(|| {
+            let input: String = match env.get_string(&request) {
+                Ok(text) => text.into(),
+                Err(_) => {
+                    return "{\"ok\":false,\"error\":\"could not read the request string\"}"
+                        .to_string()
+                }
+            };
+            crate::dispatch_mic(&input)
+        }))
+        .unwrap_or_else(|_| {
+            "{\"ok\":false,\"error\":\"internal error in the microphone host\"}".to_string()
         });
 
         match env.new_string(reply) {

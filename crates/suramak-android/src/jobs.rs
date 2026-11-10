@@ -801,6 +801,92 @@ impl<B: InferenceBackend + Send + 'static, P: Prefetcher + Send + 'static> JobHo
         self.shared.persist(&state);
     }
 
+    /// Adopts a finished recording as a queued job.
+    ///
+    /// The M13F mic path writes its WAV directly at the inbox path
+    /// (`media/<key>.wav`), so this is the recording's `import_done`: the bytes
+    /// are already there, the size is verified, and the job enters the same
+    /// M16.1 queue an imported file does. It deliberately does **not** copy:
+    /// a recording is not a platform URI whose grant dies with the process.
+    pub fn adopt_recording(
+        &self,
+        key: &str,
+        title: &str,
+        source_name: &str,
+        media_path: &Path,
+        model_id: &str,
+        language: &str,
+    ) -> Result<(), String> {
+        if key.trim().is_empty() || title.trim().is_empty() {
+            return Err("a recording needs a key and a title".to_string());
+        }
+        let info =
+            models::find_model(model_id).ok_or_else(|| format!("unknown model '{model_id}'"))?;
+        let model_path = self.shared.dirs.models_dir.join(info.hf_file);
+        if !model_path.is_file() {
+            return Err(format!(
+                "the {model_id} model is not installed on this phone yet"
+            ));
+        }
+        let media_dir = self.shared.dirs.media_dir.as_path();
+        if media_path.parent() != Some(media_dir) {
+            return Err(format!(
+                "{} is not in the transcription inbox ({})",
+                media_path.display(),
+                media_dir.display()
+            ));
+        }
+        if !media_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))
+        {
+            return Err("a recording must be a .wav in the inbox".to_string());
+        }
+        let size = fs::metadata(media_path)
+            .map_err(|err| format!("the recording is not readable: {err}"))?
+            .len();
+        // 44-byte canonical header + whole i16 samples.
+        if size < 44 || (size - 44) % 2 != 0 {
+            return Err(format!(
+                "the recording is {size} bytes, which is not a whole PCM16 WAV"
+            ));
+        }
+
+        let mut state = self.shared.state.lock().expect("job state lock");
+        if let Some(existing) = state.job(key) {
+            // A recovery can replay an adoption whose journal write was cut by
+            // the process death: the job is already in the inbox, so this is
+            // the same take, not a duplicate.
+            if existing.media_path == media_path {
+                return Ok(());
+            }
+            return Err(format!("a job with key '{key}' already exists"));
+        }
+        state.prune();
+        let mut job = JobRecord::new(
+            key.to_string(),
+            title.to_string(),
+            source_name.to_string(),
+            media_path.to_path_buf(),
+            model_id.to_string(),
+            language.to_string(),
+            size,
+        );
+        job.copy_complete = true;
+        job.bytes_done = size;
+        job.percent = 100;
+        job.phase = Phase::Queued;
+        state.total += 1;
+        state.jobs.push(job);
+        self.shared.persist(&state);
+        drop(state);
+        if !self.send(Command::Accept(key.to_string())) {
+            return Err("the job thread is gone".to_string());
+        }
+        Ok(())
+    }
+
     // -- control -----------------------------------------------------------
 
     /// The user cancelled: stop, delete the copy, never write a row.

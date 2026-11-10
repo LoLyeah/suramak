@@ -246,6 +246,13 @@ pub struct QueueDriver<B: InferenceBackend, P: Prefetcher> {
     samples: HashMap<u64, Vec<f32>>,
     current: Option<Running>,
     events: Vec<QueueEvent>,
+    /// Tasks handed to the prefetch pool whose completion has not arrived yet
+    /// (M13F found the hole: the queue's row may have been cancelled — removed
+    /// from the waiting count — while the pool still reads the file; `is_idle`
+    /// would otherwise go true too early and the CLI batch loop could exit
+    /// mid-batch). Incremented in `start_decode`, decremented on every
+    /// `DecodeDone` arrival.
+    prefetch_in_flight: usize,
 }
 
 impl<B: InferenceBackend, P: Prefetcher> QueueDriver<B, P> {
@@ -259,6 +266,7 @@ impl<B: InferenceBackend, P: Prefetcher> QueueDriver<B, P> {
             samples: HashMap::new(),
             current: None,
             events: Vec::new(),
+            prefetch_in_flight: 0,
         }
     }
 
@@ -280,13 +288,15 @@ impl<B: InferenceBackend, P: Prefetcher> QueueDriver<B, P> {
         &self.queue
     }
 
+    /// Updates the queue's owned snapshot of the counts at the time of an event.
     pub fn counts(&self) -> QueueCounts {
         self.queue.counts()
     }
 
-    /// Whether any work — waiting, decoding, running — remains.
+    /// Whether any work — running, waiting, decoded-ahead, or an in-flight
+    /// prefetch decode — remains (the CLI batch loop's exit condition).
     pub fn is_idle(&self) -> bool {
-        self.queue.is_idle() && self.current.is_none()
+        self.queue.is_idle() && self.current.is_none() && self.prefetch_in_flight == 0
     }
 
     /// Takes the events produced since the last drain.
@@ -369,6 +379,9 @@ impl<B: InferenceBackend, P: Prefetcher> QueueDriver<B, P> {
     }
 
     fn on_decoded(&mut self, done: DecodeDone) {
+        // The completion arrived, whatever happens to the item next — the
+        // in-flight counter is the drain discipline of `is_idle`.
+        self.prefetch_in_flight = self.prefetch_in_flight.saturating_sub(1);
         match done.result {
             Ok(samples) => {
                 let bytes = samples.len() * std::mem::size_of::<f32>();
@@ -541,6 +554,7 @@ impl<B: InferenceBackend, P: Prefetcher> QueueDriver<B, P> {
             input: ticket.input,
             cancel: token,
         });
+        self.prefetch_in_flight += 1;
         true
     }
 

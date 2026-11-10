@@ -655,6 +655,12 @@ fn the_manifest_declares_the_share_matrix_and_the_service() {
         "android.permission.FOREGROUND_SERVICE_DATA_SYNC",
         "android.permission.WAKE_LOCK",
         "app.suramak.transcribe.CancelTranscriptionReceiver",
+        // M13F: the microphone permission, the microphone-typed foreground
+        // service and its normal permission.
+        "android.permission.RECORD_AUDIO",
+        "android.permission.FOREGROUND_SERVICE_MICROPHONE",
+        "app.suramak.mic.RecordingService",
+        "foregroundServiceType=\"microphone\"",
     ] {
         assert!(
             manifest.contains(needle),

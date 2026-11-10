@@ -59,4 +59,49 @@
     <!-- M13e: pintasan peluncur untuk membuka pemilih SAF. -->
     <string name="shortcut_import_short">Impor</string>
     <string name="shortcut_import_long">Impor berkas audio</string>
+
+    <!-- M13F: perekaman mikrofon. -->
+    <string name="mic_channel">Perekaman</string>
+    <string name="mic_channel_desc">Layanan latar depan mikrofon: waktu berjalan dan Berhenti</string>
+    <string name="mic_recording_title">Merekam</string>
+    <string name="mic_title_prefix">Merekam %1$s</string>
+    <string name="mic_stop">Berhenti</string>
+    <string name="mic_record">Rekam</string>
+    <string name="mic_settings">Pengaturan</string>
+    <string name="mic_quit">Keluar</string>
+    <string name="mic_locked_screen_body">Layar terkunci? Perekaman tetap berjalan.</string>
+    <string name="mic_doze_body">Doze aktif — layanan latar depan tetap merekam.</string>
+    <string name="mic_saved_title">%1$s disimpan</string>
+    <string name="mic_saved_queued">%1$s Disimpan dan masuk antrean transkripsi.</string>
+    <string name="mic_saved">%1$s Disimpan.</string>
+    <string name="mic_saved_empty">%1$s Tidak ada audio yang terekam.</string>
+    <string name="mic_permission_title">Izin mikrofon mati</string>
+    <string name="mic_permission_body">Perekaman membutuhkan mikrofon. Aktifkan untuk Suramak di Pengaturan.</string>
+    <string name="mic_permission_settings">Aktifkan mikrofon untuk Suramak di Pengaturan.</string>
+    <string name="mic_permission_denied">Izin mikrofon tidak diberikan. Perekaman tetap nonaktif sampai Anda mengizinkannya di Pengaturan.</string>
+    <string name="mic_stopped_title">Perekaman berhenti</string>
+    <string name="mic_stopped_focus_unavailable">Aplikasi lain memegang fokus audio. Tidak ada yang terekam.</string>
+    <string name="mic_unavailable_title">Perekaman tidak dimulai</string>
+    <string name="mic_unavailable_body">Layanan mikrofon tidak dapat dimulai. Buka Suramak di layar lalu coba lagi.</string>
+    <string name="mic_stopped_user">Dihentikan.</string>
+    <string name="mic_stopped_call">Dihentikan karena panggilan mengambil jalur audio.</string>
+    <string name="mic_stopped_focus">Dihentikan karena aplikasi lain mengambil fokus audio.</string>
+    <string name="mic_stopped_bluetooth">Dihentikan karena headset Bluetooth terputus.</string>
+    <string name="mic_stopped_timeout">Dihentikan karena batas waktu sistem.</string>
+    <string name="mic_stopped_service">Dihentikan karena sistem mengakhiri layanan perekaman.</string>
+    <string name="mic_stopped_stream_error">Aliran mikrofon gagal.</string>
+    <string name="mic_foreground_required">Buka Suramak di layar untuk mulai merekam.</string>
+    <string name="mic_already_recording">Perekaman sudah berjalan.</string>
+    <string name="mic_bar_ready">Mikrofon siap.</string>
+    <string name="mic_bar_recording">Merekam %1$s — tetap berjalan saat layar terkunci.</string>
+    <string name="mic_bar_denied">Izin mikrofon mati — perekaman dinonaktifkan.</string>
+    <string name="mic_bar_recovered">Perekaman terakhir berakhir mendadak. %1$s telah dipulihkan.</string>
+    <string name="mic_bar_recovered_queued">Perekaman terakhir berakhir mendadak. %1$s telah dipulihkan dan masuk antrean transkripsi.</string>
+    <string name="mic_bar_recovered_empty">Perekaman terakhir berakhir mendadak sebelum ada audio yang tersimpan.</string>
+    <string name="mic_recovered_title">Rekaman dipulihkan</string>
+    <string name="mic_recovered_notification">%1$s berakhir mendadak. Bagian yang tersimpan telah dipulihkan.</string>
+    <string name="mic_recovered_notification_queued">%1$s berakhir mendadak. Bagian yang tersimpan telah dipulihkan dan masuk antrean transkripsi.</string>
+    <string name="mic_recovered_notification_empty">%1$s berakhir mendadak sebelum ada audio yang tersimpan.</string>
+    <string name="mic_quit_title">Keluar dari Suramak?</string>
+    <string name="mic_quit_body">Perekaman apa pun akan dihentikan, disimpan, dan masuk antrean transkripsi terlebih dahulu.</string>
 </resources>
