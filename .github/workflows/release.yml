@@ -160,6 +160,11 @@ jobs:
       - name: Rust cache (android targets)
         uses: Swatinem/rust-cache@v2
 
+      - name: Android toolchain (cargo-ndk 4.1.2 + rustup targets)
+        run: |
+          cargo install cargo-ndk --version 4.1.2 --locked
+          rustup target add aarch64-linux-android x86_64-linux-android
+
       - name: Build the release APK (scripts/android/build-apk.sh, release mode)
         env:
           SURAMAK_ANDROID_RELEASE: "1"
