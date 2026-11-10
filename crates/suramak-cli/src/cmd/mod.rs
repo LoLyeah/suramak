@@ -27,6 +27,7 @@ pub enum ExportFormat {
     Json,
     Srt,
     Vtt,
+    Tsv,
 }
 
 impl ExportFormat {
@@ -38,6 +39,7 @@ impl ExportFormat {
             ExportFormat::Json => "json",
             ExportFormat::Srt => "srt",
             ExportFormat::Vtt => "vtt",
+            ExportFormat::Tsv => "tsv",
         }
     }
 
@@ -49,6 +51,7 @@ impl ExportFormat {
             ExportFormat::Json => core_export::to_json(transcript)?,
             ExportFormat::Srt => core_export::to_srt(transcript)?,
             ExportFormat::Vtt => core_export::to_vtt(transcript)?,
+            ExportFormat::Tsv => core_export::to_tsv(transcript)?,
         };
         Ok(text)
     }

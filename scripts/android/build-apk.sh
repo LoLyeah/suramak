@@ -58,6 +58,12 @@ if [ -z "${JAVA_HOME:-}" ]; then
       break
     fi
   done
+elif [ -x "${JAVA_HOME:-/nonexistent}/bin/javac" ]; then
+  : # the exported JAVA_HOME already carries javac
+elif [ -x "/home/ubuntu/android-sdk/jdk/jdk-17.0.20.1+1/bin/javac" ]; then
+  # The shell may carry a JAVA_HOME exported by another toolchain's session
+  # (e.g. a system JRE without javac); the pinned build JDK wins.
+  JAVA_HOME="/home/ubuntu/android-sdk/jdk/jdk-17.0.20.1+1"
 fi
 [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/javac" ] \
   || fail "no JDK with javac found (set JAVA_HOME); a JRE-only install cannot build Kotlin"
@@ -170,13 +176,13 @@ if [ -x "$AAPT" ]; then
   # Same SIGPIPE reasoning as above: match in the shell, not through a pipe.
   BADGING="$("$AAPT" dump badging "$APK")"
   case "$BADGING" in
-    *"package: name='app.suramak.spike' versionCode='9' versionName='0.4.0-m13g1.1'"*) ;;
+    *"package: name='app.suramak.spike' versionCode='10' versionName='0.4.0-m13g2.1'"*) ;;
     *)
       # Fall back to a narrower match so a future versionCode bump does not
       # hide a real versionName regression.
       case "$BADGING" in
-        *"package: name='app.suramak.spike'"*"versionName='0.4.0-m13g1.1'"*) ;;
-        *) fail "APK versionName is not 0.4.0-m13g1.1 (see aapt output below)" ;;
+        *"package: name='app.suramak.spike'"*"versionName='0.4.0-m13g2.1'"*) ;;
+        *) fail "APK versionName is not 0.4.0-m13g2.1 (see aapt output below)" ;;
       esac
       ;;
   esac
@@ -348,6 +354,7 @@ if [ -x "$AAPT" ]; then
     FOUND_CHANNEL_ID=0
     FOUND_UI_BRIDGE=0
     FOUND_QUIT=0
+    FOUND_EXPORT_WRITER=0
     for DEX in "$TMPDEX"/*.dex; do
       "$DEXDUMP" "$DEX" > "$TMPDEX/dump.txt" || true
       grep -q "app/suramak/mic/MicBridge" "$TMPDEX/dump.txt" && FOUND_BRIDGE=1
@@ -357,6 +364,7 @@ if [ -x "$AAPT" ]; then
       grep -q "'recording'" "$TMPDEX/dump.txt" && FOUND_CHANNEL_ID=1
       grep -q "app/suramak/ui/UiBridge" "$TMPDEX/dump.txt" && FOUND_UI_BRIDGE=1
       grep -q "app/suramak/ui/QuitReceiver" "$TMPDEX/dump.txt" && FOUND_QUIT=1
+      grep -q "app/suramak/ui/ExportWriter" "$TMPDEX/dump.txt" && FOUND_EXPORT_WRITER=1
     done
     rm -rf "$TMPDEX"
     [ "$FOUND_BRIDGE" = 1 ] || fail "the packaged dex is missing app.suramak.mic.MicBridge"
@@ -366,6 +374,9 @@ if [ -x "$AAPT" ]; then
     [ "$FOUND_CHANNEL_ID" = 1 ] || fail "the packaged dex has no 'recording' notification-channel id"
     [ "$FOUND_UI_BRIDGE" = 1 ] || fail "the packaged dex is missing app.suramak.ui.UiBridge"
     [ "$FOUND_QUIT" = 1 ] || fail "the packaged dex is missing app.suramak.ui.QuitReceiver"
+    # M13g2: the export picker/writer is the phone's only export path; a
+    # missing class is a NoClassDefFoundError the moment the sheet exports.
+    [ "$FOUND_EXPORT_WRITER" = 1 ] || fail "the packaged dex is missing app.suramak.ui.ExportWriter"
   else
     fail "no dexdump at $DEXDUMP (cannot verify the recording notification channel)"
   fi
@@ -387,6 +398,24 @@ EXIT_LINE="$(quit_line 'Process.killProcess')"
 [ "$CAPTURE_LINE" -lt "$JOBS_LINE" ] && [ "$JOBS_LINE" -lt "$SERVICES_LINE" ] \
   && [ "$SERVICES_LINE" -lt "$EXIT_LINE" ] \
   || fail "QuitReceiver.kt is not in the owner's order: capture($CAPTURE_LINE) → jobs($JOBS_LINE) → services($SERVICES_LINE) → exit($EXIT_LINE)"
+
+# --- 3c. The compact export path (source-level, deliberately) ----------------
+# M13g2: the phone has exactly two ways to export, and both must be the real
+# platform intents — a missing ACTION_CREATE_DOCUMENT is a sheet button that
+# does nothing, a missing ACTION_SEND is an undisclosed dead alternative.
+EXPORT_SRC="android/app/src/main/java/app/suramak/ui/ExportWriter.kt"
+grep -q "Intent.ACTION_CREATE_DOCUMENT" "$EXPORT_SRC" \
+  || fail "ExportWriter.kt does not open ACTION_CREATE_DOCUMENT"
+grep -q "Intent.ACTION_SEND" "$EXPORT_SRC" \
+  || fail "ExportWriter.kt does not offer the one-file ACTION_SEND path"
+grep -q "openOutputStream(uri, \"wt\")" "$EXPORT_SRC" \
+  || fail "ExportWriter.kt does not truncate/create the picked document ('wt')"
+grep -q "checksum" "$EXPORT_SRC" \
+  || fail "ExportWriter.kt does not verify the staged export's checksum"
+grep -q "exportLauncher.launch" android/app/src/main/java/app/suramak/spike/MainActivity.kt \
+  || fail "MainActivity never launches the export picker"
+grep -q "UiBridge.exportDone" android/app/src/main/java/app/suramak/spike/MainActivity.kt \
+  || fail "MainActivity never reports a completed export to the host"
 
 SIZE="$(stat -c %s "$APK")"
 SHA="$(sha256sum "$APK" | cut -d' ' -f1)"

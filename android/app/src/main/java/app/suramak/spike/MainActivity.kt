@@ -40,6 +40,7 @@ import app.suramak.transcribe.Notify
 import app.suramak.transcribe.TranscribeBridge
 import app.suramak.models.DeviceMemory
 import app.suramak.transcribe.TranscriptionJobService
+import app.suramak.ui.ExportWriter
 import app.suramak.ui.UiBridge
 import com.google.androidgamesdk.GameActivity
 import com.google.androidgamesdk.gametextinput.State
@@ -137,6 +138,47 @@ class MainActivity : GameActivity(), RecordBar.Listener {
 
     /** One recovery prompt per Activity instance (a rotation would repeat it). */
     private var recoveryShown = false
+
+    /**
+     * M13g2 — the export the picker is currently placing. Set before the
+     * `ACTION_CREATE_DOCUMENT` chooser opens; consumed by its result.
+     */
+    private var pendingExport: ExportWriter.Staged? = null
+
+    /**
+     * M13g2 — the compact editor's export sheet calls
+     * [exportFromCompact]/[shareFromCompact]. The picker is a per-format
+     * contract (six MIME types), so it is registered once and given the staged
+     * export as input.
+     */
+    private val exportLauncher =
+        registerForActivityResult(ExportWriter.CreateExportDocument()) { uri ->
+            val staged = pendingExport
+            pendingExport = null
+            if (staged == null) {
+                logToRust("export: the picker returned with no staged export")
+                return@registerForActivityResult
+            }
+            if (uri == null) {
+                UiBridge.exportCancel(staged.job)
+                logToRust("export: cancelled at the picker (${staged.name})")
+                return@registerForActivityResult
+            }
+            ExportWriter.write(this, uri, staged).fold(
+                onSuccess = { written ->
+                    UiBridge.exportDone(staged.job, written)
+                    logToRust("export: wrote ${staged.name} ($written bytes, checksum verified)")
+                },
+                onFailure = { failure ->
+                    // The staged bytes stay; the sheet reports the host's reason
+                    // and offers Try again.
+                    val message = failure.message ?: failure.javaClass.simpleName
+                    UiBridge.exportFailed(staged.job, message)
+                    logToRust("export: failed — $message")
+                    Toast.makeText(this, "Export failed: $message", Toast.LENGTH_LONG).show()
+                },
+            )
+        }
 
     /**
      * M13F — the pre-compact-UI record bar. It reads the Rust host's status;
@@ -917,6 +959,73 @@ class MainActivity : GameActivity(), RecordBar.Listener {
         } catch (t: Throwable) {
             logToRust("back ($source): nativeBackPressed failed (${t.javaClass.simpleName})")
             Log.e(TAG, "nativeBackPressed failed", t)
+        }
+    }
+
+    /**
+     * M13g2 — the compact editor's **Export** action.
+     *
+     * Kotlin formats nothing: the Rust host renders through the same M15
+     * serializers the desktop uses, stages the bytes atomically, and returns
+     * the one file. This opens `ACTION_CREATE_DOCUMENT` with that format's
+     * MIME type and suggested name; [exportLauncher] writes and verifies.
+     *
+     * Called by the compact surface's action dispatcher. The surface is drawn
+     * by the Deck on the host and by the M13b shell's window on the phone, so
+     * this entry is the seam between them — no screen invents an export.
+     */
+    @Suppress("unused")
+    fun exportFromCompact(format: String, bilingual: Boolean) {
+        val reply = UiBridge.export(format, bilingual)
+        if (!reply.optBoolean("ok")) {
+            val reason = reply.optString("error", "the export could not be staged")
+            logToRust("export: refused — $reason")
+            Toast.makeText(this, reason, Toast.LENGTH_LONG).show()
+            return
+        }
+        val staged = ExportWriter.Staged.from(reply)
+        if (staged == null) {
+            logToRust("export: the host returned an incomplete job")
+            return
+        }
+        pendingExport = staged
+        try {
+            exportLauncher.launch(staged)
+            logToRust("export: picker opened for ${staged.name} (${staged.bytes} bytes)")
+        } catch (t: Throwable) {
+            pendingExport = null
+            UiBridge.exportCancel(staged.job)
+            logToRust("export: the picker could not open (${t.javaClass.simpleName})")
+            Toast.makeText(this, "No file picker available", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    /**
+     * M13g2 — the sheet's **Share instead** action: the same staged file
+     * handed to the share chooser (`ACTION_SEND`, one file). The staged copy
+     * stays until the next process start so the receiving app can read it.
+     */
+    @Suppress("unused")
+    fun shareFromCompact(format: String, bilingual: Boolean) {
+        val reply = UiBridge.exportShare(format, bilingual)
+        if (!reply.optBoolean("ok")) {
+            val reason = reply.optString("error", "the export could not be staged")
+            logToRust("export: share refused — $reason")
+            Toast.makeText(this, reason, Toast.LENGTH_LONG).show()
+            return
+        }
+        val staged = ExportWriter.Staged.from(reply)
+        if (staged == null) {
+            logToRust("export: the host returned an incomplete share job")
+            return
+        }
+        try {
+            startActivity(Intent.createChooser(ExportWriter.shareIntent(this, staged), "Share transcript"))
+            UiBridge.exportShared(staged.job)
+            logToRust("export: shared ${staged.name} (${staged.bytes} bytes)")
+        } catch (t: Throwable) {
+            UiBridge.exportCancel(staged.job)
+            logToRust("export: the share chooser did not open (${t.javaClass.simpleName})")
         }
     }
 

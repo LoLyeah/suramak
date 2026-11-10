@@ -6,39 +6,51 @@
 //! language — only the phone's navigation and layout (single column, 48 dp
 //! targets, push/pop, sheets).
 //!
-//! The dispatcher below owns exactly three things: which screen is on top, the
-//! in-flight push/pop spring, and the modal sheet layer. The screens own their
-//! content; the host owns the store and the platform.
+//! The dispatcher below owns exactly four things: which screen is on top, the
+//! in-flight push/pop (two layers), the modal sheet layer, and the frame
+//! budget. The screens own their content; the host owns the store and the
+//! platform.
+//!
+//! **Frame budget (M13g2).** A frame is requested only while an animation is
+//! between endpoints ([`CompactApp::advance`]) — never while a job runs and
+//! nothing changed. A worker event wakes the surface once
+//! ([`CompactApp::take_frame_request`]); a repeated poll with the same value is
+//! not an event. This is what keeps a ten-minute transcription from redrawing
+//! the screen at 60 Hz.
 
+pub mod a11y;
 pub mod chrome;
 pub mod editor;
 pub mod library;
 pub mod model;
+pub mod motion;
 pub mod settings;
 
 use egui::{vec2, Rect, Ui, UiBuilder};
 
-use crate::deck::motion::{self, Motion};
+use crate::deck::motion::Motion;
 use crate::deck::theme::{self, AppTheme, Tokens};
 
 pub use model::{
-    bytes_label, clock, count_noun, sanitise_stem, snippet, CompactAction, CompactApp,
-    CompactEditor, CompactExportFormat, CompactRoute, CompactSetting, CompactSettings, Insets,
-    LibraryHit, LibraryRow, ModelRow, SegmentEdit, Sheet,
+    bytes_label, clock, count_noun, row_key, sanitise_stem, snippet, CompactAction, CompactApp,
+    CompactEditor, CompactExportFormat, CompactRoute, CompactSetting, CompactSettings, ExportPhase,
+    ExportSession, FlingProbe, Insets, JobView, LibraryHit, LibraryRow, ModelRow, SegmentEdit,
+    Sheet,
 };
 
 /// Paints one frame of the compact app and returns everything the host must do.
 ///
-/// Call order per frame: advance the navigation spring (requesting a repaint
-/// only while it is between endpoints), draw the active screen, then the sheet
-/// layer. No idle frame work: once a transition settles the context returns to
-/// on-demand repaints.
+/// Call order per frame: advance every spring/fade (requesting a repaint only
+/// while one is between endpoints), paint the outgoing layer, paint the
+/// arriving layer, then the sheet layer above both. No idle frame work: once a
+/// transition settles the context returns to on-demand repaints.
 pub fn ui(ctx: &egui::Context, state: &mut CompactApp) -> Vec<CompactAction> {
     let now = ctx.input(|input| input.time);
     let animating = state.advance(now);
     if animating {
         ctx.request_repaint();
     }
+    a11y::begin_frame(ctx);
     let tokens = theme::tokens(state.theme);
     let motion = Motion::new(state.reduce_motion);
     let screen = ctx.content_rect();
@@ -51,57 +63,119 @@ pub fn ui(ctx: &egui::Context, state: &mut CompactApp) -> Vec<CompactAction> {
             .max_rect(screen)
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
+    // The window fill under every layer: during a push/pop the two panes do
+    // not yet meet, and the exposed strip must be the window, not the
+    // renderer's clear colour.
+    ui.painter()
+        .rect_filled(screen, egui::CornerRadius::ZERO, tokens.window);
 
-    // The navigation spring: the entering screen slides in from the right (push)
-    // or the revealed screen slides back from the left (pop). Both are the same
-    // spring; only the sign differs, so the two directions cannot drift apart.
-    let (dx, opacity) = match state.nav.motion() {
-        Some(anim) if !anim.is_done() => match anim.direction {
-            crate::deck::nav::Direction::Push => (anim.offset(screen.width()), anim.opacity()),
-            crate::deck::nav::Direction::Pop => (
-                -anim.offset(screen.width()) * 0.18,
-                0.55 + 0.45 * anim.opacity(),
-            ),
-        },
-        _ => (0.0, 1.0),
-    };
+    // The navigation: two layers while a transition is in flight (the screen
+    // leaving beneath, the one arriving on top), one static layer otherwise.
+    let in_flight = state.nav.motion().filter(|anim| !anim.is_done());
+    if let Some(anim) = in_flight {
+        let layers = anim.layers(screen.width());
+        let (outgoing, incoming) = state.nav.layer_routes();
+        if let (Some(route), Some(layer)) = (outgoing, layers.outgoing) {
+            let mut pane = layer_ui(
+                &mut ui,
+                screen.translate(vec2(layer.dx, 0.0)),
+                layer.alpha,
+                0,
+                false,
+            );
+            let mut layer_actions = draw_route(
+                &mut pane,
+                route,
+                &tokens,
+                &motion,
+                state,
+                screen.translate(vec2(layer.dx, 0.0)),
+            );
+            actions.append(&mut layer_actions);
+        }
+        let mut pane = layer_ui(
+            &mut ui,
+            screen.translate(vec2(layers.incoming.dx, 0.0)),
+            layers.incoming.alpha,
+            1,
+            true,
+        );
+        let mut layer_actions = draw_route(
+            &mut pane,
+            incoming,
+            &tokens,
+            &motion,
+            state,
+            screen.translate(vec2(layers.incoming.dx, 0.0)),
+        );
+        actions.append(&mut layer_actions);
+    } else {
+        let route = state.nav.current();
+        let mut pane = layer_ui(&mut ui, screen, 1.0, 1, true);
+        let mut route_actions = draw_route(&mut pane, route, &tokens, &motion, state, screen);
+        actions.append(&mut route_actions);
+    }
 
-    let route = state.nav.current();
-    let route_rect = screen.translate(vec2(dx, 0.0));
-    let mut pane = ui.new_child(
-        UiBuilder::new()
-            .max_rect(route_rect)
-            .layout(egui::Layout::top_down(egui::Align::Min)),
-    );
-    pane.set_opacity(opacity);
-    let mut route_actions = match route {
-        CompactRoute::Library => library::ui(&mut pane, &tokens, &motion, state, route_rect),
-        CompactRoute::Editor => editor::ui(&mut pane, &tokens, &motion, state, route_rect),
-        CompactRoute::Settings => settings::ui(&mut pane, &tokens, &motion, state, route_rect),
-    };
-    actions.append(&mut route_actions);
-
-    // The sheet layer rides above the screen and absorbs back first
-    // (`CompactApp::back`).
+    // The sheet layer rides above both screens and absorbs back first
+    // (`CompactApp::back`). Its present/dismiss animation is the fade + rise
+    // pair; under Reduce Motion the rise is zero and only the fade runs.
     if let Some(sheet) = state.sheet {
-        let sheet_rect = chrome::sheet(&mut ui, &tokens, screen);
+        let fade = state.sheet_anim.value().max(0.001);
+        let rise = state.sheet_anim.rise(state.reduce_motion);
+        let mut sheet_ui = layer_ui(&mut ui, screen, fade, 2, state.sheet_anim.is_present());
+        let sheet_rect = chrome::sheet(&mut sheet_ui, &tokens, screen, rise);
         match sheet {
             Sheet::Export => {
-                if let Some(action) =
-                    editor::export_sheet(&mut ui, &tokens, &motion, state, sheet_rect)
-                {
-                    actions.push(action);
-                }
+                actions.extend(editor::export_sheet(
+                    &mut sheet_ui,
+                    &tokens,
+                    &motion,
+                    state,
+                    sheet_rect,
+                ));
             }
-            Sheet::Quit => match editor::quit_sheet(&mut ui, &tokens, &motion, sheet_rect) {
+            Sheet::Quit => match editor::quit_sheet(&mut sheet_ui, &tokens, &motion, sheet_rect) {
                 Some(true) => actions.push(state.confirm_quit()),
-                Some(false) => state.sheet = None,
+                Some(false) => state.close_export_sheet(now),
                 None => {}
             },
         }
     }
 
     actions
+}
+
+/// One painted layer: a child `Ui` clipped to the screen with an opacity and,
+/// when it is not the active screen, interaction disabled.
+fn layer_ui(ui: &mut Ui, rect: Rect, opacity: f32, salt: u8, interactive: bool) -> Ui {
+    let mut pane = ui.new_child(
+        UiBuilder::new()
+            .id_salt(("compact-layer", salt))
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    pane.set_opacity(opacity);
+    if !interactive {
+        pane.disable();
+    }
+    pane
+}
+
+/// Dispatches one route. `rect` is the pane's screen-space rect (already
+/// translated by the layer transform), which the screens use for their bands.
+fn draw_route(
+    pane: &mut Ui,
+    route: CompactRoute,
+    tokens: &Tokens,
+    motion: &Motion,
+    state: &mut CompactApp,
+    rect: Rect,
+) -> Vec<CompactAction> {
+    match route {
+        CompactRoute::Library => library::ui(pane, tokens, motion, state, rect),
+        CompactRoute::Editor => editor::ui(pane, tokens, motion, state, rect),
+        CompactRoute::Settings => settings::ui(pane, tokens, motion, state, rect),
+    }
 }
 
 /// The viewport helper used by the screenshot suite: a portrait phone viewport
@@ -124,12 +198,12 @@ pub fn small_phone_screen_rect() -> Rect {
 
 /// The motion token the navigation transitions use (asserted by a test).
 pub fn base_token() -> f32 {
-    motion::BASE
+    crate::deck::motion::BASE
 }
 
-/// Whether the dispatcher should keep a frame alive (the navigation spring).
+/// Whether the dispatcher should keep a frame alive (any compact animation).
 pub fn wants_repaint(state: &CompactApp) -> bool {
-    state.nav.motion().is_some_and(|anim| !anim.is_done())
+    state.needs_frame()
 }
 
 /// A token ladder for an explicit appearance — used by the screenshot suite and

@@ -1,23 +1,27 @@
 //! The compact transcript editor: read, tap-to-select, inline edit, search,
-//! play/pause and the export sheet entry.
+//! play/pause and the export sheet.
 //!
 //! Semantics are the desktop editor's, at phone scale: one segment is selected,
 //! an inline field edits exactly that segment, Save persists the drafted rows
 //! through the host (the same `update_segment_text` path), search filters the
-//! visible row set, and Export asks for one of the five formats through
-//! `ACTION_CREATE_DOCUMENT`. Playback is transport state here; the host owns the
-//! audio engine (the phone's M13F/M8 edges).
+//! visible row set, and Export opens the sheet that writes through
+//! `ACTION_CREATE_DOCUMENT` (or hands the same one file to `ACTION_SEND`).
+//! Playback is transport state here; the host owns the audio engine (the
+//! phone's M13F/M8 edges).
 
 use egui::{
     pos2, vec2, Align, Align2, Color32, CornerRadius, FontFamily, FontId, Layout, Rect, ScrollArea,
-    Sense, Stroke, StrokeKind, Ui,
+    Sense, Stroke, StrokeKind, Ui, WidgetType,
 };
 
-use crate::deck::motion::Motion;
+use crate::deck::motion::{self, Motion};
 use crate::deck::theme::Tokens;
 
+use super::a11y;
 use super::chrome::{self, GUTTER, MIN_TOUCH};
-use super::model::{clock, CompactAction, CompactApp, CompactExportFormat};
+use super::model::{
+    clock, CompactAction, CompactApp, CompactExportFormat, ExportPhase, ExportSession,
+};
 
 /// One segment row's height (read mode).
 const SEGMENT_ROW: f32 = 66.0;
@@ -54,8 +58,10 @@ pub fn ui(
         true,
         None,
     );
+    let mut left_editor = false;
     if back {
         state.back(now);
+        left_editor = state.nav.current() != super::model::CompactRoute::Editor;
     }
 
     // --- meta line ---------------------------------------------------------
@@ -111,13 +117,21 @@ pub fn ui(
             &mut editor.search,
             "Find in transcript",
         );
+        a11y::describe(ui, search_rect, "Find in transcript");
         let close = Rect::from_min_size(
             pos2(search_rect.right() + 8.0, search_rect.top()),
             vec2(48.0, MIN_TOUCH),
         );
-        if ui
-            .interact(close, ui.id().with("editor-search-close"), Sense::click())
-            .clicked()
+        if a11y::touch(
+            ui,
+            tokens,
+            close,
+            "editor-search-close",
+            WidgetType::Button,
+            "Close search",
+            true,
+        )
+        .clicked()
         {
             editor.search_open = false;
             editor.search.clear();
@@ -167,8 +181,20 @@ pub fn ui(
                 .is_some_and(|(idx, _)| *idx == segment.idx);
             let row_h = if editing { 150.0 } else { SEGMENT_ROW };
             let (rect, _) = ui.allocate_exact_size(vec2(list_rect.width(), row_h), Sense::hover());
-            let response =
-                ui.interact(rect, ui.id().with(("segment", segment.idx)), Sense::click());
+            let label = format!(
+                "Segment {} · {}",
+                segment.idx + 1,
+                truncate(&editor.text(&segment), 96)
+            );
+            let response = a11y::touch(
+                ui,
+                tokens,
+                rect,
+                ("segment", segment.idx),
+                WidgetType::Button,
+                &label,
+                true,
+            );
             let fill = if selected {
                 tokens.accent_tint
             } else if response.hovered() {
@@ -219,18 +245,32 @@ pub fn ui(
                     pos2(edit_rect.right() - 72.0, rect.bottom() - 44.0),
                     vec2(72.0, 34.0),
                 );
-                if ui
-                    .interact(save, ui.id().with(("seg-save", idx)), Sense::click())
-                    .clicked()
+                if a11y::touch(
+                    ui,
+                    tokens,
+                    save,
+                    ("seg-save", idx),
+                    WidgetType::Button,
+                    "Save segment",
+                    true,
+                )
+                .clicked()
                 {
                     editor.commit_edit_buffer();
                     for edit in editor.pending_edits() {
                         row_actions.push(CompactAction::SaveSegment(edit));
                     }
                 }
-                if ui
-                    .interact(cancel, ui.id().with(("seg-cancel", idx)), Sense::click())
-                    .clicked()
+                if a11y::touch(
+                    ui,
+                    tokens,
+                    cancel,
+                    ("seg-cancel", idx),
+                    WidgetType::Button,
+                    "Cancel edit",
+                    true,
+                )
+                .clicked()
                 {
                     editor.cancel_edit();
                 }
@@ -319,15 +359,23 @@ pub fn ui(
     );
     // Position, not just numbers: a 3 pt track with the played portion in the
     // accent. It is a read-out (the transcript rows are the seek targets), so it
-    // never steals the row taps.
+    // never steals the row taps. The drawn playhead eases to a seek and follows
+    // playback exactly (the Deck's seek rule); a jump asks for frames only for
+    // the ease, never as a constant redraw.
     let track = Rect::from_min_size(
         pos2(bar.left() + GUTTER, bar.top() + 6.0),
         vec2(bar.width() - GUTTER * 2.0, 3.0),
     );
     ui.painter()
         .rect_filled(track, CornerRadius::same(2), tokens.control_fill);
+    let drawn_ms = motion.seek_ease(
+        ui.ctx(),
+        ui.id().with("editor-playhead"),
+        editor.playhead_ms as f32,
+        motion::BASE,
+    );
     let played = if duration > 0 {
-        (editor.playhead_ms as f32 / duration as f32).clamp(0.0, 1.0)
+        (drawn_ms / duration as f32).clamp(0.0, 1.0)
     } else {
         0.0
     };
@@ -342,7 +390,15 @@ pub fn ui(
         pos2(bar.left() + GUTTER + 28.0, bar.center().y),
         vec2(56.0, 56.0),
     );
-    let play = ui.interact(play_rect, ui.id().with("editor-play"), Sense::click());
+    let play = a11y::touch(
+        ui,
+        tokens,
+        play_rect,
+        "editor-play",
+        WidgetType::Button,
+        if editor.playing { "Pause" } else { "Play" },
+        true,
+    );
     ui.painter()
         .circle_filled(play_rect.center(), 26.0, tokens.accent);
     if editor.playing {
@@ -366,6 +422,15 @@ pub fn ui(
     if play.clicked() {
         editor.playing = !editor.playing;
     }
+    let time_rect = Rect::from_min_size(
+        pos2(bar.left() + GUTTER + 64.0, bar.center().y - 10.0),
+        vec2(96.0, 20.0),
+    );
+    a11y::describe(
+        ui,
+        time_rect,
+        &format!("{} of {}", clock(editor.playhead_ms), clock(duration)),
+    );
     ui.painter().text(
         pos2(bar.left() + GUTTER + 64.0, bar.center().y),
         Align2::LEFT_CENTER,
@@ -377,9 +442,16 @@ pub fn ui(
         pos2(bar.right() - GUTTER - 104.0, bar.center().y),
         vec2(72.0, 48.0),
     );
-    if ui
-        .interact(search_btn, ui.id().with("editor-search"), Sense::click())
-        .clicked()
+    if a11y::touch(
+        ui,
+        tokens,
+        search_btn,
+        "editor-search",
+        WidgetType::Button,
+        "Find",
+        true,
+    )
+    .clicked()
     {
         editor.search_open = !editor.search_open;
     }
@@ -405,27 +477,33 @@ pub fn ui(
     )
     .clicked()
     {
-        state.sheet = Some(super::model::Sheet::Export);
+        state.open_export_sheet(now);
     }
+    a11y::record_button(ui, export_btn, "Export", true);
 
-    if state.nav.current() == super::model::CompactRoute::Editor {
+    if !left_editor {
         state.editor = Some(editor);
     }
     actions
 }
 
-/// The export sheet's body: five format chips and the write button. Drawn by
-/// the parent over the scrim so back dismisses it first.
+/// The export sheet's body: the format chips, the bilingual switch and the two
+/// ways out (picker or one-file share), then the picker/write result.
+///
+/// The sheet is the disclosure: the picker line names `ACTION_CREATE_DOCUMENT`,
+/// the secondary action names `ACTION_SEND`, and the note says both write the
+/// same bytes the desktop writes. No action happens on open.
 pub fn export_sheet(
     ui: &mut Ui,
     tokens: &Tokens,
     motion: &Motion,
     state: &mut CompactApp,
     body: Rect,
-) -> Option<CompactAction> {
-    let editor = state.editor.as_mut()?;
+) -> Vec<CompactAction> {
+    let now = ui.input(|input| input.time);
+    let mut actions = Vec::new();
     ui.painter().text(
-        pos2(body.center().x, body.top() + 34.0),
+        pos2(body.center().x, body.top() + 30.0),
         Align2::CENTER_CENTER,
         "Export transcript",
         FontId::new(
@@ -434,31 +512,49 @@ pub fn export_sheet(
         ),
         tokens.ink,
     );
+    let Some(editor) = state.editor.as_ref() else {
+        return actions;
+    };
+    // Copy what the sheet needs before any branch mutates the app: the format
+    // chips and the bilingual gate are decisions about the editor, not a live
+    // borrow of it.
+    let current_format = editor.format;
+    let has_translation = editor.has_translation;
+
+    if let Some(session) = state.export_session.clone() {
+        export_result(ui, tokens, motion, state, body, &session, now, &mut actions);
+        return actions;
+    }
+
     ui.painter().text(
-        pos2(body.center().x, body.top() + 58.0),
+        pos2(body.center().x, body.top() + 54.0),
         Align2::CENTER_CENTER,
-        "The file is written where you choose.",
+        "Same bytes as the desktop. Choose where it goes.",
         FontId::proportional(12.5),
         tokens.ink_soft,
     );
     let chip_w = (body.width() - GUTTER * 2.0 - 8.0 * 2.0) / 3.0;
-    let chip_h = 44.0;
+    let chip_h = 42.0;
     for (index, format) in CompactExportFormat::ALL.iter().enumerate() {
         let column = index % 3;
         let row = index / 3;
         let rect = Rect::from_min_size(
             pos2(
                 body.left() + GUTTER + column as f32 * (chip_w + 8.0),
-                body.top() + 84.0 + row as f32 * (chip_h + 8.0),
+                body.top() + 76.0 + row as f32 * (chip_h + 8.0),
             ),
             vec2(chip_w, chip_h),
         );
-        let response = ui.interact(
+        let selected = current_format == *format;
+        let response = a11y::touch(
+            ui,
+            tokens,
             rect,
-            ui.id().with(("export-format", format.label())),
-            Sense::click(),
+            ("export-format", format.label()),
+            WidgetType::RadioButton,
+            &format!("Export format: {}", format.label()),
+            true,
         );
-        let selected = editor.format == *format;
         let fill = if selected {
             tokens.accent_tint
         } else if response.hovered() {
@@ -488,28 +584,243 @@ pub fn export_sheet(
             if selected { tokens.accent } else { tokens.ink },
         );
         if response.clicked() {
-            editor.format = *format;
+            if let Some(editor) = state.editor.as_mut() {
+                editor.format = *format;
+            }
         }
     }
+
+    // The bilingual switch: only rendered for the stacked formats and only when
+    // the transcript actually has a translation to stack.
+    if current_format.supports_bilingual() {
+        let toggle_rect = Rect::from_min_size(
+            pos2(body.left() + GUTTER, body.top() + 176.0),
+            vec2(body.width() - GUTTER * 2.0, 40.0),
+        );
+        let response = a11y::touch(
+            ui,
+            tokens,
+            toggle_rect,
+            "export-bilingual",
+            WidgetType::Checkbox,
+            "Include the translation",
+            has_translation,
+        );
+        let box_rect = Rect::from_min_size(
+            pos2(toggle_rect.left() + 2.0, toggle_rect.center().y - 10.0),
+            vec2(20.0, 20.0),
+        );
+        ui.painter().rect(
+            box_rect,
+            CornerRadius::same(5),
+            if state.export_bilingual && has_translation {
+                tokens.accent
+            } else {
+                Color32::TRANSPARENT
+            },
+            Stroke::new(1.0_f32, tokens.hairline_strong),
+            StrokeKind::Inside,
+        );
+        if state.export_bilingual && has_translation {
+            ui.painter().add(egui::Shape::line(
+                vec![
+                    pos2(box_rect.left() + 5.0, box_rect.center().y),
+                    pos2(box_rect.center().x, box_rect.bottom() - 5.0),
+                    pos2(box_rect.right() - 4.0, box_rect.top() + 5.0),
+                ],
+                Stroke::new(2.0_f32, tokens.on_accent),
+            ));
+        }
+        ui.painter().text(
+            pos2(box_rect.right() + 10.0, toggle_rect.center().y),
+            Align2::LEFT_CENTER,
+            if has_translation {
+                "Include the translation (stacked)"
+            } else {
+                "No translation to include"
+            },
+            FontId::proportional(13.0),
+            if has_translation {
+                tokens.ink
+            } else {
+                tokens.ink_faint
+            },
+        );
+        if response.clicked() && has_translation {
+            state.export_bilingual = !state.export_bilingual;
+        }
+    }
+
+    // Two ways out, both disclosed.
+    ui.painter().text(
+        pos2(body.left() + GUTTER, body.top() + 232.0),
+        Align2::LEFT_CENTER,
+        "Picker: the system file chooser writes to the frame you pick.",
+        FontId::proportional(11.5),
+        tokens.ink_faint,
+    );
+    ui.painter().text(
+        pos2(body.left() + GUTTER, body.top() + 250.0),
+        Align2::LEFT_CENTER,
+        "Share: hands this one file to another app (ACTION_SEND).",
+        FontId::proportional(11.5),
+        tokens.ink_faint,
+    );
+    let share = Rect::from_min_size(
+        pos2(body.left() + GUTTER, body.bottom() - 128.0),
+        vec2(body.width() - GUTTER * 2.0, 46.0),
+    );
+    if chrome::action_button(
+        ui,
+        tokens,
+        motion,
+        share,
+        "export-share",
+        "Share instead",
+        false,
+    )
+    .clicked()
+    {
+        if let Some(action) = state.share_export(now) {
+            actions.push(action);
+        }
+    }
+    a11y::record_button(ui, share, "Share instead", true);
     let submit = Rect::from_min_size(
         pos2(body.left() + GUTTER, body.bottom() - 72.0),
         vec2(body.width() - GUTTER * 2.0, 52.0),
     );
-    let mut action = None;
     if chrome::action_button(
         ui,
         tokens,
         motion,
         submit,
         "export-submit",
-        &format!("Export {}", editor.format.label()),
+        &format!("Export {}", current_format.label()),
         true,
     )
     .clicked()
     {
-        action = Some(editor.export_request());
+        if let Some(action) = state.begin_export(now) {
+            actions.push(action);
+        }
     }
-    action
+    a11y::record_button(ui, submit, "Export", true);
+    actions
+}
+
+/// The sheet's working/result body. Drawn instead of the chips once the picker
+/// has been asked for a destination — the "picker result path" the screenshot
+/// suite fixes in place.
+#[allow(clippy::too_many_arguments)]
+fn export_result(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    state: &mut CompactApp,
+    body: Rect,
+    session: &ExportSession,
+    now: f64,
+    actions: &mut Vec<CompactAction>,
+) {
+    let (line, detail, error) = match &session.phase {
+        ExportPhase::Choosing => (
+            "Waiting for the picker".to_string(),
+            "If the system chooser is not in front, press Back to return.".to_string(),
+            false,
+        ),
+        ExportPhase::Writing => (
+            "Writing".to_string(),
+            format!(
+                "{} · the file is verified before this screen says saved",
+                session.name
+            ),
+            false,
+        ),
+        ExportPhase::Written => (
+            "Saved".to_string(),
+            match session.bytes {
+                Some(bytes) => format!("{} · {}", session.name, file_size_label(bytes)),
+                None => session.name.clone(),
+            },
+            false,
+        ),
+        ExportPhase::Shared => ("Shared".to_string(), session.name.clone(), false),
+        ExportPhase::Failed => (
+            "Export failed".to_string(),
+            session
+                .error
+                .clone()
+                .unwrap_or_else(|| "the host did not say why".to_string()),
+            true,
+        ),
+    };
+    let card = Rect::from_min_size(
+        pos2(body.left() + GUTTER, body.top() + 76.0),
+        vec2(body.width() - GUTTER * 2.0, 132.0),
+    );
+    chrome::card(ui, tokens, card);
+    let spoken = format!("{line}: {detail}");
+    ui.painter().text(
+        pos2(card.left() + 16.0, card.top() + 30.0),
+        Align2::LEFT_CENTER,
+        line,
+        FontId::new(
+            20.0,
+            FontFamily::Name(crate::deck::theme::SERIF_FAMILY.into()),
+        ),
+        if error {
+            tokens.record_red_text
+        } else {
+            tokens.ink
+        },
+    );
+    ui.painter().text(
+        pos2(card.left() + 16.0, card.top() + 60.0),
+        Align2::LEFT_CENTER,
+        truncate(&detail, 58),
+        FontId::proportional(12.5),
+        tokens.ink_soft,
+    );
+    ui.painter().text(
+        pos2(card.left() + 16.0, card.top() + 96.0),
+        Align2::LEFT_CENTER,
+        format!("{} · {}", session.format.label(), session.format.mime()),
+        FontId::new(11.5, FontFamily::Monospace),
+        tokens.ink_faint,
+    );
+    a11y::describe(ui, card, &spoken);
+
+    let done = Rect::from_min_size(
+        pos2(body.left() + GUTTER, body.bottom() - 72.0),
+        vec2(body.width() - GUTTER * 2.0, 52.0),
+    );
+    if chrome::action_button(ui, tokens, motion, done, "export-done", "Done", true).clicked() {
+        state.close_export_sheet(now);
+    }
+    a11y::record_button(ui, done, "Done", true);
+    if matches!(session.phase, ExportPhase::Failed) {
+        let retry = Rect::from_min_size(
+            pos2(body.left() + GUTTER, body.bottom() - 128.0),
+            vec2(body.width() - GUTTER * 2.0, 46.0),
+        );
+        if chrome::action_button(
+            ui,
+            tokens,
+            motion,
+            retry,
+            "export-retry",
+            "Try again",
+            false,
+        )
+        .clicked()
+        {
+            if let Some(action) = state.begin_export(now) {
+                actions.push(action);
+            }
+        }
+        a11y::record_button(ui, retry, "Try again", true);
+    }
 }
 
 /// The quit confirm sheet (Settings' Quit action). Returns `Some(true)` when
@@ -548,5 +859,29 @@ pub fn quit_sheet(ui: &mut Ui, tokens: &Tokens, motion: &Motion, body: Rect) -> 
     if chrome::action_button(ui, tokens, motion, cancel, "quit-cancel", "Cancel", false).clicked() {
         answer = Some(false);
     }
+    a11y::record_button(ui, quit, "Quit", true);
+    a11y::record_button(ui, cancel, "Cancel", true);
     answer
+}
+
+/// A file size for the result line: bytes/KB below a megabyte (an SRT export
+/// is a few kilobytes; "0 MB" would read as an empty file).
+fn file_size_label(bytes: u64) -> String {
+    if bytes < 1_000 {
+        format!("{bytes} B")
+    } else if bytes < 1_000_000 {
+        format!("{:.1} KB", bytes as f64 / 1_000.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+    }
+}
+
+/// Shortens a string to `chars` characters with an ellipsis (labels only).
+fn truncate(text: &str, chars: usize) -> String {
+    if text.chars().count() <= chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }

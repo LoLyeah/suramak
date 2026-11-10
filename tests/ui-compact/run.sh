@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# M13g1 — the phone-viewport screenshot suite.
+# M13g1/M13g2 — the phone-viewport screenshot suite (a CI gate since M13g2).
 #
 # Renders the compact profile at the plan's portrait viewport (1216 × 2640
-# physical, scale 2.6) and writes four shots under tests/ui-compact/shots/:
-# library, library-light, editor, settings. The renderer is
+# physical, scale 2.6) and writes seven shots under tests/ui-compact/shots/:
+# library, library-light, editor, settings, export-sheet, export-written,
+# settings-tiers. The renderer is
 # `suramak_ui::deck::snapshot` (egui's own tessellation + a CPU rasteriser), so
 # the output is deterministic and needs no GPU; the command still runs under
 # Xvfb because CI's UI harness family does.
@@ -11,9 +12,11 @@
 #   tests/ui-compact/run.sh
 #
 # The test also asserts the layout rules: 48 dp targets, the bottom bar clear of
-# the gesture inset, no screen outside the viewport, and Reduce Motion's hard
-# cut. The shots are the review artifact, not a pixel golden: CI compares the
-# asserted geometry, a human reviews the PNGs.
+# the gesture inset, no screen outside the viewport, Reduce Motion's
+# crossfade-only transition, the a11y label/role floor on every control, and
+# that a settled screen with a live job requests no frames. The shots are the
+# review artifact, not a pixel golden: CI compares the asserted geometry and a
+# human reviews the PNGs.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
@@ -24,14 +27,15 @@ xvfb-run -a --server-args="-screen 0 1400x2800x24" \
 # The Rust writer emits uncompressed PNGs (no image crate in the workspace).
 # Compress the committed artifacts when ImageMagick is present; the assertions
 # below are unaffected.
+SHOTS="library library-light editor settings export-sheet export-written settings-tiers"
 if command -v convert >/dev/null 2>&1; then
-  for shot in library library-light editor settings; do
+  for shot in $SHOTS; do
     path="tests/ui-compact/shots/$shot.png"
     convert "$path" -strip -define png:compression-level=9 "$path.tmp" && mv "$path.tmp" "$path"
   done
 fi
 
-for shot in library library-light editor settings; do
+for shot in $SHOTS; do
   path="tests/ui-compact/shots/$shot.png"
   [ -f "$path" ] || { echo "missing shot: $path" >&2; exit 1; }
   file "$path" | grep -q "1216 x 2640" \

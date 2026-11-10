@@ -64,6 +64,26 @@ pub fn spring_ease(t: f32) -> f32 {
     value.clamp(0.0, 1.0 + SPRING_OVERSHOOT)
 }
 
+/// How far apart two clocks may be before a transition treats them as
+/// different bases. The UI advances with egui's input time; a host command
+/// (a notification deep link, a back from Kotlin, a worker event) carries the
+/// process uptime instead. Both start at process launch, so they differ by at
+/// most the time since the last context rebuild — but a rebuild can reset
+/// egui's clock. A gap larger than this is a base mismatch, not jitter.
+pub const CLOCK_SKEW_LIMIT: f64 = 0.5;
+
+/// Re-anchors a transition whose stored start is in a **different clock base**
+/// than the frame that is advancing it. Called at the top of every `advance`:
+/// without it, a host-started transition sees a negative elapsed time forever,
+/// stays at progress 0 and keeps asking for frames (an invisible sheet and a
+/// battery leak). Small skew is left alone so a normal UI-started animation is
+/// never restarted.
+pub fn reanchor(started_at: &mut f64, now: f64) {
+    if now + CLOCK_SKEW_LIMIT < *started_at {
+        *started_at = now;
+    }
+}
+
 /// The spring's value at normalised progress `t` (0..=1) between `from` and
 /// `to` — [`spring_ease`] scaled onto the travel. Exactly `from` at 0, exactly
 /// `to` at 1, bounded overshoot in between.

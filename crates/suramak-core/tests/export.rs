@@ -2,7 +2,7 @@ use chrono::DateTime;
 use suramak_core::diagnostics::SubtitleLimits;
 use suramak_core::export::{
     bilingual_advisories, bilingual_cues, to_ass, to_ass_bilingual, to_ass_with, to_json,
-    to_markdown, to_srt, to_srt_bilingual, to_txt, to_vtt, to_vtt_bilingual, AssOptions,
+    to_markdown, to_srt, to_srt_bilingual, to_tsv, to_txt, to_vtt, to_vtt_bilingual, AssOptions,
     ZeroDuration, ASS_ONE_FRAME_MS, BILINGUAL_LINE_BUDGET_CPL,
 };
 use suramak_core::transcript::{Segment, Source, Transcript};
@@ -78,6 +78,33 @@ This is a test.\n\
 Goodbye.\n\
 \n";
     assert_eq!(out, expected);
+}
+
+#[test]
+fn export_tsv_is_a_header_plus_one_row_per_segment() {
+    let t = fixed_transcript();
+    let out = to_tsv(&t).unwrap();
+    let expected = "\
+idx\tstart_ms\tend_ms\ttext
+0\t0\t2400\tHello world.
+1\t2400\t5000\tThis is a test.
+2\t5000\t8500\tGoodbye.
+";
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn export_tsv_folds_tabs_and_line_breaks_into_single_spaces() {
+    let mut t = fixed_transcript();
+    t.segments[0].text = "  a\tb\nc  ".to_string();
+    let out = to_tsv(&t).unwrap();
+    let row = out.lines().nth(1).expect("first row");
+    assert_eq!(row, "0\t0\t2400\ta b c");
+    assert_eq!(
+        row.split('\t').count(),
+        4,
+        "the text cell may not add a column"
+    );
 }
 
 #[test]

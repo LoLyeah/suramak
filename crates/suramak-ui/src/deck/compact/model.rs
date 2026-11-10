@@ -20,6 +20,8 @@ use uuid::Uuid;
 use crate::deck::nav::{BackOutcome, NavStack};
 use crate::deck::theme::AppTheme;
 
+use super::motion::{ListAnim, ProgressAnim, SheetAnim};
+
 /// The three screens of the G1 compact profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactRoute {
@@ -101,8 +103,11 @@ pub struct LibraryHit {
     pub start_ms: i64,
 }
 
-/// The compact export formats (the five the phone's `ACTION_CREATE_DOCUMENT`
-/// path supports; ASS stays a desktop-only extra).
+/// The compact export formats — the desktop export list's set, in the same
+/// order (Markdown, Text, JSON, SRT, VTT, TSV), minus ASS: ASS is a desktop
+/// extra the phone does not offer. Every format is rendered by the same
+/// `suramak_core::export` function the desktop calls, so the phone writes the
+/// exact bytes the desktop writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactExportFormat {
     Md,
@@ -110,10 +115,18 @@ pub enum CompactExportFormat {
     Json,
     Srt,
     Vtt,
+    Tsv,
 }
 
 impl CompactExportFormat {
-    pub const ALL: [Self; 5] = [Self::Md, Self::Txt, Self::Json, Self::Srt, Self::Vtt];
+    pub const ALL: [Self; 6] = [
+        Self::Md,
+        Self::Txt,
+        Self::Json,
+        Self::Srt,
+        Self::Vtt,
+        Self::Tsv,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -122,6 +135,7 @@ impl CompactExportFormat {
             Self::Json => "JSON",
             Self::Srt => "SRT",
             Self::Vtt => "VTT",
+            Self::Tsv => "TSV",
         }
     }
 
@@ -132,7 +146,219 @@ impl CompactExportFormat {
             Self::Json => "json",
             Self::Srt => "srt",
             Self::Vtt => "vtt",
+            Self::Tsv => "tsv",
         }
+    }
+
+    /// The MIME type `ACTION_CREATE_DOCUMENT` advertises. `text/*` where the
+    /// platform has a canonical type; the subtitle types are the ones players
+    /// register for.
+    pub fn mime(self) -> &'static str {
+        match self {
+            Self::Md => "text/markdown",
+            Self::Txt => "text/plain",
+            Self::Json => "application/json",
+            Self::Srt => "application/x-subrip",
+            Self::Vtt => "text/vtt",
+            Self::Tsv => "text/tab-separated-values",
+        }
+    }
+
+    /// Whether the stacked bilingual variant exists (SRT and VTT; ASS is not
+    /// offered on the phone).
+    pub fn supports_bilingual(self) -> bool {
+        matches!(self, Self::Srt | Self::Vtt)
+    }
+}
+
+/// The export sheet's phase — the "picker result path" is a modelled state, not
+/// a platform callback the UI infers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportPhase {
+    /// `ACTION_CREATE_DOCUMENT` / the share chooser is on screen.
+    Choosing,
+    /// The destination is chosen; the host is writing and verifying.
+    Writing,
+    /// The file is at the chosen frame, bytes verified.
+    Written,
+    /// Handed to another app through `ACTION_SEND`.
+    Shared,
+    Failed,
+}
+
+/// One export attempt, bound to its transcript and format.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportSession {
+    pub transcript: Uuid,
+    pub format: CompactExportFormat,
+    pub bilingual: bool,
+    pub phase: ExportPhase,
+    /// The suggested file name (also the staged file's name).
+    pub name: String,
+    /// Bytes written, once known.
+    pub bytes: Option<u64>,
+    /// The honest failure line, when the phase is [`ExportPhase::Failed`].
+    pub error: Option<String>,
+}
+
+impl ExportSession {
+    pub fn new(
+        transcript: Uuid,
+        format: CompactExportFormat,
+        bilingual: bool,
+        name: String,
+    ) -> Self {
+        Self {
+            transcript,
+            format,
+            bilingual,
+            phase: ExportPhase::Choosing,
+            name,
+            bytes: None,
+            error: None,
+        }
+    }
+
+    /// Whether the sheet should show the working/result state rather than the
+    /// format chips.
+    pub fn busy_or_done(&self) -> bool {
+        !matches!(self.phase, ExportPhase::Choosing)
+    }
+}
+
+/// A fling observation in progress: one pointer release, then the scroll
+/// offset's own decay.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct ActiveFling {
+    velocity: f32,
+    distance: f32,
+    frames: u32,
+    last_offset: f32,
+}
+
+/// Watches a scroll area's drag release and measures what egui's momentum did
+/// with it. This is the "probe" half of the fling decision: on the host it
+/// measures nothing useful (no touch), on the owner's phone it records the
+/// gesture's actual decay next to the Deck layer's expectation.
+#[derive(Debug, Clone, Default)]
+pub struct FlingTracker {
+    last_offset: f32,
+    last_velocity: f32,
+    active: Option<ActiveFling>,
+}
+
+impl FlingTracker {
+    /// Feeds one frame. A drag frame records the pointer's velocity; the
+    /// release frame starts the probe with the last drag velocity (egui zeroes
+    /// the pointer velocity as the finger lifts, so the release frame alone
+    /// would measure nothing). The returned probe lands when the offset has
+    /// stopped moving (or after 180 frames, so a probe can never run forever).
+    pub fn observe(&mut self, offset: f32, velocity: f32, released: bool) -> Option<FlingProbe> {
+        if velocity > 0.0 {
+            self.last_velocity = velocity;
+        }
+        if released {
+            let start = self.last_velocity.max(velocity);
+            self.last_velocity = 0.0;
+            if start > 40.0 && self.active.is_none() {
+                self.active = Some(ActiveFling {
+                    velocity: start,
+                    distance: 0.0,
+                    frames: 0,
+                    last_offset: offset,
+                });
+            }
+            self.last_offset = offset;
+            return None;
+        }
+        let Some(mut active) = self.active.take() else {
+            self.last_offset = offset;
+            return None;
+        };
+        let delta = (offset - active.last_offset).abs();
+        active.distance += delta;
+        active.frames += 1;
+        active.last_offset = offset;
+        if delta < 0.5 || active.frames >= 180 {
+            self.last_offset = offset;
+            return Some(FlingProbe {
+                release_velocity: active.velocity,
+                distance: active.distance,
+                frames: active.frames,
+            });
+        }
+        self.active = Some(active);
+        self.last_offset = offset;
+        None
+    }
+
+    /// The offset the tracker last saw (the caller may diff against it).
+    pub fn last_offset(&self) -> f32 {
+        self.last_offset
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active.is_some()
+    }
+}
+
+/// A running transcription job, as the host reports it (M16.1's bounded slot is
+/// the producer; this is only the display).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobView {
+    pub label: String,
+    pub done: u32,
+    pub total: u32,
+}
+
+impl JobView {
+    pub fn percent(&self) -> u8 {
+        if self.total == 0 {
+            return 0;
+        }
+        ((self.done.min(self.total) as f32 / self.total as f32) * 100.0).round() as u8
+    }
+
+    pub fn line(&self) -> String {
+        format!("{} · {}%", self.label, self.percent())
+    }
+}
+
+/// One fling observation from the compact list (owner-device calibration).
+///
+/// egui's `ScrollArea` owns the scroll offset and its momentum; this records
+/// what the gesture delivered and how far the list travelled afterwards so the
+/// owner can compare it with the Deck motion layer's expected curve. Nothing
+/// here changes scrolling — the report states why (the probe argument).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct FlingProbe {
+    /// Pointer velocity at release, points/second (absolute).
+    pub release_velocity: f32,
+    /// Distance the scroll offset moved after release.
+    pub distance: f32,
+    /// Frames the list kept moving after release.
+    pub frames: u32,
+}
+
+impl FlingProbe {
+    /// egui's default scroll animation decays over roughly this fraction of a
+    /// second; the expected travel is the release velocity times it. The report
+    /// cites the measured field, not this estimate.
+    pub const EXPECTED_DECAY: f32 = 0.12;
+
+    pub fn expected_distance(&self) -> f32 {
+        self.release_velocity * Self::EXPECTED_DECAY
+    }
+
+    /// A one-line log/summary the owner checklist can read back.
+    pub fn summary(&self) -> String {
+        format!(
+            "fling {:.0} pt/s → {:.0} pt over {} frames (egui expectation {:.0} pt)",
+            self.release_velocity,
+            self.distance,
+            self.frames,
+            self.expected_distance()
+        )
     }
 }
 
@@ -186,6 +412,15 @@ pub enum CompactAction {
     Export {
         transcript: Uuid,
         format: CompactExportFormat,
+        bilingual: bool,
+        suggested_name: String,
+    },
+    /// The one-file `ACTION_SEND` alternative: stage the same bytes and hand
+    /// that one file to the share chooser (disclosed in the sheet).
+    ShareExport {
+        transcript: Uuid,
+        format: CompactExportFormat,
+        bilingual: bool,
         suggested_name: String,
     },
     /// The library's Import button (SAF / share).
@@ -227,6 +462,10 @@ pub struct CompactEditor {
     pub playhead_ms: i64,
     /// The search hit the editor jumped to (a transient highlight).
     pub focus_segment: Option<u32>,
+    /// Whether the transcript has at least one stored translation (seeded by
+    /// the host from `Store::segment_translations`). The bilingual export
+    /// switch is offered only when there is a second line to stack.
+    pub has_translation: bool,
 }
 
 impl CompactEditor {
@@ -243,6 +482,7 @@ impl CompactEditor {
             playing: false,
             playhead_ms: 0,
             focus_segment: None,
+            has_translation: false,
         }
     }
 
@@ -360,17 +600,34 @@ impl CompactEditor {
         }
     }
 
-    /// The export request for the current transcript.
-    pub fn export_request(&self) -> CompactAction {
+    /// The export request for the current transcript. `bilingual` adds the
+    /// stacked translation (SRT/VTT only; the sheet gates the switch).
+    pub fn export_request(&self, bilingual: bool) -> CompactAction {
         CompactAction::Export {
             transcript: self.transcript.id,
             format: self.format,
-            suggested_name: format!(
-                "{}.{}",
-                sanitise_stem(&self.transcript.title),
-                self.format.extension()
-            ),
+            bilingual: bilingual && self.format.supports_bilingual(),
+            suggested_name: self.suggested_name(),
         }
+    }
+
+    /// The one-file share request (same bytes, `ACTION_SEND`).
+    pub fn share_request(&self, bilingual: bool) -> CompactAction {
+        CompactAction::ShareExport {
+            transcript: self.transcript.id,
+            format: self.format,
+            bilingual: bilingual && self.format.supports_bilingual(),
+            suggested_name: self.suggested_name(),
+        }
+    }
+
+    /// The file name the sheet and the host use for this format.
+    pub fn suggested_name(&self) -> String {
+        format!(
+            "{}.{}",
+            sanitise_stem(&self.transcript.title),
+            self.format.extension()
+        )
     }
 
     /// Whether anything is unsaved (drives the Save affordance + back guard).
@@ -417,6 +674,27 @@ pub struct CompactApp {
     pub sheet: Option<Sheet>,
     pub settings: CompactSettings,
     pub models: Vec<ModelRow>,
+    /// The export sheet's flow (picker → write → result), when one is open.
+    pub export_session: Option<ExportSession>,
+    /// The sheet's "include the translation" switch.
+    pub export_bilingual: bool,
+    /// The sheet's present/dismiss animation.
+    pub sheet_anim: SheetAnim,
+    /// The library's insert/delete animation.
+    pub list_anim: ListAnim,
+    /// The running job, as last reported by the host.
+    pub job: Option<JobView>,
+    /// The job's eased progress fill.
+    pub job_progress: ProgressAnim,
+    /// A job event landed and the host should wake the surface exactly once.
+    frame_request: bool,
+    /// The last fling observation (owner-device calibration).
+    pub fling_probe: Option<FlingProbe>,
+    /// The scroll gesture watcher (the probe's input side).
+    pub fling: FlingTracker,
+    /// A one-shot Settings scroll offset (the tier screenshot / "scroll to the
+    /// model table" affordance).
+    pub settings_scroll: Option<f32>,
     /// `None` when the shell has not reported memory: the Settings card says so
     /// instead of pretending a tier.
     pub tier: Option<PhoneTier>,
@@ -474,6 +752,16 @@ impl CompactApp {
             sheet: None,
             settings,
             models: Vec::new(),
+            export_session: None,
+            export_bilingual: false,
+            sheet_anim: SheetAnim::closed(),
+            list_anim: ListAnim::new(),
+            job: None,
+            job_progress: ProgressAnim::new(),
+            frame_request: false,
+            fling_probe: None,
+            fling: FlingTracker::default(),
+            settings_scroll: None,
             tier: None,
             ram_bytes: None,
             status: None,
@@ -591,27 +879,227 @@ impl CompactApp {
         self.nav.push(CompactRoute::Settings, now);
     }
 
-    /// The back gesture. Sheets dismiss first; then the stack pops; at the
-    /// root the host finishes the Activity (v2.4's `nativeBackPressed` funnel).
+    /// The back gesture. A sheet dismisses (with its exit animation), then the
+    /// stack pops; at the root the host finishes the Activity (v2.4's
+    /// `nativeBackPressed` funnel).
+    ///
+    /// **Predictive back mid-transition.** The gesture is answered from this
+    /// one place at the moment it arrives, never queued: if a push/pop spring
+    /// is in flight, the gesture's target is the screen the stack says is on
+    /// top now, so a back during a push pops that screen immediately (the
+    /// in-flight push is retargeted, not completed first). The Android shell
+    /// reports `finish:true` only from the root, so the system's predictive
+    /// animation is never asked to commit a screen this stack did not pop.
     pub fn back(&mut self, now: f64) -> BackOutcome {
-        let outcome = self.nav.back(self.sheet.is_some(), now);
-        if outcome == BackOutcome::Dismissed {
-            self.sheet = None;
+        if self.sheet.is_some() {
+            if !self.sheet_anim.is_present() && !self.sheet_anim.is_done() {
+                // Already dismissing: keep that exit, do not restart it.
+                return BackOutcome::Dismissed;
+            }
+            self.sheet_anim.begin(false, now);
+            self.status = None;
+            return BackOutcome::Dismissed;
         }
-        if outcome == BackOutcome::Popped && self.nav.current() == CompactRoute::Library {
-            self.editor = None;
-        }
-        outcome
+        self.nav.back(false, now)
     }
 
-    /// Advances the navigation spring; `true` means request a repaint.
+    /// Advances every compact animation and returns whether a repaint must be
+    /// requested. This is the whole frame budget: a settled screen (even one
+    /// with a job running) returns false and the surface goes idle.
     pub fn advance(&mut self, now: f64) -> bool {
-        self.nav.advance(now, self.reduce_motion)
+        let mut animating = self.nav.advance(now, self.reduce_motion);
+        animating |= self.sheet_anim.advance(now, self.reduce_motion);
+        animating |= self.list_anim.advance(now, self.reduce_motion).animating;
+        animating |= self.job_progress.advance(now);
+        if self.sheet.is_some() && !self.sheet_anim.is_present() && self.sheet_anim.is_done() {
+            self.sheet = None;
+            self.export_session = None;
+        }
+        // The editor's data outlives a pop until the transition has played: the
+        // outgoing screen is painted while it slides away.
+        let settled = match self.nav.motion() {
+            Some(motion) => motion.is_done(),
+            None => true,
+        };
+        if settled && self.nav.current() == CompactRoute::Library {
+            self.editor = None;
+        }
+        animating
+    }
+
+    /// Whether the surface must draw another frame for an animation.
+    pub fn needs_frame(&self) -> bool {
+        self.nav.motion().is_some_and(|motion| !motion.is_done())
+            || !self.sheet_anim.is_done()
+            || self.list_anim.is_animating()
+            || !self.job_progress.is_done()
+    }
+
+    /// A worker event (job progress, completion) asks the host to wake the
+    /// surface exactly once. The flag is taken, never polled: `false` after the
+    /// first wake means "stay idle".
+    pub fn take_frame_request(&mut self) -> bool {
+        std::mem::take(&mut self.frame_request)
+    }
+
+    /// Reports job progress from the M16.1 worker. Returns whether the value
+    /// changed — a repeated poll with the same percent asks for no frame, which
+    /// is what keeps a 10-minute job from redrawing at 60 Hz.
+    pub fn on_job(&mut self, label: impl Into<String>, done: u32, total: u32, now: f64) -> bool {
+        let next = JobView {
+            label: label.into(),
+            done,
+            total,
+        };
+        if self.job.as_ref() == Some(&next) {
+            return false;
+        }
+        let percent = if next.total == 0 {
+            0.0
+        } else {
+            next.done.min(next.total) as f32 / next.total as f32
+        };
+        self.job = Some(next);
+        self.job_progress.set(percent, now);
+        self.frame_request = true;
+        true
+    }
+
+    /// The job ended (success, failure or cancellation): drop the strip and
+    /// wake the surface once.
+    pub fn job_finished(&mut self) {
+        if self.job.take().is_some() {
+            self.frame_request = true;
+        }
+    }
+
+    /// The painter's progress factor for the job strip (settles at its target).
+    pub fn job_fraction(&self) -> f32 {
+        self.job_progress.value()
+    }
+
+    /// Records a fling observation from a compact list (see [`FlingProbe`]).
+    pub fn note_fling(&mut self, probe: FlingProbe) {
+        self.fling_probe = Some(probe);
+        self.frame_request = true;
     }
 
     /// The library's Back is the system finish.
     pub fn finish_requested(&self) -> bool {
         self.nav.depth() == 1 && self.sheet.is_none()
+    }
+
+    /// Opens the export sheet for the open transcript.
+    pub fn open_export_sheet(&mut self, now: f64) {
+        if self.editor.is_none() {
+            return;
+        }
+        self.sheet = Some(Sheet::Export);
+        self.export_session = None;
+        self.sheet_anim.begin(true, now);
+    }
+
+    /// The sheet's Export button: the host opens `ACTION_CREATE_DOCUMENT`.
+    /// Returns the action the host must run, or `None` when no editor is open.
+    pub fn begin_export(&mut self, now: f64) -> Option<CompactAction> {
+        let editor = self.editor.as_ref()?;
+        let action = editor.export_request(self.export_bilingual);
+        let (transcript, format) = match &action {
+            CompactAction::Export {
+                transcript, format, ..
+            } => (*transcript, *format),
+            _ => return None,
+        };
+        self.export_session = Some(ExportSession::new(
+            transcript,
+            format,
+            self.export_bilingual,
+            editor.suggested_name(),
+        ));
+        self.sheet_anim.begin(true, now);
+        Some(action)
+    }
+
+    /// The sheet's Share button: the same bytes, one file, `ACTION_SEND`.
+    pub fn share_export(&mut self, now: f64) -> Option<CompactAction> {
+        let editor = self.editor.as_ref()?;
+        let action = editor.share_request(self.export_bilingual);
+        let (transcript, format) = match &action {
+            CompactAction::ShareExport {
+                transcript, format, ..
+            } => (*transcript, *format),
+            _ => return None,
+        };
+        let mut session = ExportSession::new(
+            transcript,
+            format,
+            self.export_bilingual,
+            editor.suggested_name(),
+        );
+        session.phase = ExportPhase::Writing;
+        self.export_session = Some(session);
+        self.sheet_anim.begin(true, now);
+        Some(action)
+    }
+
+    /// The picker returned a destination; the host is writing.
+    pub fn on_export_picked(&mut self) {
+        if let Some(session) = self.export_session.as_mut() {
+            session.phase = ExportPhase::Writing;
+        }
+    }
+
+    /// The picker was dismissed (back or Cancel). The sheet stays open on the
+    /// chips — an abandoned export is not an error.
+    pub fn on_export_cancelled(&mut self) {
+        self.export_session = None;
+        self.status = Some(("Export cancelled".to_string(), false));
+    }
+
+    /// The write landed and was verified.
+    pub fn on_export_written(&mut self, name: impl Into<String>, bytes: u64) {
+        let name = name.into();
+        if let Some(session) = self.export_session.as_mut() {
+            session.phase = ExportPhase::Written;
+            session.bytes = Some(bytes);
+            session.name = name.clone();
+        }
+        self.status = Some((format!("Saved {name}"), false));
+    }
+
+    /// The file went to another app (ACTION_SEND).
+    pub fn on_export_shared(&mut self, name: impl Into<String>) {
+        let name = name.into();
+        if let Some(session) = self.export_session.as_mut() {
+            session.phase = ExportPhase::Shared;
+            session.name = name.clone();
+        }
+        self.status = Some((format!("Shared {name}"), false));
+    }
+
+    /// The write failed. The message is the host's own words — never invented.
+    pub fn on_export_failed(&mut self, reason: impl Into<String>) {
+        let reason = reason.into();
+        if let Some(session) = self.export_session.as_mut() {
+            session.phase = ExportPhase::Failed;
+            session.error = Some(reason.clone());
+        }
+        self.status = Some((reason, true));
+    }
+
+    /// Closes the export sheet (Done, or a tap outside).
+    pub fn close_export_sheet(&mut self, now: f64) {
+        self.sheet_anim.begin(false, now);
+    }
+
+    /// The keys the library list is painted with (stable per transcript id).
+    pub fn library_keys(&self) -> Vec<u64> {
+        self.rows.iter().map(|row| row_key(row.id)).collect()
+    }
+
+    /// The one-shot Settings scroll offset (taken by the screen).
+    pub fn take_settings_scroll(&mut self) -> Option<f32> {
+        self.settings_scroll.take()
     }
 
     /// Applies a settings change to the in-memory form (the host persists it).
@@ -632,13 +1120,13 @@ impl CompactApp {
         None
     }
 
-    /// The host reports an export result.
+    /// The host reports an export result in one step (the non-picker paths):
+    /// `Ok` names the written file, `Err` is the host's own message.
     pub fn on_export(&mut self, result: Result<String, String>) {
-        self.sheet = None;
-        self.status = Some(match result {
-            Ok(path) => (format!("Exported {path}"), false),
-            Err(reason) => (reason, true),
-        });
+        match result {
+            Ok(name) => self.on_export_written(name, 0),
+            Err(reason) => self.on_export_failed(reason),
+        }
     }
 
     /// The host rejected a save: the drafts stay dirty so nothing is lost.
@@ -656,6 +1144,17 @@ impl CompactApp {
         self.sheet = None;
         CompactAction::Quit
     }
+}
+
+/// A stable 64-bit key for a transcript row (the list animator's identity).
+pub fn row_key(id: Uuid) -> u64 {
+    let bytes = id.as_bytes();
+    let mut key = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in &bytes[..8] {
+        key ^= u64::from(*byte);
+        key = key.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    key
 }
 
 /// The model rows for a device, from the M13D manifest rules.
@@ -853,17 +1352,25 @@ mod tests {
         app.open_editor(transcript("Rapat: 12/03", &["halo"]), 0.0);
         let editor = app.editor.as_mut().expect("editor");
         editor.format = CompactExportFormat::Srt;
-        match editor.export_request() {
+        match editor.export_request(false) {
             CompactAction::Export {
                 format,
                 suggested_name,
+                bilingual,
                 ..
             } => {
                 assert_eq!(format, CompactExportFormat::Srt);
+                assert!(!bilingual);
                 assert!(suggested_name.ends_with(".srt"));
                 assert!(!suggested_name.contains('/'));
                 assert!(!suggested_name.contains(':'));
             }
+            other => panic!("unexpected {other:?}"),
+        }
+        // The sheet gates translation to the stacked formats.
+        editor.format = CompactExportFormat::Md;
+        match editor.export_request(true) {
+            CompactAction::Export { bilingual, .. } => assert!(!bilingual),
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -902,8 +1409,14 @@ mod tests {
     fn back_dismisses_a_sheet_then_pops_then_finishes() {
         let mut app = app();
         app.open_editor(transcript("x", &["y"]), 0.0);
-        app.sheet = Some(Sheet::Export);
+        app.advance(1.0);
+        app.open_export_sheet(1.0);
+        assert_eq!(app.sheet, Some(Sheet::Export));
         assert_eq!(app.back(1.0), BackOutcome::Dismissed);
+        // The dismissal animates out before the sheet is gone.
+        assert_eq!(app.sheet, Some(Sheet::Export));
+        assert!(app.advance(1.05), "the exiting sheet asks for frames");
+        assert!(!app.advance(1.2));
         assert!(app.sheet.is_none());
         assert_eq!(app.nav.current(), CompactRoute::Editor);
         assert_eq!(app.back(2.0), BackOutcome::Popped);
@@ -940,6 +1453,184 @@ mod tests {
         assert_eq!(defaults.appearance, desktop.ui.appearance);
         assert_eq!(defaults.keep_audio, desktop.storage.keep_audio);
         assert_eq!(defaults.language, "auto");
+    }
+
+    #[test]
+    fn the_export_sheet_walks_the_picker_to_a_verified_write() {
+        let mut app = app();
+        let first = app.transcripts[0].clone();
+        app.open_editor(first, 0.0);
+        app.advance(1.0);
+        app.open_export_sheet(1.0);
+        assert_eq!(app.sheet, Some(Sheet::Export));
+        app.editor.as_mut().expect("editor").format = CompactExportFormat::Srt;
+
+        let action = app.begin_export(1.0).expect("an export request");
+        let CompactAction::Export {
+            transcript,
+            format,
+            bilingual,
+            suggested_name,
+        } = action
+        else {
+            panic!("expected an Export action");
+        };
+        assert_eq!(transcript, app.transcripts[0].id);
+        assert_eq!(format, CompactExportFormat::Srt);
+        assert!(!bilingual);
+        assert!(suggested_name.ends_with(".srt"));
+        let session = app.export_session.as_ref().expect("session");
+        assert_eq!(session.phase, ExportPhase::Choosing);
+        assert_eq!(session.name, suggested_name);
+
+        app.on_export_picked();
+        assert_eq!(
+            app.export_session.as_ref().expect("session").phase,
+            ExportPhase::Writing
+        );
+        app.on_export_written("Morning notes.srt", 1_234);
+        let session = app.export_session.as_ref().expect("session");
+        assert_eq!(session.phase, ExportPhase::Written);
+        assert_eq!(session.bytes, Some(1_234));
+        assert!(app
+            .status
+            .as_ref()
+            .is_some_and(|(text, error)| text.contains("Saved") && !error));
+
+        app.close_export_sheet(2.0);
+        app.advance(3.0);
+        assert_eq!(app.sheet, None);
+        assert!(app.export_session.is_none());
+    }
+
+    #[test]
+    fn a_cancelled_picker_returns_to_the_format_chips() {
+        let mut app = app();
+        let first = app.transcripts[0].clone();
+        app.open_editor(first, 0.0);
+        app.advance(1.0);
+        app.open_export_sheet(1.0);
+        assert!(app.begin_export(1.0).is_some());
+        app.on_export_cancelled();
+        assert!(app.export_session.is_none(), "back to the chips");
+        assert_eq!(app.sheet, Some(Sheet::Export), "the sheet stays open");
+    }
+
+    #[test]
+    fn the_share_alternative_is_one_file_of_the_same_format() {
+        let mut app = app();
+        let first = app.transcripts[0].clone();
+        app.open_editor(first, 0.0);
+        app.advance(1.0);
+        app.open_export_sheet(1.0);
+        app.editor.as_mut().expect("editor").format = CompactExportFormat::Vtt;
+        let action = app.share_export(1.0).expect("a share request");
+        let CompactAction::ShareExport {
+            format,
+            suggested_name,
+            ..
+        } = action
+        else {
+            panic!("expected a ShareExport action");
+        };
+        assert_eq!(format, CompactExportFormat::Vtt);
+        assert!(suggested_name.ends_with(".vtt"));
+        assert_eq!(
+            app.export_session.as_ref().expect("session").phase,
+            ExportPhase::Writing
+        );
+        app.on_export_shared("Morning notes.vtt");
+        assert_eq!(
+            app.export_session.as_ref().expect("session").phase,
+            ExportPhase::Shared
+        );
+    }
+
+    #[test]
+    fn the_six_formats_match_the_desktop_list_in_order() {
+        let labels: Vec<&str> = CompactExportFormat::ALL
+            .iter()
+            .map(|format| format.label())
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["Markdown", "Text", "JSON", "SRT", "VTT", "TSV"]
+        );
+        let extensions: Vec<&str> = CompactExportFormat::ALL
+            .iter()
+            .map(|format| format.extension())
+            .collect();
+        assert_eq!(extensions, vec!["md", "txt", "json", "srt", "vtt", "tsv"]);
+        for format in CompactExportFormat::ALL {
+            assert!(!format.mime().is_empty());
+            assert_eq!(
+                format.supports_bilingual(),
+                matches!(format, CompactExportFormat::Srt | CompactExportFormat::Vtt)
+            );
+        }
+    }
+
+    #[test]
+    fn a_job_event_asks_the_host_to_wake_exactly_once() {
+        let mut app = app();
+        assert!(!app.take_frame_request());
+        assert!(app.on_job("Transcribing", 1, 10, 0.0));
+        assert!(app.take_frame_request());
+        assert!(!app.take_frame_request(), "one wake per change");
+        assert!(
+            !app.on_job("Transcribing", 1, 10, 0.1),
+            "a repeated poll with the same value is not an event"
+        );
+        assert!(!app.take_frame_request());
+        assert!(app.on_job("Transcribing", 5, 10, 0.2));
+        assert_eq!(app.job.as_ref().expect("job").percent(), 50);
+    }
+
+    #[test]
+    fn a_settled_screen_with_a_live_job_needs_no_frames() {
+        let mut app = app();
+        app.on_job("Transcribing", 4, 10, 0.0);
+        app.advance(1.0);
+        assert!(!app.needs_frame(), "the job strip is static between events");
+        assert!(!app.advance(2.0));
+        app.job_finished();
+        assert!(app.take_frame_request());
+        assert!(!app.needs_frame());
+    }
+
+    #[test]
+    fn the_fling_tracker_uses_the_drag_velocity_at_release() {
+        let mut tracker = FlingTracker::default();
+        // Drag frames: the offset moves and the pointer has velocity.
+        assert!(tracker.observe(0.0, 900.0, false).is_none());
+        assert!(tracker.observe(40.0, 700.0, false).is_none());
+        // Release with the pointer's velocity already zeroed: the probe starts
+        // from the last drag velocity.
+        assert!(tracker.observe(80.0, 0.0, true).is_none());
+        assert!(tracker.is_active());
+        // The momentum moves the offset for a few frames, then stops.
+        assert!(tracker.observe(110.0, 0.0, false).is_none());
+        assert!(tracker.observe(140.0, 0.0, false).is_none());
+        let probe = tracker
+            .observe(140.2, 0.0, false)
+            .expect("the probe lands when the offset stops");
+        assert_eq!(probe.release_velocity, 700.0, "the last drag velocity");
+        assert!((probe.distance - 60.2).abs() < 0.01, "{probe:?}");
+        assert!(probe.summary().contains("700 pt/s"));
+    }
+
+    #[test]
+    fn the_fling_probe_names_its_expected_travel() {
+        let mut app = app();
+        app.note_fling(FlingProbe {
+            release_velocity: 1_000.0,
+            distance: 90.0,
+            frames: 7,
+        });
+        let probe = app.fling_probe.expect("probe");
+        assert_eq!(probe.expected_distance(), 120.0);
+        assert!(probe.summary().contains("1000 pt/s"));
+        assert!(app.take_frame_request());
     }
 
     #[test]

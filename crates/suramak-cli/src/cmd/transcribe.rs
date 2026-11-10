@@ -316,7 +316,11 @@ pub fn run(args: TranscribeArgs) -> Result<()> {
     let mut failed = 0usize;
     let mut cancelled = 0usize;
 
-    while !driver.is_idle() {
+    // Drain after every pump, **including the last one**: `is_idle` can become
+    // true in the same `run_once` that produced the batch's terminal events,
+    // and a `while !is_idle` head check would then exit without ever draining
+    // them (the batch reported 0 outcomes; M13g2's full run caught it).
+    loop {
         driver.run_once();
         for event in driver.drain_events() {
             match event {
@@ -377,6 +381,9 @@ pub fn run(args: TranscribeArgs) -> Result<()> {
                     cancelled += 1;
                 }
             }
+        }
+        if driver.is_idle() {
+            break;
         }
         std::thread::sleep(Duration::from_millis(5));
     }

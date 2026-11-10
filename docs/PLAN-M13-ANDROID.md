@@ -230,10 +230,16 @@ Each slice is one workorder. The ordering front-loads the two existential risks:
 > `docs/WORKORDER-M13G1.md`, report `docs/reports/M13g1-compact-library.md`)
 > lands the `suramak-ui` component/shell split, the compact Library + editor +
 > Settings profile, push/pop motion, the completion notification's deep link
-> and the notification Quit action. G2 carries the remaining §3 surface —
-> playback-synced segment highlighting, the export sheet's
-> `ACTION_CREATE_DOCUMENT` write, onboarding/polish, and the device motion
-> review — once G1's shared Deck is in place.
+> and the notification Quit action. G2 (workorder `docs/WORKORDER-M13G2.md`,
+> report `docs/reports/M13g2-compact-completion.md`) lands the export sheet's
+> `ACTION_CREATE_DOCUMENT` write (six formats through the M15 serializers, plus
+> the disclosed one-file `ACTION_SEND`), the motion pass (two-layer push/pop,
+> sheet, list, progress, the predictive-back mid-transition contract, Reduce
+> Motion = springs only), the job-time frame budget, the `tests/ui-compact` CI
+> step, and the compact a11y floor. **Not in the G2 workorder:** playback-synced
+> segment highlighting and onboarding copy; they remain open. The visible phone
+> surface is still the M13b spike shell — the compact routes are host-drawn and
+> screenshot-gated, and the export/back bridge is wired for the shell swap.
 
 - **Goal:** the real product UI in compact profile. Library, transcript editor, playback-synced segments, exports, settings, and polish (§9 — retained).
 - **Deliverables:**

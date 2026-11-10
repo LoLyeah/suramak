@@ -1,21 +1,31 @@
-//! The compact Library: search, the transcript list, and the Import/Record bar.
+//! The compact Library: search, the job strip, the transcript list, and the
+//! Import/Record bar.
 //!
 //! One screen, one column. The same data the desktop sidebar shows
 //! (`Store::list_transcripts`, newest first as the store returns it), the same
 //! search semantics (title or segment text, case-insensitive), phone-sized rows
 //! and 48 dp actions. Tapping a row opens the editor — a push, not a selection
 //! in a side panel.
+//!
+//! **M13g2:** inserted rows fade/slide in and a removed row's slot collapses
+//! (`super::motion::ListAnim`); a running job is a static strip between the
+//! search field and the list (it redraws on events, not on a clock); and the
+//! scroll offset is fed to the fling probe after a drag release.
 
 use egui::{
     pos2, vec2, Align, Align2, Color32, CornerRadius, FontFamily, FontId, Layout, Rect, ScrollArea,
-    Sense, Stroke, Ui,
+    Sense, Stroke, Ui, WidgetType,
 };
 
-use crate::deck::motion::Motion;
+use crate::deck::motion::{self, Motion};
 use crate::deck::theme::Tokens;
 
+use super::a11y;
 use super::chrome::{self, GUTTER, MIN_TOUCH, ROW};
 use super::model::{clock, CompactAction, CompactApp, CompactRoute};
+
+/// The job strip's height (between the search field and the list).
+pub const JOB_STRIP: f32 = 46.0;
 
 /// Draws the Library into `screen`. Returns the actions it requested.
 pub fn ui(
@@ -59,6 +69,7 @@ pub fn ui(
         &mut state.library_query,
         "Search transcripts",
     );
+    a11y::describe(ui, search_rect, "Search transcripts");
     let mut list_top = search_rect.bottom() + 6.0;
 
     // --- status / error ----------------------------------------------------
@@ -68,6 +79,7 @@ pub fn ui(
             vec2(bands.content.width() - GUTTER * 2.0, 40.0),
         );
         paint_note(ui, tokens, rect, &text, error);
+        a11y::describe(ui, rect, &text);
         list_top = rect.bottom() + 8.0;
     }
     if let Some(error) = state.library_error.clone() {
@@ -94,7 +106,15 @@ pub fn ui(
             pos2(rect.right() - 104.0, rect.bottom() - 40.0),
             vec2(88.0, 32.0),
         );
-        let response = ui.interact(retry, ui.id().with("library-retry"), Sense::click());
+        let response = a11y::touch(
+            ui,
+            tokens,
+            retry,
+            "library-retry",
+            WidgetType::Button,
+            "Reload the library",
+            true,
+        );
         ui.painter().rect_filled(
             retry,
             CornerRadius::same(tokens.radius.control),
@@ -113,6 +133,38 @@ pub fn ui(
         list_top = rect.bottom() + 10.0;
     }
 
+    // --- job strip ----------------------------------------------------------
+    if let Some(job) = state.job.clone() {
+        let rect = Rect::from_min_size(
+            pos2(bands.content.left() + GUTTER, list_top),
+            vec2(bands.content.width() - GUTTER * 2.0, JOB_STRIP),
+        );
+        chrome::card(ui, tokens, rect);
+        ui.painter().text(
+            pos2(rect.left() + 14.0, rect.top() + 17.0),
+            Align2::LEFT_CENTER,
+            job.line(),
+            FontId::proportional(13.0),
+            tokens.ink,
+        );
+        let track = Rect::from_min_size(
+            pos2(rect.left() + 14.0, rect.bottom() - 14.0),
+            vec2(rect.width() - 28.0, 3.0),
+        );
+        ui.painter()
+            .rect_filled(track, CornerRadius::same(2), tokens.control_fill);
+        let fraction = state.job_fraction();
+        if fraction > 0.0 {
+            ui.painter().rect_filled(
+                Rect::from_min_size(track.min, vec2(track.width() * fraction, 3.0)),
+                CornerRadius::same(2),
+                tokens.accent,
+            );
+        }
+        a11y::describe(ui, rect, &job.line());
+        list_top = rect.bottom() + 8.0;
+    }
+
     // --- list --------------------------------------------------------------
     let list_rect = Rect::from_min_max(
         pos2(bands.content.left(), list_top),
@@ -122,12 +174,17 @@ pub fn ui(
         if state.rows.is_empty() {
             empty_library(ui, tokens, list_rect);
         } else {
+            let now = ui.input(|input| input.time);
+            let keys = state.library_keys();
+            let snapshot = state.list_anim.sync(&keys, now, state.reduce_motion);
+            let appear: Vec<f32> = snapshot.rows.iter().map(|(_, value)| *value).collect();
+            let ghosts = snapshot.ghosts.clone();
             let mut child = ui.new_child(
                 egui::UiBuilder::new()
                     .max_rect(list_rect)
                     .layout(Layout::top_down(Align::Min)),
             );
-            ScrollArea::vertical()
+            let output = ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .scroll_source(egui::containers::scroll_area::ScrollSource {
                     drag: true,
@@ -135,14 +192,30 @@ pub fn ui(
                 })
                 .show(&mut child, |ui| {
                     for (index, row) in state.rows.iter().enumerate() {
-                        let (rect, _) =
-                            ui.allocate_exact_size(vec2(list_rect.width(), ROW), Sense::hover());
+                        // A removed row's slot collapses before this row.
+                        for ghost in ghosts.iter().filter(|ghost| ghost.at == index) {
+                            ui.add_space(ROW * ghost.value);
+                        }
+                        let factor = appear.get(index).copied().unwrap_or(1.0);
+                        let rise = motion::rise(factor, super::motion::ROW_RISE);
+                        let rect = Rect::from_min_size(
+                            pos2(list_rect.left(), ui.cursor().top() + rise),
+                            vec2(list_rect.width(), ROW),
+                        );
+                        ui.allocate_space(vec2(list_rect.width(), ROW));
+                        let mut row_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .id_salt(("library-row-layer", index))
+                                .max_rect(rect)
+                                .layout(Layout::top_down(Align::Min)),
+                        );
+                        row_ui.set_opacity(factor.clamp(0.0, 1.0));
                         let selected = state
                             .editor
                             .as_ref()
                             .is_some_and(|editor| editor.transcript.id == row.id);
                         let response = chrome::row(
-                            ui,
+                            &mut row_ui,
                             tokens,
                             motion,
                             rect,
@@ -154,7 +227,7 @@ pub fn ui(
                         // The list ends without a dangling rule under its last
                         // row (chrome::row paints one for row separation).
                         if index + 1 == state.rows.len() {
-                            ui.painter().rect_filled(
+                            row_ui.painter().rect_filled(
                                 Rect::from_min_size(
                                     pos2(rect.left() + GUTTER, rect.bottom() - 1.0),
                                     vec2(rect.width() - GUTTER, 1.0),
@@ -173,7 +246,7 @@ pub fn ui(
                         // quiet ink (the row itself is the 64 dp target).
                         {
                             let c = pos2(rect.right() - GUTTER - 8.0, rect.center().y);
-                            ui.painter().add(egui::Shape::line(
+                            row_ui.painter().add(egui::Shape::line(
                                 vec![
                                     pos2(c.x - 2.5, c.y - 5.0),
                                     pos2(c.x + 2.5, c.y),
@@ -185,6 +258,11 @@ pub fn ui(
                     }
                     ui.add_space(8.0);
                 });
+            // The fling probe's input side: a release starts the measurement,
+            // the following frames accumulate the offset egui's momentum moved.
+            let velocity = ui.input(|input| input.pointer.velocity().length());
+            let released = ui.input(|input| input.pointer.any_released());
+            observe_fling(state, output.state.offset.y, velocity, released);
         }
     } else {
         let hits = state.hits();
@@ -208,8 +286,15 @@ pub fn ui(
                             vec2(list_rect.width(), ROW + 18.0),
                             Sense::hover(),
                         );
-                        let response =
-                            ui.interact(rect, ui.id().with(("hit", index)), Sense::click());
+                        let response = a11y::touch(
+                            ui,
+                            tokens,
+                            rect,
+                            ("hit", index),
+                            WidgetType::Button,
+                            &format!("Open {} · {}", hit.title, hit.snippet),
+                            true,
+                        );
                         if response.clicked() {
                             actions.push(CompactAction::OpenTranscript {
                                 id: hit.id,
@@ -289,13 +374,29 @@ pub fn ui(
     {
         actions.push(CompactAction::Import);
     }
+    a11y::record_button(ui, import, "Import audio", true);
     if chrome::action_button(ui, tokens, motion, record, "library-record", "Record", true).clicked()
     {
         actions.push(CompactAction::Record);
     }
+    a11y::record_button(ui, record, "Record from the microphone", true);
 
     let _ = state.nav.current() == CompactRoute::Library;
     actions
+}
+
+/// Feeds the list's scroll offset to the fling probe. Called by the screen after
+/// the scroll area draws: one release starts a probe, and the following frames
+/// measure the offset the momentum actually covers.
+pub fn observe_fling(
+    state: &mut CompactApp,
+    offset: f32,
+    velocity: f32,
+    released: bool,
+) -> Option<super::model::FlingProbe> {
+    let probe = state.fling.observe(offset, velocity, released)?;
+    state.note_fling(probe);
+    Some(probe)
 }
 
 fn paint_note(ui: &mut Ui, tokens: &Tokens, rect: Rect, text: &str, error: bool) {
@@ -366,8 +467,8 @@ pub fn row_rect(index: usize, list_top: f32, width: f32) -> Rect {
 /// `egui`'s touch fling probe (documented, not a device claim): dragging the
 /// list moves the scroll offset immediately; the offset is retained after the
 /// pointer lifts, which is egui's own momentum source (`scroll_with_drag`).
-/// This asserts the mechanism exists at our viewport; real fling feel is the
-/// owner-device checklist item.
+/// [`observe_fling`] records what that momentum actually did, so the owner's
+/// phone run can be compared with the Deck layer's expectation.
 pub fn fling_probe_size() -> egui::Vec2 {
     vec2(360.0, 640.0)
 }

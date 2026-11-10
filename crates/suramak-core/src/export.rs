@@ -108,6 +108,29 @@ pub fn to_srt(t: &Transcript) -> Result<String, SuramakError> {
     Ok(out)
 }
 
+/// Exports a transcript to tab-separated values — one row per segment, with a
+/// header row. This is the spreadsheet/automation sibling of [`to_txt`]: the
+/// same rows, the same order, the same text.
+///
+/// A TSV cell cannot carry a tab or a line break, and the format has no quoting
+/// convention every reader honours. The text cell therefore folds every run of
+/// whitespace to one space (the only lossy step, and the same normalization a
+/// spreadsheet would apply on paste). `idx`, `start_ms` and `end_ms` are the
+/// machine columns; a reader that wants `m:ss` uses [`to_txt`] or the JSON.
+pub fn to_tsv(t: &Transcript) -> Result<String, SuramakError> {
+    let mut out = String::from("idx\tstart_ms\tend_ms\ttext\n");
+    for seg in &t.segments {
+        let text = seg.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{}",
+            seg.idx, seg.start_ms, seg.end_ms, text
+        )
+        .unwrap();
+    }
+    Ok(out)
+}
+
 /// Exports a transcript to WebVTT subtitle format.
 pub fn to_vtt(t: &Transcript) -> Result<String, SuramakError> {
     let mut out = String::new();

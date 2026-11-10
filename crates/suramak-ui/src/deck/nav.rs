@@ -7,19 +7,36 @@
 //! dispatch paths, one `handleBack`), so the app only has to answer one
 //! question: *pop, dismiss, or leave?* That answer is [`NavStack::back`].
 //!
-//! **Motion.** A push enters the new screen from the right; a pop returns the
-//! previous one from the left. Both use ONE spring — [`motion::spring_ease`]
-//! over the base token — with the direction only changing the sign of the
-//! travel. There is no second curve and no bounce: the spring's overshoot is
-//! bounded by [`motion::SPRING_OVERSHOOT`] and it settles exactly at 1.0.
-//! Reduce Motion makes the transition a hard cut (progress 1 on the first
-//! frame), and a finished transition requests no repaint — an idle phone UI
-//! draws only on input.
+//! **Motion (M13g2).** A navigation move paints **two layers**: the screen
+//! leaving and the screen arriving. A push enters from the right while the
+//! previous screen drifts left by 18 % of the travel and dims; a pop sends the
+//! outgoing screen right while the revealed one drifts in from 18 % left. Both
+//! directions use ONE spring — [`motion::spring_ease`] over the base token — so
+//! the two cannot drift apart. Overshoot is bounded by
+//! [`motion::SPRING_OVERSHOOT`] (2 %) and the value lands exactly at 1.0.
+//!
+//! **Reduce Motion removes only the springs.** The travel above is settled on
+//! the first frame and no overshoot is ever drawn, but the opacity crossfade
+//! still runs over [`REDUCE_FADE`] (120 ms). Opacity is not vestibular motion;
+//! cutting straight to the next screen is what makes a reduced-motion user
+//! lose their place. There is no translation, scale or bounce in that path.
+//!
+//! A finished transition requests no repaint (`advance()` returns false once
+//! the token elapsed) — an idle phone UI draws only on input.
 //!
 //! The stack is pure: it owns no egui state, so every rule here is unit-tested
 //! on the host (the device-only boundary is touch/fling delivery, not this).
 
 use crate::deck::motion::{self, Motion};
+
+/// The crossfade Reduce Motion keeps (120 ms — the fast token). See the module
+/// docs: only a spring's *travel* is removed.
+pub const REDUCE_FADE: f32 = motion::FAST;
+
+/// The outgoing screen's parallax as a fraction of the viewport width. Small
+/// on purpose: the arriving screen is the subject; the old one only has to
+/// move enough to read as "behind".
+pub const PARALLAX: f32 = 0.18;
 
 /// Which way a navigation move goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,16 +58,34 @@ pub enum BackOutcome {
     Finish,
 }
 
+/// One painted layer's transform for the current frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Layer {
+    /// Horizontal offset in points (positive moves right).
+    pub dx: f32,
+    /// Opacity, 0..=1.
+    pub alpha: f32,
+}
+
+/// The two layers a transition paints: the screen leaving (if any) and the one
+/// arriving.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NavLayers {
+    pub outgoing: Option<Layer>,
+    pub incoming: Layer,
+}
+
 /// The in-flight navigation animation.
 ///
-/// `progress` is the *entering* screen's normalized position: 0 = fully
-/// outside, 1 = settled. A pop animates the leaving screen from 1 to 0; the
-/// renderer reads [`NavMotion::offset`] for whichever side it paints.
+/// `travel` is the **spring's** normalized position (0 = fully outside, 1 =
+/// settled); `fade` is the opacity crossfade. They share a clock in the normal
+/// path and diverge only under Reduce Motion (travel snaps, fade still runs).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NavMotion {
     pub direction: Direction,
     started_at: f64,
-    progress: f32,
+    travel: f32,
+    fade: f32,
     done: bool,
 }
 
@@ -60,42 +95,91 @@ impl NavMotion {
         Self {
             direction,
             started_at: now,
-            progress: 0.0,
+            travel: 0.0,
+            fade: 0.0,
             done: false,
         }
     }
 
-    /// Advances the transition. Under Reduce Motion the first call settles it —
-    /// a hard cut, never a zero-length animation that still asks for a frame.
+    /// Advances the transition and returns the travel progress (kept for the
+    /// callers that only need the spring). Under Reduce Motion the travel is
+    /// settled on the first call; [`NavMotion::is_done`] stays false until the
+    /// crossfade has run.
     pub fn advance(&mut self, now: f64, reduce_motion: bool) -> f32 {
         if self.done {
-            return self.progress;
+            return self.travel;
         }
-        if reduce_motion {
-            self.progress = 1.0;
-            self.done = true;
-            return 1.0;
-        }
+        motion::reanchor(&mut self.started_at, now);
         let elapsed = (now - self.started_at).max(0.0) as f32;
+        if reduce_motion {
+            self.travel = 1.0;
+            self.fade = motion::ease_out((elapsed / REDUCE_FADE).clamp(0.0, 1.0));
+            if elapsed >= REDUCE_FADE {
+                self.fade = 1.0;
+                self.done = true;
+            }
+            return self.travel;
+        }
         let t = (elapsed / motion::BASE).clamp(0.0, 1.0);
-        self.progress = motion::spring_ease(t);
+        self.travel = motion::spring_ease(t);
+        self.fade = motion::ease_out(t);
         if t >= 1.0 {
-            self.progress = 1.0;
+            self.travel = 1.0;
+            self.fade = 1.0;
             self.done = true;
         }
-        self.progress
+        self.travel
+    }
+
+    /// The spring's progress (1 under Reduce Motion from the first frame).
+    pub fn travel(&self) -> f32 {
+        self.travel
+    }
+
+    /// The opacity crossfade (0..=1).
+    pub fn fade(&self) -> f32 {
+        self.fade
     }
 
     /// The entering screen's horizontal offset as a fraction of the viewport
     /// width (always positive: it comes from the right on push; on pop the
     /// outgoing screen is the one drawn at this offset).
     pub fn offset(&self, viewport_width: f32) -> f32 {
-        (1.0 - self.progress).max(0.0) * viewport_width
+        (1.0 - self.travel).max(0.0) * viewport_width
     }
 
     /// Opacity of the entering screen (a short fade over the same spring).
     pub fn opacity(&self) -> f32 {
-        self.progress.clamp(0.0, 1.0)
+        self.fade.clamp(0.0, 1.0)
+    }
+
+    /// The two layers for this frame. Callers paint `outgoing` first.
+    pub fn layers(&self, viewport_width: f32) -> NavLayers {
+        let travel = self.travel.clamp(0.0, 1.0);
+        let fade = self.fade.clamp(0.0, 1.0);
+        let behind = PARALLAX * (1.0 - travel) * viewport_width;
+        match self.direction {
+            Direction::Push => NavLayers {
+                outgoing: Some(Layer {
+                    dx: -behind,
+                    alpha: 1.0 - 0.30 * fade,
+                }),
+                incoming: Layer {
+                    dx: (1.0 - travel) * viewport_width,
+                    alpha: fade,
+                },
+            },
+            Direction::Pop => NavLayers {
+                outgoing: Some(Layer {
+                    dx: travel * viewport_width,
+                    alpha: 1.0 - fade,
+                }),
+                incoming: Layer {
+                    dx: -behind,
+                    alpha: 0.55 + 0.45 * fade,
+                },
+            },
+        }
     }
 
     /// Whether the animation has ended (and therefore must not request a
@@ -107,7 +191,8 @@ impl NavMotion {
     /// Force-settle (a second back press during a transition, a lifecycle
     /// pause): the next frame is static.
     pub fn settle(&mut self) {
-        self.progress = 1.0;
+        self.travel = 1.0;
+        self.fade = 1.0;
         self.done = true;
     }
 }
@@ -118,10 +203,14 @@ impl NavMotion {
 /// root screen is pushed at construction and can never be popped: back at the
 /// root is [`BackOutcome::Finish`], which the Android shell maps to
 /// `finishAndRemoveTask()` (the v2.4 contract).
+///
+/// A pop keeps its **outgoing** screen until the transition settles so the
+/// renderer can slide it away; [`NavStack::advance`] drops it at the end.
 #[derive(Debug, Clone)]
 pub struct NavStack<S> {
     screens: Vec<S>,
     motion: Option<NavMotion>,
+    outgoing: Option<S>,
     /// Direction of the most recent move, so the renderer can tell which side
     /// is entering without re-deriving it from the animation.
     pub last_direction: Direction,
@@ -134,6 +223,7 @@ impl<S: Copy + PartialEq> NavStack<S> {
         Self {
             screens: vec![root],
             motion: None,
+            outgoing: None,
             last_direction: Direction::Push,
         }
     }
@@ -147,6 +237,11 @@ impl<S: Copy + PartialEq> NavStack<S> {
     pub fn previous(&self) -> Option<S> {
         let len = self.screens.len();
         (len >= 2).then(|| self.screens[len - 2])
+    }
+
+    /// The screen leaving a pop, while its transition runs.
+    pub fn outgoing(&self) -> Option<S> {
+        self.outgoing
     }
 
     /// Number of screens on the stack (1 = root).
@@ -167,6 +262,7 @@ impl<S: Copy + PartialEq> NavStack<S> {
             return false;
         }
         self.screens.push(screen);
+        self.outgoing = None;
         self.last_direction = Direction::Push;
         self.motion = Some(NavMotion::begin(Direction::Push, now));
         true
@@ -182,6 +278,7 @@ impl<S: Copy + PartialEq> NavStack<S> {
         self.screens.clear();
         self.screens.push(root);
         self.screens.push(screen);
+        self.outgoing = None;
         self.last_direction = Direction::Push;
         self.motion = Some(NavMotion::begin(Direction::Push, now));
         true
@@ -194,6 +291,7 @@ impl<S: Copy + PartialEq> NavStack<S> {
             return None;
         }
         let popped = self.screens.pop();
+        self.outgoing = popped;
         self.last_direction = Direction::Pop;
         self.motion = Some(NavMotion::begin(Direction::Pop, now));
         popped
@@ -214,17 +312,21 @@ impl<S: Copy + PartialEq> NavStack<S> {
     }
 
     /// Advances the in-flight transition (if any). Returns whether a repaint
-    /// must be requested — exactly while the spring is between its endpoints.
+    /// must be requested — exactly while the spring/crossfade is between its
+    /// endpoints. Drops the outgoing screen when the transition ends.
     pub fn advance(&mut self, now: f64, reduce_motion: bool) -> bool {
-        match self.motion.as_mut() {
-            Some(anim) => {
-                if anim.is_done() {
-                    return false;
-                }
-                anim.advance(now, reduce_motion);
-                !anim.is_done()
-            }
-            None => false,
+        let Some(anim) = self.motion.as_mut() else {
+            return false;
+        };
+        if anim.is_done() {
+            return false;
+        }
+        anim.advance(now, reduce_motion);
+        if anim.is_done() {
+            self.outgoing = None;
+            false
+        } else {
+            true
         }
     }
 
@@ -238,11 +340,21 @@ impl<S: Copy + PartialEq> NavStack<S> {
         if let Some(anim) = self.motion.as_mut() {
             anim.settle();
         }
+        self.outgoing = None;
     }
 
     /// The Deck motion policy, for callers that need `reduce_motion` here.
     pub fn policy(&self, reduce_motion: bool) -> Motion {
         Motion::new(reduce_motion)
+    }
+
+    /// Which route each painted layer is: `(outgoing, incoming)`. A push's
+    /// outgoing is the screen below; a pop's is the popped screen.
+    pub fn layer_routes(&self) -> (Option<S>, S) {
+        match self.last_direction {
+            Direction::Push => (self.previous(), self.current()),
+            Direction::Pop => (self.outgoing, self.current()),
+        }
     }
 }
 
@@ -277,6 +389,11 @@ mod tests {
         assert_eq!(nav.pop(2.0), Some(Screen::Editor));
         assert_eq!(nav.current(), Screen::Library);
         assert_eq!(nav.depth(), 1);
+        assert_eq!(
+            nav.outgoing(),
+            Some(Screen::Editor),
+            "the leaving screen survives for the pop transition"
+        );
     }
 
     #[test]
@@ -336,11 +453,49 @@ mod tests {
     }
 
     #[test]
-    fn reduce_motion_is_a_hard_cut_on_the_first_frame() {
+    fn the_two_layer_offsets_partition_the_viewport_at_the_ends() {
+        let mut anim = NavMotion::begin(Direction::Push, 0.0);
+        anim.advance(0.0, false);
+        let start = anim.layers(400.0);
+        assert_eq!(start.incoming.dx, 400.0, "the new screen starts off-screen");
+        assert_eq!(start.incoming.alpha, 0.0);
+        let old = start.outgoing.expect("the library is painted beneath");
+        assert_eq!(old.dx, -PARALLAX * 400.0);
+
+        anim.advance(10.0, false);
+        let end = anim.layers(400.0);
+        assert_eq!(end.incoming.dx, 0.0);
+        assert_eq!(end.incoming.alpha, 1.0);
+        assert_eq!(end.outgoing.expect("beneath").dx, 0.0);
+
+        // A pop sends the outgoing screen fully right and leaves the revealed
+        // one exactly home.
+        let mut pop = NavMotion::begin(Direction::Pop, 0.0);
+        pop.advance(10.0, false);
+        let settled = pop.layers(400.0);
+        assert_eq!(settled.incoming.dx, 0.0);
+        assert_eq!(settled.incoming.alpha, 1.0);
+        assert_eq!(settled.outgoing.expect("leaving").alpha, 0.0);
+    }
+
+    #[test]
+    fn reduce_motion_removes_the_travel_but_keeps_the_crossfade() {
         let mut anim = NavMotion::begin(Direction::Push, 5.0);
+        // Travel settles on the first frame: no translation, ever.
         assert_eq!(anim.advance(5.0, true), 1.0);
-        assert!(anim.is_done());
         assert_eq!(anim.offset(400.0), 0.0);
+        assert_eq!(anim.layers(400.0).incoming.dx, 0.0);
+        // The fade is still climbing, so the frame is not static yet…
+        assert!(anim.fade() < 1.0);
+        assert!(!anim.is_done());
+        let mid = anim.advance(5.0 + REDUCE_FADE as f64 * 0.5, true);
+        assert_eq!(mid, 1.0);
+        assert!(anim.fade() > 0.0 && anim.fade() < 1.0);
+        // …and it ends exactly on the fast token, requesting no more frames.
+        anim.advance(5.0 + REDUCE_FADE as f64 + 0.001, true);
+        assert_eq!(anim.fade(), 1.0);
+        assert!(anim.is_done());
+        assert_eq!(anim.layers(400.0).incoming.alpha, 1.0);
     }
 
     #[test]
@@ -352,6 +507,20 @@ mod tests {
             !nav.advance(1.0, false),
             "after the token the stack asks for no frames"
         );
+        assert_eq!(nav.outgoing(), None);
+    }
+
+    #[test]
+    fn a_finished_pop_drops_the_outgoing_screen() {
+        let mut nav = NavStack::new(Screen::Library);
+        nav.push(Screen::Editor, 0.0);
+        nav.advance(1.0, false);
+        nav.pop(2.0);
+        assert_eq!(nav.layer_routes(), (Some(Screen::Editor), Screen::Library));
+        assert!(nav.advance(2.05, false));
+        assert!(!nav.advance(2.5, false));
+        assert_eq!(nav.outgoing(), None);
+        assert_eq!(nav.layer_routes(), (None, Screen::Library));
     }
 
     #[test]
@@ -361,5 +530,33 @@ mod tests {
         nav.settle();
         assert!(nav.motion().expect("push motion").is_done());
         assert!(!nav.advance(0.1, false));
+    }
+
+    #[test]
+    fn a_host_clock_start_reanchors_on_the_first_ui_frame() {
+        // A host command (back/deep link) starts at process uptime; the UI
+        // advances with egui time. The mismatch must start the spring, not
+        // freeze it at progress 0 forever.
+        let mut anim = NavMotion::begin(Direction::Push, 100.0);
+        assert_eq!(
+            anim.advance(2.0, false),
+            0.0,
+            "the first UI frame starts it"
+        );
+        assert!(!anim.is_done());
+        let end = anim.advance(2.0 + motion::BASE as f64 + 0.01, false);
+        assert_eq!(end, 1.0, "and it completes on the UI clock");
+        assert!(anim.is_done());
+    }
+
+    #[test]
+    fn reduce_motion_still_costs_exactly_one_token_of_frames() {
+        let mut nav = NavStack::new(Screen::Library);
+        nav.push(Screen::Editor, 0.0);
+        assert!(nav.advance(0.0, true), "the crossfade starts");
+        assert!(
+            !nav.advance(REDUCE_FADE as f64 + 0.01, true),
+            "and stops after the fast token — never an endless idle repaint"
+        );
     }
 }

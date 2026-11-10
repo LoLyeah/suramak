@@ -829,16 +829,18 @@ pub enum ExportFormat {
     Json,
     Srt,
     Vtt,
+    Tsv,
     Ass,
 }
 
 impl ExportFormat {
-    pub const ALL: [ExportFormat; 6] = [
+    pub const ALL: [ExportFormat; 7] = [
         ExportFormat::Md,
         ExportFormat::Txt,
         ExportFormat::Json,
         ExportFormat::Srt,
         ExportFormat::Vtt,
+        ExportFormat::Tsv,
         ExportFormat::Ass,
     ];
 
@@ -849,6 +851,7 @@ impl ExportFormat {
             ExportFormat::Json => "json",
             ExportFormat::Srt => "srt",
             ExportFormat::Vtt => "vtt",
+            ExportFormat::Tsv => "tsv",
             ExportFormat::Ass => "ass",
         }
     }
@@ -860,6 +863,7 @@ impl ExportFormat {
             ExportFormat::Json => "JSON",
             ExportFormat::Srt => "SRT",
             ExportFormat::Vtt => "VTT",
+            ExportFormat::Tsv => "TSV",
             ExportFormat::Ass => "ASS",
         }
     }
@@ -872,6 +876,7 @@ impl ExportFormat {
             ExportFormat::Json => core_export::to_json(transcript),
             ExportFormat::Srt => core_export::to_srt(transcript),
             ExportFormat::Vtt => core_export::to_vtt(transcript),
+            ExportFormat::Tsv => core_export::to_tsv(transcript),
             ExportFormat::Ass => core_export::to_ass(transcript),
         };
         rendered.map_err(|err| err.to_string())
@@ -901,7 +906,7 @@ impl ExportFormat {
                 translations,
                 &core_export::AssOptions::default(),
             ),
-            ExportFormat::Md | ExportFormat::Txt | ExportFormat::Json => {
+            ExportFormat::Md | ExportFormat::Txt | ExportFormat::Json | ExportFormat::Tsv => {
                 return Err(format!(
                     "{} has no bilingual variant — choose SRT, VTT or ASS",
                     self.label()

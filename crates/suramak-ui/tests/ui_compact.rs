@@ -1,11 +1,19 @@
-//! The phone-viewport screenshot suite (M13g1).
+//! The phone-viewport screenshot suite (M13g1, extended in M13g2).
 //!
 //! Runs the compact profile at the plan's portrait viewport (1216 × 2640
 //! physical, scale 2.6 ⇒ 467.7 × 1015.4 points), rasterises the real egui shape
-//! stream with [`suramak_ui::deck::snapshot`], writes the three shots under
-//! `tests/ui-compact/shots/`, and asserts the layout rules the profile promises:
-//! 48 dp targets, nothing outside the viewport, the bottom bar clearing the
-//! gesture inset, and the same three screens reachable by push/pop.
+//! stream with [`suramak_ui::deck::snapshot`], writes the shots under
+//! `tests/ui-compact/shots/`, and asserts the rules the profile promises:
+//!
+//! * 48 dp targets, nothing outside the viewport, the bottom bar clearing the
+//!   gesture inset;
+//! * the export sheet's open state and its picker-result state (M13g2);
+//! * the M13D model tiers on Settings (M13g2's low-memory shot);
+//! * every compact control carries a non-empty semantic label (the a11y
+//!   floor), with its role;
+//! * Reduce Motion removes the navigation travel and keeps exactly one
+//!   crossfade token of frames — never an idle redraw;
+//! * a settled screen with a live job asks for no frames at all.
 //!
 //! The suite is display-free by construction (the rasteriser owns its pixels),
 //! but `tests/ui-compact/run.sh` invokes it under `xvfb-run` exactly like the
@@ -15,7 +23,7 @@ use suramak_core::device::DeviceProfile;
 use suramak_core::settings::Appearance;
 use suramak_core::transcript::{Segment, Source, Transcript};
 use suramak_ui::deck::compact::{
-    self, chrome, library, CompactApp, CompactRoute, CompactSettings, Insets,
+    self, a11y, chrome, library, CompactApp, CompactRoute, CompactSettings, Insets, Sheet,
 };
 use suramak_ui::deck::snapshot;
 use suramak_ui::deck::theme::{self, AppTheme};
@@ -93,12 +101,17 @@ fn seeded_app() -> CompactApp {
     app
 }
 
-fn render(app: &mut CompactApp, name: &str) -> snapshot::Shot {
-    let (_, _, scale) = compact::phone_viewport();
-    let screen = compact::phone_screen_rect();
+fn fresh_context(app: &CompactApp) -> egui::Context {
     let ctx = egui::Context::default();
     theme::install_fonts(&ctx);
     theme::install(&ctx, app.theme, app.reduce_motion);
+    ctx
+}
+
+fn render(app: &mut CompactApp, name: &str) -> snapshot::Shot {
+    let (_, _, scale) = compact::phone_viewport();
+    let screen = compact::phone_screen_rect();
+    let ctx = fresh_context(app);
     let shot = snapshot::render(&ctx, screen, scale, |ctx| {
         let _ = compact::ui(ctx, app);
     });
@@ -161,6 +174,73 @@ fn the_phone_viewport_shoots_library_editor_and_settings() {
 }
 
 #[test]
+fn the_export_sheet_and_its_picker_result_are_shots() {
+    let mut app = seeded_app();
+    let target = app.transcripts[0].clone();
+    app.open_editor(target, 0.0);
+    app.advance(10.0);
+    app.editor.as_mut().expect("editor").format = compact::CompactExportFormat::Srt;
+    app.editor.as_mut().expect("editor").has_translation = true;
+    app.export_bilingual = true;
+    app.open_export_sheet(10.0);
+    app.advance(11.0); // the sheet's present animation settles
+    assert_eq!(app.sheet, Some(Sheet::Export));
+    assert_eq!(app.sheet_anim.value(), 1.0);
+    let sheet_shot = render(&mut app, "export-sheet");
+    assert!(sheet_shot.painted_fraction(egui::Color32::BLACK) > 0.5);
+
+    // The picker returned and the write verified: the sheet shows the result.
+    let action = app.begin_export(12.0).expect("export action");
+    assert!(matches!(action, compact::CompactAction::Export { .. }));
+    app.on_export_picked();
+    app.on_export_written("Morning notes.srt", 12_480);
+    assert_eq!(
+        app.export_session.as_ref().expect("session").phase,
+        compact::ExportPhase::Written
+    );
+    let written_shot = render(&mut app, "export-written");
+    assert!(written_shot.painted_fraction(egui::Color32::BLACK) > 0.5);
+
+    // The sheet is dismissed with its exit animation, then gone.
+    app.close_export_sheet(13.0);
+    assert!(app.advance(13.05), "the exit animates");
+    assert_eq!(
+        app.sheet,
+        Some(Sheet::Export),
+        "still painted while closing"
+    );
+    assert!(!app.advance(13.2));
+    assert_eq!(app.sheet, None);
+    assert!(app.export_session.is_none());
+}
+
+#[test]
+fn the_settings_shot_shows_the_low_tier_refusals() {
+    let mut app = seeded_app();
+    app.settings.model_id = "tiny".to_string();
+    app.seed_device(
+        DeviceProfile::new(3_000_000_000, 1_500_000_000, false, true),
+        &["tiny".to_string()],
+    );
+    app.open_settings(0.0);
+    app.advance(10.0);
+    let shot = render(&mut app, "settings-tiers");
+    assert!(shot.painted_fraction(egui::Color32::BLACK) > 0.5);
+    let offered: Vec<&str> = app
+        .models
+        .iter()
+        .filter(|row| row.offered)
+        .map(|row| row.id.as_str())
+        .collect();
+    assert_eq!(offered, vec!["tiny"], "below the 4 GB floor only tiny runs");
+    assert!(
+        app.models.iter().any(|row| !row.offered),
+        "the hidden/larger models are the M13D refusal statement"
+    );
+    assert_eq!(app.tier, Some(suramak_core::device::PhoneTier::BelowFloor));
+}
+
+#[test]
 fn a_small_phone_keeps_every_target_at_least_48_dp() {
     let screen = compact::small_phone_screen_rect();
     assert!(library::bar_is_safe(screen));
@@ -176,20 +256,150 @@ fn a_small_phone_keeps_every_target_at_least_48_dp() {
 }
 
 #[test]
-fn reduce_motion_settles_the_push_on_the_first_frame() {
+fn reduce_motion_removes_the_travel_and_keeps_one_crossfade_token() {
     let mut app = seeded_app();
     app.reduce_motion = true;
     let target = app.transcripts[0].clone();
     app.open_editor(target, 0.0);
-    assert!(!app.advance(0.0), "a hard cut asks for no extra frame");
-    assert!(app.nav.motion().expect("push").is_done());
+    assert!(
+        app.advance(0.0),
+        "the opacity crossfade still asks for its 120 ms"
+    );
+    let motion = app.nav.motion().expect("push");
+    assert_eq!(
+        motion.offset(compact::phone_screen_rect().width()),
+        0.0,
+        "no translation under Reduce Motion"
+    );
+    assert!(motion.fade() < 1.0);
+    assert!(
+        !app.advance(0.13),
+        "the crossfade ends on the fast token, not on a frame loop"
+    );
     assert_eq!(app.nav.current(), CompactRoute::Editor);
 }
 
 #[test]
-fn the_light_ladder_renders_too() {
+fn every_compact_control_carries_a_label_and_a_role() {
     let mut app = seeded_app();
-    app.theme = AppTheme::Light;
-    let shot = render(&mut app, "library-light");
-    assert!(shot.painted_fraction(egui::Color32::BLACK) > 0.5);
+    let (_, _, scale) = compact::phone_viewport();
+    let screen = compact::phone_screen_rect();
+    let ctx = fresh_context(&app);
+    let _ = snapshot::render(&ctx, screen, scale, |ctx| {
+        let _ = compact::ui(ctx, &mut app);
+    });
+    let controls = a11y::controls(&ctx);
+    assert!(
+        controls.len() >= 6,
+        "the library frame registers its controls, got {}",
+        controls.len()
+    );
+    for control in &controls {
+        assert!(
+            !control.label.trim().is_empty(),
+            "unlabeled control at {:?}",
+            control.rect
+        );
+    }
+    let labels: Vec<&str> = controls
+        .iter()
+        .map(|control| control.label.as_str())
+        .collect();
+    assert!(labels.contains(&"Settings"), "labels: {labels:?}");
+    assert!(labels
+        .iter()
+        .any(|label| label.starts_with("Morning notes")));
+    assert!(labels.contains(&"Import audio"));
+    assert!(labels.contains(&"Record from the microphone"));
+
+    // The editor's chrome and transport, then the export sheet.
+    let target = app.transcripts[0].clone();
+    app.open_editor(target, 0.0);
+    app.advance(10.0);
+    let ctx = fresh_context(&app);
+    let _ = snapshot::render(&ctx, screen, scale, |ctx| {
+        let _ = compact::ui(ctx, &mut app);
+    });
+    let labels: Vec<String> = a11y::controls(&ctx)
+        .into_iter()
+        .map(|control| control.label)
+        .collect();
+    for expected in ["Back", "Play", "Find", "Export"] {
+        assert!(
+            labels.iter().any(|label| label == expected),
+            "the editor registers {expected}: {labels:?}"
+        );
+    }
+    assert!(labels.iter().any(|label| label.starts_with("Segment 1")));
+
+    app.editor.as_mut().expect("editor").format = compact::CompactExportFormat::Srt;
+    app.editor.as_mut().expect("editor").has_translation = true;
+    app.open_export_sheet(11.0);
+    app.advance(12.0);
+    let ctx = fresh_context(&app);
+    let _ = snapshot::render(&ctx, screen, scale, |ctx| {
+        let _ = compact::ui(ctx, &mut app);
+    });
+    let controls = a11y::controls(&ctx);
+    let labels: Vec<&str> = controls
+        .iter()
+        .map(|control| control.label.as_str())
+        .collect();
+    for expected in [
+        "Export format: Markdown",
+        "Export format: TSV",
+        "Include the translation",
+        "Share instead",
+        "Export",
+    ] {
+        assert!(
+            labels.contains(&expected),
+            "the export sheet registers {expected}: {labels:?}"
+        );
+    }
+}
+
+#[test]
+fn a_settled_screen_with_a_live_job_requests_no_frames() {
+    let mut app = seeded_app();
+    let (_, _, scale) = compact::phone_viewport();
+    let screen = compact::phone_screen_rect();
+    let mut ctx = fresh_context(&app);
+    // Settle the initial frame.
+    let _ = snapshot::render(&ctx, screen, scale, |ctx| {
+        let _ = compact::ui(ctx, &mut app);
+    });
+    assert!(
+        !app.needs_frame(),
+        "an idle library has no animation to run"
+    );
+
+    // A live job is painted from its last event; the surface stays idle.
+    app.on_job("Transcribing", 3, 10, 1.0);
+    assert!(app.take_frame_request(), "the event wakes the host once");
+    assert!(app.advance(1.05), "the progress fill eases to the value");
+    assert!(!app.advance(1.3));
+    assert!(!app.needs_frame());
+    ctx = fresh_context(&app);
+    // The first frame on a fresh context lays out and uploads the font atlas;
+    // egui may ask for one settling frame. Measure the steady state.
+    let mut requested = Vec::new();
+    for frame in 0..3 {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(2.0 + frame as f64 * 0.016),
+                ..Default::default()
+            },
+            |ctx| {
+                let _ = compact::ui(ctx, &mut app);
+                requested.push(ctx.has_requested_repaint());
+            },
+        );
+    }
+    assert_eq!(
+        requested.last(),
+        Some(&false),
+        "a settled screen with a live job must not request a frame: {requested:?}"
+    );
 }

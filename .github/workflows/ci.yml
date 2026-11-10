@@ -67,6 +67,15 @@ jobs:
       - name: Tests (debug profile)
         run: cargo test --workspace
 
+      # M13g2: the phone-viewport profile is gated like every other suite. The
+      # step renders the compact Library/editor/Settings/export sheet at the
+      # plan's 1216×2640 viewport, asserts the 48 dp / inset / a11y-floor rules,
+      # and writes the review shots under tests/ui-compact/shots/. Xvfb is the
+      # same harness family as the desktop smoke; the rasteriser itself is
+      # display-free, so there is no GPU variance in the artifacts.
+      - name: UI compact (phone viewport, Xvfb)
+        run: bash tests/ui-compact/run.sh
+
       # M3: the capture feature must compile on Linux (libasound2-dev installed
       # above) and its pure helpers run headless. `capture` stays OFF in every
       # default build, so nothing below changes what ships.

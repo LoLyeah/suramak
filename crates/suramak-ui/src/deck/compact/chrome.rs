@@ -7,12 +7,14 @@
 
 use egui::{
     pos2, vec2, Align, Align2, Color32, CornerRadius, FontFamily, FontId, Layout, Rect, Response,
-    Sense, Stroke, StrokeKind, Ui, WidgetInfo, WidgetType,
+    Stroke, StrokeKind, Ui, WidgetType,
 };
 
 use crate::deck::controls::{self, Glyph};
 use crate::deck::motion::{self, Motion};
 use crate::deck::theme::{Tokens, SERIF_FAMILY};
+
+use super::a11y;
 
 /// The minimum touch target (dp).
 pub const MIN_TOUCH: f32 = 48.0;
@@ -88,7 +90,15 @@ pub fn app_bar(
             pos2(rect.left() + GUTTER + 12.0, center_y),
             vec2(48.0, 48.0),
         );
-        let response = ui.interact(hit, ui.id().with(("compact-back", title)), Sense::click());
+        let response = a11y::touch(
+            ui,
+            tokens,
+            hit,
+            ("compact-back", title),
+            WidgetType::Button,
+            "Back",
+            true,
+        );
         let color = if response.is_pointer_button_down_on() {
             tokens.accent_active
         } else if response.hovered() {
@@ -127,10 +137,14 @@ pub fn app_bar(
             pos2(rect.right() - width - GUTTER + 12.0, center_y - 24.0),
             vec2(width, 48.0),
         );
-        let response = ui.interact(
+        let response = a11y::touch(
+            ui,
+            tokens,
             hit,
-            ui.id().with(("compact-trailing", title)),
-            Sense::click(),
+            ("compact-trailing", title),
+            WidgetType::Button,
+            label,
+            enabled,
         );
         let color = if !enabled {
             tokens.ink_faint.gamma_multiply(tokens.disabled_alpha)
@@ -174,7 +188,7 @@ pub fn row(
     meta: &str,
     selected: bool,
 ) -> Response {
-    let response = ui.interact(rect, ui.id().with(id), Sense::click());
+    let response = a11y::touch(ui, tokens, rect, id, WidgetType::Button, title, true);
     let fill = if selected {
         tokens.accent_tint
     } else if response.is_pointer_button_down_on() {
@@ -222,7 +236,6 @@ pub fn row(
         ],
         Stroke::new(1.0_f32, tokens.hairline),
     );
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, title));
     response
 }
 
@@ -261,7 +274,7 @@ pub fn setting_row(
     value: &str,
     enabled: bool,
 ) -> Response {
-    let response = ui.interact(rect, ui.id().with(id), Sense::click());
+    let response = a11y::touch(ui, tokens, rect, id, WidgetType::Button, label, enabled);
     let wash = if response.is_pointer_button_down_on() {
         tokens.surface_active
     } else if response.hovered() && enabled {
@@ -309,22 +322,23 @@ pub fn setting_row(
         ],
         Stroke::new(1.0_f32, tokens.hairline),
     );
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, label));
     response
 }
 
 /// A painted toggle (48 × 28 body inside a 48-tall hit area). Returns the hit
 /// response; the knob crossfades with the fast token.
+#[allow(clippy::too_many_arguments)]
 pub fn toggle(
     ui: &mut Ui,
     tokens: &Tokens,
     motion: &Motion,
     center: egui::Pos2,
     id: impl std::hash::Hash,
+    label: &str,
     on: bool,
 ) -> Response {
     let hit = Rect::from_center_size(center, vec2(56.0, MIN_TOUCH));
-    let response = ui.interact(hit, ui.id().with(&id), Sense::click());
+    let response = a11y::touch(ui, tokens, hit, &id, WidgetType::Checkbox, label, true);
     let track = Rect::from_center_size(center, vec2(46.0, 28.0));
     let t = motion.factor(
         ui.ctx(),
@@ -403,14 +417,20 @@ pub fn search_field(
     response.changed()
 }
 
-/// The modal sheet scrim + body. Returns the body rect; `None` while closed.
-pub fn sheet(ui: &mut Ui, tokens: &Tokens, rect: Rect) -> Rect {
+/// The modal sheet scrim + body. Returns the body rect.
+///
+/// `rise` moves the **body** only: at the start of the present animation the
+/// body sits `rise` points below its resting place (partly past the screen
+/// edge, clipped), so it slides up while the scrim already covers the whole
+/// screen. Translating the scrim too would leave an unscrimmed strip at the
+/// bottom for the length of the animation.
+pub fn sheet(ui: &mut Ui, tokens: &Tokens, rect: Rect, rise: f32) -> Rect {
     ui.painter()
         .rect_filled(rect, CornerRadius::ZERO, tokens.scrim);
     let height = (rect.height() * 0.46).clamp(240.0, 420.0);
     let body = Rect::from_min_max(
-        pos2(rect.left(), rect.bottom() - height),
-        rect.right_bottom(),
+        pos2(rect.left(), rect.bottom() - height + rise),
+        pos2(rect.right(), rect.bottom() + rise),
     );
     ui.painter().rect_filled(
         body,

@@ -24,6 +24,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 pub mod compact_host;
+pub mod export_job;
 pub mod jobs;
 pub mod mic;
 pub mod model_host;

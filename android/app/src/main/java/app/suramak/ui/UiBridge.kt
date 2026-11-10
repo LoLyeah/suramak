@@ -65,8 +65,50 @@ object UiBridge {
                 .put("arm64", report.arm64),
         )
 
-    fun export(format: String): JSONObject =
-        dispatch(JSONObject().put("op", "export").put("format", format))
+    /**
+     * Stages one export through the M15 serializer. The reply carries `job`,
+     * `path`, `suggested_name`, `bytes`, `checksum` and `mime`; the platform
+     * writes that one file and then calls [exportDone].
+     *
+     * `bilingual` adds the stacked translation (SRT/VTT only).
+     */
+    fun export(format: String, bilingual: Boolean = false): JSONObject =
+        dispatch(
+            JSONObject()
+                .put("op", "export")
+                .put("format", format)
+                .put("bilingual", bilingual),
+        )
+
+    /** The `ACTION_SEND` alternative: the same staged bytes, one file. */
+    fun exportShare(format: String, bilingual: Boolean = false): JSONObject =
+        dispatch(
+            JSONObject()
+                .put("op", "export_share")
+                .put("format", format)
+                .put("bilingual", bilingual),
+        )
+
+    /** The picker's stream is closed and verified at [bytes]. */
+    fun exportDone(job: String, bytes: Long): JSONObject =
+        dispatch(JSONObject().put("op", "export_done").put("job", job).put("bytes", bytes))
+
+    /** The chooser has the one-file URI (the staged file outlives the call). */
+    fun exportShared(job: String): JSONObject =
+        dispatch(JSONObject().put("op", "export_shared").put("job", job))
+
+    /** The destination write failed; `error` is shown verbatim by the sheet. */
+    fun exportFailed(job: String, error: String): JSONObject =
+        dispatch(
+            JSONObject()
+                .put("op", "export_failed")
+                .put("job", job)
+                .put("error", error),
+        )
+
+    /** The picker/chooser was dismissed: drop the staged bytes. */
+    fun exportCancel(job: String): JSONObject =
+        dispatch(JSONObject().put("op", "export_cancel").put("job", job))
 
     /** The ordered plan (capture → jobs → services → exit); Kotlin executes it. */
     fun quit(): JSONObject = dispatch(JSONObject().put("op", "quit"))
