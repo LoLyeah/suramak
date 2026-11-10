@@ -91,6 +91,23 @@ No whole candidate needs outright rejection. Rejected implementations and commer
 
 ## 3. New milestone definitions
 
+### M15 — Transcript Workbench — **CLOSED (2026-11-10, commit `acedee2`)**
+
+All eight ordered slices landed and verified via the pipeline: M15.1
+persistence/provenance audit + source_text preservation (`829ec09`), M15.2
+decode parity + sha256-pinned fixtures (same run), M15.3 transactional
+split/merge + undo (`2d989e2`), M15.4 CPL/CPS + basic ASS (same run as M15.2),
+M15.5 measured-tokenizer glossary + reversible rules (`2d989e2`), M15.7 FTS5
+search + snippets + click-to-seek (`5d026a9`), M15.8 opt-in bilingual export
+with sticky staleness + zero-traffic assertion (`304596c`), M15.6 alignment
+feasibility GO (whisper token spans; EN 11 ms / ID 112 ms median word-start
+error measured on the pinned tiny model) + word chips/karaoke playback with
+reduced-motion and segment fallback (`acedee2`). Final gates: 807/807 tests,
+fmt/clippy clean, additive schema v1→v6, zero new dependencies, zero engine
+behaviour change. Remaining honest limits live in
+docs/reports/M15{a,b,c,d,e}-*.md (v5-upgraded libraries fall back to segment
+seek; Parakeet timing unwired; tinted-playback state test-verified only).
+
 ### M15 — Transcript Workbench
 
 **Goal:** Make imported transcripts easier to correct, search, and export without adding a continuously resident inference service.
