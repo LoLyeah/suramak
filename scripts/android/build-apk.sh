@@ -170,13 +170,13 @@ if [ -x "$AAPT" ]; then
   # Same SIGPIPE reasoning as above: match in the shell, not through a pipe.
   BADGING="$("$AAPT" dump badging "$APK")"
   case "$BADGING" in
-    *"package: name='app.suramak.spike' versionCode='8' versionName='0.4.0-m13f.1'"*) ;;
+    *"package: name='app.suramak.spike' versionCode='9' versionName='0.4.0-m13g1.1'"*) ;;
     *)
       # Fall back to a narrower match so a future versionCode bump does not
       # hide a real versionName regression.
       case "$BADGING" in
-        *"package: name='app.suramak.spike'"*"versionName='0.4.0-m13f.1'"*) ;;
-        *) fail "APK versionName is not 0.4.0-m13f.1 (see aapt output below)" ;;
+        *"package: name='app.suramak.spike'"*"versionName='0.4.0-m13g1.1'"*) ;;
+        *) fail "APK versionName is not 0.4.0-m13g1.1 (see aapt output below)" ;;
       esac
       ;;
   esac
@@ -290,6 +290,12 @@ if [ -x "$AAPT" ]; then
     *"app.suramak.mic.RecordingService"*) ;;
     *) fail "APK manifest declares no app.suramak.mic.RecordingService" ;;
   esac
+  # M13g1: the notification Quit action's receiver must be in the packaged
+  # manifest, or the Quit action throws on the phone where it cannot be seen.
+  case "$MANIFEST_TREE" in
+    *"app.suramak.ui.QuitReceiver"*) ;;
+    *) fail "APK manifest declares no app.suramak.ui.QuitReceiver" ;;
+  esac
   case "$MANIFEST_TREE" in
     *"foregroundServiceType"*"0x80"*) ;;
     *) fail "the recording service does not declare the microphone foreground type (0x80)" ;;
@@ -313,6 +319,11 @@ if [ -x "$AAPT" ]; then
       *"Java_app_suramak_mic_MicBridge_nativeCommand"*) ;;
       *) fail "$APP_SO exports no MicBridge.nativeCommand symbol" ;;
     esac
+    # M13g1: the compact UI bridge (library routes, settings, save, export).
+    case "$SYMBOLS" in
+      *"Java_app_suramak_ui_UiBridge_nativeCommand"*) ;;
+      *) fail "$APP_SO exports no UiBridge.nativeCommand symbol" ;;
+    esac
   else
     fail "no llvm-nm at $LLVM_NM (cannot verify the JNI symbols)"
   fi
@@ -335,6 +346,8 @@ if [ -x "$AAPT" ]; then
     FOUND_BAR=0
     FOUND_CHANNEL_CALL=0
     FOUND_CHANNEL_ID=0
+    FOUND_UI_BRIDGE=0
+    FOUND_QUIT=0
     for DEX in "$TMPDEX"/*.dex; do
       "$DEXDUMP" "$DEX" > "$TMPDEX/dump.txt" || true
       grep -q "app/suramak/mic/MicBridge" "$TMPDEX/dump.txt" && FOUND_BRIDGE=1
@@ -342,6 +355,8 @@ if [ -x "$AAPT" ]; then
       grep -q "app/suramak/mic/RecordBar" "$TMPDEX/dump.txt" && FOUND_BAR=1
       grep -q "createNotificationChannel" "$TMPDEX/dump.txt" && FOUND_CHANNEL_CALL=1
       grep -q "'recording'" "$TMPDEX/dump.txt" && FOUND_CHANNEL_ID=1
+      grep -q "app/suramak/ui/UiBridge" "$TMPDEX/dump.txt" && FOUND_UI_BRIDGE=1
+      grep -q "app/suramak/ui/QuitReceiver" "$TMPDEX/dump.txt" && FOUND_QUIT=1
     done
     rm -rf "$TMPDEX"
     [ "$FOUND_BRIDGE" = 1 ] || fail "the packaged dex is missing app.suramak.mic.MicBridge"
@@ -349,11 +364,29 @@ if [ -x "$AAPT" ]; then
     [ "$FOUND_BAR" = 1 ] || fail "the packaged dex is missing app.suramak.mic.RecordBar"
     [ "$FOUND_CHANNEL_CALL" = 1 ] || fail "the packaged dex never calls createNotificationChannel"
     [ "$FOUND_CHANNEL_ID" = 1 ] || fail "the packaged dex has no 'recording' notification-channel id"
+    [ "$FOUND_UI_BRIDGE" = 1 ] || fail "the packaged dex is missing app.suramak.ui.UiBridge"
+    [ "$FOUND_QUIT" = 1 ] || fail "the packaged dex is missing app.suramak.ui.QuitReceiver"
   else
     fail "no dexdump at $DEXDUMP (cannot verify the recording notification channel)"
   fi
   printf '%s\n' "$BADGING" | grep -E "^(package|sdkVersion|targetSdkVersion|launchable-activity|native-code)" || true
 fi
+
+# --- 3b. The notification Quit order (source-level, deliberately) ------------
+# The owner's contract is an ORDER: capture → jobs → services → exit. Kotlin has
+# no unit-test harness in this repo; assert the calls appear in that order in the
+# one function that executes them, so a future edit cannot quietly reorder it.
+QUIT_SRC="android/app/src/main/java/app/suramak/ui/QuitReceiver.kt"
+quit_line() { grep -n "$1" "$QUIT_SRC" | head -1 | cut -d: -f1; }
+CAPTURE_LINE="$(quit_line 'MicBridge.quit()')"
+JOBS_LINE="$(quit_line 'TranscribeBridge.dispatch')"
+SERVICES_LINE="$(quit_line 'RecordingService.stop(context)')"
+EXIT_LINE="$(quit_line 'Process.killProcess')"
+[ -n "$CAPTURE_LINE" ] && [ -n "$JOBS_LINE" ] && [ -n "$SERVICES_LINE" ] && [ -n "$EXIT_LINE" ] \
+  || fail "QuitReceiver.kt no longer names the four Quit steps (capture/jobs/services/exit)"
+[ "$CAPTURE_LINE" -lt "$JOBS_LINE" ] && [ "$JOBS_LINE" -lt "$SERVICES_LINE" ] \
+  && [ "$SERVICES_LINE" -lt "$EXIT_LINE" ] \
+  || fail "QuitReceiver.kt is not in the owner's order: capture($CAPTURE_LINE) → jobs($JOBS_LINE) → services($SERVICES_LINE) → exit($EXIT_LINE)"
 
 SIZE="$(stat -c %s "$APK")"
 SHA="$(sha256sum "$APK" | cut -d' ' -f1)"

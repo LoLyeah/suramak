@@ -66,6 +66,7 @@
     <string name="mic_recording_title">Merekam</string>
     <string name="mic_title_prefix">Merekam %1$s</string>
     <string name="mic_stop">Berhenti</string>
+    <string name="quit_action">Keluar</string>
     <string name="mic_record">Rekam</string>
     <string name="mic_settings">Pengaturan</string>
     <string name="mic_quit">Keluar</string>

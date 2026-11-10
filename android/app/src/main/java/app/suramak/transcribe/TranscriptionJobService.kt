@@ -472,6 +472,20 @@ class TranscriptionJobService : JobService() {
          * the journaled jobs in the host, and the service is what makes them
          * foreground work with a wake lock.
          */
+        /**
+         * M13g1 Quit: unschedule every job this app owns and stop the service
+         * instance. Called after the Rust host paused the work and before the
+         * process exits, so the platform cannot restart a job on the way down.
+         */
+        fun shutdown(context: Context) {
+            try {
+                context.getSystemService(JobScheduler::class.java)?.cancelAll()
+            } catch (t: Throwable) {
+                Log.w(TAG, "the scheduler could not be cleared", t)
+            }
+            context.stopService(Intent(context, TranscriptionJobService::class.java))
+        }
+
         fun resumePending(context: Context): Boolean {
             val extras = PersistableBundle().apply {
                 putString(KEY_MODE, MODE_RESUME)

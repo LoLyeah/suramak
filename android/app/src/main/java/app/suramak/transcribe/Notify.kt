@@ -10,6 +10,7 @@ import android.graphics.drawable.Icon
 import android.os.Build
 import app.suramak.mic.RecordingService
 import app.suramak.spike.MainActivity
+import app.suramak.ui.QuitReceiver
 import app.suramak.spike.R
 
 /**
@@ -38,6 +39,7 @@ object Notify {
     const val ACTION_CANCEL = "app.suramak.transcribe.CANCEL"
     const val ACTION_OPEN_TRANSCRIPT = "app.suramak.transcribe.OPEN_TRANSCRIPT"
     const val ACTION_STOP_RECORDING = "app.suramak.mic.STOP"
+    const val ACTION_QUIT = "app.suramak.ui.QUIT"
     const val ACTION_OPEN_RECORDING = "app.suramak.mic.OPEN"
     const val EXTRA_KEY = "app.suramak.transcribe.KEY"
     const val EXTRA_TRANSCRIPT_ID = "app.suramak.transcribe.TRANSCRIPT_ID"
@@ -105,6 +107,7 @@ object Notify {
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setCategory(Notification.CATEGORY_PROGRESS)
+        builder.addAction(quitAction(context))
         if (key != null) {
             val cancel = PendingIntent.getBroadcast(
                 context,
@@ -202,6 +205,7 @@ object Notify {
                 stop,
             ).build(),
         )
+        builder.addAction(quitAction(context))
         return builder.build()
     }
 
@@ -214,6 +218,25 @@ object Notify {
             .setStyle(Notification.BigTextStyle().bigText(body))
             .setAutoCancel(true)
             .build()
+
+    /**
+     * M13g1 — the persistent notification's Quit. A broadcast so it works with
+     * no Activity alive (lock screen included); [QuitReceiver] executes the
+     * owner's capture → jobs → services → exit order.
+     */
+    private fun quitAction(context: Context): Notification.Action {
+        val quit = PendingIntent.getBroadcast(
+            context,
+            4999,
+            Intent(context, QuitReceiver::class.java).setAction(ACTION_QUIT),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        return Notification.Action.Builder(
+            Icon.createWithResource(context, android.R.drawable.ic_menu_close_clear_cancel),
+            context.getString(R.string.quit_action),
+            quit,
+        ).build()
+    }
 
     private fun openRecording(context: Context): PendingIntent =
         PendingIntent.getActivity(
@@ -231,5 +254,13 @@ object Notify {
 
     fun clearProgress(context: Context) {
         context.getSystemService(NotificationManager::class.java).cancel(PROGRESS_ID)
+    }
+
+    /** Removes every notification this app owns (Quit's last visible act). */
+    fun clearAll(context: Context) {
+        val manager = context.getSystemService(NotificationManager::class.java)
+        manager.cancel(PROGRESS_ID)
+        manager.cancel(STATUS_ID)
+        manager.cancel(RECORDING_ID)
     }
 }

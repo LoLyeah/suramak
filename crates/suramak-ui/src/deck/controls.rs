@@ -19,8 +19,8 @@ use egui::{
     StrokeKind, Ui, WidgetInfo, WidgetType,
 };
 
-use crate::motion::{self, Motion};
-use crate::theme::Tokens;
+use crate::deck::motion::{self, Motion};
+use crate::deck::theme::Tokens;
 
 /// The control tiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -923,7 +923,7 @@ pub fn transport(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::{tokens, AppTheme};
+    use crate::deck::theme::{tokens, AppTheme};
 
     #[test]
     fn state_selection_orders_disabled_press_hover_focus_rest() {

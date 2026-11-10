@@ -23,10 +23,12 @@ use std::ffi::{c_char, CString};
 use std::path::Path;
 use std::sync::OnceLock;
 
+pub mod compact_host;
 pub mod jobs;
 pub mod mic;
 pub mod model_host;
 
+use compact_host::CompactHost;
 use jobs::{AndroidJobHost, HostDirs};
 use mic::MicHost;
 use model_host::ModelHost;
@@ -67,6 +69,21 @@ pub fn mic_host() -> Option<&'static MicHost> {
 }
 
 static MIC_HOST: OnceLock<MicHost> = OnceLock::new();
+
+/// The compact UI host (M13g1): the library/settings state the shared Deck
+/// screens read and the notification's deep link writes.
+pub fn compact_host() -> Option<&'static CompactHost> {
+    COMPACT_HOST.get()
+}
+
+static COMPACT_HOST: OnceLock<CompactHost> = OnceLock::new();
+
+/// Handles the compact UI protocol, including the one command that creates the
+/// host (`init`). Kept beside [`dispatch_jobs`] so the JNI surface stays one
+/// match per bridge.
+pub fn dispatch_compact(request: &str) -> String {
+    compact_host::dispatch(request)
+}
 
 /// Handles the mic protocol, including the one command that runs before the
 /// host exists (`init`).
@@ -233,6 +250,46 @@ mod jni_transcribe {
         }))
         .unwrap_or_else(|_| {
             "{\"ok\":false,\"error\":\"internal error in the job host\"}".to_string()
+        });
+
+        match env.new_string(reply) {
+            Ok(string) => string.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+}
+
+/// The M13g1 compact-UI JNI surface: one function, the same shape as the other
+/// bridges. Kotlin (`app.suramak.ui.UiBridge`) declares
+/// `private external fun nativeCommand(request: String): String`; every call
+/// goes through [`crate::dispatch_compact`], which owns the `init` special case.
+#[cfg(target_os = "android")]
+mod jni_compact {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    use jni::objects::{JObject, JString};
+    use jni::sys::jstring;
+    use jni::JNIEnv;
+
+    /// `UiBridge.nativeCommand(String): String`.
+    #[no_mangle]
+    pub extern "system" fn Java_app_suramak_ui_UiBridge_nativeCommand<'local>(
+        mut env: JNIEnv<'local>,
+        _this: JObject<'local>,
+        request: JString<'local>,
+    ) -> jstring {
+        let reply = catch_unwind(AssertUnwindSafe(|| {
+            let input: String = match env.get_string(&request) {
+                Ok(text) => text.into(),
+                Err(_) => {
+                    return "{\"ok\":false,\"error\":\"could not read the request string\"}"
+                        .to_string()
+                }
+            };
+            crate::dispatch_compact(&input)
+        }))
+        .unwrap_or_else(|_| {
+            "{\"ok\":false,\"error\":\"internal error in the compact UI host\"}".to_string()
         });
 
         match env.new_string(reply) {

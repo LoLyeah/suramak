@@ -934,6 +934,30 @@ impl<B: InferenceBackend + Send + 'static, P: Prefetcher + Send + 'static> JobHo
         let _ = self.send(Command::Pause(key.to_string()));
     }
 
+    /// The owner's Quit: stop every live job before the services and the
+    /// process go away. Pausing (not cancelling) keeps the copied file and the
+    /// journal, so a quit mid-transcription is the same recoverable state as an
+    /// `onTimeout` — the next launch offers Resume.
+    ///
+    /// Returns how many jobs were live. The ordering itself (capture → jobs →
+    /// services → exit) is the Kotlin receiver's, asserted by
+    /// `scripts/android/build-apk.sh`.
+    pub fn quit(&self) -> usize {
+        let live: Vec<String> = {
+            let state = self.shared.state.lock().expect("job state lock");
+            state
+                .jobs
+                .iter()
+                .filter(|job| job.phase.is_live())
+                .map(|job| job.key.clone())
+                .collect()
+        };
+        for key in &live {
+            self.pause(key);
+        }
+        live.len()
+    }
+
     /// Pauses everything live — the `onTimeout` path has no key of its own.
     pub fn pause_all(&self) {
         let keys: Vec<String> = {
@@ -1079,6 +1103,10 @@ impl<B: InferenceBackend + Send + 'static, P: Prefetcher + Send + 'static> JobHo
             "pause_all" => {
                 self.pause_all();
                 json!({ "ok": true }).to_string()
+            }
+            "quit" => {
+                let paused = self.quit();
+                json!({ "ok": true, "paused": paused }).to_string()
             }
             "resume" => match self.resume(text("key")) {
                 Ok(()) => json!({ "ok": true }).to_string(),

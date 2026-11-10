@@ -226,6 +226,15 @@ Each slice is one workorder. The ordering front-loads the two existential risks:
 
 ### M13g — Touch Deck
 
+> **Execution note (2026-11-11): split into M13g1 and M13g2.** G1 (workorder
+> `docs/WORKORDER-M13G1.md`, report `docs/reports/M13g1-compact-library.md`)
+> lands the `suramak-ui` component/shell split, the compact Library + editor +
+> Settings profile, push/pop motion, the completion notification's deep link
+> and the notification Quit action. G2 carries the remaining §3 surface —
+> playback-synced segment highlighting, the export sheet's
+> `ACTION_CREATE_DOCUMENT` write, onboarding/polish, and the device motion
+> review — once G1's shared Deck is in place.
+
 - **Goal:** the real product UI in compact profile. Library, transcript editor, playback-synced segments, exports, settings, and polish (§9 — retained).
 - **Deliverables:**
   - The `suramak-ui` components/shell split.

@@ -38,7 +38,9 @@ import app.suramak.transcribe.ImportSource
 import app.suramak.transcribe.ModelChoice
 import app.suramak.transcribe.Notify
 import app.suramak.transcribe.TranscribeBridge
+import app.suramak.models.DeviceMemory
 import app.suramak.transcribe.TranscriptionJobService
+import app.suramak.ui.UiBridge
 import com.google.androidgamesdk.GameActivity
 import com.google.androidgamesdk.gametextinput.State
 import org.json.JSONArray
@@ -273,6 +275,15 @@ class MainActivity : GameActivity(), RecordBar.Listener {
         val micStatus = try {
             TranscribeBridge.init(this)
             val status = MicBridge.init(this)
+            // M13g1: the compact UI host reads the same library/settings. Its
+            // device probe is what makes the Settings model table follow the
+            // M13D tiers; a probe failure only leaves that table unseeded.
+            try {
+                UiBridge.init(this)
+                UiBridge.device(DeviceMemory.read(this))
+            } catch (t: Throwable) {
+                Log.w(TAG, "the compact UI host did not initialise", t)
+            }
             Notify.ensureChannels(this)
             status
         } catch (t: Throwable) {
@@ -513,31 +524,27 @@ class MainActivity : GameActivity(), RecordBar.Listener {
 
     /**
      * The completion notification's tap. One path, everywhere: the intent
-     * carries the transcript id and the host looks the row up in the library.
-     * With no compact UI (M13G) the landing is a toast that names the row; it is
-     * deliberately a no-op-with-a-message when the row is gone, never a crash.
+     * carries the transcript id, and the compact UI host lands on **Library →
+     * Editor** with the row loaded (or on Library with the "no longer in the
+     * library" line). This replaced M13E's toast: the route is the host's, not
+     * a message about a route that did not exist yet.
      */
     private fun showTranscript(id: String) {
-        val reply = try {
-            TranscribeBridge.openTranscript(id)
+        try {
+            val reply = UiBridge.openTranscript(id)
+            val screen = reply.optString("screen", "library")
+            val title = reply.optString("title")
+            logToRust(
+                if (reply.optBoolean("ok")) {
+                    "open transcript: $id → $screen" + if (title.isNotEmpty()) " ($title)" else ""
+                } else {
+                    "open transcript: $id failed — ${reply.optString("error")}"
+                },
+            )
         } catch (t: Throwable) {
-            Log.w(TAG, "the transcript could not be opened", t)
-            null
-        }
-        if (reply != null && reply.optBoolean("ok") && reply.optBoolean("found")) {
-            Toast.makeText(
-                this,
-                getString(
-                    R.string.transcribe_opened,
-                    reply.optString("title"),
-                    reply.optInt("segments"),
-                ),
-                Toast.LENGTH_LONG,
-            ).show()
-            logToRust("open transcript: ${reply.optString("title")} (${reply.optInt("segments")} segments)")
-        } else {
-            Toast.makeText(this, getString(R.string.transcribe_open_missing), Toast.LENGTH_LONG).show()
-            logToRust("open transcript: $id not in the library")
+            // Never a toast and never a crash: the tap lands, the log says why.
+            Log.w(TAG, "the transcript route could not be opened", t)
+            logToRust("open transcript: $id failed (${t.javaClass.simpleName})")
         }
     }
 
@@ -887,6 +894,20 @@ class MainActivity : GameActivity(), RecordBar.Listener {
             return
         }
         lastBackAtMs = now
+        // M13g1: the compact stack gets the first answer. A dismissed sheet or a
+        // popped screen consumes the gesture; `finish:true` falls through to the
+        // v2.4 spike path below (and, in G2, to `finishAndRemoveTask`).
+        try {
+            val reply = UiBridge.back()
+            if (reply.optBoolean("ok") && !reply.optBoolean("finish")) {
+                logToRust(
+                    "back ($source): compact ${reply.optString("back")} → ${reply.optString("screen")}",
+                )
+                return
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "the compact back route failed", t)
+        }
         try {
             nativeBackPressed()
             logToRust(

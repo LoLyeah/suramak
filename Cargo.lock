@@ -4282,6 +4282,7 @@ dependencies = [
  "serde_json",
  "suramak-asr",
  "suramak-core",
+ "suramak-ui",
  "uuid",
 ]
 

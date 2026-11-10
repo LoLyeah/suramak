@@ -42,35 +42,33 @@
 //! the wav + writes the pending-transcription entry and then exits through the
 //! unchanged funnel; Discard exits exactly as before; Keep aborts the quit.
 
-mod app;
-mod cadence;
-mod framestats;
+pub(crate) mod app;
+pub(crate) mod cadence;
+pub(crate) mod framestats;
 /// M16B: the Compact HUD — six-state machine, `hud.toml`, the floating card and
 /// the macOS panel/insertion adapters.
-mod hud;
-mod instance;
+pub(crate) mod hud;
+pub(crate) mod instance;
 /// M14b (D2): the Windows named-mutex guard; the unix `flock` path is `instance`.
 #[cfg(windows)]
-mod instance_windows;
-mod motion;
-mod pending_transcription;
+pub(crate) mod instance_windows;
+pub(crate) mod pending_transcription;
 /// M14b: "reveal in folder" (`explorer /select,`). Compiled on every target so
 /// the host build type-checks the whole call path; the spawn is `cfg(windows)`
 /// and the stub elsewhere reports `Unsupported` (never reached — the only caller
 /// checks `cfg!(windows)`).
-mod reveal;
-mod runtime;
-mod shell;
-mod shutdown;
-mod theme;
-mod updates;
+pub(crate) mod reveal;
+pub(crate) mod runtime;
+pub(crate) mod shell;
+pub(crate) mod shutdown;
+pub(crate) mod updates;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use app::{Effect, Job, QuitAction, QuitAnswer, QuitOutcome, QuitSource, RecordState};
-use runtime::{PendingResume, Runtime};
-use shell::Shell;
+use self::app::{Effect, Job, QuitAction, QuitAnswer, QuitOutcome, QuitSource, RecordState};
+use self::runtime::{PendingResume, Runtime};
+use self::shell::Shell;
 use suramak_core::paths;
 use suramak_core::store::Store;
 use winit::application::ApplicationHandler;
@@ -148,7 +146,7 @@ fn write_smoke_file(path: &str, content: &str) -> std::io::Result<()> {
     std::fs::write(path, content)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
     let smoke = Smoke::from_env();
     // One Suramak at a time (skipped in smoke modes — transient runs).

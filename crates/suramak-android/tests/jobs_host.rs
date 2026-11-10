@@ -415,6 +415,43 @@ fn cancelling_mid_transcribe_stops_the_job_and_writes_no_row() {
         .is_empty());
 }
 
+/// M13g1 Quit: the job host pauses every live job (the copy and the journal
+/// stay, so the next launch can resume) rather than deleting work. The
+/// capture/service/exit steps are Kotlin's; this is the job half.
+#[test]
+fn quit_pauses_the_live_job_and_keeps_it_resumable() {
+    let dirs = dirs("quit");
+    let (backend, steps, _control) = FakeBackend::new(false);
+    let host = JobHost::with_prefetcher(
+        backend,
+        ThreadedPrefetch::new(Box::new(FileDecoder)),
+        dirs.clone(),
+    );
+    let source = fixtures().join("speech-en.webm");
+    let size = std::fs::metadata(&source).unwrap().len();
+    let (key, dest) = host
+        .begin_import("voice.webm", "audio/webm", size, "tiny", "auto")
+        .unwrap();
+    std::fs::copy(&source, &dest).unwrap();
+    host.import_done(&key).unwrap();
+    steps.send(()).unwrap();
+    wait_until("the engine to report 50%", || host.status().percent == 50);
+
+    assert_eq!(host.quit(), 1, "one live job is paused");
+    wait_until("the paused job", || host.status().paused == 1);
+    assert!(dest.exists(), "a quit keeps the copied audio for resume");
+    let journal = std::fs::read_to_string(&dirs.journal_path).unwrap();
+    assert!(
+        journal.contains("\"paused\""),
+        "the journal records the pause"
+    );
+    assert!(Store::open(&dirs.db_path)
+        .unwrap()
+        .list_transcripts()
+        .unwrap()
+        .is_empty());
+}
+
 /// A process kill during transcription is visible at the next launch, is
 /// offered for resume, and the journal never carried the transcript's text.
 #[test]

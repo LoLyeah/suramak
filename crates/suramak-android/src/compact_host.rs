@@ -1,0 +1,629 @@
+//! The compact UI's Android host (M13g1).
+//!
+//! This is the seam between the real on-device state and the shared Deck
+//! screens in `suramak_ui::deck::compact`: it owns the library store, the
+//! settings file and the `CompactApp` state machine, and answers one JSON
+//! command per call (the same one-function bridge pattern as M13d/M13e/M13f).
+//!
+//! **What is host-testable** (and tested in `tests/compact_host.rs`): opening a
+//! transcript from the completion notification lands on Library → Editor with
+//! the row loaded; a deleted row lands on Library with the honest line; back
+//! pops then finishes; a saved segment reaches sqlite; a setting reaches
+//! `settings.toml`; the model table follows the M13D device tiers. **What is
+//! not** (owner-device): drawing the surface with wgpu, touch/fling delivery,
+//! and the platform back gesture itself — those are the M13b v2.4 shell's and
+//! G2's job.
+//!
+//! The visible egui surface still belongs to the M13b spike in this G1 cut; the
+//! host is what the notification and the future compact shell both call, so the
+//! route arguments flow through one place instead of a Kotlin toast.
+
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Instant;
+
+use serde_json::{json, Value};
+use suramak_core::device::DeviceProfile;
+use suramak_core::settings::{LangMode, Settings};
+use suramak_core::store::Store;
+use suramak_core::transcript::Transcript;
+use suramak_ui::deck::compact::{
+    CompactAction, CompactApp, CompactExportFormat, CompactRoute, CompactSetting, CompactSettings,
+    Sheet,
+};
+
+use crate::jobs::HostDirs;
+
+/// One host per process (the JNI `init` creates it).
+pub struct CompactHost {
+    inner: Mutex<Inner>,
+}
+
+struct Inner {
+    app: CompactApp,
+    dirs: HostDirs,
+    settings_path: PathBuf,
+}
+
+impl CompactHost {
+    /// Opens the library and settings under the app's files directory.
+    pub fn new(root: &Path) -> Self {
+        let dirs = HostDirs::under(root);
+        let settings_path = root.join("settings.toml");
+        let settings = Settings::load(&settings_path).unwrap_or_default();
+        let compact = compact_settings(&settings);
+        let mut app = CompactApp::new(compact);
+        let language = match &settings.asr.language {
+            LangMode::Auto => "auto".to_string(),
+            LangMode::Fixed(lang) => lang.clone(),
+        };
+        app.settings.language = language;
+        let mut inner = Inner {
+            app,
+            dirs,
+            settings_path,
+        };
+        inner.reload_library();
+        Self {
+            inner: Mutex::new(inner),
+        }
+    }
+
+    /// Runs one JSON command. Never panics on bad input.
+    pub fn dispatch(&self, request: &str) -> String {
+        let Ok(value) = serde_json::from_str::<Value>(request) else {
+            return error("invalid JSON request");
+        };
+        let op = value.get("op").and_then(Value::as_str).unwrap_or_default();
+        let Ok(mut inner) = self.inner.lock() else {
+            return error("the UI state lock is poisoned");
+        };
+        match op {
+            "library" => {
+                inner.reload_library();
+                inner.snapshot()
+            }
+            "route" => inner.snapshot(),
+            "open_transcript" => {
+                let id = value
+                    .get("transcript_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                inner.open_transcript(id)
+            }
+            "back" => inner.back(),
+            "save_segment" => inner.save_segment(&value),
+            "setting" => inner.setting(&value),
+            "device" => inner.device(&value),
+            "export" => inner.export(&value),
+            "quit" => inner.quit(),
+            "version" => json!({ "ok": true, "version": env!("CARGO_PKG_VERSION") }).to_string(),
+            other => error(&format!("unknown op '{other}'")),
+        }
+    }
+}
+
+impl Inner {
+    fn reload_library(&mut self) {
+        match Store::open(&self.dirs.db_path) {
+            Ok(store) => match store.list_transcripts() {
+                Ok(items) => self.app.set_library(items),
+                Err(err) => self.app.set_library_error(err.to_string()),
+            },
+            Err(err) => self.app.set_library_error(err.to_string()),
+        }
+    }
+
+    /// The route/state payload the Kotlin side mirrors (and the host tests
+    /// assert). Deliberately small: screen, depth, the open transcript, the
+    /// sheet and any status line.
+    fn snapshot(&self) -> String {
+        let route = match self.app.nav.current() {
+            CompactRoute::Library => "library",
+            CompactRoute::Editor => "editor",
+            CompactRoute::Settings => "settings",
+        };
+        json!({
+            "ok": true,
+            "screen": route,
+            "depth": self.app.nav.depth(),
+            "transcript_id": self.app.editor.as_ref().map(|editor| editor.transcript.id.to_string()),
+            "title": self.app.editor.as_ref().map(|editor| editor.transcript.title.clone()),
+            "sheet": match self.app.sheet { Some(Sheet::Export) => "export", Some(Sheet::Quit) => "quit", None => "none" },
+            "status": self.app.status.as_ref().map(|(text, error)| json!({"text": text, "error": error})),
+            "library_rows": self.app.rows.len(),
+            "models": self.app.models.iter().map(|row| json!({
+                "id": row.id,
+                "offered": row.offered,
+                "installed": row.installed,
+                "recommended": row.recommended,
+            })).collect::<Vec<_>>(),
+            "library_error": self.app.library_error.clone(),
+        })
+        .to_string()
+    }
+
+    fn open_transcript(&mut self, id: &str) -> String {
+        let now = self.started_now();
+        let Ok(uuid) = uuid::Uuid::parse_str(id) else {
+            self.app.deep_link_missing(uuid::Uuid::nil(), now);
+            return self.snapshot_with_error("that transcript id is not valid");
+        };
+        let found = Store::open(&self.dirs.db_path)
+            .ok()
+            .and_then(|store| store.get_transcript(uuid).ok());
+        match found {
+            Some(transcript) => {
+                self.reload_library();
+                self.app.deep_link(transcript, now);
+                self.snapshot()
+            }
+            None => {
+                self.app.deep_link_missing(uuid, now);
+                self.snapshot()
+            }
+        }
+    }
+
+    fn back(&mut self) -> String {
+        let outcome = self.app.back(self.started_now());
+        self.app.nav.settle();
+        let mut reply: Value =
+            serde_json::from_str(&self.snapshot()).unwrap_or_else(|_| json!({ "ok": true }));
+        reply["back"] = json!(match outcome {
+            suramak_ui::deck::nav::BackOutcome::Popped => "popped",
+            suramak_ui::deck::nav::BackOutcome::Dismissed => "dismissed",
+            suramak_ui::deck::nav::BackOutcome::Finish => "finish",
+        });
+        reply["finish"] = json!(outcome == suramak_ui::deck::nav::BackOutcome::Finish);
+        reply.to_string()
+    }
+
+    fn save_segment(&mut self, value: &Value) -> String {
+        let idx = value.get("idx").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let text = value
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let Some(editor) = self.app.editor.as_mut() else {
+            return error("no transcript is open");
+        };
+        let id = editor.transcript.id;
+        editor.edit(idx, text.to_string());
+        let edits = editor.pending_edits();
+        let store = match Store::open(&self.dirs.db_path) {
+            Ok(store) => store,
+            Err(err) => {
+                self.app.on_save_failed(err.to_string());
+                return error(&err.to_string());
+            }
+        };
+        for edit in &edits {
+            if let Err(err) = store.update_segment_text(id, edit.idx, &edit.text) {
+                self.app.on_save_failed(err.to_string());
+                return error(&err.to_string());
+            }
+        }
+        self.app.on_saved();
+        self.snapshot()
+    }
+
+    fn setting(&mut self, value: &Value) -> String {
+        let Some(kind) = value.get("setting").and_then(Value::as_str) else {
+            return error("setting needs a 'setting' name");
+        };
+        let mut settings = Settings::load(&self.settings_path).unwrap_or_default();
+        match kind {
+            "model" => {
+                let id = value
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if id.is_empty() {
+                    return error("model needs a value");
+                }
+                settings.asr.model_id = id.clone();
+                self.app.apply_setting(CompactSetting::Model(id));
+            }
+            "language" => {
+                let lang = value.get("value").and_then(Value::as_str).unwrap_or("auto");
+                settings.asr.language = if lang == "auto" {
+                    LangMode::Auto
+                } else {
+                    LangMode::Fixed(lang.to_string())
+                };
+                self.app
+                    .apply_setting(CompactSetting::Language(lang.to_string()));
+            }
+            "appearance" => {
+                let appearance = match value.get("value").and_then(Value::as_str) {
+                    Some("light") => suramak_core::settings::Appearance::Light,
+                    Some("dark") => suramak_core::settings::Appearance::Dark,
+                    _ => suramak_core::settings::Appearance::System,
+                };
+                settings.ui.appearance = appearance;
+                self.app
+                    .apply_setting(CompactSetting::Appearance(appearance));
+            }
+            "keep_audio" => {
+                let keep = value.get("value").and_then(Value::as_bool).unwrap_or(false);
+                settings.storage.keep_audio = keep;
+                self.app.apply_setting(CompactSetting::KeepAudio(keep));
+            }
+            other => return error(&format!("unknown setting '{other}'")),
+        }
+        if let Err(err) = settings.save(&self.settings_path) {
+            return error(&err.to_string());
+        }
+        self.snapshot()
+    }
+
+    fn device(&mut self, value: &Value) -> String {
+        let number = |name: &str| value.get(name).and_then(Value::as_u64).unwrap_or(0);
+        let profile = DeviceProfile::new(
+            number("total_ram_bytes"),
+            number("available_ram_bytes"),
+            value
+                .get("low_memory")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            value.get("arm64").and_then(Value::as_bool).unwrap_or(true),
+        );
+        let installed = installed_models(&self.dirs.models_dir);
+        self.app.seed_device(profile, &installed);
+        self.snapshot()
+    }
+
+    fn export(&mut self, value: &Value) -> String {
+        let format = match value.get("format").and_then(Value::as_str) {
+            Some("txt") => CompactExportFormat::Txt,
+            Some("json") => CompactExportFormat::Json,
+            Some("srt") => CompactExportFormat::Srt,
+            Some("vtt") => CompactExportFormat::Vtt,
+            _ => CompactExportFormat::Md,
+        };
+        let Some(editor) = self.app.editor.as_mut() else {
+            return error("no transcript is open");
+        };
+        editor.format = format;
+        let CompactAction::Export {
+            transcript,
+            format,
+            suggested_name,
+        } = editor.export_request()
+        else {
+            return error("the editor did not produce an export request");
+        };
+        let Some(transcript) = self
+            .app
+            .transcripts
+            .iter()
+            .find(|item| item.id == transcript)
+            .cloned()
+        else {
+            return error("the transcript is no longer in the library");
+        };
+        let rendered = match export_text(format, &transcript) {
+            Ok(text) => text,
+            Err(err) => return error(&err),
+        };
+        self.app.on_export(Ok(suggested_name.clone()));
+        json!({
+            "ok": true,
+            "suggested_name": suggested_name,
+            "text": rendered,
+            "screen": "editor",
+        })
+        .to_string()
+    }
+
+    fn quit(&mut self) -> String {
+        let action = self.app.confirm_quit();
+        debug_assert_eq!(action, CompactAction::Quit);
+        json!({
+            "ok": true,
+            "steps": ["capture", "jobs", "services", "exit"],
+            "note": "capture is stopped and handed off before the service and the process exit",
+        })
+        .to_string()
+    }
+
+    fn started_now(&self) -> f64 {
+        // `Inner` does not own the clock; the caller's host does. Navigation only
+        // needs a monotonic value, so the process uptime is enough.
+        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        START.get_or_init(Instant::now).elapsed().as_secs_f64()
+    }
+}
+
+impl Inner {
+    fn snapshot_with_error(&self, reason: &str) -> String {
+        let mut value: Value =
+            serde_json::from_str(&self.snapshot()).unwrap_or_else(|_| json!({ "ok": true }));
+        value["error"] = json!(reason);
+        value.to_string()
+    }
+}
+
+/// `Settings` → the compact form (the fields the phone edits).
+fn compact_settings(settings: &Settings) -> CompactSettings {
+    CompactSettings {
+        model_id: settings.asr.model_id.clone(),
+        language: match &settings.asr.language {
+            LangMode::Auto => "auto".to_string(),
+            LangMode::Fixed(lang) => lang.clone(),
+        },
+        appearance: settings.ui.appearance,
+        keep_audio: settings.storage.keep_audio,
+    }
+}
+
+/// Which manifest models have a file in `<root>/models`.
+fn installed_models(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let files: Vec<String> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect();
+    suramak_core::models::MODELS
+        .iter()
+        .filter(|model| files.iter().any(|file| file == model.hf_file))
+        .map(|model| model.id.to_string())
+        .collect()
+}
+
+fn export_text(format: CompactExportFormat, transcript: &Transcript) -> Result<String, String> {
+    let rendered = match format {
+        CompactExportFormat::Md => suramak_core::export::to_markdown(transcript),
+        CompactExportFormat::Txt => suramak_core::export::to_txt(transcript),
+        CompactExportFormat::Json => suramak_core::export::to_json(transcript),
+        CompactExportFormat::Srt => suramak_core::export::to_srt(transcript),
+        CompactExportFormat::Vtt => suramak_core::export::to_vtt(transcript),
+    };
+    rendered.map_err(|err| err.to_string())
+}
+
+fn error(message: &str) -> String {
+    json!({ "ok": false, "error": message }).to_string()
+}
+
+/// The process-wide host (created by `init` on the JNI side).
+pub fn host() -> Option<&'static CompactHost> {
+    HOST.get()
+}
+
+static HOST: std::sync::OnceLock<CompactHost> = std::sync::OnceLock::new();
+
+/// Handles the protocol, including the one command that creates the host.
+pub fn dispatch(request: &str) -> String {
+    let value = match serde_json::from_str::<Value>(request) {
+        Ok(value) => value,
+        Err(_) => return error("invalid JSON request"),
+    };
+    let op = value.get("op").and_then(Value::as_str).unwrap_or_default();
+    if op == "init" {
+        let root = value
+            .get("root")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if root.is_empty() {
+            return error("init needs the app files directory");
+        }
+        #[cfg(target_os = "android")]
+        suramak_core::android::set_data_dir(PathBuf::from(root));
+        let host = HOST.get_or_init(|| CompactHost::new(Path::new(root)));
+        return host.dispatch(request);
+    }
+    match host() {
+        Some(host) => host.dispatch(request),
+        None => error("the compact UI host has not been initialised (send init first)"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use suramak_core::settings::Appearance;
+    use suramak_core::transcript::{Segment, Source};
+
+    fn fixture(dir: &Path) -> (Store, uuid::Uuid) {
+        std::fs::create_dir_all(dir).expect("dir");
+        let store = Store::open(&dir.join("suramak.db")).expect("store");
+        let transcript = Transcript::new(
+            "Field notes".to_string(),
+            Source::File {
+                name: "notes.m4a".to_string(),
+            },
+            "base".to_string(),
+            Some("en".to_string()),
+            None,
+            vec![
+                Segment {
+                    idx: 0,
+                    start_ms: 0,
+                    end_ms: 3_000,
+                    text: "first line".to_string(),
+                },
+                Segment {
+                    idx: 1,
+                    start_ms: 3_000,
+                    end_ms: 6_000,
+                    text: "second line".to_string(),
+                },
+            ],
+        );
+        store.insert_transcript(&transcript).expect("insert");
+        (store, transcript.id)
+    }
+
+    #[test]
+    fn a_notification_tap_opens_library_then_the_finished_editor() {
+        let dir =
+            std::env::temp_dir().join(format!("suramak-compact-host-{}", uuid::Uuid::new_v4()));
+        let (_, id) = fixture(&dir);
+        let host = CompactHost::new(&dir);
+        let reply: Value = serde_json::from_str(
+            &host.dispatch(
+                &json!({
+                    "op": "open_transcript",
+                    "transcript_id": id.to_string(),
+                })
+                .to_string(),
+            ),
+        )
+        .expect("json");
+        assert_eq!(reply["screen"], "editor");
+        assert_eq!(reply["depth"], 2);
+        assert_eq!(reply["title"], "Field notes");
+        assert_eq!(reply["transcript_id"], id.to_string());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_deleted_transcript_lands_on_the_library_with_a_note() {
+        let dir =
+            std::env::temp_dir().join(format!("suramak-compact-host-{}", uuid::Uuid::new_v4()));
+        fixture(&dir);
+        let host = CompactHost::new(&dir);
+        let reply: Value = serde_json::from_str(
+            &host.dispatch(
+                &json!({
+                    "op": "open_transcript",
+                    "transcript_id": uuid::Uuid::new_v4().to_string(),
+                })
+                .to_string(),
+            ),
+        )
+        .expect("json");
+        assert_eq!(reply["screen"], "library");
+        assert_eq!(reply["depth"], 1);
+        assert!(reply["status"]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no longer"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_saved_segment_reaches_sqlite() {
+        let dir =
+            std::env::temp_dir().join(format!("suramak-compact-host-{}", uuid::Uuid::new_v4()));
+        let (store, id) = fixture(&dir);
+        let host = CompactHost::new(&dir);
+        let _ = host.dispatch(
+            &json!({
+                "op": "open_transcript",
+                "transcript_id": id.to_string(),
+            })
+            .to_string(),
+        );
+        let reply: Value = serde_json::from_str(
+            &host.dispatch(
+                &json!({
+                    "op": "save_segment",
+                    "idx": 0,
+                    "text": "edited line",
+                })
+                .to_string(),
+            ),
+        )
+        .expect("json");
+        assert_eq!(reply["screen"], "editor");
+        let stored = Store::open(&dir.join("suramak.db"))
+            .expect("store")
+            .get_transcript(id)
+            .expect("row");
+        assert_eq!(stored.segments[0].text, "edited line");
+        let _ = store;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_round_trip_through_settings_toml() {
+        let dir =
+            std::env::temp_dir().join(format!("suramak-compact-host-{}", uuid::Uuid::new_v4()));
+        fixture(&dir);
+        let host = CompactHost::new(&dir);
+        let _ = host.dispatch(
+            &json!({
+                "op": "setting", "setting": "appearance", "value": "light"
+            })
+            .to_string(),
+        );
+        let _ = host.dispatch(
+            &json!({
+                "op": "setting", "setting": "language", "value": "id"
+            })
+            .to_string(),
+        );
+        let saved = Settings::load(&dir.join("settings.toml")).expect("settings");
+        assert_eq!(saved.ui.appearance, Appearance::Light);
+        assert_eq!(saved.asr.language, LangMode::Fixed("id".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn back_pops_then_finishes_at_the_library_root() {
+        let dir =
+            std::env::temp_dir().join(format!("suramak-compact-host-{}", uuid::Uuid::new_v4()));
+        let (_, id) = fixture(&dir);
+        let host = CompactHost::new(&dir);
+        let _ = host.dispatch(
+            &json!({
+                "op": "open_transcript", "transcript_id": id.to_string()
+            })
+            .to_string(),
+        );
+        let popped: Value = serde_json::from_str(&host.dispatch(r#"{"op":"back"}"#)).expect("json");
+        assert_eq!(popped["back"], "popped");
+        assert_eq!(popped["screen"], "library");
+        assert_eq!(popped["finish"], false);
+        let finished: Value =
+            serde_json::from_str(&host.dispatch(r#"{"op":"back"}"#)).expect("json");
+        assert_eq!(finished["back"], "finish");
+        assert_eq!(finished["finish"], true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_device_probe_builds_the_m13d_model_table() {
+        let dir =
+            std::env::temp_dir().join(format!("suramak-compact-host-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("models")).expect("models");
+        std::fs::write(
+            dir.join("models").join("ggml-base.bin"),
+            b"not a model, just a filename",
+        )
+        .expect("model file");
+        let host = CompactHost::new(&dir);
+        let reply: Value = serde_json::from_str(
+            &host.dispatch(
+                &json!({
+                    "op": "device",
+                    "total_ram_bytes": 6_000_000_000_u64,
+                    "available_ram_bytes": 2_000_000_000_u64,
+                    "low_memory": false,
+                    "arm64": true,
+                })
+                .to_string(),
+            ),
+        )
+        .expect("json");
+        let models = reply["models"].as_array().expect("models");
+        let base = models
+            .iter()
+            .find(|row| row["id"] == "base")
+            .expect("base row");
+        assert_eq!(base["installed"], true);
+        assert_eq!(base["recommended"], true);
+        let q8 = models
+            .iter()
+            .find(|row| row["id"] == "turbo-q8-0")
+            .expect("q8 row");
+        assert_eq!(q8["offered"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

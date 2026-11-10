@@ -5,12 +5,26 @@ edition.workspace = true
 rust-version.workspace = true
 description = "Suramak desktop app: winit + manual egui-winit/egui-wgpu wiring over the AppKit glass shell"
 
+[lib]
+# M13g1: the shared Deck (tokens, motion, painted controls, compact profile).
+# Depends on `egui` + `suramak-core` only, so it compiles for Android and is
+# drawn unchanged by both shells.
+name = "suramak_ui"
+path = "src/lib.rs"
+
 [[bin]]
 name = "suramak"
 path = "src/main.rs"
 
 [dependencies]
+# ---- shared Deck (host AND Android) -----------------------------------------
 suramak-core = { path = "../suramak-core" }
+egui = { workspace = true }
+uuid = { workspace = true }                      # transcript ids in Effect::DeleteTranscript (M4.5)
+chrono = { workspace = true }                    # `Recording <date>` titles (M3)
+
+# ---- desktop shell only (compiled out on Android) ---------------------------
+[target.'cfg(not(target_os = "android"))'.dependencies]
 suramak-asr = { path = "../suramak-asr" }        # default features; `capture` OFF on Linux
 suramak-glass = { path = "../suramak-glass" }
 suramak-playback = { path = "../suramak-playback" }  # M8: cpal output engine + transport
@@ -19,13 +33,10 @@ suramak-playback = { path = "../suramak-playback" }  # M8: cpal output engine + 
 suramak-taps = { path = "../suramak-taps" }
 serde = { workspace = true }                     # M16B: HudSettings (hud.toml)
 toml = { workspace = true }                      # M16B: hud.toml
-uuid = { workspace = true }                      # transcript ids in Effect::DeleteTranscript (M4.5)
-egui = { workspace = true }
 egui-winit = { workspace = true }
 egui-wgpu = { workspace = true }         # wgpu consumed via egui_wgpu::wgpu re-export only
 winit = { workspace = true }
 pollster = { workspace = true }          # block_on for surface creation
-chrono = { workspace = true }            # `Recording <date>` titles (M3)
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
@@ -60,7 +71,7 @@ objc2-app-kit = { version = "0.3", features = [
     "NSWindow",       # M16B: the HUD panel level / collection behaviour
 ] }
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(all(unix, not(target_os = "android")))'.dependencies]
 # Single-instance guard (flock on the data-dir lock file, `src/instance.rs`).
 # Unix-only; the Windows port will need its own mechanism (no-op stub for now).
 libc = "0.2"

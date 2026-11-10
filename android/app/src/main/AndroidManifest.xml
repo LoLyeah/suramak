@@ -196,6 +196,13 @@
             android:name="app.suramak.mic.RecordingService"
             android:exported="false"
             android:foregroundServiceType="microphone" />
+
+        <!-- M13g1: the foreground notifications' Quit action. A broadcast so it
+             works with no Activity alive; it executes capture → jobs →
+             services → exit in that order (QuitReceiver.kt). -->
+        <receiver
+            android:name="app.suramak.ui.QuitReceiver"
+            android:exported="false" />
     </application>
 
 </manifest>

@@ -14,7 +14,6 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[cfg(test)]
 use egui::epaint::ClippedShape;
 use egui::{Id, Rect};
 
@@ -28,7 +27,6 @@ pub fn enabled() -> bool {
 }
 
 /// Test seam: force recording on/off.
-#[cfg(test)]
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);
 }
@@ -60,7 +58,6 @@ pub fn record(ctx: &egui::Context, id: Id, rect: Rect, kind: &'static str) {
 }
 
 /// Drains the rects recorded since the last call (call after one frame).
-#[cfg(test)]
 pub fn take(ctx: &egui::Context) -> Vec<ControlRect> {
     ctx.data_mut(|data| {
         data.remove_temp::<Vec<ControlRect>>(slot())
@@ -70,7 +67,6 @@ pub fn take(ctx: &egui::Context) -> Vec<ControlRect> {
 
 /// Every painted shape that no recorded control rect (expanded by `allow`)
 /// contains — the audit's failure list, empty when the invariant holds.
-#[cfg(test)]
 pub fn violations(shapes: &[ClippedShape], records: &[ControlRect], allow: f32) -> Vec<String> {
     let mut out = Vec::new();
     for clipped in shapes {
@@ -93,9 +89,9 @@ pub fn violations(shapes: &[ClippedShape], records: &[ControlRect], allow: f32) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::controls::{self, Glyph, Tier};
-    use crate::motion::Motion;
-    use crate::theme::{tokens, AppTheme};
+    use crate::deck::controls::{self, Glyph, Tier};
+    use crate::deck::motion::Motion;
+    use crate::deck::theme::{tokens, AppTheme};
     use egui::{pos2, vec2};
 
     /// The audit's `ENABLED` flag is process-global, so the two tests that
@@ -110,7 +106,10 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn showcase_frame(ctx: &egui::Context, tokens: &crate::theme::Tokens) -> egui::FullOutput {
+    fn showcase_frame(
+        ctx: &egui::Context,
+        tokens: &crate::deck::theme::Tokens,
+    ) -> egui::FullOutput {
         let motion = Motion::new(false);
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 700.0))),

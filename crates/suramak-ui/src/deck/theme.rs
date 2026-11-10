@@ -463,7 +463,7 @@ pub fn install(ctx: &egui::Context, theme: AppTheme, reduce_motion: bool) {
     let animation_time = if reduce_motion {
         0.0
     } else {
-        crate::motion::FAST
+        crate::deck::motion::FAST
     };
     ctx.set_theme(match theme {
         AppTheme::Light => ThemePreference::Light,
@@ -741,7 +741,7 @@ mod tests {
     fn reduce_motion_zeroes_the_stock_widget_animation_time() {
         let ctx = egui::Context::default();
         install(&ctx, AppTheme::Dark, false);
-        assert_eq!(ctx.style().animation_time, crate::motion::FAST);
+        assert_eq!(ctx.style().animation_time, crate::deck::motion::FAST);
         install(&ctx, AppTheme::Dark, true);
         assert_eq!(ctx.style().animation_time, 0.0);
     }

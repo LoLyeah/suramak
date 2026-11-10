@@ -48,8 +48,9 @@ use self::settings_form::SettingsForm;
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub mod bilingual;
-pub mod bounds;
-pub mod controls;
+#[allow(unused_imports)] // named only from `cfg(test)` audit tests
+pub use suramak_ui::deck::bounds;
+pub use suramak_ui::deck::controls;
 pub mod copy;
 pub mod dropdown;
 pub mod editor;

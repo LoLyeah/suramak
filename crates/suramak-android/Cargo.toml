@@ -14,6 +14,10 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 suramak-core = { path = "../suramak-core" }
 suramak-asr = { path = "../suramak-asr" }
+# M13g1: the shared Deck library (tokens, motion, compact profile). It has no
+# winit/glass edges, so it compiles for Android unchanged — the point of the
+# split.
+suramak-ui = { path = "../suramak-ui" }
 # M13d: the JSON command protocol between Kotlin and the model host. Already a
 # workspace dependency of `suramak-core` — no new package.
 serde_json = { workspace = true }
