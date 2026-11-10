@@ -56,7 +56,11 @@ pub fn theme_caption(platform: Platform) -> &'static str {
              appearance. Applied when you press Save."
         }
         Platform::Windows => {
-            "System follows the Windows light/dark setting live; Light or Dark forces this app's \
+            // Shorter than the macOS sentence on purpose: the Windows fonts
+            // measure wider, and at the 900\u00d7600 minimum pane the longer
+            // variant let row 0 of this caption cross the pane edge
+            // (m14e's wrap test caught it).
+            "The Windows light/dark setting is followed live; Light or Dark forces this app's \
              appearance. Applied when you press Save."
         }
         Platform::Linux => {
