@@ -138,17 +138,25 @@ case "$FILE_INFO" in
 esac
 
 # --- 2. APK ------------------------------------------------------------------
-echo "== gradle assembleDebug =="
+# M13H: SURAMAK_ANDROID_RELEASE=1 builds assembleRelease (the signing is done
+# post-build by the release job's apksigner step — no Gradle secrets needed).
+if [ "${SURAMAK_ANDROID_RELEASE:-0}" = "1" ]; then
+  GRADLE_TASK="clean assembleRelease"
+  APK="android/app/build/outputs/apk/release/app-release-unsigned.apk"
+else
+  GRADLE_TASK="clean assembleDebug"
+  APK="android/app/build/outputs/apk/debug/app-debug.apk"
+fi
+echo "== gradle $GRADLE_TASK =="
 (
   cd android
   # `clean` on purpose: an incremental packageDebug that repackages a *changed*
   # stored (uncompressed) .so leaves a ~13 MB zero-filled hole in the APK on
   # AGP 8.7 — the artifact then reports a bogus size. A clean package is 25 s
   # and the numbers in the report are the numbers you install.
-  ./gradlew --no-daemon --console=plain clean assembleDebug
+  ./gradlew --no-daemon --console=plain $GRADLE_TASK
 )
 
-APK="android/app/build/outputs/apk/debug/app-debug.apk"
 [ -f "$APK" ] || fail "Gradle did not produce $APK"
 
 # --- 3. Assert the APK really carries what the checks need -------------------

@@ -86,3 +86,57 @@ and CI keeps proving it on every push.
 Does not prove (next gates): anything about runtime behaviour — no Android
 binary is executed here. Runtime verification is the CI emulator smoke and the
 owner's device at M13b.
+
+---
+
+## For the owner (the M13h release): install, first-run, permissions
+
+Install, no adb:
+
+1. Open the release page on the phone: `https://github.com/LoLyeah/suramak/releases`
+   — pick the newest release, download `suramak-<version>-android-arm64-v8a.apk`.
+2. Open the downloaded file; Android asks once to install from this source
+   (Chrome/Files). Tap **Install**. The APK is signed with Suramak's own key
+   (not a store key): Play Protect may note "unknown developer" the first
+   time — proceed; on-device only, no telemetry; the sha256 is published
+   beside the APK (check with any file-hash app).
+
+First run:
+
+1. The app opens on the **Library** with a **model download card** — the
+   recommendation is language-aware (Indonesian steers you away from `tiny`),
+   free-space-checked, downloaded over the dataSync foreground service with a
+   percent notification that survives being backgrounded and resumes after
+   the app dies.
+2. Onboarding explains the three paths once: **share a voice note**
+   (WhatsApp/Telegram → share → Suramak), **open a file** (Ogg/WebM/MKV/m4a/
+   mp3/wav via the picker), **record in-app** (mic).
+3. A transcription's progress lives in the notification (percent + waiting
+   count, cancel action). With the screen off it keeps running (the
+   foreground service holds a partial wake lock); killing the app mid-job
+   offers **resume or discard** on the next launch.
+
+Permissions — what they are for:
+
+- **Microphone**: only when you press record. The recording is local; the
+  foreground notification shows whenever the mic is open — no hidden
+  recording.
+- **Notifications**: the transcription progress/completion and the
+  model-download progress. Denied, the job still runs — you just won't get
+  the banner.
+- **Files (SAF)**: only what you pick or share into the app; nothing else is
+  read.
+- **Battery optimization** (optional): Vivo/Xiaomi/Oppo-class systems kill
+  backgrounded apps aggressively. Suramak resumes work after being killed,
+  but for long jobs allow "run in background" for Suramak in the battery
+  settings.
+
+Diagnostics: Settings → Diagnostics keeps the shell spike's four-check
+counters and the last-crash banner — if anything misbehaves on a new device,
+that card names it; the crash file (shareable) sits in the app's external
+files dir.
+
+Updates ride the same release page (a newer APK with a higher versionCode
+installs over the old one; the library data stays). Uninstall removes the
+library database — back up via the export sheet first (the library itself is
+app-private).

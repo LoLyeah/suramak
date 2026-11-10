@@ -1,0 +1,12 @@
+Suramak — on-device transcription.
+
+Record or import audio (WhatsApp voice notes, Ogg/WebM, mic) and transcribe it entirely on this phone: no account, no cloud, no telemetry.
+
+• English + Indonesian transcription (Whisper on-device; the model downloads on first use)
+• Correct in the editor: split/merge segments with undo, reversible cleanup rules, a personal glossary
+• Search the whole library instantly
+• Export SRT/VTT/ASS/Markdown/JSON/TXT; optional bilingual subtitles through your own endpoint
+• Word-level playback highlighting
+• Foreground-service transcription with the screen off; kill-safe resume
+
+GPL-3.0, source at github.com/LoLyeah/suramak.

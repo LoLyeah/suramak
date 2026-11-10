@@ -120,9 +120,79 @@ jobs:
           name: linux-app
           path: suramak-*-linux-x86_64.tar.gz
 
+  android-app:
+    name: Android app (signed APK, arm64-v8a)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: JDK 17 (javac required for Kotlin)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openjdk-17-jdk
+          echo JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac)))) >> $GITHUB_ENV
+
+      - name: Android SDK + NDK r27d (sha256-pinned)
+        run: |
+          echo JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac)))) >> $GITHUB_ENV
+          echo "ANDROID_HOME=/usr/local/lib/android/sdk" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=/usr/local/lib/android/sdk" >> $GITHUB_ENV
+          sudo apt-get install -y ninja-build
+          curl -sSLf -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          echo "601246087a682d1944e1e16dd85bc6e49560fe8b6d61255be2829178c8ed15d9  /tmp/ndk.zip" | sha256sum -c
+          unzip -q /tmp/ndk.zip -d /tmp
+          echo "ANDROID_NDK_HOME=/tmp/android-ndk-r27d" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=/tmp/android-ndk-r27d" >> $GITHUB_ENV
+
+      - name: Release keystore (from repo secrets; bytes never committed)
+        run: |
+          set -euo pipefail
+          : "${SURAMAK_ANDROID_KEYSTORE_B64:?SURAMAK_ANDROID_KEYSTORE_B64 secret is required for an Android release}"
+          : "${SURAMAK_ANDROID_KEYSTORE_PASS:?SURAMAK_ANDROID_KEYSTORE_PASS secret is required for an Android release}"
+          echo "$SURAMAK_ANDROID_KEYSTORE_B64" | base64 -d > /home/runner/keys/suramak-release.keystore || {
+            mkdir -p /home/runner/keys; echo "$SURAMAK_ANDROID_KEYSTORE_B64" | base64 -d > /home/runner/keys/suramak-release.keystore; }
+          echo "SURAMAK_KEYSTORE=/home/runner/keys/suramak-release.keystore" >> $GITHUB_ENV
+          echo "SURAMAK_KEYSTORE_PASS=$SURAMAK_ANDROID_KEYSTORE_PASS" >> $GITHUB_ENV
+        env:
+          SURAMAK_ANDROID_KEYSTORE_B64: ${{ secrets.SURAMAK_ANDROID_KEYSTORE_B64 }}
+          SURAMAK_ANDROID_KEYSTORE_PASS: ${{ secrets.SURAMAK_ANDROID_KEYSTORE_PASS }}
+
+      - name: Rust cache (android targets)
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build the release APK (scripts/android/build-apk.sh, release mode)
+        env:
+          SURAMAK_ANDROID_RELEASE: "1"
+        run: bash scripts/android/build-apk.sh
+
+      - name: Sign (apksigner, v2 scheme)
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          UNSIGNED=$(ls android/app/build/outputs/apk/release/*.apk | head -1)
+          OUT="suramak-${TAG}-android-arm64-v8a.apk"
+          cp "$UNSIGNED" "$OUT"
+          "$(ls -d ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/*/bin | head -1)"/../bin/apksigner sign \
+            --ks "$SURAMAK_KEYSTORE" --ks-key-alias suramak \
+            --ks-pass "pass:$SURAMAK_KEYSTORE_PASS" --key-pass "pass:$SURAMAK_KEYSTORE_PASS" \
+            --out "$OUT" "$OUT" || \
+          "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/apksigner" sign \
+            --ks "$SURAMAK_KEYSTORE" --ks-key-alias suramak \
+            --ks-pass "pass:$SURAMAK_KEYSTORE_PASS" --key-pass "pass:$SURAMAK_KEYSTORE_PASS" \
+            --out "$OUT" "$OUT"
+          "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/apksigner" verify --print-certs "$OUT"
+          sha256sum "$OUT" > "${OUT}.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: android-app
+          path: |
+            suramak-*-android-arm64-v8a.apk
+            suramak-*-android-arm64-v8a.apk.sha256
+
   release:
     name: Publish GitHub Release
-    needs: [macos-app, linux-app]
+    needs: [macos-app, linux-app, android-app]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -140,6 +210,7 @@ jobs:
             echo "Ad-hoc signed build: on first launch macOS may ask you to right-click → Open (Gatekeeper)."
             echo "Models are not bundled — they download on first use (sha256-pinned)."
             echo "Linux: extract the tarball and run ./suramak — needs a Vulkan or OpenGL capable desktop; suramak.desktop + icon are included for your app menu."
+            echo "Android: install the arm64-v8a APK (Android 10+; the model downloads on first use)."
             echo "Owner checklist for this machine: docs/USER_SMOKE.md"
           } >> RELEASE-NOTES.md
 
@@ -157,6 +228,8 @@ jobs:
             Suramak-*.zip
             Suramak-*.dmg
             suramak-*-linux-x86_64.tar.gz
+            suramak-*-android-arm64-v8a.apk
+            suramak-*-android-arm64-v8a.apk.sha256
             appcast.xml
             *.delta
           body_path: RELEASE-NOTES.md

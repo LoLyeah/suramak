@@ -59,6 +59,18 @@ def bump_windows_rc(version: str) -> None:
     path.write_text(text)
 
 
+def bump_gradle(version: str) -> None:
+    """M13h: the Android versionCode/Name (MAJOR*100000 + MINOR*100 + PATCH;
+    0.4.1 -> 401) stays in sync with the desktop versions."""
+    major, minor, patch = (int(x) for x in version.split("-")[0].split("."))
+    code = major * 100000 + minor * 100 + patch
+    path = ROOT / "android" / "app" / "build.gradle.kts"
+    text = path.read_text()
+    text = re.sub(r"versionCode = \d+", f"versionCode = {code}", text)
+    text = re.sub(r'versionName = "[^"]+"', f'versionName = "{version}"', text)
+    path.write_text(text)
+
+
 def rotate_changelog(version: str) -> None:
     path = ROOT / "CHANGELOG.md"
     text = path.read_text()
@@ -77,8 +89,9 @@ def main() -> None:
     bump_cargo(version)
     bump_plist(version)
     bump_windows_rc(version)
+    bump_gradle(version)
     rotate_changelog(version)
-    print(f"bumped to {version}: Cargo.toml, packaging/Info.plist, packaging/windows/suramak.rc, CHANGELOG.md")
+    print(f"bumped to {version}: Cargo.toml, packaging/Info.plist, packaging/windows/suramak.rc, android/app/build.gradle.kts, CHANGELOG.md")
 
 
 if __name__ == "__main__":

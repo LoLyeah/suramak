@@ -18,8 +18,12 @@ android {
         // RECORD_AUDIO flow, the microphone FGS and the record bar).
         // `scripts/android/build-apk.sh` asserts this exact versionName with
         // `aapt dump badging`, which is what the owner checks before installing.
-        versionCode = 11
-        versionName = "0.4.0-m13g3.1"
+        // M13h: versionCode derives from the semver version (MAJOR*100000 +
+        // MINOR*100 + PATCH; 0.4.1 → 401) and is kept in sync with
+        // packaging/Info.plist by `scripts/bump_version.py` — monotonic for
+        // future releases, always above the M13x debug sequence.
+        versionCode = 401
+        versionName = "0.4.1"
 
         // Only the phone ABI: this APK exists to be installed by the owner.
         ndk {

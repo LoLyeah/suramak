@@ -4,6 +4,19 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased]
 
+## 0.4.1 - 2026-11-11
+
+### Added
+- **Android is a product (M13c–h)** — the phone app the milestone plan promised, release-signed:
+  - **Share a voice note** (WhatsApp/Telegram's 9 voice-note media types) or **open a file** (Ogg/WebM/mkv-opus through the same decode path the desktop uses — fixture-parity, sha256-pinned) → transcribed **entirely on the phone** with the model downloaded on first use (checksummed, resumable across app kills, free-space checked).
+  - **Recording**: mic capture through the desktop's capture path (16 kHz mono WAV identical to desktop bytes), foreground-service notification with elapsed time, interruption handling (calls, audio focus, Bluetooth), locked-screen recording.
+  - **Compact phone UI**: the launch surface is the Library; transcript editor with split/merge + undo, search, playback-synced word highlighting, exports (SRT/VTT/ASS/MD/JSON/TXT) byte-identical to the desktop, onboarding sheet, honest diagnostics behind Settings.
+  - **Background safety**: one inference slot (the desktop queue discipline), kill-proof job journaling with resume-or-discard, foreground-service progress/cancel notifications, a Quit action (capture → services → exit).
+  - Device floor: arm64 + Android 10+; below 4 GB the larger models are refused with clear messages. release-signed APK on the release page (`suramak-<version>-android-arm64-v8a.apk` + sha256); install steps + permissions explained in docs/android.md.
+- **M16.1 — the multi-file job queue** (desktop + CLI): batch imports transcribe one-by-one with per-item state, cancel-anything-from-anywhere, failures never cascade.
+- **M16B (macOS) — global hotkey + floating dictation HUD**: Carbon hotkey (zero permission prompts), six-state HUD card, Accessibility-gated insertion with a Copy-first fallback.
+- **M16.4 feasibility**: Silero VAD chunked long-recording capture is a GO gated into five slices (VAD ≈ 0.53% of transcription CPU; report `docs/reports/M16d-vad-feasibility.md`) — integration starts post-release.
+
 ## 0.4.0 - 2026-11-10
 
 ### Added
