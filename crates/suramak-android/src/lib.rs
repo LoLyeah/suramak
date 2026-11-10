@@ -28,6 +28,22 @@ pub mod export_job;
 pub mod jobs;
 pub mod mic;
 pub mod model_host;
+#[cfg(target_os = "android")]
+pub mod shell;
+
+/// android-activity's entry point (M13g3).
+///
+/// The APK loads **this** library (`libsuramak_android.so`) and the window's
+/// whole life — winit, wgpu, egui, the destroy gate — comes from the M13b
+/// spike crate's `android_entry`. The product surface it draws is this crate's
+/// [`shell::CompactShell`], so the one `CompactApp` the JNI `UiBridge` mutates
+/// and the one the window paints are the same object: there is no second copy
+/// of the host in a second loaded library.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub fn android_main(app: android_activity::AndroidApp) {
+    suramak_android_spike::android_entry(app, Box::new(shell::CompactShell::new()));
+}
 
 use compact_host::CompactHost;
 use jobs::{AndroidJobHost, HostDirs};

@@ -55,15 +55,21 @@ object UiBridge {
                 .put("value", value),
         )
 
-    fun device(report: app.suramak.models.DeviceMemory.Report): JSONObject =
-        dispatch(
-            JSONObject()
-                .put("op", "device")
-                .put("total_ram_bytes", report.totalBytes)
-                .put("available_ram_bytes", report.availableBytes)
-                .put("low_memory", report.lowMemory)
-                .put("arm64", report.arm64),
-        )
+    fun device(
+        report: app.suramak.models.DeviceMemory.Report,
+        freeBytes: Long? = null,
+        reduceMotion: Boolean? = null,
+    ): JSONObject {
+        val request = JSONObject()
+            .put("op", "device")
+            .put("total_ram_bytes", report.totalBytes)
+            .put("available_ram_bytes", report.availableBytes)
+            .put("low_memory", report.lowMemory)
+            .put("arm64", report.arm64)
+        freeBytes?.let { request.put("free_bytes", it) }
+        reduceMotion?.let { request.put("reduce_motion", it) }
+        return dispatch(request)
+    }
 
     /**
      * Stages one export through the M15 serializer. The reply carries `job`,

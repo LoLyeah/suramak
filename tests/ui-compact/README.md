@@ -1,4 +1,4 @@
-# tests/ui-compact — the phone-viewport suite (M13g1, gated in M13g2)
+# tests/ui-compact — the phone-viewport suite (M13g1, gated in M13g2, extended in M13g3)
 
 The compact profile's CI-side evidence. `run.sh` renders the **real egui shape
 stream** of the shared Deck compact screens at the plan's portrait viewport and
@@ -11,10 +11,17 @@ tests/ui-compact/run.sh
 
 | shot | screen | what it proves |
 |---|---|---|
-| `shots/library.png` | Library | app bar, search field, three rows with metadata + chevrons, Import/Record bar |
+| `shots/launch-library.png` | Library | **the launch surface** (M13g3): app bar, search, rows with play affordance + chevrons, Import/Record bar |
+| `shots/library.png` | Library | the same Library after the model card is gone (a normal launch) |
 | `shots/library-light.png` | Library | the same layout on the light token ladder |
-| `shots/editor.png` | Editor | back, title, meta line, selected segment, play marks, transport + scrubber + Export |
-| `shots/settings.png` | Settings | transcription card, M13D model tiers (offered only), appearance chips, device card, Quit |
+| `shots/library-empty.png` | Library | the zero-empty-screen hint: share a voice note / Import / Record |
+| `shots/first-run-download.png` | Library | **the first-run release path**: M13D's recommendation, `tiny` absent, free-space line, Download/Get |
+| `shots/download-progress.png` | Library | the job's own percent on the card (the notification's number) + Pause |
+| `shots/download-resume.png` | Library | the `.part` resume offer at the same percent after a relaunch |
+| `shots/onboarding.png` | Library + sheet | the one-time intro: three paths, Start, Skip, on the Deck spring |
+| `shots/diagnostics.png` | Settings → Diagnostics | the four check groups + the v2.4 crash banner (Clear / Share log) |
+| `shots/editor.png` | Editor | back, title, meta line, selected segment with **M15.6 word chips**, transport + Export |
+| `shots/settings.png` | Settings | transcription card, M13D model tiers (offered only), appearance chips, device card, Diagnostics, Quit |
 | `shots/export-sheet.png` | Editor + sheet | six format chips (md/txt/json/srt/vtt/tsv), the bilingual switch, both export routes disclosed |
 | `shots/export-written.png` | Editor + sheet | the picker result path: **Saved** with the name, size and MIME |
 | `shots/settings-tiers.png` | Settings | the M13D low-tier statement: only `tiny` offered below the 4 GB floor, 5 models hidden |

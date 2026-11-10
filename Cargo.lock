@@ -4277,9 +4277,14 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 name = "suramak-android"
 version = "0.4.0"
 dependencies = [
+ "android-activity",
+ "egui",
  "jni 0.21.1",
+ "log",
+ "ndk-context",
  "serde",
  "serde_json",
+ "suramak-android-spike",
  "suramak-asr",
  "suramak-core",
  "suramak-ui",
@@ -4299,6 +4304,7 @@ dependencies = [
  "log",
  "ndk-context",
  "pollster",
+ "suramak-ui",
  "wgpu",
  "winit",
 ]

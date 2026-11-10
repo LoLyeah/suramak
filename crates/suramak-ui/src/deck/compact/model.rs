@@ -14,7 +14,8 @@ use chrono::{DateTime, Local};
 use suramak_core::device::{self, DeviceProfile, PhoneTier};
 use suramak_core::models::MODELS;
 use suramak_core::settings::Appearance;
-use suramak_core::transcript::{Segment, Transcript};
+use suramak_core::store::WordAlignment;
+use suramak_core::transcript::{Segment, Transcript, WordTiming};
 use uuid::Uuid;
 
 use crate::deck::nav::{BackOutcome, NavStack};
@@ -22,7 +23,7 @@ use crate::deck::theme::AppTheme;
 
 use super::motion::{ListAnim, ProgressAnim, SheetAnim};
 
-/// The three screens of the G1 compact profile.
+/// The three screens of the G1 compact profile, plus G3's Diagnostics card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactRoute {
     /// The library: every transcript, search, import/record entry.
@@ -31,6 +32,8 @@ pub enum CompactRoute {
     Editor,
     /// Engine/model/language/appearance/storage, plus Quit.
     Settings,
+    /// The M13b four checks + the crash banner, kept behind Settings (G3).
+    Diagnostics,
 }
 
 /// One row in the compact library.
@@ -369,6 +372,8 @@ pub enum CompactSetting {
     Language(String),
     Appearance(Appearance),
     KeepAudio(bool),
+    /// M13g3: the one-time intro has been shown (additive `first_run_seen`).
+    FirstRunSeen(bool),
 }
 
 /// One model row in Settings, derived from the core manifest + device tier.
@@ -384,6 +389,134 @@ pub struct ModelRow {
     pub installed: bool,
     /// The model the action should select/download.
     pub recommended: bool,
+}
+
+impl ModelRow {
+    /// `"78 MB · CI + tests"` — the one-line subtitle the cards reuse.
+    pub fn size_role(&self) -> String {
+        format!(
+            "{} · {}",
+            super::model::bytes_label(self.size_bytes),
+            self.role
+        )
+    }
+}
+
+/// The model download's phase (M13D's `ModelHost` state, mirrored for the UI).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadState {
+    /// A `.part` left by an interrupted run: the next start resumes it.
+    Paused,
+    Running,
+    Done,
+    Failed,
+}
+
+impl DownloadState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Paused => "Paused",
+            Self::Running => "Downloading",
+            Self::Done => "Downloaded",
+            Self::Failed => "Download failed",
+        }
+    }
+}
+
+/// One download, as the model job reports it. `percent` is the **job's own**
+/// integer percent (`bytes_done * 100 / bytes_total`), never a UI estimate:
+/// the card and the dataSync notification show one number because they read
+/// one number.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DownloadView {
+    pub model: String,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub percent: u8,
+    pub state: DownloadState,
+    /// The host's own sentence (a refusal, a pause reason, a failure).
+    pub message: String,
+    /// This view was reconstructed from a `.part` at launch (the resume offer).
+    pub resumed: bool,
+}
+
+impl DownloadView {
+    pub fn line(&self) -> String {
+        match self.state {
+            DownloadState::Paused => format!(
+                "Paused at {}% — {} of {}",
+                self.percent,
+                super::model::bytes_label(self.bytes_done),
+                super::model::bytes_label(self.bytes_total)
+            ),
+            DownloadState::Running => format!(
+                "Downloading {} · {}% · {} of {}",
+                self.model,
+                self.percent,
+                super::model::bytes_label(self.bytes_done),
+                super::model::bytes_label(self.bytes_total)
+            ),
+            DownloadState::Done => format!("{} downloaded", self.model),
+            DownloadState::Failed => format!("{} failed", self.model),
+        }
+    }
+
+    pub fn fraction(&self) -> f32 {
+        if self.bytes_total == 0 {
+            0.0
+        } else {
+            (self.bytes_done.min(self.bytes_total) as f32 / self.bytes_total as f32).clamp(0.0, 1.0)
+        }
+    }
+}
+
+/// The v2.4 crash banner, as the diagnostics card shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CrashBanner {
+    /// `true` = recorded by this process; `false` = read from the crash file.
+    pub live: bool,
+    pub text: String,
+}
+
+impl CrashBanner {
+    pub fn title(&self) -> &'static str {
+        if self.live {
+            "CRASH — THIS SESSION (caught, app still running)"
+        } else {
+            "CRASH — LAST LAUNCH (read from the crash file)"
+        }
+    }
+}
+
+/// The four-check counters + crash banner behind Settings → Diagnostics.
+///
+/// This is the M13b spike's evidence, kept at the same coverage (nothing is
+/// dropped) but aggregated into four groups instead of a tab farm. The Android
+/// shell fills it from `SpikeState`/`diag` every frame; the host suite fills it
+/// with fixtures for the shot.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DiagnosticsView {
+    // 1 · text
+    pub text_chars: u64,
+    pub ime_updates: u64,
+    pub deletions: u64,
+    // 2 · lifecycle
+    pub resumes: u32,
+    pub surface_recreates: u32,
+    pub frames_gated: u64,
+    pub frames_after_destroy: u64,
+    pub probe_saves: u32,
+    pub probe_restores: u32,
+    // 3 · motion
+    pub avg_fps: Option<f32>,
+    pub frames: u64,
+    // 4 · insets + back
+    pub inset_updates: u32,
+    pub inset_top: f32,
+    pub inset_bottom: f32,
+    pub back_presses: u32,
+    /// The last crash (this session's or the previous launch's).
+    pub crash: Option<CrashBanner>,
 }
 
 /// A transcript edit the host persists.
@@ -427,10 +560,32 @@ pub enum CompactAction {
     Import,
     /// The library's Record button.
     Record,
+    /// The library's Stop button while the mic host is recording.
+    StopRecording,
+    /// A row's play affordance: open the transcript and start the transport.
+    PlayTranscript(Uuid),
+    /// The transport started or stopped (the host owns audio; this is state).
+    Playback {
+        playing: bool,
+    },
+    /// A word chip or a segment seek: park the transport at this position.
+    Seek {
+        position_ms: i64,
+    },
     /// Apply a setting; the host writes it and refreshes the store cache.
     Setting(CompactSetting),
     DownloadModel(String),
     DeleteModel(String),
+    /// The model job's Cancel action (the `.part` stays for a resume).
+    CancelDownload,
+    /// The one-time intro was dismissed (`skipped` distinguishes the paths).
+    OnboardingSeen {
+        skipped: bool,
+    },
+    /// Diagnostics: delete `spike-last-crash.txt` + the history log.
+    ClearCrash,
+    /// Diagnostics: hand the crash log to another app (the v2.1 share route).
+    ShareCrashLog,
     /// Quit: the host runs capture → jobs → services → exit.
     Quit,
     /// Back at the root: the host finishes the Activity.
@@ -442,6 +597,8 @@ pub enum CompactAction {
 pub enum Sheet {
     Export,
     Quit,
+    /// M13g3: the one-time intro (three paths, skippable).
+    Onboarding,
 }
 
 /// Editor state for the open transcript.
@@ -466,6 +623,10 @@ pub struct CompactEditor {
     /// the host from `Store::segment_translations`). The bilingual export
     /// switch is offered only when there is a second line to stack.
     pub has_translation: bool,
+    /// M15.6 estimated word timing, as the store reports it. Only segments
+    /// whose rows are current drive the compact chips; the rest fall back to
+    /// segment seeking (there is no row-level badge for it on the phone).
+    pub words: WordAlignment,
 }
 
 impl CompactEditor {
@@ -483,7 +644,68 @@ impl CompactEditor {
             playhead_ms: 0,
             focus_segment: None,
             has_translation: false,
+            words: WordAlignment::default(),
         }
+    }
+
+    /// The transcript's whole duration (the last segment's end).
+    pub fn duration_ms(&self) -> i64 {
+        self.transcript
+            .segments
+            .iter()
+            .map(|segment| segment.end_ms)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Adopts the store's usable word timing (after a load or a fresh job).
+    pub fn set_words(&mut self, words: WordAlignment) {
+        self.words = words;
+    }
+
+    /// The current words of one segment, or an empty slice (the fallback).
+    pub fn words_for(&self, idx: u32) -> &[WordTiming] {
+        self.words
+            .current
+            .get(&idx)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// The index of the word the playhead is in, for the segment the playhead
+    /// is inside (M15.6's `word_at`, the same rule the desktop uses).
+    pub fn current_word(&self, idx: u32) -> Option<usize> {
+        word_at(self.words_for(idx), self.playhead_ms)
+    }
+
+    /// The segment containing the playhead, if any.
+    pub fn playhead_segment(&self) -> Option<u32> {
+        self.transcript
+            .segments
+            .iter()
+            .find(|segment| {
+                self.playhead_ms >= segment.start_ms && self.playhead_ms < segment.end_ms
+            })
+            .map(|segment| segment.idx)
+            .or_else(|| {
+                self.transcript
+                    .segments
+                    .last()
+                    .filter(|segment| self.playhead_ms >= segment.end_ms)
+                    .map(|segment| segment.idx)
+            })
+    }
+
+    /// Starts the transport from the current playhead (no-op at the end).
+    pub fn start_playback(&mut self) {
+        if self.playhead_ms >= self.duration_ms() {
+            self.playhead_ms = 0;
+        }
+        self.playing = self.duration_ms() > 0;
+    }
+
+    pub fn stop_playback(&mut self) {
+        self.playing = false;
     }
 
     /// The text the row paints: the draft when one exists, else the stored one.
@@ -636,6 +858,15 @@ impl CompactEditor {
     }
 }
 
+/// The index of the word the playhead is in (M15.6's rule, shared with the
+/// desktop editor): the last word whose estimate starts at or before
+/// `position_ms`, or `None` before the first word. Karaoke holds the word it
+/// just read through the pause that follows it.
+pub fn word_at(words: &[WordTiming], position_ms: i64) -> Option<usize> {
+    let after = words.partition_point(|word| word.start_ms <= position_ms);
+    after.checked_sub(1)
+}
+
 /// A filesystem-safe stem for `ACTION_CREATE_DOCUMENT`'s suggestion.
 pub fn sanitise_stem(title: &str) -> String {
     let mut out: String = title
@@ -674,6 +905,24 @@ pub struct CompactApp {
     pub sheet: Option<Sheet>,
     pub settings: CompactSettings,
     pub models: Vec<ModelRow>,
+    /// The profile the model rows were derived from (`None` until the shell
+    /// reports memory); a language change re-derives the rows through it.
+    pub profile: Option<DeviceProfile>,
+    /// Free space on the models volume, in bytes (the M13D preflight's number).
+    pub free_bytes: Option<u64>,
+    /// The model download as the host reports it (the launch card's state).
+    pub download: Option<DownloadView>,
+    /// M13g3: the one-time intro has been shown. Seeded from settings.
+    pub first_run_seen: bool,
+    /// The last four-check snapshot the shell pushed (Settings → Diagnostics).
+    pub diagnostics: DiagnosticsView,
+    /// Whether the mic host is recording (the Library's Record becomes Stop).
+    pub recording: bool,
+    /// The transport's last tick (the preview clock; `None` when stopped).
+    playback_last: Option<f64>,
+    /// A back gesture dismissed the intro; the host persists the flag after
+    /// `back()` returns (the gesture has no action vector to return one).
+    onboarding_seen_pending: bool,
     /// The export sheet's flow (picker → write → result), when one is open.
     pub export_session: Option<ExportSession>,
     /// The sheet's "include the translation" switch.
@@ -752,6 +1001,14 @@ impl CompactApp {
             sheet: None,
             settings,
             models: Vec::new(),
+            profile: None,
+            free_bytes: None,
+            download: None,
+            first_run_seen: false,
+            diagnostics: DiagnosticsView::default(),
+            recording: false,
+            playback_last: None,
+            onboarding_seen_pending: false,
             export_session: None,
             export_bilingual: false,
             sheet_anim: SheetAnim::closed(),
@@ -777,7 +1034,180 @@ impl CompactApp {
     pub fn seed_device(&mut self, profile: DeviceProfile, installed: &[String]) {
         self.tier = Some(device::tier_for(profile));
         self.ram_bytes = Some(profile.total_ram_bytes);
+        self.profile = Some(profile);
         self.models = model_rows(profile, &self.settings.language, installed);
+    }
+
+    /// Re-derives the model rows after a language change (Indonesian's `tiny`
+    /// steering is a property of the recommendation, not of the tier).
+    pub fn refresh_models(&mut self, installed: &[String]) {
+        if let Some(profile) = self.profile {
+            self.models = model_rows(profile, &self.settings.language, installed);
+        }
+    }
+
+    /// Whether the Library must lead with the M13D download card: the shell
+    /// knows the manifest but no offered model is on disk.
+    pub fn model_card_needed(&self) -> bool {
+        !self.models.is_empty() && !self.models.iter().any(|row| row.installed && row.offered)
+    }
+
+    /// The recommended row for this phone + language.
+    pub fn recommended_model(&self) -> Option<&ModelRow> {
+        self.models
+            .iter()
+            .find(|row| row.recommended && row.offered)
+            .or_else(|| self.models.iter().find(|row| row.offered && !row.installed))
+            .or_else(|| self.models.iter().find(|row| row.offered))
+    }
+
+    /// The offered rows in card order: recommended first, then cheapest first.
+    pub fn offered_models(&self) -> Vec<&ModelRow> {
+        let mut rows: Vec<&ModelRow> = self.models.iter().filter(|row| row.offered).collect();
+        rows.sort_by_key(|row| (!row.recommended, row.size_bytes));
+        rows
+    }
+
+    /// Whether the models volume can hold `bytes`, if the shell reported space.
+    pub fn has_space_for(&self, bytes: u64) -> Option<bool> {
+        self.free_bytes.map(|free| free >= bytes)
+    }
+
+    /// The M13D language sentence (Indonesian's `tiny` warning), when set.
+    pub fn language_note(&self) -> Option<String> {
+        self.profile
+            .map(|profile| device::recommend(profile, &self.settings.language))
+            .and_then(|recommendation| recommendation.language_note)
+    }
+
+    /// The recommendation's headline for the card's top line.
+    pub fn model_headline(&self) -> String {
+        match self.profile {
+            Some(profile) => device::recommend(profile, &self.settings.language)
+                .headline
+                .to_string(),
+            None => "Device memory not reported by the shell".to_string(),
+        }
+    }
+
+    /// Records the job's progress. `percent` is the **job's own** number; the
+    /// UI never recomputes it (the notification shows the same integer).
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_download(
+        &mut self,
+        model: impl Into<String>,
+        bytes_done: u64,
+        bytes_total: u64,
+        percent: u8,
+        state: DownloadState,
+        message: impl Into<String>,
+        now: f64,
+    ) -> bool {
+        let next = DownloadView {
+            model: model.into(),
+            bytes_done,
+            bytes_total,
+            percent: percent.min(100),
+            state,
+            message: message.into(),
+            resumed: false,
+        };
+        if self.download.as_ref() == Some(&next) {
+            return false;
+        }
+        self.download = Some(next);
+        self.frame_request = true;
+        if state == DownloadState::Running {
+            // The card's fill rides the same job-progress machinery as the
+            // library strip: one ease per changed percent, then idle.
+            self.job_progress.set(percent as f32 / 100.0, now);
+        }
+        true
+    }
+
+    /// A `.part` found at launch: the resume offer, at the same percent the
+    /// next job run will start from.
+    pub fn on_download_resume(
+        &mut self,
+        model: impl Into<String>,
+        bytes_done: u64,
+        bytes_total: u64,
+        percent: u8,
+    ) {
+        self.download = Some(DownloadView {
+            model: model.into(),
+            bytes_done,
+            bytes_total,
+            percent: percent.min(100),
+            state: DownloadState::Paused,
+            message: "A partial download is on this phone; it resumes where it stopped."
+                .to_string(),
+            resumed: true,
+        });
+    }
+
+    pub fn clear_download(&mut self) {
+        self.download = None;
+    }
+
+    pub fn set_free_space(&mut self, bytes: Option<u64>) {
+        self.free_bytes = bytes;
+    }
+
+    /// Opens the one-time intro when the settings say it has not been seen.
+    pub fn maybe_begin_onboarding(&mut self, now: f64) -> bool {
+        if self.first_run_seen || self.sheet.is_some() {
+            return false;
+        }
+        self.sheet = Some(Sheet::Onboarding);
+        self.sheet_anim.begin_spring(true, now);
+        true
+    }
+
+    /// Start/Skip on the intro: dismiss it (spring back down) and ask the host
+    /// to persist `first_run_seen = true`. Returns the host action.
+    pub fn finish_onboarding(&mut self, now: f64, skipped: bool) -> CompactAction {
+        self.first_run_seen = true;
+        self.sheet_anim.begin(false, now);
+        CompactAction::OnboardingSeen { skipped }
+    }
+
+    /// Opens Diagnostics (a push; back returns to Settings).
+    pub fn open_diagnostics(&mut self, now: f64) {
+        self.sheet = None;
+        self.nav.push(CompactRoute::Diagnostics, now);
+    }
+
+    /// The shell's four-check snapshot (drawn by the Diagnostics route).
+    pub fn set_diagnostics(&mut self, view: DiagnosticsView) {
+        if self.diagnostics != view {
+            self.diagnostics = view;
+        }
+    }
+
+    /// The mic host's recording state (the Library's Record/Stop toggle).
+    pub fn set_recording(&mut self, recording: bool) {
+        if self.recording != recording {
+            self.recording = recording;
+            self.frame_request = true;
+        }
+    }
+
+    /// Starts the transport for the open transcript (the row's play affordance).
+    pub fn start_playback(&mut self) {
+        if let Some(editor) = self.editor.as_mut() {
+            editor.start_playback();
+            self.playback_last = None;
+            self.frame_request = true;
+        }
+    }
+
+    /// The host's playhead while it owns the audio clock (M8/M13 media host).
+    pub fn on_playhead(&mut self, position_ms: i64) {
+        if let Some(editor) = self.editor.as_mut() {
+            editor.playhead_ms = position_ms.clamp(0, editor.duration_ms());
+            self.frame_request = true;
+        }
     }
 
     /// Replaces the library list (a fresh `Store::list_transcripts`).
@@ -845,7 +1275,15 @@ impl CompactApp {
 
     /// Opens the editor on a loaded transcript (Library stays below it).
     pub fn open_editor(&mut self, transcript: Transcript, now: f64) {
-        self.editor = Some(CompactEditor::new(transcript));
+        self.open_editor_words(transcript, WordAlignment::default(), now);
+    }
+
+    /// Opens the editor with the store's usable M15.6 word timing (the compact
+    /// chips). The host reads `Store::word_alignment` on the same open.
+    pub fn open_editor_words(&mut self, transcript: Transcript, words: WordAlignment, now: f64) {
+        let mut editor = CompactEditor::new(transcript);
+        editor.set_words(words);
+        self.editor = Some(editor);
         self.nav.push(CompactRoute::Editor, now);
     }
 
@@ -853,9 +1291,16 @@ impl CompactApp {
     /// editor, in one motion. This is the path M13E's `ACTION_OPEN_TRANSCRIPT`
     /// intent feeds through the platform event.
     pub fn deep_link(&mut self, transcript: Transcript, now: f64) {
+        self.deep_link_words(transcript, WordAlignment::default(), now);
+    }
+
+    /// The deep link with the transcript's stored word timing.
+    pub fn deep_link_words(&mut self, transcript: Transcript, words: WordAlignment, now: f64) {
         self.sheet = None;
         self.pending_open = None;
-        self.editor = Some(CompactEditor::new(transcript));
+        let mut editor = CompactEditor::new(transcript);
+        editor.set_words(words);
+        self.editor = Some(editor);
         self.nav
             .open_deep(CompactRoute::Library, CompactRoute::Editor, now);
     }
@@ -896,11 +1341,22 @@ impl CompactApp {
                 // Already dismissing: keep that exit, do not restart it.
                 return BackOutcome::Dismissed;
             }
+            if self.sheet == Some(Sheet::Onboarding) {
+                // Back on the intro is Skip: it is a one-time sheet, so the
+                // gesture must not bring it back on the next launch.
+                self.first_run_seen = true;
+                self.onboarding_seen_pending = true;
+            }
             self.sheet_anim.begin(false, now);
             self.status = None;
             return BackOutcome::Dismissed;
         }
         self.nav.back(false, now)
+    }
+
+    /// Whether a back gesture dismissed the intro (the host persists it).
+    pub fn take_onboarding_seen(&mut self) -> bool {
+        std::mem::take(&mut self.onboarding_seen_pending)
     }
 
     /// Advances every compact animation and returns whether a repaint must be
@@ -911,6 +1367,11 @@ impl CompactApp {
         animating |= self.sheet_anim.advance(now, self.reduce_motion);
         animating |= self.list_anim.advance(now, self.reduce_motion).animating;
         animating |= self.job_progress.advance(now);
+        // The transport is a clock, not a spring: while it plays it owns the
+        // playhead (and therefore the karaoke word). It asks for frames only
+        // while playing; stopping at the transcript's end returns the surface
+        // to on-demand repaints.
+        animating |= self.tick_playback(now);
         if self.sheet.is_some() && !self.sheet_anim.is_present() && self.sheet_anim.is_done() {
             self.sheet = None;
             self.export_session = None;
@@ -927,12 +1388,48 @@ impl CompactApp {
         animating
     }
 
+    /// The transport's clock (see [`CompactEditor::playing`]). It follows the
+    /// host's egui clock exactly; the first tick after a start only anchors
+    /// (no jump), and the last tick stops at the transcript's duration. Reduce
+    /// Motion changes nothing here: this is position, not decoration.
+    fn tick_playback(&mut self, now: f64) -> bool {
+        let Some(editor) = self.editor.as_mut() else {
+            self.playback_last = None;
+            return false;
+        };
+        if !editor.playing {
+            self.playback_last = None;
+            return false;
+        }
+        let duration = editor.duration_ms();
+        if duration <= 0 {
+            editor.playing = false;
+            self.playback_last = None;
+            return false;
+        }
+        let previous = self.playback_last.replace(now);
+        if let Some(previous) = previous {
+            let dt_ms = ((now - previous).max(0.0) * 1000.0).round() as i64;
+            if dt_ms > 0 {
+                editor.playhead_ms = (editor.playhead_ms + dt_ms).min(duration);
+            }
+        }
+        if editor.playhead_ms >= duration {
+            editor.playhead_ms = duration;
+            editor.playing = false;
+            self.playback_last = None;
+            return false;
+        }
+        true
+    }
+
     /// Whether the surface must draw another frame for an animation.
     pub fn needs_frame(&self) -> bool {
         self.nav.motion().is_some_and(|motion| !motion.is_done())
             || !self.sheet_anim.is_done()
             || self.list_anim.is_animating()
             || !self.job_progress.is_done()
+            || self.editor.as_ref().is_some_and(|editor| editor.playing)
     }
 
     /// A worker event (job progress, completion) asks the host to wake the
@@ -1106,9 +1603,22 @@ impl CompactApp {
     pub fn apply_setting(&mut self, change: CompactSetting) {
         match change {
             CompactSetting::Model(id) => self.settings.model_id = id,
-            CompactSetting::Language(lang) => self.settings.language = lang,
+            CompactSetting::Language(lang) => {
+                self.settings.language = lang;
+                // The phone's model guidance is language-aware (Indonesian is
+                // steered off tiny), so the rows are re-derived here rather
+                // than only on the next launch.
+                let installed: Vec<String> = self
+                    .models
+                    .iter()
+                    .filter(|row| row.installed)
+                    .map(|row| row.id.clone())
+                    .collect();
+                self.refresh_models(&installed);
+            }
             CompactSetting::Appearance(appearance) => self.settings.appearance = appearance,
             CompactSetting::KeepAudio(keep) => self.settings.keep_audio = keep,
+            CompactSetting::FirstRunSeen(seen) => self.first_run_seen = seen,
         }
     }
 
@@ -1638,5 +2148,277 @@ mod tests {
         assert_eq!(sanitise_stem("Rapat: 12/03"), "Rapat 12 03");
         assert_eq!(sanitise_stem("///"), "transcript");
         assert_eq!(sanitise_stem(""), "transcript");
+    }
+
+    // ---- M13g3: first-run, download, onboarding, diagnostics, words --------
+
+    #[test]
+    fn a_phone_with_no_installed_model_needs_the_download_card() {
+        let mut app = CompactApp::new(CompactSettings::default());
+        assert!(!app.model_card_needed(), "no device report yet: no card");
+        app.seed_device(
+            DeviceProfile::new(6_000_000_000, 2_000_000_000, false, true),
+            &[],
+        );
+        assert!(app.model_card_needed());
+        assert_eq!(
+            app.recommended_model().map(|row| row.id.as_str()),
+            Some("base"),
+            "M13D: 6 GB defaults to base"
+        );
+        let offered: Vec<&str> = app
+            .offered_models()
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(offered.first().copied(), Some("base"), "recommended first");
+        assert!(
+            app.language_note().is_none(),
+            "English has no steering line"
+        );
+
+        // Once a model is installed the card is gone; the Library lists rows.
+        app.seed_device(
+            DeviceProfile::new(6_000_000_000, 2_000_000_000, false, true),
+            &["base".to_string()],
+        );
+        assert!(!app.model_card_needed());
+    }
+
+    #[test]
+    fn indonesian_is_steered_off_tiny_by_the_card() {
+        let settings = CompactSettings {
+            language: "id".to_string(),
+            ..CompactSettings::default()
+        };
+        let mut app = CompactApp::new(settings);
+        app.seed_device(
+            DeviceProfile::new(6_000_000_000, 2_000_000_000, false, true),
+            &[],
+        );
+        assert_eq!(
+            app.recommended_model().map(|row| row.id.as_str()),
+            Some("base"),
+            "Indonesian still defaults to base, never tiny"
+        );
+        let note = app.language_note().expect("Indonesian steering");
+        assert!(note.contains("tiny"), "{note}");
+        assert!(note.contains("base or small"), "{note}");
+
+        // A language change re-derives the rows through the stored profile.
+        let settings = CompactSettings {
+            language: "en".to_string(),
+            ..CompactSettings::default()
+        };
+        let mut app = CompactApp::new(settings);
+        app.seed_device(
+            DeviceProfile::new(6_000_000_000, 2_000_000_000, false, true),
+            &[],
+        );
+        app.apply_setting(CompactSetting::Language("id".to_string()));
+        assert!(app.language_note().is_some(), "the note follows the change");
+    }
+
+    #[test]
+    fn the_download_card_uses_the_jobs_percent_and_offers_the_resume() {
+        let mut app = CompactApp::new(CompactSettings::default());
+        app.seed_device(
+            DeviceProfile::new(6_000_000_000, 2_000_000_000, false, true),
+            &[],
+        );
+        assert!(app.on_download(
+            "base",
+            61_000_000,
+            143_000_000,
+            42,
+            DownloadState::Running,
+            "starting",
+            1.0
+        ));
+        let view = app.download.clone().expect("download");
+        assert_eq!(view.percent, 42, "the job's own integer, never recomputed");
+        assert!(view.line().contains("42%"));
+        assert!(!app.on_download(
+            "base",
+            61_000_000,
+            143_000_000,
+            42,
+            DownloadState::Running,
+            "starting",
+            2.0
+        ));
+
+        app.on_download_resume("base", 61_000_000, 143_000_000, 42);
+        let view = app.download.clone().expect("resume");
+        assert_eq!(view.state, DownloadState::Paused);
+        assert!(view.resumed);
+        assert!(view.line().contains("Paused at 42%"));
+    }
+
+    #[test]
+    fn the_free_space_line_refuses_a_download_that_cannot_fit() {
+        let mut app = CompactApp::new(CompactSettings::default());
+        app.seed_device(
+            DeviceProfile::new(6_000_000_000, 2_000_000_000, false, true),
+            &[],
+        );
+        app.set_free_space(Some(50_000_000));
+        let base = app.recommended_model().expect("base").clone();
+        assert_eq!(app.has_space_for(base.size_bytes), Some(false));
+        app.set_free_space(Some(9_000_000_000));
+        assert_eq!(app.has_space_for(base.size_bytes), Some(true));
+    }
+
+    #[test]
+    fn the_intro_is_one_time_and_back_counts_as_skip() {
+        let mut first_app = app();
+        assert!(first_app.maybe_begin_onboarding(0.0));
+        assert_eq!(first_app.sheet, Some(Sheet::Onboarding));
+        assert_eq!(
+            first_app.sheet_anim.curve(),
+            super::super::motion::SheetCurve::Spring
+        );
+
+        // A second call while the sheet is open does nothing.
+        assert!(!first_app.maybe_begin_onboarding(0.1));
+
+        // Back is Skip: the sheet dismisses and the flag is stashed for the
+        // host to persist (the gesture has no action vector).
+        assert_eq!(first_app.back(0.2), BackOutcome::Dismissed);
+        assert!(first_app.take_onboarding_seen());
+        assert!(first_app.first_run_seen);
+        assert!(!first_app.take_onboarding_seen(), "one-shot");
+        first_app.advance(0.5);
+        assert!(first_app.sheet.is_none());
+        assert!(!first_app.maybe_begin_onboarding(1.0), "never again");
+
+        // Start emits the host action and marks the sheet seen.
+        let mut second = app();
+        second.maybe_begin_onboarding(0.0);
+        assert_eq!(
+            second.finish_onboarding(0.0, false),
+            CompactAction::OnboardingSeen { skipped: false }
+        );
+        assert!(second.first_run_seen);
+    }
+
+    #[test]
+    fn the_editor_highlights_the_word_the_playhead_is_in() {
+        let mut app = app();
+        let first = app.transcripts[0].clone();
+        app.open_editor(first, 0.0);
+        let mut alignment = WordAlignment::default();
+        alignment.current.insert(
+            0,
+            vec![
+                WordTiming {
+                    segment_idx: 0,
+                    word_idx: 0,
+                    start_ms: 0,
+                    end_ms: 400,
+                    text: "the".to_string(),
+                },
+                WordTiming {
+                    segment_idx: 0,
+                    word_idx: 1,
+                    start_ms: 400,
+                    end_ms: 900,
+                    text: "quick".to_string(),
+                },
+                WordTiming {
+                    segment_idx: 0,
+                    word_idx: 2,
+                    start_ms: 900,
+                    end_ms: 1_500,
+                    text: "brown".to_string(),
+                },
+            ],
+        );
+        app.editor.as_mut().expect("editor").set_words(alignment);
+        let editor = app.editor.as_ref().expect("editor");
+        assert_eq!(word_at(editor.words_for(0), 0), Some(0));
+        assert_eq!(word_at(editor.words_for(0), 399), Some(0));
+        assert_eq!(word_at(editor.words_for(0), 400), Some(1));
+        assert_eq!(word_at(editor.words_for(0), 1_400), Some(2));
+        assert_eq!(editor.current_word(0), Some(0), "the playhead starts at 0");
+
+        // The transport clock moves the playhead and stops at the duration.
+        app.editor.as_mut().expect("editor").start_playback();
+        assert!(app.advance(1.0));
+        assert!(app.advance(1.45));
+        let editor = app.editor.as_ref().expect("editor");
+        assert!(
+            editor.playhead_ms >= 400,
+            "playhead advanced: {}",
+            editor.playhead_ms
+        );
+        assert_eq!(editor.current_word(0), Some(1));
+        assert!(app.advance(1.5));
+        assert!(!app.advance(20.0));
+        assert!(!app.editor.as_ref().expect("editor").playing);
+        assert_eq!(
+            app.editor.as_ref().expect("editor").playhead_ms,
+            app.editor.as_ref().expect("editor").duration_ms()
+        );
+    }
+
+    #[test]
+    fn a_host_playhead_is_clamped_and_wakes_the_surface_once() {
+        let mut app = app();
+        let first = app.transcripts[0].clone();
+        app.open_editor(first, 0.0);
+        app.on_playhead(1_000);
+        assert_eq!(app.editor.as_ref().expect("editor").playhead_ms, 1_000);
+        assert!(app.take_frame_request());
+        app.on_playhead(99_999_999);
+        assert_eq!(
+            app.editor.as_ref().expect("editor").playhead_ms,
+            app.editor.as_ref().expect("editor").duration_ms()
+        );
+    }
+
+    #[test]
+    fn diagnostics_lives_behind_settings_and_keeps_its_counters() {
+        let mut app = app();
+        app.open_settings(0.0);
+        app.advance(1.0);
+        app.open_diagnostics(1.0);
+        assert_eq!(app.nav.current(), CompactRoute::Diagnostics);
+        assert_eq!(
+            app.nav.screens(),
+            &[
+                CompactRoute::Library,
+                CompactRoute::Settings,
+                CompactRoute::Diagnostics
+            ]
+        );
+        app.set_diagnostics(DiagnosticsView {
+            text_chars: 42,
+            ime_updates: 7,
+            deletions: 2,
+            resumes: 3,
+            surface_recreates: 1,
+            frames_gated: 9,
+            frames_after_destroy: 4,
+            probe_saves: 2,
+            probe_restores: 2,
+            avg_fps: Some(59.4),
+            frames: 900,
+            inset_updates: 5,
+            inset_top: 28.0,
+            inset_bottom: 20.0,
+            back_presses: 1,
+            crash: Some(CrashBanner {
+                live: false,
+                text: "panic: boom".to_string(),
+            }),
+        });
+        assert_eq!(app.diagnostics.text_chars, 42);
+        assert_eq!(
+            app.diagnostics.crash.as_ref().unwrap().title(),
+            "CRASH — LAST LAUNCH (read from the crash file)"
+        );
+        assert_eq!(app.back(2.0), BackOutcome::Popped);
+        assert_eq!(app.nav.current(), CompactRoute::Settings);
     }
 }

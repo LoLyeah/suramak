@@ -21,9 +21,11 @@
 
 use suramak_core::device::DeviceProfile;
 use suramak_core::settings::Appearance;
-use suramak_core::transcript::{Segment, Source, Transcript};
+use suramak_core::store::WordAlignment;
+use suramak_core::transcript::{Segment, Source, Transcript, WordTiming};
 use suramak_ui::deck::compact::{
-    self, a11y, chrome, library, CompactApp, CompactRoute, CompactSettings, Insets, Sheet,
+    self, a11y, chrome, library, CompactApp, CompactRoute, CompactSettings, CrashBanner,
+    DiagnosticsView, DownloadState, Insets, Sheet,
 };
 use suramak_ui::deck::snapshot;
 use suramak_ui::deck::theme::{self, AppTheme};
@@ -58,6 +60,33 @@ fn fixture_settings() -> CompactSettings {
         appearance: Appearance::Dark,
         keep_audio: true,
     }
+}
+
+/// A tiny M15.6 fixture: four words inside the second segment.
+fn words_for_second_segment() -> WordAlignment {
+    let words = [
+        ("This", 4_200, 4_500),
+        ("is", 4_500, 4_650),
+        ("a", 4_650, 4_750),
+        ("second", 4_750, 5_300),
+        ("line", 5_300, 5_700),
+    ];
+    let mut alignment = WordAlignment::default();
+    alignment.current.insert(
+        1,
+        words
+            .iter()
+            .enumerate()
+            .map(|(index, (text, start, end))| WordTiming {
+                segment_idx: 1,
+                word_idx: index as u32,
+                start_ms: *start,
+                end_ms: *end,
+                text: (*text).to_string(),
+            })
+            .collect(),
+    );
+    alignment
 }
 
 fn seeded_app() -> CompactApp {
@@ -148,11 +177,24 @@ fn the_phone_viewport_shoots_library_editor_and_settings() {
         "the search field is in-viewport"
     );
 
+    // The same layout on the light token ladder (the second appearance is part
+    // of the release surface, not a debug toggle).
+    let mut light = seeded_app();
+    light.theme = AppTheme::Light;
+    let light_shot = render(&mut light, "library-light");
+    assert!(light_shot.painted_fraction(egui::Color32::BLACK) > 0.5);
+
     // --- Editor ------------------------------------------------------------
     let target = app.transcripts[0].clone();
     app.open_editor(target, 0.0);
     app.advance(10.0); // settle the push spring: the shot is a rest frame
     app.editor.as_mut().expect("editor").select(1);
+    app.editor
+        .as_mut()
+        .expect("editor")
+        .set_words(words_for_second_segment());
+    app.editor.as_mut().expect("editor").start_playback();
+    app.on_playhead(4_900); // the "second" chip is current
     let editor_shot = render(&mut app, "editor");
     assert!(editor_shot.painted_fraction(egui::Color32::BLACK) > 0.5);
     assert_eq!(app.nav.current(), CompactRoute::Editor);
@@ -357,6 +399,261 @@ fn every_compact_control_carries_a_label_and_a_role() {
             "the export sheet registers {expected}: {labels:?}"
         );
     }
+}
+
+#[test]
+fn the_launch_surface_is_the_library_and_the_first_run_card_leads() {
+    // The launch surface: MainActivity's initial route is the Library, not the
+    // spike's diagnostics. With a model installed it is the transcript list.
+    let mut app = seeded_app();
+    let shot = render(&mut app, "launch-library");
+    assert_eq!(app.nav.current(), CompactRoute::Library);
+    assert!(app.sheet.is_none(), "no sheet on a settled launch");
+    assert!(shot.painted_fraction(egui::Color32::BLACK) > 0.5);
+
+    // No model yet: the same route leads with M13D's card, never an empty list.
+    let mut fresh = CompactApp::new(fixture_settings());
+    fresh.theme = AppTheme::Dark;
+    fresh.insets = Insets {
+        top: 28.0,
+        bottom: 20.0,
+    };
+    fresh.seed_device(
+        DeviceProfile::new(6_000_000_000, 2_000_000_000, false, true),
+        &[],
+    );
+    fresh.set_free_space(Some(9_000_000_000));
+    assert!(fresh.model_card_needed());
+    let (_, _, scale) = compact::phone_viewport();
+    let screen = compact::phone_screen_rect();
+    let ctx = fresh_context(&fresh);
+    let shot = snapshot::render(&ctx, screen, scale, |ctx| {
+        let _ = compact::ui(ctx, &mut fresh);
+    });
+    let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/ui-compact/shots")
+        .join("first-run-download.png");
+    snapshot::write_png(&out, &shot).expect("write shot");
+    assert!(shot.painted_fraction(egui::Color32::BLACK) > 0.5);
+    let labels: Vec<String> = a11y::controls(&ctx)
+        .into_iter()
+        .map(|control| control.label)
+        .collect();
+    assert!(
+        labels.iter().any(|label| label == "Download base"),
+        "the card offers the recommendation: {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|label| label == "Download small"),
+        "small is the next offered model: {labels:?}"
+    );
+    assert_eq!(
+        fresh.recommended_model().map(|row| row.id.as_str()),
+        Some("base")
+    );
+    assert!(
+        !labels.iter().any(|label| label.contains("tiny")),
+        "the card never headlines tiny on a 6 GB phone: {labels:?}"
+    );
+
+    // Indonesian at the same tier: still base, with the tiny warning on screen.
+    let mut indonesian = CompactApp::new(CompactSettings {
+        language: "id".to_string(),
+        ..fixture_settings()
+    });
+    indonesian.theme = AppTheme::Dark;
+    indonesian.seed_device(
+        DeviceProfile::new(6_000_000_000, 2_000_000_000, false, true),
+        &[],
+    );
+    assert!(indonesian.language_note().unwrap().contains("tiny"));
+    assert_eq!(
+        indonesian.recommended_model().map(|row| row.id.as_str()),
+        Some("base")
+    );
+}
+
+#[test]
+fn the_first_run_download_shows_the_jobs_percent_and_the_resume() {
+    let mut app = CompactApp::new(fixture_settings());
+    app.theme = AppTheme::Dark;
+    app.seed_device(
+        DeviceProfile::new(6_000_000_000, 2_000_000_000, false, true),
+        &[],
+    );
+    app.set_free_space(Some(9_000_000_000));
+    app.on_download(
+        "base",
+        61_000_000,
+        143_000_000,
+        42,
+        DownloadState::Running,
+        "starting",
+        0.0,
+    );
+    assert_eq!(app.download.as_ref().unwrap().percent, 42);
+    let ctx = fresh_context(&app);
+    let (_, _, scale) = compact::phone_viewport();
+    let screen = compact::phone_screen_rect();
+    let shot = snapshot::render(&ctx, screen, scale, |ctx| {
+        let _ = compact::ui(ctx, &mut app);
+    });
+    let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/ui-compact/shots")
+        .join("download-progress.png");
+    snapshot::write_png(&out, &shot).expect("write shot");
+    let labels: Vec<String> = a11y::controls(&ctx)
+        .into_iter()
+        .map(|control| control.label)
+        .collect();
+    assert!(labels.iter().any(|label| label == "Pause the download"));
+    assert!(
+        labels.iter().any(|label| label.contains("42%")),
+        "the card reads the job's percent: {labels:?}"
+    );
+
+    // Relaunch with the `.part`: the same number, offered as a resume.
+    let mut resumed = CompactApp::new(fixture_settings());
+    resumed.theme = AppTheme::Dark;
+    resumed.seed_device(
+        DeviceProfile::new(6_000_000_000, 2_000_000_000, false, true),
+        &[],
+    );
+    resumed.set_free_space(Some(9_000_000_000));
+    resumed.on_download_resume("base", 61_000_000, 143_000_000, 42);
+    let ctx = fresh_context(&resumed);
+    let shot = snapshot::render(&ctx, screen, scale, |ctx| {
+        let _ = compact::ui(ctx, &mut resumed);
+    });
+    let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/ui-compact/shots")
+        .join("download-resume.png");
+    snapshot::write_png(&out, &shot).expect("write shot");
+    let labels: Vec<String> = a11y::controls(&ctx)
+        .into_iter()
+        .map(|control| control.label)
+        .collect();
+    assert!(
+        labels.iter().any(|label| label == "Resume base"),
+        "{labels:?}"
+    );
+}
+
+#[test]
+fn the_onboarding_sheet_is_a_shot_with_the_deck_spring() {
+    let mut app = seeded_app();
+    app.first_run_seen = false;
+    assert!(app.maybe_begin_onboarding(0.0));
+    app.advance(1.0); // the spring lands exactly
+    assert_eq!(app.sheet, Some(Sheet::Onboarding));
+    assert_eq!(app.sheet_anim.curve(), compact::motion::SheetCurve::Spring);
+    let shot = render(&mut app, "onboarding");
+    assert!(shot.painted_fraction(egui::Color32::BLACK) > 0.5);
+    let ctx = fresh_context(&app);
+    let (_, _, scale) = compact::phone_viewport();
+    let screen = compact::phone_screen_rect();
+    let _ = snapshot::render(&ctx, screen, scale, |ctx| {
+        let _ = compact::ui(ctx, &mut app);
+    });
+    let labels: Vec<String> = a11y::controls(&ctx)
+        .into_iter()
+        .map(|control| control.label)
+        .collect();
+    for expected in ["Start using Suramak", "Skip the introduction"] {
+        assert!(labels.iter().any(|label| label == expected), "{labels:?}");
+    }
+
+    // Reduce Motion removes the travel but keeps the sheet and its fade.
+    let mut app = seeded_app();
+    app.reduce_motion = true;
+    app.maybe_begin_onboarding(0.0);
+    assert!(app.advance(0.05));
+    assert_eq!(app.sheet_anim.rise(true), 0.0);
+    assert!(app.sheet_anim.value() > 0.0);
+}
+
+#[test]
+fn the_empty_library_offers_the_share_hint() {
+    let mut app = seeded_app();
+    app.set_library(Vec::new());
+    assert!(app.rows.is_empty() && !app.model_card_needed());
+    let shot = render(&mut app, "library-empty");
+    assert!(shot.painted_fraction(egui::Color32::BLACK) > 0.5);
+    let ctx = fresh_context(&app);
+    let (_, _, scale) = compact::phone_viewport();
+    let screen = compact::phone_screen_rect();
+    let _ = snapshot::render(&ctx, screen, scale, |ctx| {
+        let _ = compact::ui(ctx, &mut app);
+    });
+    let labels: Vec<String> = a11y::controls(&ctx)
+        .into_iter()
+        .map(|control| control.label)
+        .collect();
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.contains("Share a voice note") && label.contains("Import")),
+        "the empty state names both working entries: {labels:?}"
+    );
+}
+
+#[test]
+fn the_diagnostics_card_keeps_the_four_checks_and_the_crash_banner() {
+    let mut app = seeded_app();
+    app.open_settings(0.0);
+    app.advance(10.0);
+    app.open_diagnostics(10.0);
+    app.advance(11.0);
+    assert_eq!(app.nav.current(), CompactRoute::Diagnostics);
+    app.set_diagnostics(DiagnosticsView {
+        text_chars: 128,
+        ime_updates: 14,
+        deletions: 3,
+        resumes: 4,
+        surface_recreates: 2,
+        frames_gated: 17,
+        frames_after_destroy: 0,
+        probe_saves: 3,
+        probe_restores: 3,
+        avg_fps: Some(59.6),
+        frames: 2_400,
+        inset_updates: 6,
+        inset_top: 28.0,
+        inset_bottom: 20.0,
+        back_presses: 2,
+        crash: Some(CrashBanner {
+            live: false,
+            text: "=== Suramak spike crash #1 ===\nwhen: 2026-11-11\nwhere: src/app.rs:10:5\npanic: rotation probe\n--- last 3 platform events ---\n[0.10s] info onCreate"
+                .to_string(),
+        }),
+    });
+    let shot = render(&mut app, "diagnostics");
+    assert!(shot.painted_fraction(egui::Color32::BLACK) > 0.5);
+    let ctx = fresh_context(&app);
+    let (_, _, scale) = compact::phone_viewport();
+    let screen = compact::phone_screen_rect();
+    let _ = snapshot::render(&ctx, screen, scale, |ctx| {
+        let _ = compact::ui(ctx, &mut app);
+    });
+    let labels: Vec<String> = a11y::controls(&ctx)
+        .into_iter()
+        .map(|control| control.label)
+        .collect();
+    for expected in ["Clear crash", "Share log", "Back"] {
+        assert!(labels.iter().any(|label| label == expected), "{labels:?}");
+    }
+    assert!(
+        labels.iter().any(|label| label.contains("128 chars")),
+        "the text counter is on the card: {labels:?}"
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.contains("CRASH — LAST LAUNCH")),
+        "the v2.4 banner is on the card: {labels:?}"
+    );
+    assert_eq!(app.back(12.0), suramak_ui::deck::nav::BackOutcome::Popped);
+    assert_eq!(app.nav.current(), CompactRoute::Settings);
 }
 
 #[test]

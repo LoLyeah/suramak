@@ -2,9 +2,11 @@
 # M13g1/M13g2 — the phone-viewport screenshot suite (a CI gate since M13g2).
 #
 # Renders the compact profile at the plan's portrait viewport (1216 × 2640
-# physical, scale 2.6) and writes seven shots under tests/ui-compact/shots/:
-# library, library-light, editor, settings, export-sheet, export-written,
-# settings-tiers. The renderer is
+# physical, scale 2.6) and writes the release-surface shots under
+# tests/ui-compact/shots/: launch-library, library, library-light, library-empty,
+# first-run-download, download-progress, download-resume, onboarding,
+# diagnostics, editor, settings, settings-tiers, export-sheet, export-written.
+# The renderer is
 # `suramak_ui::deck::snapshot` (egui's own tessellation + a CPU rasteriser), so
 # the output is deterministic and needs no GPU; the command still runs under
 # Xvfb because CI's UI harness family does.
@@ -27,7 +29,7 @@ xvfb-run -a --server-args="-screen 0 1400x2800x24" \
 # The Rust writer emits uncompressed PNGs (no image crate in the workspace).
 # Compress the committed artifacts when ImageMagick is present; the assertions
 # below are unaffected.
-SHOTS="library library-light editor settings export-sheet export-written settings-tiers"
+SHOTS="launch-library library library-light library-empty first-run-download download-progress download-resume onboarding diagnostics editor settings settings-tiers export-sheet export-written"
 if command -v convert >/dev/null 2>&1; then
   for shot in $SHOTS; do
     path="tests/ui-compact/shots/$shot.png"

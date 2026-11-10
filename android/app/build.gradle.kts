@@ -18,8 +18,8 @@ android {
         // RECORD_AUDIO flow, the microphone FGS and the record bar).
         // `scripts/android/build-apk.sh` asserts this exact versionName with
         // `aapt dump badging`, which is what the owner checks before installing.
-        versionCode = 10
-        versionName = "0.4.0-m13g2.1"
+        versionCode = 11
+        versionName = "0.4.0-m13g3.1"
 
         // Only the phone ABI: this APK exists to be installed by the owner.
         ndk {

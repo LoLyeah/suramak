@@ -1,6 +1,7 @@
 package app.suramak.spike
 
 import android.Manifest
+import android.animation.ValueAnimator
 import android.content.ClipData
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -11,6 +12,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.provider.Settings
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
@@ -32,13 +34,13 @@ import androidx.core.content.FileProvider
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import app.suramak.mic.MicBridge
-import app.suramak.mic.RecordBar
 import app.suramak.mic.RecordingService
 import app.suramak.transcribe.ImportSource
 import app.suramak.transcribe.ModelChoice
 import app.suramak.transcribe.Notify
 import app.suramak.transcribe.TranscribeBridge
 import app.suramak.models.DeviceMemory
+import app.suramak.models.ModelDownloadJobService
 import app.suramak.transcribe.TranscriptionJobService
 import app.suramak.ui.ExportWriter
 import app.suramak.ui.UiBridge
@@ -99,7 +101,7 @@ import org.json.JSONObject
  * `filesDir` above is `CrashFiles.dir(this)` — the app's *external* files dir
  * since v2.1 (`Android/data/app.suramak.spike/files`), not the private one.
  */
-class MainActivity : GameActivity(), RecordBar.Listener {
+class MainActivity : GameActivity() {
 
     /** Cached so Rust's recreate request never touches a View off the UI thread. */
     private var root: View? = null
@@ -181,12 +183,12 @@ class MainActivity : GameActivity(), RecordBar.Listener {
         }
 
     /**
-     * M13F — the pre-compact-UI record bar. It reads the Rust host's status;
-     * it is deliberately not a second source of recording state.
+     * M13F — the microphone host. The pre-compact record bar is gone (M13g3:
+     * the compact Library's Record is the entry); the host itself is unchanged.
      */
-    private var recordBar: RecordBar? = null
-
     private external fun nativeInit(filesDir: String)
+
+    private external fun nativeSetReduceMotion(enabled: Boolean)
 
     private external fun nativeSetInsets(
         top: Int,
@@ -233,8 +235,13 @@ class MainActivity : GameActivity(), RecordBar.Listener {
         init {
             // Must run before GameActivity.onCreate calls initializeNativeCode():
             // class initialisation happens when the Activity is instantiated, so
-            // the library is loaded in time.
-            System.loadLibrary("suramak_android_spike")
+            // the library is loaded in time. M13g3: the window and the compact
+            // surface are one library now — `libsuramak_android.so` exports
+            // `android_main` (the M13b lifecycle + the compact shell) and every
+            // bridge symbol (Ui/Model/Transcribe/Mic). The M13b spike library is
+            // still built and packaged for its history and host harness, but no
+            // longer loaded: a second loaded copy would mean a second host.
+            System.loadLibrary("suramak_android")
         }
 
         private const val TAG = "SuramakSpike"
@@ -254,6 +261,29 @@ class MainActivity : GameActivity(), RecordBar.Listener {
 
         /** M13e — the launcher shortcut's action (`res/xml/shortcuts.xml`). */
         const val ACTION_IMPORT_AUDIO = "app.suramak.action.IMPORT_AUDIO"
+
+        /**
+         * M13g3 — the compact surface's platform verbs. Rust sends these as
+         * explicit intents to this Activity (Application context +
+         * FLAG_ACTIVITY_NEW_TASK; `singleTask` delivers them to `onNewIntent`),
+         * because the Activity is the only owner of the picker, the services
+         * and `finishAndRemoveTask`. The strings are mirrored in
+         * `crates/suramak-android-spike/src/shell.rs`.
+         */
+        const val ACTION_COMPACT_IMPORT = "app.suramak.action.COMPACT_IMPORT"
+        const val ACTION_COMPACT_RECORD = "app.suramak.action.COMPACT_RECORD"
+        const val ACTION_COMPACT_STOP_RECORDING = "app.suramak.action.COMPACT_STOP_RECORDING"
+        const val ACTION_COMPACT_EXPORT = "app.suramak.action.COMPACT_EXPORT"
+        const val ACTION_COMPACT_SHARE = "app.suramak.action.COMPACT_SHARE"
+        const val ACTION_COMPACT_DOWNLOAD = "app.suramak.action.COMPACT_DOWNLOAD"
+        const val ACTION_COMPACT_QUIT = "app.suramak.action.COMPACT_QUIT"
+        const val ACTION_COMPACT_FINISH = "app.suramak.action.COMPACT_FINISH"
+        const val ACTION_COMPACT_SHARE_CRASH = "app.suramak.action.COMPACT_SHARE_CRASH"
+
+        private const val EXTRA_FORMAT = "format"
+        private const val EXTRA_BILINGUAL = "bilingual"
+        private const val EXTRA_MODEL = "model"
+        private const val EXTRA_LANGUAGE = "language"
 
         /** M13e — the POST_NOTIFICATIONS request code. */
         private const val REQUEST_NOTIFICATIONS = 4301
@@ -287,6 +317,22 @@ class MainActivity : GameActivity(), RecordBar.Listener {
             Log.e(TAG, "nativeInit failed", t)
         }
 
+        // M13g3: the compact host must exist *before* `super.onCreate` starts
+        // the native thread — `android_main`'s first frame draws the Library
+        // from it. `UiBridge.init` is idempotent (one process-wide host), so
+        // this is the same call the later job-host block used to make.
+        try {
+            UiBridge.init(this)
+            UiBridge.device(
+                DeviceMemory.read(this),
+                freeBytes = DeviceMemory.freeBytes(this),
+                reduceMotion = reduceMotionEnabled(),
+            )
+            nativeSetReduceMotion(reduceMotionEnabled())
+        } catch (t: Throwable) {
+            Log.w(TAG, "the compact UI host did not initialise", t)
+        }
+
         // v2.4: the instance state comes back *before* `super.onCreate` starts the
         // native thread, so the restored text is already in SpikeState when
         // `android_main` for this Activity runs. Same process for a rotation, a
@@ -317,26 +363,36 @@ class MainActivity : GameActivity(), RecordBar.Listener {
         val micStatus = try {
             TranscribeBridge.init(this)
             val status = MicBridge.init(this)
-            // M13g1: the compact UI host reads the same library/settings. Its
-            // device probe is what makes the Settings model table follow the
-            // M13D tiers; a probe failure only leaves that table unseeded.
-            try {
-                UiBridge.init(this)
-                UiBridge.device(DeviceMemory.read(this))
-            } catch (t: Throwable) {
-                Log.w(TAG, "the compact UI host did not initialise", t)
-            }
             Notify.ensureChannels(this)
             status
         } catch (t: Throwable) {
             Log.e(TAG, "the transcription/microphone host did not initialise", t)
             null
         }
-        installRecordBar()
         micStatus?.let { showRecoveredRecording(it) }
         requestNotificationPermission()
         handleLaunchIntent(intent)
         offerRecovery()
+    }
+
+    /**
+     * M13g3 — whether the OS asks for reduced motion. `areAnimatorsEnabled()`
+     * is Android 12's accessibility animator switch; the two system scales are
+     * what a user turning animation off in Developer options changes. Either
+     * one at zero means the compact surface keeps its fades and drops springs.
+     */
+    private fun reduceMotionEnabled(): Boolean {
+        val durations = Settings.Global.getFloat(
+            contentResolver,
+            Settings.Global.ANIMATOR_DURATION_SCALE,
+            1f,
+        )
+        val transition = Settings.Global.getFloat(
+            contentResolver,
+            Settings.Global.TRANSITION_ANIMATION_SCALE,
+            1f,
+        )
+        return !ValueAnimator.areAnimatorsEnabled() || durations == 0f || transition == 0f
     }
 
     /**
@@ -373,8 +429,9 @@ class MainActivity : GameActivity(), RecordBar.Listener {
         pushCurrentInsets()
         // A recording may have been stopped by the notification, an
         // interruption or a process recovery while this Activity was away.
-        recordBar?.refresh()
-        recordBar?.startTicker()
+        // M13g3: the compact surface reads the host's status; there is no
+        // second Kotlin record bar to refresh.
+        logToRust("mic: status is owned by the compact host")
         // A crash recorded by Rust while the surface was dead only becomes
         // readable here if the overlay missed it.
         showCrashOverlayIfPresent("resume", force = false)
@@ -382,10 +439,6 @@ class MainActivity : GameActivity(), RecordBar.Listener {
 
     override fun onPause() {
         logToRust("onPause")
-        // Stop the record bar's status poll: with the screen locked the
-        // service (and its wake lock) owns the recording, and a UI timer would
-        // keep waking the process for nothing.
-        recordBar?.stopTicker()
         super.onPause()
     }
 
@@ -466,7 +519,37 @@ class MainActivity : GameActivity(), RecordBar.Listener {
                 val id = intent.getStringExtra(Notify.EXTRA_TRANSCRIPT_ID)
                 if (id != null) showTranscript(id)
             }
-            Notify.ACTION_OPEN_RECORDING -> recordBar?.refresh()
+            Notify.ACTION_OPEN_RECORDING -> logToRust("mic: recording notification tapped")
+            ACTION_COMPACT_IMPORT -> importLauncher.launch(arrayOf("audio/*", "video/*"))
+            ACTION_COMPACT_RECORD -> recordFromCompact()
+            ACTION_COMPACT_STOP_RECORDING -> {
+                RecordingService.stop(this)
+                logToRust("mic: stop requested from the compact Library")
+            }
+            ACTION_COMPACT_EXPORT -> exportFromCompact(
+                intent.getStringExtra(EXTRA_FORMAT) ?: "md",
+                intent.getBooleanExtra(EXTRA_BILINGUAL, false),
+            )
+            ACTION_COMPACT_SHARE -> shareFromCompact(
+                intent.getStringExtra(EXTRA_FORMAT) ?: "md",
+                intent.getBooleanExtra(EXTRA_BILINGUAL, false),
+            )
+            ACTION_COMPACT_DOWNLOAD -> {
+                val model = intent.getStringExtra(EXTRA_MODEL)
+                val language = intent.getStringExtra(EXTRA_LANGUAGE) ?: "auto"
+                if (model.isNullOrEmpty()) {
+                    logToRust("download: the compact card named no model")
+                } else if (ModelDownloadJobService.enqueue(this, model, language)) {
+                    logToRust("download: scheduled $model ($language)")
+                } else {
+                    Toast.makeText(this, "The download could not be scheduled", Toast.LENGTH_LONG)
+                        .show()
+                    logToRust("download: the platform refused to schedule $model")
+                }
+            }
+            ACTION_COMPACT_QUIT -> quitApp()
+            ACTION_COMPACT_FINISH -> finishAndRemoveTask()
+            ACTION_COMPACT_SHARE_CRASH -> shareCrashLog()
         }
     }
 
@@ -606,28 +689,10 @@ class MainActivity : GameActivity(), RecordBar.Listener {
 
     // --- M13F: microphone ----------------------------------------------------
 
-    /** Adds the stopgap record bar above the egui surface (M13G replaces it). */
-    private fun installRecordBar() {
-        if (recordBar != null) return
-        val decor = window.decorView as? ViewGroup ?: return
-        val bar = RecordBar(this, this)
-        decor.addView(
-            bar,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.BOTTOM,
-            ),
-        )
-        recordBar = bar
-        logToRust("mic: record bar installed")
-    }
-
     /**
      * Surfaces a take the journal replayed after a process kill. The service
      * cannot post this itself (it died with the process); the recovery notice
-     * is the "abrupt end" the workorder asks for on the next launch, alongside
-     * the record bar's line.
+     * is the "abrupt end" the workorder asks for on the next launch.
      */
     private fun showRecoveredRecording(status: JSONObject) {
         val recovered = status.optJSONArray("recovered") ?: return
@@ -649,11 +714,11 @@ class MainActivity : GameActivity(), RecordBar.Listener {
     }
 
     /**
-     * Record was tapped. The permission is requested **once**; after a refusal
-     * the button states the truth and the only way forward is the system app
-     * page — no repeated prompts, no silent failure.
+     * Record was tapped on the compact Library. The permission is requested
+     * **once**; after a refusal the only way forward is the system app page —
+     * no repeated prompts, no silent failure.
      */
-    override fun onRecord() {
+    private fun recordFromCompact() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
             PackageManager.PERMISSION_GRANTED
         ) {
@@ -673,16 +738,6 @@ class MainActivity : GameActivity(), RecordBar.Listener {
         requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_RECORD_AUDIO)
     }
 
-    override fun onStopRecording() {
-        RecordingService.stop(this)
-        logToRust("mic: stop requested from the record bar")
-        recordBar?.postDelayed({ recordBar?.refresh() }, 300L)
-    }
-
-    override fun onOpenSettings() = openMicSettings()
-
-    override fun onQuit() = confirmQuit()
-
     override fun onRequestPermissionsResult(
         requestCode: Int,
         permissions: Array<out String>,
@@ -692,7 +747,6 @@ class MainActivity : GameActivity(), RecordBar.Listener {
         if (requestCode != REQUEST_RECORD_AUDIO) return
         val granted = grantResults.isNotEmpty() &&
             grantResults[0] == PackageManager.PERMISSION_GRANTED
-        recordBar?.refresh()
         if (granted) {
             logToRust("mic: RECORD_AUDIO granted")
             startRecordingFromForeground()
@@ -741,7 +795,6 @@ class MainActivity : GameActivity(), RecordBar.Listener {
             return
         }
         logToRust("mic: recording service started with $model")
-        recordBar?.postDelayed({ recordBar?.refresh() }, 400L)
     }
 
     private fun openMicSettings() {
@@ -757,20 +810,12 @@ class MainActivity : GameActivity(), RecordBar.Listener {
         }
     }
 
-    private fun confirmQuit() {
-        AlertDialog.Builder(this)
-            .setTitle(getString(R.string.mic_quit_title))
-            .setMessage(getString(R.string.mic_quit_body))
-            .setNegativeButton(android.R.string.cancel, null)
-            .setPositiveButton(getString(R.string.mic_quit)) { _, _ -> quitApp() }
-            .show()
-    }
-
     /**
      * **The owner's Quit invariant:** capture first, service second, exit
      * third. `MicBridge.quit()` stops the stream, finalizes the WAV, journals
      * the reason and hands the take to the M13E inbox synchronously; only after
-     * it returns does the service stop and the Activity leave.
+     * it returns does the service stop and the Activity leave. The compact
+     * Settings sheet has already confirmed, so there is no second dialog.
      */
     private fun quitApp() {
         val reply = MicBridge.quit()
@@ -941,7 +986,12 @@ class MainActivity : GameActivity(), RecordBar.Listener {
         // v2.4 spike path below (and, in G2, to `finishAndRemoveTask`).
         try {
             val reply = UiBridge.back()
-            if (reply.optBoolean("ok") && !reply.optBoolean("finish")) {
+            if (reply.optBoolean("ok")) {
+                if (reply.optBoolean("finish")) {
+                    logToRust("back ($source): compact root — finishing the Activity")
+                    finishAndRemoveTask()
+                    return
+                }
                 logToRust(
                     "back ($source): compact ${reply.optString("back")} → ${reply.optString("screen")}",
                 )

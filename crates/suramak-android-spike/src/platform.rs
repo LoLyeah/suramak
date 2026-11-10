@@ -174,6 +174,19 @@ pub fn begin_activity() -> u32 {
     CURRENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
 }
 
+/// Whether the OS asked for reduced motion. The Kotlin shim reports the
+/// animator duration scale (0 = animations off) and `Settings.Global`'s
+/// transition scales; the compact surface keeps opacity and drops springs.
+static REDUCE_MOTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn reduce_motion() -> bool {
+    REDUCE_MOTION.load(Ordering::SeqCst)
+}
+
+pub fn set_reduce_motion(enabled: bool) {
+    REDUCE_MOTION.store(enabled, Ordering::SeqCst);
+}
+
 /// Was **this** generation's Activity destroyed? `android-activity` documents
 /// that `android_main` must return promptly once the Activity is destroyed
 /// (`android-activity-0.6.1/src/lib.rs`, "No associated Activity after
@@ -358,6 +371,22 @@ pub extern "system" fn Java_app_suramak_spike_MainActivity_nativeBackPressed(
     });
 }
 
+/// `MainActivity.nativeSetReduceMotion(enabled)` — the OS's Reduce Motion
+/// state for the compact surface (M13g3). The value is read by the shell each
+/// frame; it never starts a frame of its own.
+#[no_mangle]
+pub extern "system" fn Java_app_suramak_spike_MainActivity_nativeSetReduceMotion(
+    _env: *mut jni::sys::JNIEnv,
+    _this: jni::sys::jobject,
+    enabled: jni::sys::jboolean,
+) {
+    jni_guard("nativeSetReduceMotion", || {
+        let enabled = enabled != 0;
+        set_reduce_motion(enabled);
+        diag::info(format!("jni: nativeSetReduceMotion({enabled})"));
+    });
+}
+
 /// `MainActivity.nativeImeText(text, selectionStart, selectionEnd)` — the soft
 /// keyboard's editing state, forwarded from `GameActivity.stateChanged`.
 ///
@@ -414,6 +443,12 @@ pub extern "system" fn Java_app_suramak_spike_MainActivity_nativeImeText(
 /// inside the platform's patience), then builds the JNI string outside the lock.
 /// Returns null if anything at all goes wrong: Kotlin treats null as "nothing to
 /// save", never as an error to throw inside a lifecycle callback.
+///
+/// The raw `JNIEnv` pointer is the JVM's own argument; the function is called
+/// only through JNI, which guarantees its validity for the call. The lint is
+/// allowed for that ABI reason (marking the export `unsafe` would not change
+/// the symbol, but the JNI contract is the safety argument).
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[no_mangle]
 pub extern "system" fn Java_app_suramak_spike_MainActivity_nativeSaveProbe(
     env: *mut jni::sys::JNIEnv,

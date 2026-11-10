@@ -34,3 +34,10 @@ ndk-context = "0.1"
 # plain `call_method(&[JValue])` API; the inbound JNI exports take raw
 # `jni::sys` pointers, so no wrapper types cross the FFI boundary.
 jni = "0.21"
+# M13g3: the compact surface is the product's launch screen. The shell draws
+# `suramak_ui::deck::compact` from the same `CompactApp` the JNI host owns, and
+# answers its actions through `suramak_android::compact_host` (library/settings/
+# save/export), the model host's progress, and Kotlin intents for the platform's
+# own verbs (picker, share, record, job schedule, quit). All path deps: no new
+# package enters `Cargo.lock`.
+suramak-ui = { path = "../suramak-ui" }

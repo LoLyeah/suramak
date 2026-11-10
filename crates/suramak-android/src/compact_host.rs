@@ -43,6 +43,8 @@ struct Inner {
     app: CompactApp,
     dirs: HostDirs,
     settings_path: PathBuf,
+    /// The last device probe; the download card and `download_state` reuse it.
+    profile: Option<DeviceProfile>,
     /// The export job slot (single-flight; staging under `files/exports`).
     exports: ExportJobs,
 }
@@ -60,16 +62,24 @@ impl CompactHost {
             LangMode::Fixed(lang) => lang.clone(),
         };
         app.settings.language = language;
+        app.first_run_seen = settings.ui.first_run_seen;
         let mut inner = Inner {
             app,
             dirs,
             settings_path,
+            profile: None,
             exports: ExportJobs::new(root),
         };
         inner.reload_library();
         Self {
             inner: Mutex::new(inner),
         }
+    }
+
+    /// Runs `f` against the one app state (the Android shell draws it directly;
+    /// the JNI ops mutate the same object, so the phone never has two routes).
+    pub fn with_app<R>(&self, f: impl FnOnce(&mut CompactApp) -> R) -> Option<R> {
+        self.inner.lock().ok().map(|mut inner| f(&mut inner.app))
     }
 
     /// Runs one JSON command. Never panics on bad input.
@@ -98,6 +108,8 @@ impl CompactHost {
             "save_segment" => inner.save_segment(&value),
             "setting" => inner.setting(&value),
             "device" => inner.device(&value),
+            "download_state" => inner.download_state(),
+            "refresh_models" => inner.refresh_models(),
             "export" => inner.prepare_export(&value, false),
             "export_share" => inner.prepare_export(&value, true),
             "export_done" => inner.finish_export(&value),
@@ -130,6 +142,7 @@ impl Inner {
             CompactRoute::Library => "library",
             CompactRoute::Editor => "editor",
             CompactRoute::Settings => "settings",
+            CompactRoute::Diagnostics => "diagnostics",
         };
         json!({
             "ok": true,
@@ -137,9 +150,11 @@ impl Inner {
             "depth": self.app.nav.depth(),
             "transcript_id": self.app.editor.as_ref().map(|editor| editor.transcript.id.to_string()),
             "title": self.app.editor.as_ref().map(|editor| editor.transcript.title.clone()),
-            "sheet": match self.app.sheet { Some(Sheet::Export) => "export", Some(Sheet::Quit) => "quit", None => "none" },
+            "sheet": match self.app.sheet { Some(Sheet::Export) => "export", Some(Sheet::Quit) => "quit", Some(Sheet::Onboarding) => "onboarding", None => "none" },
             "status": self.app.status.as_ref().map(|(text, error)| json!({"text": text, "error": error})),
             "library_rows": self.app.rows.len(),
+            "first_run_seen": self.app.first_run_seen,
+            "recording": self.app.recording,
             "models": self.app.models.iter().map(|row| json!({
                 "id": row.id,
                 "offered": row.offered,
@@ -178,11 +193,16 @@ impl Inner {
         match found {
             Some(transcript) => {
                 self.reload_library();
-                let translations = Store::open(&self.dirs.db_path)
-                    .ok()
+                let store = Store::open(&self.dirs.db_path).ok();
+                let translations = store
+                    .as_ref()
                     .and_then(|store| store.segment_translations(uuid).ok())
                     .unwrap_or_default();
-                self.app.deep_link(transcript, now);
+                let words = store
+                    .as_ref()
+                    .and_then(|store| store.word_alignment(uuid).ok())
+                    .unwrap_or_default();
+                self.app.deep_link_words(transcript, words, now);
                 if let Some(editor) = self.app.editor.as_mut() {
                     editor.has_translation = !translations.is_empty();
                 }
@@ -204,6 +224,11 @@ impl Inner {
             if let Some(live) = self.exports.live() {
                 self.exports.cancel(&live.job);
             }
+        }
+        // M13g3: a back gesture on the one-time intro is Skip; persist it here
+        // because the gesture has no action vector of its own.
+        if self.app.take_onboarding_seen() {
+            self.persist_first_run_seen(true);
         }
         self.app.nav.settle();
         let mut reply: Value =
@@ -289,6 +314,11 @@ impl Inner {
                 settings.storage.keep_audio = keep;
                 self.app.apply_setting(CompactSetting::KeepAudio(keep));
             }
+            "first_run_seen" => {
+                let seen = value.get("value").and_then(Value::as_bool).unwrap_or(true);
+                settings.ui.first_run_seen = seen;
+                self.app.apply_setting(CompactSetting::FirstRunSeen(seen));
+            }
             other => return error(&format!("unknown setting '{other}'")),
         }
         if let Err(err) = settings.save(&self.settings_path) {
@@ -309,8 +339,90 @@ impl Inner {
             value.get("arm64").and_then(Value::as_bool).unwrap_or(true),
         );
         let installed = installed_models(&self.dirs.models_dir);
+        self.profile = Some(profile);
         self.app.seed_device(profile, &installed);
+        self.app
+            .set_free_space(value.get("free_bytes").and_then(Value::as_u64));
+        if let Some(reduce) = value.get("reduce_motion").and_then(Value::as_bool) {
+            self.app.reduce_motion = reduce;
+        }
         self.snapshot()
+    }
+
+    /// Rescans `files/models` after a job finishes, adopts the new model as the
+    /// setting when nothing else is installed, and re-derives the card.
+    fn refresh_models(&mut self) -> String {
+        let installed = installed_models(&self.dirs.models_dir);
+        self.app.refresh_models(&installed);
+        if let Some(profile) = self.profile {
+            if self.app.model_card_needed() {
+                self.app.seed_device(profile, &installed);
+            }
+        }
+        if self
+            .app
+            .download
+            .as_ref()
+            .is_some_and(|download| installed.iter().any(|id| id == &download.model))
+        {
+            if let Some(model) = self.app.recommended_model().map(|row| row.id.clone()) {
+                if installed.iter().any(|id| id == &model) {
+                    self.app.apply_setting(CompactSetting::Model(model.clone()));
+                    let mut settings = Settings::load(&self.settings_path).unwrap_or_default();
+                    settings.asr.model_id = model;
+                    let _ = settings.save(&self.settings_path);
+                }
+            }
+            self.app.clear_download();
+        }
+        self.snapshot()
+    }
+
+    /// The `.part` a killed run left, at the job's own percent. The card offers
+    /// **Resume** from this; the next `start` appends from the same byte.
+    fn download_state(&mut self) -> String {
+        let Some(profile) = self.profile else {
+            return json!({ "ok": true, "known": false }).to_string();
+        };
+        let recommendation = suramak_core::device::recommend(profile, &self.app.settings.language);
+        let Some(model_id) = recommendation.default_model_id else {
+            return json!({ "ok": true, "known": false }).to_string();
+        };
+        let installed = installed_models(&self.dirs.models_dir);
+        if installed.iter().any(|id| id == model_id) {
+            return json!({ "ok": true, "known": true, "model": model_id, "installed": true })
+                .to_string();
+        }
+        let Some(info) = suramak_core::models::find_model(model_id) else {
+            return error("the recommended model is not in the manifest");
+        };
+        let part = suramak_core::download::part_path(&self.dirs.models_dir.join(info.hf_file));
+        let bytes_done = std::fs::metadata(&part).map(|meta| meta.len()).unwrap_or(0);
+        if bytes_done == 0 {
+            return json!({ "ok": true, "known": true, "model": model_id, "installed": false })
+                .to_string();
+        }
+        let percent = crate::model_host::percent(bytes_done, info.size_bytes);
+        json!({
+            "ok": true,
+            "known": true,
+            "model": model_id,
+            "installed": false,
+            "bytes_done": bytes_done,
+            "bytes_total": info.size_bytes,
+            "percent": percent,
+        })
+        .to_string()
+    }
+
+    /// Writes `first_run_seen` without touching the other settings.
+    fn persist_first_run_seen(&mut self, seen: bool) {
+        let mut settings = Settings::load(&self.settings_path).unwrap_or_default();
+        settings.ui.first_run_seen = seen;
+        if let Err(err) = settings.save(&self.settings_path) {
+            self.app
+                .on_save_failed(format!("could not save the intro state: {err}"));
+        }
     }
 
     /// `export` / `export_share`: render through the M15 serializer, stage the
@@ -678,6 +790,65 @@ mod tests {
         let saved = Settings::load(&dir.join("settings.toml")).expect("settings");
         assert_eq!(saved.ui.appearance, Appearance::Light);
         assert_eq!(saved.asr.language, LangMode::Fixed("id".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_intro_flag_is_persisted_additively_and_a_new_host_reads_it() {
+        let dir =
+            std::env::temp_dir().join(format!("suramak-compact-host-{}", uuid::Uuid::new_v4()));
+        fixture(&dir);
+        let host = CompactHost::new(&dir);
+        let route: Value = serde_json::from_str(&host.dispatch(r#"{"op":"route"}"#)).expect("json");
+        assert_eq!(
+            route["first_run_seen"], false,
+            "a fresh install shows the intro"
+        );
+        let saved: Value = serde_json::from_str(&host.dispatch(
+            &json!({ "op": "setting", "setting": "first_run_seen", "value": true }).to_string(),
+        ))
+        .expect("json");
+        assert_eq!(saved["first_run_seen"], true);
+        let settings = Settings::load(&dir.join("settings.toml")).expect("settings");
+        assert!(settings.ui.first_run_seen);
+        // A relaunch constructs a new host over the same settings file.
+        let relaunched = CompactHost::new(&dir);
+        let route: Value =
+            serde_json::from_str(&relaunched.dispatch(r#"{"op":"route"}"#)).expect("json");
+        assert_eq!(route["first_run_seen"], true, "once only");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn download_state_reports_the_part_left_by_a_killed_run() {
+        let dir =
+            std::env::temp_dir().join(format!("suramak-compact-host-{}", uuid::Uuid::new_v4()));
+        fixture(&dir);
+        let host = CompactHost::new(&dir);
+        let _ = host.dispatch(
+            &json!({
+                "op": "device",
+                "total_ram_bytes": 6_000_000_000u64,
+                "available_ram_bytes": 2_000_000_000u64,
+                "low_memory": false,
+                "arm64": true,
+                "free_bytes": 9_000_000_000u64,
+            })
+            .to_string(),
+        );
+        let base = suramak_core::models::find_model("base").expect("base");
+        let part = suramak_core::download::part_path(&dir.join("models").join(base.hf_file));
+        std::fs::create_dir_all(part.parent().expect("models dir")).expect("models dir");
+        std::fs::write(&part, vec![0u8; 1_000]).expect("part");
+        let reply: Value =
+            serde_json::from_str(&host.dispatch(r#"{"op":"download_state"}"#)).expect("json");
+        assert_eq!(reply["known"], true);
+        assert_eq!(reply["model"], "base");
+        assert_eq!(reply["bytes_done"], 1_000);
+        assert_eq!(
+            reply["percent"],
+            crate::model_host::percent(1_000, base.size_bytes)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

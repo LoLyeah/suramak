@@ -12,12 +12,21 @@
 //! crossfades keep their token. A progress fill is a width tween, not a
 //! vestibular motion, so it is unchanged.
 
-use crate::deck::motion::{self, ease_out};
+use crate::deck::motion::{self, ease_out, spring_ease};
 
 /// How far a sheet rises while presenting (points).
 pub const SHEET_RISE: f32 = 14.0;
 /// How far a new list row slides up while it appears (points).
 pub const ROW_RISE: f32 = 6.0;
+
+/// The curve a sheet's present animation rides. G2's export/quit sheets use
+/// the ease-out; G3's one-time intro uses the Deck press spring (the
+/// workorder's "the sheet rides the Deck spring").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SheetCurve {
+    Ease,
+    Spring,
+}
 
 /// A sheet's present/dismiss animation.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -29,6 +38,7 @@ pub struct SheetAnim {
     duration: f32,
     done: bool,
     present: bool,
+    curve: SheetCurve,
 }
 
 impl SheetAnim {
@@ -42,29 +52,74 @@ impl SheetAnim {
             duration: 0.0,
             done: true,
             present: false,
+            curve: SheetCurve::Ease,
         }
     }
 
     /// Starts (or retargets) the animation. A flip mid-flight starts from the
     /// **current** value — it never snaps back to 0 and never queues.
     pub fn begin(&mut self, present: bool, now: f64) {
+        self.begin_with(present, now, SheetCurve::Ease);
+    }
+
+    /// The intro's presentation: the same fade and rise, but the value rides
+    /// the Deck's damped spring ([`motion::spring_ease`]) instead of the
+    /// ease-out. Dismissal stays the fast ease-out (exits do not bounce).
+    pub fn begin_spring(&mut self, present: bool, now: f64) {
+        self.begin_with(
+            present,
+            now,
+            if present {
+                SheetCurve::Spring
+            } else {
+                SheetCurve::Ease
+            },
+        );
+    }
+
+    fn begin_with(&mut self, present: bool, now: f64, curve: SheetCurve) {
         self.from = self.value;
         self.target = if present { 1.0 } else { 0.0 };
-        self.duration = if present { motion::BASE } else { motion::FAST };
+        self.duration = if !present {
+            motion::FAST
+        } else if curve == SheetCurve::Spring {
+            motion::SPRING_DURATION
+        } else {
+            motion::BASE
+        };
         self.started_at = now;
         self.present = present;
         self.done = false;
+        self.curve = curve;
     }
 
     /// Advances the animation. Returns whether another frame is needed.
-    pub fn advance(&mut self, now: f64, _reduce_motion: bool) -> bool {
+    ///
+    /// Under Reduce Motion a spring-sheet keeps its **fade** (the base token,
+    /// the same one the export sheet uses) and loses the spring's travel
+    /// shape — the state is unchanged, only the arrival stops springing.
+    pub fn advance(&mut self, now: f64, reduce_motion: bool) -> bool {
         if self.done {
             return false;
         }
         motion::reanchor(&mut self.started_at, now);
         let elapsed = (now - self.started_at).max(0.0) as f32;
-        let t = (elapsed / self.duration.max(1e-6)).clamp(0.0, 1.0);
-        self.value = self.from + (self.target - self.from) * ease_out(t);
+        let reduced_spring = reduce_motion && self.curve == SheetCurve::Spring;
+        let duration = if reduced_spring {
+            motion::BASE
+        } else {
+            self.duration
+        };
+        let t = (elapsed / duration.max(1e-6)).clamp(0.0, 1.0);
+        let eased = if reduced_spring {
+            ease_out(t)
+        } else {
+            match self.curve {
+                SheetCurve::Ease => ease_out(t),
+                SheetCurve::Spring => spring_ease(t),
+            }
+        };
+        self.value = self.from + (self.target - self.from) * eased;
         if t >= 1.0 {
             self.value = self.target;
             self.done = true;
@@ -72,9 +127,16 @@ impl SheetAnim {
         !self.done
     }
 
-    /// The fade factor (0..=1).
+    /// The fade factor (0..=1). A spring may overshoot past 1 internally; the
+    /// opacity is clamped (an opacity cannot exceed opaque), while [`rise`]
+    /// uses the unclamped value so the travel carries the spring.
     pub fn value(&self) -> f32 {
         self.value.clamp(0.0, 1.0)
+    }
+
+    /// The unclamped 0..=1+overshoot value (the spring's geometry).
+    pub fn raw_value(&self) -> f32 {
+        self.value
     }
 
     /// Whether the sheet must still be painted (the closing fade ends first).
@@ -90,13 +152,17 @@ impl SheetAnim {
         self.done
     }
 
+    pub fn curve(&self) -> SheetCurve {
+        self.curve
+    }
+
     /// The body's rise in points. Zero under Reduce Motion: translation is the
     /// part of a sheet presentation that can unsettle, the fade is not.
     pub fn rise(&self, reduce_motion: bool) -> f32 {
         if reduce_motion {
             0.0
         } else {
-            SHEET_RISE * (1.0 - self.value)
+            SHEET_RISE * (1.0 - self.value.clamp(0.0, 1.0 + motion::SPRING_OVERSHOOT))
         }
     }
 
@@ -374,6 +440,46 @@ mod tests {
         );
         sheet.advance(0.4, false);
         assert_eq!(sheet.value(), 0.0);
+    }
+
+    #[test]
+    fn the_onboarding_sheet_rides_the_deck_spring_and_lands_exactly() {
+        let mut sheet = SheetAnim::closed();
+        sheet.begin_spring(true, 0.0);
+        assert_eq!(sheet.curve(), SheetCurve::Spring);
+        let mut peak = 0.0_f32;
+        let mut time = 0.0;
+        for _ in 0..60 {
+            time += 0.006;
+            sheet.advance(time, false);
+            peak = peak.max(sheet.raw_value());
+        }
+        assert!(
+            peak > 1.0,
+            "the Deck spring overshoots by design: peak {peak}"
+        );
+        assert!(
+            peak <= 1.0 + motion::SPRING_OVERSHOOT + 1e-6,
+            "bounded by the shared overshoot: {peak}"
+        );
+        sheet.advance(1.0, false);
+        assert_eq!(sheet.value(), 1.0);
+        assert_eq!(sheet.raw_value(), 1.0);
+        assert!(sheet.is_done());
+
+        // Dismissal is the fast ease-out, never a bounce.
+        sheet.begin_spring(false, 2.0);
+        assert_eq!(sheet.curve(), SheetCurve::Ease);
+        sheet.advance(2.2, false);
+        assert_eq!(sheet.value(), 0.0);
+
+        // Reduce Motion removes the spring and keeps the fade: the value is the
+        // ease-out's, but the body has no rise at all.
+        let mut reduced = SheetAnim::closed();
+        reduced.begin_spring(true, 0.0);
+        reduced.advance(0.06, true);
+        assert!(reduced.value() > 0.0 && reduced.value() < 1.0);
+        assert_eq!(reduced.rise(true), 0.0);
     }
 
     #[test]

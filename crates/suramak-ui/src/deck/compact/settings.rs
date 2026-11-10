@@ -399,6 +399,28 @@ pub fn ui(
         );
         y = device_card.bottom() + 22.0;
 
+        // ---- Diagnostics (M13g3) --------------------------------------
+        // The M13b spike's four checks live here now, one card per group, with
+        // the v2.4 crash banner. It stays a push (back returns to Settings) and
+        // every read-out is on that screen.
+        chrome::section_label(ui, tokens, pos2(x, y), "Diagnostics");
+        y += 18.0;
+        let diagnostics_row = Rect::from_min_size(pos2(x, y), vec2(width, 58.0));
+        let response = chrome::setting_row(
+            ui,
+            tokens,
+            motion,
+            diagnostics_row,
+            "settings-diagnostics",
+            "Diagnostics",
+            "Four checks · last crash",
+            true,
+        );
+        if response.clicked() {
+            state.open_diagnostics(now);
+        }
+        y = diagnostics_row.bottom() + 22.0;
+
         // ---- Quit -----------------------------------------------------
         let quit = Rect::from_min_size(pos2(x, y), vec2(width, 52.0));
         let response = a11y::touch(

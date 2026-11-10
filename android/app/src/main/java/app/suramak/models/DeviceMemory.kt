@@ -43,4 +43,14 @@ object DeviceMemory {
             arm64 = Build.SUPPORTED_64_BIT_ABIS.any { it == "arm64-v8a" },
         )
     }
+
+    /**
+     * M13g3 — free bytes on the volume the models live on (`filesDir`). The
+     * first-run card shows this before a download and the M13D preflight is the
+     * authority that refuses; this is only the number the card prints.
+     */
+    fun freeBytes(context: Context): Long {
+        val stat = android.os.StatFs(context.filesDir.absolutePath)
+        return stat.availableBytes
+    }
 }

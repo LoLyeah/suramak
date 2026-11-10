@@ -176,13 +176,13 @@ if [ -x "$AAPT" ]; then
   # Same SIGPIPE reasoning as above: match in the shell, not through a pipe.
   BADGING="$("$AAPT" dump badging "$APK")"
   case "$BADGING" in
-    *"package: name='app.suramak.spike' versionCode='10' versionName='0.4.0-m13g2.1'"*) ;;
+    *"package: name='app.suramak.spike' versionCode='11' versionName='0.4.0-m13g3.1'"*) ;;
     *)
       # Fall back to a narrower match so a future versionCode bump does not
       # hide a real versionName regression.
       case "$BADGING" in
-        *"package: name='app.suramak.spike'"*"versionName='0.4.0-m13g2.1'"*) ;;
-        *) fail "APK versionName is not 0.4.0-m13g2.1 (see aapt output below)" ;;
+        *"package: name='app.suramak.spike'"*"versionName='0.4.0-m13g3.1'"*) ;;
+        *) fail "APK versionName is not 0.4.0-m13g3.1 (see aapt output below)" ;;
       esac
       ;;
   esac
@@ -330,6 +330,27 @@ if [ -x "$AAPT" ]; then
       *"Java_app_suramak_ui_UiBridge_nativeCommand"*) ;;
       *) fail "$APP_SO exports no UiBridge.nativeCommand symbol" ;;
     esac
+    # M13g3: the window's entry point and the Activity JNI exports moved into
+    # `libsuramak_android.so` with the compact surface. A missing `android_main`
+    # is an app that opens nothing; a missing `nativeInit` is a crash on the
+    # first Activity frame (GameActivity's glue loads this one library).
+    case "$SYMBOLS" in
+      *" T android_main"*) ;;
+      *) fail "$APP_SO exports no android_main (the compact launch surface)" ;;
+    esac
+    for SYMBOL in \
+      Java_app_suramak_spike_MainActivity_nativeInit \
+      Java_app_suramak_spike_MainActivity_nativeSetInsets \
+      Java_app_suramak_spike_MainActivity_nativeSetReduceMotion \
+      Java_app_suramak_spike_MainActivity_nativeBackPressed \
+      Java_app_suramak_spike_MainActivity_nativeImeText \
+      Java_app_suramak_spike_MainActivity_nativeActivityDestroyed
+    do
+      case "$SYMBOLS" in
+        *"$SYMBOL"*) ;;
+        *) fail "$APP_SO exports no $SYMBOL (the Kotlin shim declares it)" ;;
+      esac
+    done
   else
     fail "no llvm-nm at $LLVM_NM (cannot verify the JNI symbols)"
   fi
@@ -416,6 +437,27 @@ grep -q "exportLauncher.launch" android/app/src/main/java/app/suramak/spike/Main
   || fail "MainActivity never launches the export picker"
 grep -q "UiBridge.exportDone" android/app/src/main/java/app/suramak/spike/MainActivity.kt \
   || fail "MainActivity never reports a completed export to the host"
+
+# --- 3d. The missing-model gate (M13g3) -------------------------------------
+# The release path must never bundle a model: a fresh install has no model, so
+# the first screen is the download card. Two assertions make that structural:
+# the APK carries no model payload at all, and the packaged dex carries the
+# compact download verb the card sends (a missing verb is a dead button on the
+# one screen a first-run user sees). aapt's manifest checks above already prove
+# the dataSync download service is declared.
+case "$APK_LISTING" in
+  *"assets/models/"*|*"assets/model/"*)
+    fail "the APK bundles a model under assets/ — a fresh install must start on the download card" ;;
+esac
+MODEL_PAYLOAD="$(printf '%s\n' "$APK_LISTING" | grep -E '(^| )assets/.*\.(bin|ggml|onnx)$|res/raw/.*\.(bin|ggml|onnx)$' || true)"
+[ -z "$MODEL_PAYLOAD" ] \
+  || fail "the APK carries a model payload (models are downloaded, never bundled): $MODEL_PAYLOAD"
+grep -q "app.suramak.action.COMPACT_DOWNLOAD" android/app/src/main/java/app/suramak/spike/MainActivity.kt \
+  || fail "MainActivity no longer handles the compact download verb (the first-run card would be dead)"
+grep -q "ModelDownloadJobService.enqueue" android/app/src/main/java/app/suramak/spike/MainActivity.kt \
+  || fail "MainActivity does not schedule the model-download job from the first-run card"
+grep -q "first_run_seen" crates/suramak-android/src/compact_host.rs \
+  || fail "the one-time intro is not persisted (no first_run_seen path in the host)"
 
 SIZE="$(stat -c %s "$APK")"
 SHA="$(sha256sum "$APK" | cut -d' ' -f1)"

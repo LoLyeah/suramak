@@ -20,10 +20,13 @@
 
 pub mod a11y;
 pub mod chrome;
+pub mod diagnostics;
 pub mod editor;
+pub mod first_run;
 pub mod library;
 pub mod model;
 pub mod motion;
+pub mod onboarding;
 pub mod settings;
 
 use egui::{vec2, Rect, Ui, UiBuilder};
@@ -32,10 +35,10 @@ use crate::deck::motion::Motion;
 use crate::deck::theme::{self, AppTheme, Tokens};
 
 pub use model::{
-    bytes_label, clock, count_noun, row_key, sanitise_stem, snippet, CompactAction, CompactApp,
-    CompactEditor, CompactExportFormat, CompactRoute, CompactSetting, CompactSettings, ExportPhase,
-    ExportSession, FlingProbe, Insets, JobView, LibraryHit, LibraryRow, ModelRow, SegmentEdit,
-    Sheet,
+    bytes_label, clock, count_noun, row_key, sanitise_stem, snippet, word_at, CompactAction,
+    CompactApp, CompactEditor, CompactExportFormat, CompactRoute, CompactSetting, CompactSettings,
+    CrashBanner, DiagnosticsView, DownloadState, DownloadView, ExportPhase, ExportSession,
+    FlingProbe, Insets, JobView, LibraryHit, LibraryRow, ModelRow, SegmentEdit, Sheet,
 };
 
 /// Paints one frame of the compact app and returns everything the host must do.
@@ -139,6 +142,18 @@ pub fn ui(ctx: &egui::Context, state: &mut CompactApp) -> Vec<CompactAction> {
                 Some(false) => state.close_export_sheet(now),
                 None => {}
             },
+            Sheet::Onboarding => {
+                let choice = onboarding::sheet(&mut sheet_ui, &tokens, &motion, sheet_rect);
+                match choice {
+                    onboarding::OnboardingChoice::Start => {
+                        actions.push(state.finish_onboarding(now, false));
+                    }
+                    onboarding::OnboardingChoice::Skip => {
+                        actions.push(state.finish_onboarding(now, true));
+                    }
+                    onboarding::OnboardingChoice::None => {}
+                }
+            }
         }
     }
 
@@ -175,6 +190,7 @@ fn draw_route(
         CompactRoute::Library => library::ui(pane, tokens, motion, state, rect),
         CompactRoute::Editor => editor::ui(pane, tokens, motion, state, rect),
         CompactRoute::Settings => settings::ui(pane, tokens, motion, state, rect),
+        CompactRoute::Diagnostics => diagnostics::ui(pane, tokens, motion, state, rect),
     }
 }
 

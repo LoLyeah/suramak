@@ -59,34 +59,36 @@ pub mod surface_lifecycle;
 pub mod ui;
 
 #[cfg(target_os = "android")]
-mod app;
+pub mod app;
 #[cfg(target_os = "android")]
-mod platform;
+pub mod platform;
+#[cfg(target_os = "android")]
+pub mod surface_api;
 
-/// android-activity's entry point. Called on a dedicated thread, once per
+/// android-activity's entry point body. Called on a dedicated thread, once per
 /// Activity instance — i.e. again after a configuration-change recreation,
 /// which is exactly the behaviour check (2) is about.
 ///
-/// Note the ABI: android-activity declares this as a Rust-ABI function
-/// (`fn android_main(app: AndroidApp)`), not `extern "C"` — matching its own
-/// docs. `AndroidApp` is a Rust type with no C layout, so `extern "C"` here
-/// would be wrong (and warns under `-D warnings`).
+/// **M13g3:** the entry point itself moved to `suramak-android` (the library
+/// the APK loads). This function keeps the M13b/M13b-v2.4 lifecycle machinery
+/// — panic containment, the destroy gate, the post-panic looper pump — and
+/// takes the product surface as a trait object, so the compact shell can live
+/// in the crate that owns the compact host (one `CompactApp`, one JNI bridge,
+/// no second copy of either).
 ///
-/// **Panic containment.** `android-activity` wraps this call in its own
-/// `catch_unwind` and then calls `GameActivity_finish()` — one unwinding panic
-/// and the Activity closes instantly, with the reason only in logcat (see
-/// `docs/reports/M13b2-spike-v2.md` §3). The guard below records the panic and
-/// keeps the process in a looper pump instead of returning, so Kotlin can put
-/// the recorded text on screen over the dead surface: the failure stays
-/// readable instead of the window vanishing.
+/// Note the ABI: android-activity declares this as a Rust-ABI function, not
+/// `extern "C"` — matching its own docs. `AndroidApp` is a Rust type with no C
+/// layout, so `extern "C"` here would be wrong (and warns under `-D warnings`).
 #[cfg(target_os = "android")]
-#[no_mangle]
-pub fn android_main(app: android_activity::AndroidApp) {
+pub fn android_entry(
+    app: android_activity::AndroidApp,
+    surface: Box<dyn surface_api::CompactSurface>,
+) {
     diag::init_panic_hook();
     // v2.4: the native-signal dump, armed before the first window call. It is
     // the only record a SIGSEGV/SIGABRT leaves in this process (see `diag`).
     diag::init_signal_handlers();
-    // Each `android_main` serves one Activity instance; the generation makes a
+    // Each entry serves one Activity instance; the generation makes a
     // "destroyed" signal from a previous Activity harmless to this one.
     let generation = platform::begin_activity();
 
@@ -96,8 +98,9 @@ pub fn android_main(app: android_activity::AndroidApp) {
     // SAFETY (unwind safety): nothing is reused after the panic — `app::run`
     // owns the event loop and drops it while unwinding, and the pump below only
     // touches the `AndroidApp` clone (an `Arc`-backed handle).
-    let outcome =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app::run(app, generation)));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        app::run(app, generation, surface)
+    }));
     if let Err(payload) = outcome {
         diag::note_contained("android_main");
         log::error!(

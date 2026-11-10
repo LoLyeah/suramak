@@ -37,3 +37,13 @@ jni = "0.21"
 # unconditionally on this target — no feature flip exists to make). Desktop
 # builds keep the same feature set as before, so no ALSA requirement leaks in.
 suramak-asr = { path = "../suramak-asr", features = ["capture"] }
+# M13g3: the window and its lifecycle gates live in the M13b spike crate; the
+# product surface and the one compact host live here. `android_main` in this
+# crate's lib.rs passes the shell to `android_entry`, so the APK loads one
+# library and there is one `CompactApp` behind both the window and the JNI
+# bridge.
+suramak-android-spike = { path = "../suramak-android-spike" }
+android-activity = { version = "0.6.1", features = ["game-activity"] }
+egui.workspace = true
+log = "0.4"
+ndk-context = "0.1"

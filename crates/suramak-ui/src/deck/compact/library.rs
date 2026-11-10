@@ -22,6 +22,7 @@ use crate::deck::theme::Tokens;
 
 use super::a11y;
 use super::chrome::{self, GUTTER, MIN_TOUCH, ROW};
+use super::first_run;
 use super::model::{clock, CompactAction, CompactApp, CompactRoute};
 
 /// The job strip's height (between the search field and the list).
@@ -133,6 +134,22 @@ pub fn ui(
         list_top = rect.bottom() + 10.0;
     }
 
+    // --- first-run model card ---------------------------------------------
+    // A phone with no installed model must never see an empty library: the
+    // release path lands on M13D's one recommendation for this device and
+    // language, with the free-space line and the job's own percent. The card is
+    // the Library's lead; transcripts (a restored backup) still list below it.
+    if state.model_card_needed() {
+        let available = (bands.content.bottom() - list_top).max(0.0);
+        let height = first_run::height(state).min(available.max(220.0));
+        let rect = Rect::from_min_size(
+            pos2(bands.content.left() + GUTTER, list_top),
+            vec2(bands.content.width() - GUTTER * 2.0, height),
+        );
+        actions.extend(first_run::card(ui, tokens, motion, state, rect));
+        list_top = rect.bottom() + 10.0;
+    }
+
     // --- job strip ----------------------------------------------------------
     if let Some(job) = state.job.clone() {
         let rect = Rect::from_min_size(
@@ -224,6 +241,32 @@ pub fn ui(
                             &row.meta(),
                             selected,
                         );
+                        // The play affordance: a 48 dp target at the row's
+                        // trailing edge opens the transcript with the transport
+                        // running (the compact editor's karaoke surface).
+                        let play = Rect::from_center_size(
+                            pos2(rect.right() - GUTTER - 58.0, rect.center().y),
+                            vec2(48.0, MIN_TOUCH),
+                        );
+                        let play_response = a11y::touch(
+                            &mut row_ui,
+                            tokens,
+                            play,
+                            ("library-play", index),
+                            WidgetType::Button,
+                            &format!("Play {}", row.title),
+                            true,
+                        );
+                        let triangle = pos2(play.center().x + 1.0, play.center().y);
+                        row_ui.painter().add(egui::Shape::convex_polygon(
+                            vec![
+                                pos2(triangle.x - 5.0, triangle.y - 8.0),
+                                pos2(triangle.x - 5.0, triangle.y + 8.0),
+                                pos2(triangle.x + 8.0, triangle.y),
+                            ],
+                            tokens.ink_soft,
+                            Stroke::NONE,
+                        ));
                         // The list ends without a dangling rule under its last
                         // row (chrome::row paints one for row separation).
                         if index + 1 == state.rows.len() {
@@ -236,7 +279,9 @@ pub fn ui(
                                 tokens.window,
                             );
                         }
-                        if response.clicked() {
+                        if play_response.clicked() {
+                            actions.push(CompactAction::PlayTranscript(row.id));
+                        } else if response.clicked() {
                             actions.push(CompactAction::OpenTranscript {
                                 id: row.id,
                                 segment: None,
@@ -375,11 +420,34 @@ pub fn ui(
         actions.push(CompactAction::Import);
     }
     a11y::record_button(ui, import, "Import audio", true);
-    if chrome::action_button(ui, tokens, motion, record, "library-record", "Record", true).clicked()
+    let record_label = if state.recording { "Stop" } else { "Record" };
+    if chrome::action_button(
+        ui,
+        tokens,
+        motion,
+        record,
+        "library-record",
+        record_label,
+        true,
+    )
+    .clicked()
     {
-        actions.push(CompactAction::Record);
+        actions.push(if state.recording {
+            CompactAction::StopRecording
+        } else {
+            CompactAction::Record
+        });
     }
-    a11y::record_button(ui, record, "Record from the microphone", true);
+    a11y::record_button(
+        ui,
+        record,
+        if state.recording {
+            "Stop recording"
+        } else {
+            "Record from the microphone"
+        },
+        true,
+    );
 
     let _ = state.nav.current() == CompactRoute::Library;
     actions
@@ -421,7 +489,7 @@ fn paint_note(ui: &mut Ui, tokens: &Tokens, rect: Rect, text: &str, error: bool)
 }
 
 fn empty_library(ui: &mut Ui, tokens: &Tokens, rect: Rect) {
-    let center = pos2(rect.center().x, rect.top() + rect.height() * 0.32);
+    let center = pos2(rect.center().x, rect.top() + rect.height() * 0.30);
     ui.painter().text(
         center,
         Align2::CENTER_CENTER,
@@ -432,12 +500,31 @@ fn empty_library(ui: &mut Ui, tokens: &Tokens, rect: Rect) {
         ),
         tokens.ink,
     );
+    // The zero-empty-screen hint (M13E's two working entries): share a voice
+    // note into the app, or pick a file. Record is on the bar below; the line
+    // is the only place a first-time user learns the share target exists.
+    let hint = Rect::from_min_size(
+        pos2(rect.left() + GUTTER, center.y + 20.0),
+        vec2(rect.width() - GUTTER * 2.0, 44.0),
+    );
     ui.painter().text(
-        pos2(center.x, center.y + 28.0),
+        pos2(hint.center().x, hint.top() + 8.0),
         Align2::CENTER_CENTER,
-        "Import an audio file or record from the phone.",
-        FontId::proportional(13.5),
+        "Share a voice note into Suramak, or tap Import to choose a file.",
+        FontId::proportional(13.0),
         tokens.ink_soft,
+    );
+    ui.painter().text(
+        pos2(hint.center().x, hint.top() + 28.0),
+        Align2::CENTER_CENTER,
+        "Record works here too — it keeps going with the screen off.",
+        FontId::proportional(12.0),
+        tokens.ink_faint,
+    );
+    a11y::describe(
+        ui,
+        hint,
+        "Share a voice note into Suramak, or tap Import to choose a file. Record works here too.",
     );
 }
 

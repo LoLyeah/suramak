@@ -25,6 +25,8 @@ use super::model::{
 
 /// One segment row's height (read mode).
 const SEGMENT_ROW: f32 = 66.0;
+/// The karaoke chips' band under a row (M15.6 compact behaviour).
+const WORD_STRIP: f32 = 40.0;
 
 pub fn ui(
     ui: &mut Ui,
@@ -179,7 +181,17 @@ pub fn ui(
                 .edit_buffer
                 .as_ref()
                 .is_some_and(|(idx, _)| *idx == segment.idx);
-            let row_h = if editing { 150.0 } else { SEGMENT_ROW };
+            // M15.6: the chips ride under the row the reader is on — the
+            // selected row, or the row the transport is reading while playing.
+            let words = editor.words_for(segment.idx).to_vec();
+            let show_words = !editing && !words.is_empty() && (editor.playing || selected);
+            let row_h = if editing {
+                150.0
+            } else if show_words {
+                SEGMENT_ROW + WORD_STRIP
+            } else {
+                SEGMENT_ROW
+            };
             let (rect, _) = ui.allocate_exact_size(vec2(list_rect.width(), row_h), Sense::hover());
             let label = format!(
                 "Segment {} · {}",
@@ -335,8 +347,27 @@ pub fn ui(
                         editor.begin_edit(segment.idx);
                     } else {
                         editor.select(segment.idx);
+                        row_actions.push(CompactAction::Seek {
+                            position_ms: editor.playhead_ms,
+                        });
                     }
                 }
+            }
+            // M15.6: the word chips under the selected/playing row. Each chip
+            // is a seek target; the word the transport is inside carries the
+            // accent, its underline springs in (Reduce Motion snaps it in — the
+            // state stays). Same rule as the desktop's karaoke strip.
+            if show_words {
+                word_strip(
+                    ui,
+                    tokens,
+                    motion,
+                    &mut editor,
+                    &segment,
+                    rect,
+                    &words,
+                    &mut row_actions,
+                );
             }
             ui.painter().line_segment(
                 [
@@ -421,6 +452,8 @@ pub fn ui(
     }
     if play.clicked() {
         editor.playing = !editor.playing;
+        let playing = editor.playing;
+        actions.push(CompactAction::Playback { playing });
     }
     let time_rect = Rect::from_min_size(
         pos2(bar.left() + GUTTER + 64.0, bar.center().y - 10.0),
@@ -485,6 +518,82 @@ pub fn ui(
         state.editor = Some(editor);
     }
     actions
+}
+
+/// The M15.6 karaoke chips for one row: wrapped word targets under the text,
+/// the current word carrying the accent tint and a spring-grown underline.
+/// A tap parks the playhead at the word's estimated start and emits a Seek.
+#[allow(clippy::too_many_arguments)]
+fn word_strip(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    editor: &mut super::model::CompactEditor,
+    segment: &suramak_core::transcript::Segment,
+    rect: Rect,
+    words: &[suramak_core::transcript::WordTiming],
+    actions: &mut Vec<CompactAction>,
+) {
+    let current = editor.current_word(segment.idx);
+    let playing = editor.playing;
+    let mut x = rect.left() + 62.0;
+    let mut y = rect.top() + SEGMENT_ROW + 4.0;
+    let max_x = rect.right() - GUTTER - 8.0;
+    let line_start = x;
+    for (word_index, word) in words.iter().enumerate() {
+        let galley = ui.painter().layout_no_wrap(
+            word.text.clone(),
+            FontId::proportional(13.0),
+            tokens.ink_soft,
+        );
+        let width = galley.size().x + 14.0;
+        if x + width > max_x && x > line_start {
+            x = line_start;
+            y += 22.0;
+        }
+        let chip = Rect::from_min_size(pos2(x, y), vec2(width, 18.0));
+        let id = egui::Id::new(("compact-word", segment.idx, word_index));
+        let highlight =
+            motion.highlight_spring(ui.ctx(), id, playing && current == Some(word_index));
+        let response = a11y::touch(
+            ui,
+            tokens,
+            chip,
+            ("word", segment.idx, word_index),
+            WidgetType::Button,
+            &format!("Word {} · {}", word_index + 1, word.text),
+            true,
+        );
+        if highlight > 0.01 {
+            ui.painter().rect_filled(
+                chip,
+                CornerRadius::same(4),
+                motion::tint_over(egui::Color32::TRANSPARENT, tokens.accent_tint, highlight),
+            );
+            let bar = Rect::from_center_size(
+                pos2(chip.center().x, chip.bottom() + 0.5),
+                vec2(chip.width() * highlight, 2.0),
+            );
+            ui.painter().rect_filled(
+                bar,
+                CornerRadius::same(1),
+                tokens.accent.gamma_multiply(highlight),
+            );
+        }
+        ui.painter().galley(
+            pos2(chip.left() + 7.0, chip.top() + 1.0),
+            galley,
+            motion::lerp_color(tokens.ink_soft, tokens.ink, highlight),
+        );
+        if response.clicked() {
+            editor.playhead_ms = word.start_ms;
+            editor.selected = Some(segment.idx);
+            actions.push(CompactAction::Seek {
+                position_ms: word.start_ms,
+            });
+        }
+        x += width + 4.0;
+    }
 }
 
 /// The export sheet's body: the format chips, the bilingual switch and the two

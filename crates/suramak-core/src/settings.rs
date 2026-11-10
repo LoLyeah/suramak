@@ -256,6 +256,11 @@ pub struct UiSettings {
     /// M9a: System (default) | Light | Dark. Older files have no key.
     #[serde(default)]
     pub appearance: Appearance,
+    /// M13g3: the one-time phone intro sheet has been shown. Additive: an
+    /// older settings file has no key and reads `false`, so the intro appears
+    /// once for an existing install too — never more than once.
+    #[serde(default)]
+    pub first_run_seen: bool,
 }
 
 /// Top-level application settings persisted to `settings.toml`.
@@ -291,6 +296,7 @@ impl Default for Settings {
                 glass: GlassMode::Auto,
                 font_scale: 1.0,
                 appearance: Appearance::System,
+                first_run_seen: false,
             },
             recording: RecordingSettings::default(),
             updates: UpdatesSettings::default(),
@@ -798,5 +804,37 @@ font_scale = 1.0
             settings.updates.auto_check,
             "missing section → automatic checks ON"
         );
+    }
+
+    // ---- M13g3: the additive first-run step -------------------------------
+
+    #[test]
+    fn first_run_seen_is_additive_and_round_trips() {
+        // An older file has no key: the intro shows once, never more.
+        let legacy = r#"
+[asr]
+model_id = "base"
+language = "auto"
+translate_to_english = false
+
+[storage]
+keep_audio = false
+
+[ui]
+glass = "auto"
+font_scale = 1.0
+"#;
+        let settings: Settings = toml::from_str(legacy).expect("older settings must load");
+        assert!(!settings.ui.first_run_seen);
+        assert!(!Settings::default().ui.first_run_seen);
+
+        // Once seen, the flag round-trips through the same TOML file (no
+        // schema version bump, no migration: the key is simply present).
+        let mut settings = Settings::default();
+        settings.ui.first_run_seen = true;
+        let text = toml::to_string_pretty(&settings).expect("serialize settings");
+        assert!(text.contains("first_run_seen = true"), "{text}");
+        let back: Settings = toml::from_str(&text).expect("deserialize settings");
+        assert!(back.ui.first_run_seen);
     }
 }

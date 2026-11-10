@@ -123,11 +123,12 @@ use winit::window::{Window, WindowId};
 use crate::diag;
 use crate::gpu_context;
 use crate::platform;
+use crate::surface_api::CompactSurface;
 use crate::surface_lifecycle::{
     BuildTicket, InitStage, KillLatch, SurfaceAction, SurfaceFault, SurfaceLifecycle,
     MAX_AUTO_REBUILDS_PER_EVENT,
 };
-use crate::ui::{self, SpikeState};
+use crate::ui::SpikeState;
 
 static STATE: OnceLock<Mutex<SpikeState>> = OnceLock::new();
 /// How many times this process built a `Gpu` (first build vs. rebuilds).
@@ -161,7 +162,7 @@ fn lock_state() -> std::sync::MutexGuard<'static, SpikeState> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-pub fn run(app: android_activity::AndroidApp, generation: u32) {
+pub fn run(app: android_activity::AndroidApp, generation: u32, surface: Box<dyn CompactSurface>) {
     init_logging();
     diag::init_panic_hook();
 
@@ -192,6 +193,7 @@ pub fn run(app: android_activity::AndroidApp, generation: u32) {
         next_insets_request: None,
         panic_rebuilds: 0,
         generation,
+        surface,
     };
     if let Err(err) = event_loop.run_app(&mut handler) {
         log::error!("event loop exited with an error: {err}");
@@ -270,6 +272,8 @@ struct Handler {
     /// Which Activity instance this loop belongs to (see
     /// [`platform::activity_destroyed`]).
     generation: u32,
+    /// M13g3: the compact product surface (one per window generation).
+    surface: Box<dyn CompactSurface>,
 }
 
 impl ApplicationHandler for Handler {
@@ -785,7 +789,7 @@ impl Handler {
         let dt = now.saturating_duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
 
-        let (restart, ime_caret) = {
+        let restart = {
             let mut state = lock_state();
             state.tick(dt);
             let (insets, back_presses) = platform::drain();
@@ -794,18 +798,16 @@ impl Handler {
             }
             state.back_presses = state.back_presses.saturating_add(back_presses);
 
-            // The IME's editing state is authoritative for the text field: it
-            // arrives from the Kotlin `stateChanged` listener because winit
-            // drops android-activity's text events. The buffer is app state, so
-            // it is applied whether or not a surface exists; the caret can only
-            // move inside a live egui context (see below).
-            let mut caret = None;
+            // The IME's editing state is authoritative: it arrives from the
+            // Kotlin `stateChanged` listener because winit drops
+            // android-activity's text events. The buffer is app state, so it is
+            // applied whether or not a surface exists; the compact shell folds
+            // the delta into egui's input events at the top of the next frame.
             if state.ime_bridge {
                 if let Some(ime) = platform::take_ime_text() {
                     state.ime_updates = state.ime_updates.saturating_add(1);
                     state.text = ime.text;
                     state.ime_cursor = Some((ime.selection_start, ime.selection_end));
-                    caret = Some((ime.selection_start, ime.selection_end));
                 }
             } else {
                 // Keep the channel from replaying a stale buffer if the bridge
@@ -813,19 +815,11 @@ impl Handler {
                 let _ = platform::take_ime_text();
             }
 
-            (std::mem::take(&mut state.restart_surface), caret)
+            std::mem::take(&mut state.restart_surface)
         };
 
-        // The caret position is egui *per-context* widget state, so it has to go
-        // through the context that will draw the next frame. After a rebuild
-        // that state is empty (documented cost); the next IME callback re-pushes
-        // it, and `ui::set_text_cursor` is a no-op until the field has state.
-        if let (Some((start, end)), Some(gpu)) = (ime_caret, self.gpu.as_ref()) {
-            ui::set_text_cursor(&gpu.egui_ctx, start, end);
-        }
-
         if restart {
-            self.restart_surface("button");
+            self.restart_surface("request");
         }
 
         if let Some(gpu) = self.gpu.as_mut() {
@@ -841,7 +835,7 @@ impl Handler {
             // generation, never another `configure()`.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut state = lock_state();
-                let fault = gpu.frame(&mut state);
+                let fault = gpu.frame(&mut state, self.surface.as_mut());
                 state.observe_text();
                 fault
             }));
@@ -1075,6 +1069,14 @@ impl Gpu {
         // Built here, dropped with `self`: the context is part of the GPU
         // generation, not of the app (see the module docs).
         let egui_ctx = gpu_context::new_context();
+        // M13g3: the compact surface's type (the skip/scale and serif families)
+        // is installed once per GPU generation, with the context it belongs to.
+        suramak_ui::deck::theme::install_fonts(&egui_ctx);
+        suramak_ui::deck::theme::install(
+            &egui_ctx,
+            suramak_ui::deck::theme::AppTheme::Dark,
+            platform::reduce_motion(),
+        );
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
             ..Default::default()
@@ -1187,7 +1189,11 @@ impl Gpu {
     /// unusable and the *caller* must replace this whole generation — the frame
     /// deliberately does not touch a dying surface (v2.1's `configure()` on it
     /// is the field crash).
-    fn frame(&mut self, state: &mut SpikeState) -> Option<SurfaceFault> {
+    fn frame(
+        &mut self,
+        state: &mut SpikeState,
+        surface: &mut dyn CompactSurface,
+    ) -> Option<SurfaceFault> {
         // Some Android paths (first frame after a resume, or a rotation that
         // does not deliver `Resized` before the redraw) leave the surface at a
         // stale size; syncing here keeps the viewport correct either way. This
@@ -1202,8 +1208,15 @@ impl Gpu {
             self.resize(size);
         }
 
-        let raw_input = self.egui_state.take_egui_input(&self.window);
-        let full_output = self.egui_ctx.run(raw_input, |ctx| ui::draw(ctx, state));
+        let mut raw_input = self.egui_state.take_egui_input(&self.window);
+        // M13g3: soft-keyboard text enters egui here (the Kotlin `stateChanged`
+        // bridge is the only source on this stack), then the compact surface
+        // draws from the one host-owned `CompactApp`.
+        surface.prime_input(&mut raw_input, state);
+        let full_output = self.egui_ctx.run(raw_input, |ctx| {
+            let actions = surface.draw(ctx, state);
+            surface.dispatch(actions);
+        });
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
         let pixels_per_point = full_output.pixels_per_point;
