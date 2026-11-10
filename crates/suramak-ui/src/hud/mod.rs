@@ -33,7 +33,7 @@ pub mod window;
 use std::fmt;
 
 pub use settings::{HudSettings, InsertionPreference};
-pub use state::{HudAction, HudChrome, HudIntent, HudState};
+pub use state::{HudAction, HudChrome, HudIntent, HudPhase, HudState};
 
 /// The card's logical size. Wide enough for one comfortable result paragraph,
 /// short enough to stay out of the way; the window is fixed-size by design (a

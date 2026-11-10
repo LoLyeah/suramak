@@ -4353,6 +4353,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
  "zip",
 ]
 

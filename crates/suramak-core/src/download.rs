@@ -217,8 +217,40 @@ pub fn available_space_bytes(dir: &Path) -> Option<u64> {
 }
 
 #[cfg(not(unix))]
-pub fn available_space_bytes(_dir: &Path) -> Option<u64> {
-    None
+pub fn available_space_bytes(dir: &Path) -> Option<u64> {
+    // Windows: GetDiskFreeSpaceExW — the same "never blocks on unknown" rule
+    // as the unix branch (None on failure). The caller's probe path already
+    // exists; the free-space check is byte-level identical.
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        let mut wide: Vec<u16> = dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut available: u64 = 0;
+        // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the
+        // call; the out-pointer is a valid local u64.
+        if unsafe {
+            GetDiskFreeSpaceExW(
+                wide.as_mut_ptr(),
+                &mut available,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return None;
+        }
+        Some(available)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dir;
+        None
+    }
 }
 
 /// Refuses a download when `dir`'s filesystem cannot hold `needed_bytes` plus

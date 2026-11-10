@@ -33,6 +33,12 @@ zip = { version = "7", default-features = false, features = ["deflate-flate2-zli
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# M13d thumb: the Windows free-space preflight needs GetDiskFreeSpaceExW.
+# windows-sys 0.61 is already in the workspace lock (egui/winit bring it on
+# windows targets); declaring it here adds no package and no version.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
 
