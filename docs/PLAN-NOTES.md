@@ -83,3 +83,25 @@ Where these conflict with a tempting "simplification", this wins — the arrange
 - Build-end warning *"block v0.1.6 … code that will be rejected by a future version of Rust"*: the frozen `block 0.1.6` comes from the **`metal` crate inside wgpu/wgpu-hal** (our renderer), not from the audio stack; the flagged construct is `static _NSConcreteStackBlock: Class;` (uninhabited static, rust-lang/rust#74840). Harmless today; disappears when wgpu/metal migrate to `block2`/objc2 upstream. Do not vendor or patch it pre-1.0.
 - **macOS 27 SDK**: the CoreAudio aggregate-device description keys (`kAudioAggregateDeviceUIDKey`, `…NameKey`, `…IsPrivateKey`, `…TapListKey`, `kAudioSubTapUIDKey`) are **string-literal macros** with no linkable symbols and no `dlsym` hits; `suramak-taps` builds the dictionary keys as CFStrings from the literal values (`"uid"`, `"name"`, `"private"`, `"taps"`, `"uid"` — from the SDK header). Keep the literal-CFString approach if a future SDK shifts again: the HAL matches dictionary keys by string content.
 - On macOS 27 machines `ld` prints *"object file … was built for newer 'macOS' version (27.0) than being linked (11.0)"* for C deps: benign deployment-target noise (rustc's default `-mmacosx-version-min=11.0` vs SDK-built objects); the app's real minimum is `LSMinimumSystemVersion` in `Info.plist`.
+- **Android (2026-11-11)**: release credentials exist outside the repo at
+  `/home/ubuntu/.suramak-keys/` — `suramak-release.keystore` (RSA 2048,
+  alias `suramak`, 30-year validity, CN=Suramak/O=LoLyeah/C=ID) +
+  `keystore.pass` (the 24-byte hex store/key password). Keystore sha256
+  `1397ddda67a50aa5a5c3d3a06a269bc13128905b05e2dc65794e3547c3666c57`. Never
+  commit the bytes; the release workflow reads them via a base64 repo secret
+  (SURAMAK_ANDROID_KEYSTORE_B64). Continuity needs this VPS (or an owner
+  backup) — a GitHub-only distribution tradeoff, documented.
+- Android slice state: M13a–f landed; M13G1 landed (compact UI, versionCode
+  9); G2 scheduled; M13H cut (`docs/WORKORDER-M13H.md`). The spike's
+  four-check gate is superseded by the owner's "I'll test it on release".
+- M16.4 VAD feasibility: GO gated into 5 slices (report
+  `docs/reports/M16d-vad-feasibility.md`; sherpa-rs 0.6.8 binding; VAD ≈
+  4.17 ms per audio-second). Chunk-only capture stays unapproved until
+  slice 1's join gate passes.
+- Lessons (android-era): NEVER `export` env in the shared persistent shell
+  (an Android child leaked CMAKE_TOOLCHAIN_FILE/ANDROID_HOME/JAVA_HOME and
+  poisoned every host cmake/JDK build — set per-invocation
+  `env VAR=... cmd`); Windows-only cfg diffs called for a local
+  `cargo check --target x86_64-pc-windows-msvc -p suramak-ui` before pushing
+  desktop-split refactors; JDK for Android builds =
+  `~/android-sdk/jdk/jdk-17.0.20.1+1` (the system JRE has no javac).
