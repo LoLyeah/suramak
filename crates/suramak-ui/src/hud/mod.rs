@@ -33,6 +33,10 @@ pub mod window;
 use std::fmt;
 
 pub use settings::{HudSettings, InsertionPreference};
+// HudPhase is re-exported for the macOS cfg path in main.rs: its uses sit
+// under `cfg(target_os = "macos")`, so non-macos targets legitimately see it
+// as an unused import.
+#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
 pub use state::{HudAction, HudChrome, HudIntent, HudPhase, HudState};
 
 /// The card's logical size. Wide enough for one comfortable result paragraph,
