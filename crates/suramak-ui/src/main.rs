@@ -29,11 +29,10 @@ pub(crate) use desktop::{
     UserEvent,
 };
 
-// `desktop::instance_windows` is `pub(crate)` (the single-instance claim is
-// internal), so the historical crate-root re-export can only be had as
-// `pub(crate)` here too.
-#[cfg(all(not(target_os = "android"), windows))]
-pub(crate) use desktop::instance_windows;
+// The single-instance claim is internal to the desktop shell
+// (`desktop::instance_windows` is `pub(crate)`): no crate-root re-export —
+// desktop.rs consumes it directly, and no `crate::instance_windows` path
+// exists anywhere.
 
 pub use suramak_ui::deck::{motion, theme};
 
