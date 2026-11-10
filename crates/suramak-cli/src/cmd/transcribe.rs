@@ -143,7 +143,7 @@ pub fn run(args: TranscribeArgs) -> Result<()> {
     })?;
 
     let mut next_pct = 0u8;
-    let (transcript, engine_used, warnings) = loop {
+    let (transcript, words, engine_used, warnings) = loop {
         match worker.recv() {
             Some(WorkerEvent::Progress { pct, .. }) => {
                 if pct >= next_pct {
@@ -155,10 +155,11 @@ pub fn run(args: TranscribeArgs) -> Result<()> {
             Some(WorkerEvent::Segments { .. }) => {}
             Some(WorkerEvent::Finished {
                 transcript,
+                words,
                 engine_used,
                 warnings,
                 ..
-            }) => break (*transcript, engine_used, warnings),
+            }) => break (*transcript, words, engine_used, warnings),
             // Unreachable for the CLI (its token is never set) — handled so a
             // future cancellation surface cannot hang the loop.
             Some(WorkerEvent::Cancelled { .. }) => {
@@ -204,7 +205,9 @@ pub fn run(args: TranscribeArgs) -> Result<()> {
 
     if args.db {
         let store = Store::open(&paths::db_path()?)?;
-        store.insert_transcript(&transcript)?;
+        // M15.6: the word timing this run produced lands with the transcript
+        // (same transaction) so the editor's karaoke works on first open.
+        store.insert_transcript_with_words(&transcript, &words)?;
         println!("saved to library: id {}", transcript.id);
     } else {
         eprintln!("library save off by default (privacy) — pass --db to opt in");

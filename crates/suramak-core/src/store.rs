@@ -1,6 +1,6 @@
 use chrono::Utc;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -8,7 +8,7 @@ use crate::export::ZeroDuration;
 use crate::search::{self, HitKind, SearchHit, SearchOptions, SearchResults};
 use crate::segment_edit::{merge_rows, split_rows, EditError, SegmentRow, SegmentSnapshot};
 use crate::textrules::{Correction, Dictionary, Glossary, PromptMeasurement, TextSettings};
-use crate::transcript::{Segment, Transcript};
+use crate::transcript::{Segment, Transcript, WordTiming};
 use crate::translate::TranslationRecord;
 use crate::SuramakError;
 
@@ -73,7 +73,12 @@ const SEARCH_DOCS_DDL: &str = "CREATE TABLE IF NOT EXISTS search_docs (
 ///   derived bilingual text, its provenance (model, timestamp, source segment
 ///   id set) and the sticky stale marker. Existing rows keep `NULL`/`0`; no
 ///   table is dropped or rebuilt.
-pub const SCHEMA_VERSION: i64 = 5;
+/// - **v6** — M15.6, additive only: `word_timings` — the estimated per-word
+///   start/end that whisper's token spans yield, keyed to the segment text
+///   they were computed from (`aligned_text`) with a sticky stale marker for
+///   any later source edit. Existing tables and rows are untouched; a library
+///   that never re-aligns simply has no rows here (and gets segment seeking).
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// SQLite-backed transcript library with WAL mode.
 pub struct Store {
@@ -104,6 +109,69 @@ impl SearchIndexStats {
     /// Every indexed document, all kinds.
     pub fn total(&self) -> i64 {
         self.segments + self.titles + self.glossary + self.dictionary
+    }
+}
+
+/// How many word rows a write actually landed, and how many segment groups it
+/// refused (M15.6).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WordWriteStats {
+    /// Word rows inserted.
+    pub written: usize,
+    /// Segment groups dropped because the segment was gone or its text did not
+    /// match the words.
+    pub skipped_segments: usize,
+}
+
+/// A transcript's usable word timing (M15.6).
+///
+/// `current` holds only the segments whose rows are both un-stale and still
+/// aligned to the text the segment carries; `stale` names the segments that
+/// have rows which no longer qualify. Both are per segment, so one edit never
+/// costs an untouched segment its karaoke.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WordAlignment {
+    /// Usable words, per segment index, in word order.
+    pub current: BTreeMap<u32, Vec<WordTiming>>,
+    /// Segments that have word rows but must not use them (edited/stale).
+    pub stale: BTreeSet<u32>,
+}
+
+impl WordAlignment {
+    /// Whether any segment can drive word-level seeking at all.
+    pub fn is_empty(&self) -> bool {
+        self.current.is_empty()
+    }
+
+    /// Wraps a freshly produced word list as all-current (a just-finished job,
+    /// before the store round-trip). Rows keep their segment/word order.
+    pub fn from_words(words: &[WordTiming]) -> Self {
+        let mut current: BTreeMap<u32, Vec<WordTiming>> = BTreeMap::new();
+        for word in words {
+            current
+                .entry(word.segment_idx)
+                .or_default()
+                .push(word.clone());
+        }
+        Self {
+            current,
+            stale: BTreeSet::new(),
+        }
+    }
+
+    /// The words of one segment, when they are current.
+    pub fn segment(&self, idx: u32) -> Option<&[WordTiming]> {
+        self.current.get(&idx).map(Vec::as_slice)
+    }
+
+    /// Every usable word, in segment/word order.
+    pub fn words(&self) -> impl Iterator<Item = &WordTiming> {
+        self.current.values().flatten()
+    }
+
+    /// How many segments can drive word-level seeking.
+    pub fn current_segments(&self) -> usize {
+        self.current.len()
     }
 }
 
@@ -200,7 +268,22 @@ impl Store {
                  transcript_id TEXT,
                  segment_idx   INTEGER
              );
-             CREATE INDEX IF NOT EXISTS search_docs_transcript ON search_docs(transcript_id);",
+             CREATE INDEX IF NOT EXISTS search_docs_transcript ON search_docs(transcript_id);
+             -- M15.6: estimated word timing. `aligned_text` is the segment text
+             -- the rows were computed from; a row whose segment no longer says
+             -- exactly that is stale, and `stale` is the sticky marker any
+             -- source edit sets (never cleared except by a fresh alignment).
+             CREATE TABLE IF NOT EXISTS word_timings (
+                 transcript_id TEXT    NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
+                 segment_idx   INTEGER NOT NULL,
+                 word_idx      INTEGER NOT NULL,
+                 start_ms      INTEGER NOT NULL,
+                 end_ms        INTEGER NOT NULL,
+                 text          TEXT    NOT NULL,
+                 aligned_text  TEXT    NOT NULL,
+                 stale         INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (transcript_id, segment_idx, word_idx)
+             );",
         )?;
         self.migrate()?;
         self.ensure_search_index()
@@ -254,6 +337,9 @@ impl Store {
         }
         if version < 5 {
             self.upgrade_to_v5()?;
+        }
+        if version < 6 {
+            self.upgrade_to_v6()?;
         }
         Ok(())
     }
@@ -388,6 +474,33 @@ impl Store {
                 tx.execute_batch(ddl)?;
             }
         }
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// v5 → v6, one transaction, additive only: the estimated word timing
+    /// table (M15.6). A fresh database already has it from the DDL above, and
+    /// a re-run is a no-op; an older library simply starts with no word rows.
+    fn upgrade_to_v6(&self) -> Result<(), SuramakError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS word_timings (
+                 transcript_id TEXT    NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
+                 segment_idx   INTEGER NOT NULL,
+                 word_idx      INTEGER NOT NULL,
+                 start_ms      INTEGER NOT NULL,
+                 end_ms        INTEGER NOT NULL,
+                 text          TEXT    NOT NULL,
+                 aligned_text  TEXT    NOT NULL,
+                 stale         INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (transcript_id, segment_idx, word_idx)
+             );",
+        )?;
         tx.execute(
             "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -956,6 +1069,22 @@ impl Store {
 
     /// Inserts a new transcript (header + segments) atomically.
     pub fn insert_transcript(&self, t: &Transcript) -> Result<(), SuramakError> {
+        self.insert_transcript_with_words(t, &[])
+    }
+
+    /// Inserts a transcript and its estimated word timing in one transaction
+    /// (M15.6).
+    ///
+    /// The alignment is *derived* data about the text that was just stored, so
+    /// it lands with it: a crash can never leave a transcript whose word rows
+    /// describe a different segment set. The word rows are dropped by the same
+    /// rule the store applies everywhere — a segment whose text they do not
+    /// spell gets none (see [`Store::replace_word_timings`]).
+    pub fn insert_transcript_with_words(
+        &self,
+        t: &Transcript,
+        words: &[WordTiming],
+    ) -> Result<(), SuramakError> {
         let source_json = serde_json::to_string(&t.source)?;
         let audio_path = t
             .audio_path
@@ -995,8 +1124,146 @@ impl Store {
             &t.title,
             None,
         )?;
+        Self::write_word_rows(&tx, t.id, words)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Replaces a transcript's estimated word timing (M15.6).
+    ///
+    /// The whole set is rewritten in one savepoint: a re-alignment either
+    /// lands completely or the previous rows stay. Only segments that exist
+    /// **and** whose text is exactly the words joined by single spaces are
+    /// written — the store refuses to persist timing for text it cannot
+    /// reproduce, which is the same rule the mapper applies before handing
+    /// rows over. Skipped groups are counted so a caller can report them.
+    pub fn replace_word_timings(
+        &self,
+        id: Uuid,
+        words: &[WordTiming],
+    ) -> Result<WordWriteStats, SuramakError> {
+        self.conn.execute_batch("SAVEPOINT replace_word_timings")?;
+        let written = (|| -> Result<WordWriteStats, SuramakError> {
+            self.conn.execute(
+                "DELETE FROM word_timings WHERE transcript_id = ?1",
+                params![id.to_string()],
+            )?;
+            Self::write_word_rows(&self.conn, id, words)
+        })();
+        match written {
+            Ok(stats) => {
+                self.conn.execute_batch("RELEASE replace_word_timings")?;
+                Ok(stats)
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch(
+                    "ROLLBACK TO replace_word_timings; RELEASE replace_word_timings",
+                );
+                Err(err)
+            }
+        }
+    }
+
+    /// The usable word timing of a transcript, grouped per segment (M15.6).
+    ///
+    /// A row counts as **current** only when its sticky `stale` flag is clear
+    /// *and* the segment still says exactly the text the row was aligned to;
+    /// anything else is reported as stale, never silently used. A segment with
+    /// no rows at all is simply absent — the UI's segment fallback.
+    pub fn word_alignment(&self, id: Uuid) -> Result<WordAlignment, SuramakError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT w.segment_idx, w.word_idx, w.start_ms, w.end_ms, w.text, w.stale,
+                    s.text = w.aligned_text
+             FROM word_timings w
+             JOIN segments s
+               ON s.transcript_id = w.transcript_id AND s.idx = w.segment_idx
+             WHERE w.transcript_id = ?1
+             ORDER BY w.segment_idx, w.word_idx",
+        )?;
+        let rows = stmt.query_map(params![id.to_string()], |row| {
+            Ok((
+                row.get::<_, u32>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)? != 0,
+                row.get::<_, i64>(6)? != 0,
+            ))
+        })?;
+
+        let mut alignment = WordAlignment::default();
+        for row in rows {
+            let (segment_idx, word_idx, start_ms, end_ms, text, stale, text_matches) = row?;
+            if stale || !text_matches {
+                alignment.stale.insert(segment_idx);
+                continue;
+            }
+            alignment
+                .current
+                .entry(segment_idx)
+                .or_default()
+                .push(WordTiming {
+                    segment_idx,
+                    word_idx,
+                    start_ms,
+                    end_ms,
+                    text,
+                });
+        }
+        Ok(alignment)
+    }
+
+    /// Writes one word-row set for `id` on `conn` (inside the caller's
+    /// transaction), dropping any group that does not spell its segment.
+    fn write_word_rows(
+        conn: &Connection,
+        id: Uuid,
+        words: &[WordTiming],
+    ) -> Result<WordWriteStats, SuramakError> {
+        let mut stats = WordWriteStats::default();
+        let mut insert = conn.prepare(
+            "INSERT INTO word_timings(transcript_id, segment_idx, word_idx,
+                                      start_ms, end_ms, text, aligned_text, stale)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+        )?;
+        let mut text_of =
+            conn.prepare("SELECT text FROM segments WHERE transcript_id = ?1 AND idx = ?2")?;
+
+        let mut groups: BTreeMap<u32, Vec<&WordTiming>> = BTreeMap::new();
+        for word in words {
+            groups.entry(word.segment_idx).or_default().push(word);
+        }
+        for (segment_idx, group) in groups {
+            let text: Option<String> = text_of
+                .query_row(params![id.to_string(), segment_idx], |row| row.get(0))
+                .optional()?;
+            let Some(text) = text else {
+                // The segment vanished (a structural edit raced the job): the
+                // rows would describe nothing.
+                stats.skipped_segments += 1;
+                continue;
+            };
+            let spoken: Vec<&str> = group.iter().map(|word| word.text.as_str()).collect();
+            let stored: Vec<&str> = text.split_whitespace().collect();
+            if spoken != stored {
+                stats.skipped_segments += 1;
+                continue;
+            }
+            for word in group {
+                insert.execute(params![
+                    id.to_string(),
+                    word.segment_idx,
+                    word.word_idx,
+                    word.start_ms,
+                    word.end_ms,
+                    word.text,
+                    text,
+                ])?;
+                stats.written += 1;
+            }
+        }
+        Ok(stats)
     }
 
     /// Upserts the complete segment set for a transcript, replacing what was there.
@@ -1075,6 +1342,11 @@ impl Store {
         if deleted > 0 {
             Self::delete_segment_docs_from(&self.conn, id, segments.len() as u32)?;
         }
+        // M15.6: any row whose text is no longer exactly the text its word
+        // timing was computed from becomes stale — in the same transaction as
+        // the text write, so a reader can never see new text next to word
+        // rows that still claim to describe it.
+        Self::mark_alignment_stale(&self.conn, id)?;
         Ok(())
     }
 
@@ -1281,6 +1553,33 @@ impl Store {
                 original,
             )?;
         }
+        // M15.6: a structural edit rewrites the row set (a split shifts the tail
+        // down, a merge up), so any word rows that no longer sit on a segment
+        // with exactly their text are stale. Same rule as `write_segments`.
+        Self::mark_alignment_stale(conn, id)?;
+        Ok(())
+    }
+
+    /// Marks every word-timing row whose segment no longer says exactly the
+    /// text the row was computed from (M15.6).
+    ///
+    /// One statement, one rule, every mutation path: an edited row, a split, a
+    /// merge, a wholesale re-polish and an undo of any of those all land here.
+    /// Rows that still match stay usable (an unrelated segment keeps its
+    /// karaoke), and the flag is only ever set — a fresh alignment is the one
+    /// thing that clears it, exactly like the bilingual stale marker.
+    fn mark_alignment_stale(conn: &Connection, id: Uuid) -> Result<(), SuramakError> {
+        conn.execute(
+            "UPDATE word_timings SET stale = 1
+             WHERE transcript_id = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM segments s
+                   WHERE s.transcript_id = word_timings.transcript_id
+                     AND s.idx = word_timings.segment_idx
+                     AND s.text = word_timings.aligned_text
+               )",
+            params![id.to_string()],
+        )?;
         Ok(())
     }
 
@@ -3003,6 +3302,258 @@ mod tests {
             .set_translations(id, &[translated(0, "hello world")])
             .unwrap();
         assert!(!store.segment_translations(id).unwrap()[0].1.stale);
+    }
+
+    #[test]
+    fn a_v5_database_upgrades_to_v6_additively() {
+        let dir = std::env::temp_dir().join(format!("suramak-v6-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("suramak.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE transcripts (
+                     id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at TEXT NOT NULL,
+                     updated_at TEXT NOT NULL, source_json TEXT NOT NULL, model TEXT NOT NULL,
+                     language TEXT, audio_path TEXT);
+                 CREATE TABLE segments (
+                     transcript_id TEXT NOT NULL, idx INTEGER NOT NULL, start_ms INTEGER NOT NULL,
+                     end_ms INTEGER NOT NULL, text TEXT NOT NULL, source_text TEXT,
+                     derived TEXT NOT NULL DEFAULT '', translation TEXT,
+                     translation_model TEXT, translation_at TEXT, translation_sources TEXT,
+                     translation_stale INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY (transcript_id, idx));
+                 INSERT INTO meta(key, value) VALUES ('schema_version', '5');
+                 INSERT INTO transcripts VALUES (
+                     '00000000-0000-0000-0000-000000000001', 'old', '2024-01-01T00:00:00Z',
+                     '2024-01-01T00:00:00Z', '{\"type\":\"file\",\"name\":\"old.wav\"}', 'tiny', 'en', NULL);
+                 INSERT INTO segments VALUES (
+                     '00000000-0000-0000-0000-000000000001', 0, 0, 1000, 'halo dunia', 'halo dunia', '',
+                     NULL, NULL, NULL, NULL, 0);",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).expect("upgrade");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        // The library it carried is untouched, and it starts with no alignment.
+        assert_eq!(store.segment_rows(id).unwrap()[0].text, "halo dunia");
+        assert!(store.word_alignment(id).unwrap().is_empty());
+        // The new table accepts rows after the upgrade.
+        let stats = store
+            .replace_word_timings(
+                id,
+                &[word(0, 0, "halo", 0, 400), word(0, 1, "dunia", 400, 1000)],
+            )
+            .unwrap();
+        assert_eq!(stats.written, 2);
+        assert_eq!(
+            store.word_alignment(id).unwrap().segment(0).unwrap().len(),
+            2
+        );
+        drop(store);
+        let again = Store::open(&path).expect("reopen");
+        assert_eq!(again.schema_version().unwrap(), SCHEMA_VERSION);
+        drop(again);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- M15.6: estimated word timing --------------------------------------
+
+    fn word(segment_idx: u32, word_idx: u32, text: &str, start_ms: i64, end_ms: i64) -> WordTiming {
+        WordTiming {
+            segment_idx,
+            word_idx,
+            start_ms,
+            end_ms,
+            text: text.to_string(),
+        }
+    }
+
+    /// One word per segment — `sample`'s own text, so the store's "must spell
+    /// the segment" rule accepts them.
+    fn sample_words() -> Vec<WordTiming> {
+        vec![
+            word(0, 0, "first", 0, 900),
+            word(1, 0, "second", 900, 1_800),
+        ]
+    }
+
+    #[test]
+    fn word_timing_round_trips_and_reads_back_current() {
+        let store = Store::open_in_memory().unwrap();
+        let t = sample("words");
+        store
+            .insert_transcript_with_words(&t, &sample_words())
+            .unwrap();
+        let alignment = store.word_alignment(t.id).unwrap();
+        assert!(!alignment.is_empty());
+        assert_eq!(alignment.segment(0).unwrap(), &sample_words()[..1]);
+        assert_eq!(alignment.segment(1).unwrap(), &sample_words()[1..]);
+        assert!(alignment.stale.is_empty());
+        // The insert wrote the rows in the same transaction as the segments.
+        assert_eq!(alignment.words().count(), 2);
+    }
+
+    #[test]
+    fn a_word_group_that_does_not_spell_its_segment_is_refused() {
+        let store = Store::open_in_memory().unwrap();
+        let t = sample("mismatch");
+        store.insert_transcript(&t).unwrap();
+        let stats = store
+            .replace_word_timings(
+                t.id,
+                &[
+                    word(0, 0, "something", 0, 100),
+                    word(0, 1, "else", 100, 200),
+                ],
+            )
+            .unwrap();
+        assert_eq!(stats.written, 0, "unaligned text must never be persisted");
+        assert_eq!(stats.skipped_segments, 1);
+        assert!(store.word_alignment(t.id).unwrap().is_empty());
+        // …and a row for a segment that does not exist is refused too.
+        let stats = store
+            .replace_word_timings(t.id, &[word(9, 0, "first", 0, 100)])
+            .unwrap();
+        assert_eq!(stats.written, 0);
+        assert_eq!(stats.skipped_segments, 1);
+    }
+
+    #[test]
+    fn editing_a_segment_marks_only_that_segments_words_stale() {
+        let store = Store::open_in_memory().unwrap();
+        let mut t = sample("edit-stales-words");
+        t.segments[1].text = "another".to_string();
+        store
+            .insert_transcript_with_words(
+                &t,
+                &[
+                    word(0, 0, "first", 0, 400),
+                    word(1, 0, "another", 900, 1_800),
+                ],
+            )
+            .unwrap();
+        store.update_segment_text(t.id, 0, "changed").unwrap();
+        let alignment = store.word_alignment(t.id).unwrap();
+        assert!(
+            alignment.segment(0).is_none(),
+            "the edited row lost its timing"
+        );
+        assert!(alignment.stale.contains(&0));
+        assert!(
+            alignment.segment(1).is_some(),
+            "an untouched segment keeps its timing"
+        );
+    }
+
+    #[test]
+    fn a_no_op_text_save_keeps_the_alignment_current() {
+        let store = Store::open_in_memory().unwrap();
+        let t = sample("noop");
+        store
+            .insert_transcript_with_words(&t, &sample_words())
+            .unwrap();
+        store.update_segment_text(t.id, 0, "first").unwrap();
+        assert!(store.word_alignment(t.id).unwrap().stale.is_empty());
+    }
+
+    #[test]
+    fn a_split_marks_the_alignment_stale_and_only_realignment_clears_it() {
+        let store = Store::open_in_memory().unwrap();
+        let mut t = sample("split");
+        t.segments[0].text = "hello world".to_string();
+        store
+            .insert_transcript_with_words(
+                &t,
+                &[word(0, 0, "hello", 0, 400), word(0, 1, "world", 400, 900)],
+            )
+            .unwrap();
+        let before = store.segment_rows(t.id).unwrap();
+        store
+            .split_segment(t.id, 0, 5, Some(400), ZeroDuration::OneFrame)
+            .unwrap();
+        let alignment = store.word_alignment(t.id).unwrap();
+        assert!(alignment.stale.contains(&0), "a split invalidates the row");
+        assert!(alignment.segment(0).is_none());
+
+        // Undo restores the text, but the marker is monotonic — the alignment
+        // must be re-derived, not silently trusted again.
+        store.restore_segment_rows(t.id, &before).unwrap();
+        let alignment = store.word_alignment(t.id).unwrap();
+        assert!(alignment.segment(0).is_none());
+        assert!(alignment.stale.contains(&0));
+
+        // Re-alignment is the one action that clears it.
+        store
+            .replace_word_timings(
+                t.id,
+                &[word(0, 0, "hello", 0, 400), word(0, 1, "world", 400, 900)],
+            )
+            .unwrap();
+        let alignment = store.word_alignment(t.id).unwrap();
+        assert!(alignment.stale.is_empty());
+        assert_eq!(alignment.segment(0).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_structurally_moved_row_cannot_reuse_its_word_timing() {
+        // Merge row 0 into row 1 by rewriting the set: the row at idx 1 now
+        // says something else, so the timing that sat there is stale.
+        let store = Store::open_in_memory().unwrap();
+        let t = sample("moved");
+        store
+            .insert_transcript_with_words(
+                &t,
+                &[
+                    word(0, 0, "first", 0, 400),
+                    word(1, 0, "second", 900, 1_800),
+                ],
+            )
+            .unwrap();
+        store.merge_segments(t.id, 0, 2, " ").unwrap();
+        let alignment = store.word_alignment(t.id).unwrap();
+        assert!(alignment.is_empty());
+        assert!(alignment.stale.contains(&0));
+    }
+
+    #[test]
+    fn deleting_a_transcript_cascades_to_its_word_rows() {
+        let store = Store::open_in_memory().unwrap();
+        let t = sample("cascade");
+        store
+            .insert_transcript_with_words(&t, &sample_words())
+            .unwrap();
+        store.delete_transcript(t.id).unwrap();
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM word_timings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "the foreign key must cascade");
+    }
+
+    #[test]
+    fn replace_word_timings_is_all_or_nothing() {
+        let store = Store::open_in_memory().unwrap();
+        let t = sample("atomic");
+        store
+            .insert_transcript_with_words(&t, &sample_words())
+            .unwrap();
+        // A write whose second group is refused still lands the first one —
+        // and never leaves the transcript with a half-updated row set.
+        let stats = store
+            .replace_word_timings(
+                t.id,
+                &[word(1, 0, "second", 900, 1_800), word(0, 0, "wrong", 0, 10)],
+            )
+            .unwrap();
+        assert_eq!(stats.written, 1);
+        assert_eq!(stats.skipped_segments, 1);
+        let alignment = store.word_alignment(t.id).unwrap();
+        assert_eq!(alignment.segment(1).unwrap().len(), 1);
+        assert!(alignment.segment(0).is_none());
     }
 
     #[test]

@@ -179,6 +179,16 @@ impl Motion {
         state.value
     }
 
+    /// The current word's highlight spring (M15.6 karaoke): the same damped
+    /// spring as the press, ramped 0→1 when a word **becomes** the current one
+    /// and 1→0 when it stops being it. Reduce Motion returns the state's own
+    /// value (1.0 or 0.0) immediately — the highlight is kept, only its arrival
+    /// stops springing. There is deliberately no new motion vocabulary here:
+    /// the constants are [`SPRING_DURATION`] / [`SPRING_OVERSHOOT`].
+    pub fn highlight_spring(&self, ctx: &egui::Context, id: Id, current: bool) -> f32 {
+        self.press_spring(ctx, id, if current { 1.0 } else { 0.0 })
+    }
+
     /// The drawn playhead's seek ease (M9d item 3): what the strip *draws*
     /// eases toward `target` (ms) when the position **jumps** — a click-to-seek
     /// or a segment-stamp seek — while frame-to-frame playback advance is
@@ -703,6 +713,71 @@ mod tests {
         assert_eq!(
             run_frame(&ctx, 10.02, |ctx| reduced.press_spring(ctx, snap, rest)),
             rest
+        );
+    }
+
+    // ---- M15.6: the karaoke highlight spring -------------------------------
+
+    /// The current-word highlight: the state's value is always exactly 0 or 1,
+    /// the arrival springs (bounded overshoot) and ENDS, and Reduce Motion
+    /// keeps the state while removing only the spring.
+    #[test]
+    fn the_karaoke_highlight_springs_to_its_state_and_snaps_under_reduce_motion() {
+        let ctx = egui::Context::default();
+        let motion = Motion::new(false);
+        let id = Id::new("test-highlight-spring");
+
+        // At rest, a word that is not current has no highlight.
+        assert_eq!(
+            run_frame(&ctx, 0.0, |ctx| motion.highlight_spring(ctx, id, false)),
+            0.0
+        );
+        // Becoming current: the flip frame holds, then the ramp springs past 1
+        // by no more than the shared overshoot bound.
+        assert_eq!(
+            run_frame(&ctx, 1.0, |ctx| motion.highlight_spring(ctx, id, true)),
+            0.0,
+            "the flip frame starts from the value it had"
+        );
+        let mut peak = 0.0_f32;
+        let mut time = 1.0;
+        for _ in 0..40 {
+            time += 0.006;
+            peak = peak.max(run_frame(&ctx, time, |ctx| {
+                motion.highlight_spring(ctx, id, true)
+            }));
+        }
+        assert!(peak > 1.0, "the highlight springs in: {peak}");
+        assert!(
+            peak <= 1.0 + SPRING_OVERSHOOT + 1e-6,
+            "bounded by the shared overshoot: {peak}"
+        );
+        // …and ends exactly on the state.
+        assert_eq!(
+            run_frame(&ctx, 2.0, |ctx| motion.highlight_spring(ctx, id, true)),
+            1.0
+        );
+        // Leaving the word ramps back down to exactly 0.
+        assert_eq!(
+            run_frame(&ctx, 3.0, |ctx| motion.highlight_spring(ctx, id, false)),
+            1.0
+        );
+        assert_eq!(
+            run_frame(&ctx, 3.4, |ctx| motion.highlight_spring(ctx, id, false)),
+            0.0
+        );
+
+        // Reduce Motion: the highlight is still there, immediately — the state
+        // is kept, only the spring is removed.
+        let reduced = Motion::new(true);
+        let snap = Id::new("test-highlight-spring-reduce");
+        assert_eq!(
+            run_frame(&ctx, 4.0, |ctx| reduced.highlight_spring(ctx, snap, true)),
+            1.0
+        );
+        assert_eq!(
+            run_frame(&ctx, 4.01, |ctx| reduced.highlight_spring(ctx, snap, false)),
+            0.0
         );
     }
 

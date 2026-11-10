@@ -51,6 +51,9 @@ pub fn model_id_from_path(path: &Path) -> String {
 #[derive(Debug, Clone)]
 pub struct PipelineOutcome {
     pub transcript: Transcript,
+    /// Estimated per-word timing from the engine's own token spans (M15.6);
+    /// empty when the engine exposed none (Parakeet/SpeechTranscriber paths).
+    pub words: Vec<suramak_core::transcript::WordTiming>,
     /// Engine that actually ran (may differ from the plan when Core ML fell back).
     pub engine_used: EngineId,
     /// Non-fatal notes: engine downgrades, Core ML fallback, ignored requests.
@@ -148,6 +151,7 @@ pub fn transcribe_file(
             lang,
             outcome.segments,
         ),
+        words: outcome.words,
         engine_used: outcome.engine_used,
         warnings: outcome.warnings,
     })
@@ -181,6 +185,9 @@ pub fn transcribe_file_parakeet(
     let segments = crate::parakeet::segments_from_result(&result, audio_ms);
     Ok(PipelineOutcome {
         transcript: transcript_for(input, crate::parakeet::MODEL_ID.to_string(), lang, segments),
+        // Parakeet reports one timestamp per token but this slice neither
+        // measures nor persists word timing for it (see M15.6 report).
+        words: Vec::new(),
         engine_used: EngineId::Parakeet,
         warnings,
     })
@@ -235,6 +242,8 @@ pub fn transcribe_file_speech_transcriber(
             lang,
             segments,
         ),
+        // SpeechTranscriber exposes no per-token timing here.
+        words: Vec::new(),
         engine_used: EngineId::SpeechTranscriber,
         warnings,
     })

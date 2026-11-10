@@ -58,6 +58,11 @@ pub enum WorkerEvent {
     Finished {
         job_id: u64,
         transcript: Box<Transcript>,
+        /// Estimated per-word timing (M15.6) — empty when the engine exposed
+        /// none. `#[serde(default)]` so an older in-process consumer still
+        /// deserializes the event.
+        #[serde(default)]
+        words: Vec<suramak_core::transcript::WordTiming>,
         engine_used: EngineId,
         /// Non-fatal engine notes (downgrades, Core ML fallback).
         warnings: Vec<String>,
@@ -279,6 +284,7 @@ fn run_worker(jobs: Receiver<Job>, events: Sender<WorkerEvent>) {
                     let _ = events.send(WorkerEvent::Finished {
                         job_id,
                         transcript: Box::new(outcome.transcript),
+                        words: outcome.words,
                         engine_used: outcome.engine_used,
                         warnings: outcome.warnings,
                     });

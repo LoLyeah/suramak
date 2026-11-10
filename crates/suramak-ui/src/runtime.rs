@@ -597,12 +597,20 @@ impl Runtime {
         while let Some(effect) = queue.pop_front() {
             match effect {
                 Effect::SubmitJob { input } => self.submit_job(input, state),
-                Effect::SaveTranscript(transcript) => {
-                    let result = self.insert(&transcript);
+                Effect::SaveTranscript { transcript, words } => {
+                    let result = self.insert(&transcript, &words);
                     queue.extend(state.on_transcript_saved(*transcript, result));
                 }
                 Effect::SaveEdits { updates } => {
                     let result = self.save_edits(state, &updates);
+                    if result.is_ok() {
+                        // M15.6: a real text change just marked that row's word
+                        // timing stale; adopt the store's answer so the strip
+                        // stops offering it in the same frame the save lands.
+                        if let Some(id) = state.editor.as_ref().map(|editor| editor.transcript.id) {
+                            state.on_word_alignment_loaded(id, self.alignment_of(id));
+                        }
+                    }
                     queue.extend(state.on_edits_saved(Instant::now(), result));
                 }
                 Effect::LoadTranscript(header) => match self.load(&header) {
@@ -611,6 +619,7 @@ impl Runtime {
                         let translations = self.translations_of(id);
                         queue.extend(state.on_transcript_loaded(transcript));
                         state.on_translations_loaded(id, &translations);
+                        state.on_word_alignment_loaded(id, self.alignment_of(id));
                     }
                     Err(err) => state.set_status(err, true),
                 },
@@ -710,6 +719,12 @@ impl Runtime {
                                 );
                                 let translations = self.translations_of(transcript);
                                 state.on_translations_loaded(transcript, &translations);
+                                // M15.6: the store marked the affected rows stale
+                                // inside that transaction — read the new state.
+                                state.on_word_alignment_loaded(
+                                    transcript,
+                                    self.alignment_of(transcript),
+                                );
                             }
                             Err(err) => state.on_segment_edit_failed(err),
                         },
@@ -741,6 +756,12 @@ impl Runtime {
                                 );
                                 let translations = self.translations_of(transcript);
                                 state.on_translations_loaded(transcript, &translations);
+                                // M15.6: the store marked the affected rows stale
+                                // inside that transaction — read the new state.
+                                state.on_word_alignment_loaded(
+                                    transcript,
+                                    self.alignment_of(transcript),
+                                );
                             }
                             Err(err) => state.on_segment_edit_failed(err),
                         },
@@ -767,6 +788,12 @@ impl Runtime {
                                 state.on_segments_restored(step, loaded);
                                 let translations = self.translations_of(transcript);
                                 state.on_translations_loaded(transcript, &translations);
+                                // M15.6: the store marked the affected rows stale
+                                // inside that transaction — read the new state.
+                                state.on_word_alignment_loaded(
+                                    transcript,
+                                    self.alignment_of(transcript),
+                                );
                             }
                             Err(err) => state.set_status(err, true),
                         },
@@ -1621,12 +1648,26 @@ impl Runtime {
         }
     }
 
-    fn insert(&self, transcript: &Transcript) -> Result<(), String> {
+    fn insert(
+        &self,
+        transcript: &Transcript,
+        words: &[suramak_core::transcript::WordTiming],
+    ) -> Result<(), String> {
         self.store
             .as_ref()
             .ok_or_else(|| "library database unavailable".to_string())?
-            .insert_transcript(transcript)
+            .insert_transcript_with_words(transcript, words)
             .map_err(|err| err.to_string())
+    }
+
+    /// A transcript's stored word timing (M15.6), best-effort: a library that
+    /// cannot answer simply has none, and the editor falls back to segment
+    /// seeking rather than failing the load.
+    fn alignment_of(&self, id: Uuid) -> suramak_core::store::WordAlignment {
+        self.store
+            .as_ref()
+            .and_then(|store| store.word_alignment(id).ok())
+            .unwrap_or_default()
     }
 
     /// The stored transcript, read back after a committed structural edit.

@@ -20,10 +20,11 @@ use suramak_core::segment_edit::{
     EditKind, SegmentHistory, SegmentRow, SegmentSnapshot, UNDO_DEPTH,
 };
 use suramak_core::settings::{Appearance, EngineSetting, RecordSource};
+use suramak_core::store::WordAlignment;
 use suramak_core::textrules::{
     CleanOptions, ExportPreview, PromptBudget, PromptMeasurement, TextSettings,
 };
-use suramak_core::transcript::{Segment, Transcript};
+use suramak_core::transcript::{Segment, Transcript, WordTiming};
 use suramak_core::translate::{TargetLanguage, TranslationRecord};
 use suramak_playback::{
     resolve_playback_source, transcript_duration_ms, Command as PlaybackCommand, Peaks, Playback,
@@ -561,6 +562,11 @@ pub struct Editor {
     pub translation_last_edit: Option<Instant>,
     /// Last derived-text save failure (shown in the row caption, retried).
     pub translation_save_error: Option<String>,
+    /// M15.6: the transcript's usable word timing, per segment. Seeded from
+    /// the store on load / after every mutation, and from the worker event for
+    /// a fresh job. `current` only holds segments that are still aligned to
+    /// their text; a stale or absent segment falls back to segment seeking.
+    pub words: WordAlignment,
 }
 
 impl Editor {
@@ -582,6 +588,7 @@ impl Editor {
             translation_dirty: false,
             translation_last_edit: None,
             translation_save_error: None,
+            words: WordAlignment::default(),
         }
     }
 
@@ -604,6 +611,8 @@ impl Editor {
         self.translation_meta = vec![None; count];
         self.translation_dirty = false;
         self.translation_last_edit = None;
+        // The runtime re-seeds this from the store for the new row set.
+        self.words = WordAlignment::default();
         self.transcript = transcript;
         self.dirty = false;
         self.last_edit = None;
@@ -634,6 +643,14 @@ impl Editor {
             *buffer = text;
             if let Some(Some(record)) = self.translation_meta.get_mut(idx as usize) {
                 record.mark_stale();
+            }
+            // M15.6: this row's word timing described the text that was there
+            // before the keystroke. Drop it from the usable set now rather than
+            // waiting for the autosave round-trip (the store re-checks the same
+            // rule on read; this only keeps the strip from offering a seek
+            // target for text it no longer matches).
+            if self.words.current.remove(&idx).is_some() {
+                self.words.stale.insert(idx);
             }
         }
         let changed = !self.pending_updates().is_empty();
@@ -1071,8 +1088,12 @@ pub enum HistoryStep {
 pub enum Effect {
     /// Submit the current import to the background worker.
     SubmitJob { input: PathBuf },
-    /// Persist a finished transcript to the library (in-app jobs always save).
-    SaveTranscript(Box<Transcript>),
+    /// Persist a finished transcript to the library (in-app jobs always save),
+    /// together with the word timing the same engine run produced (M15.6).
+    SaveTranscript {
+        transcript: Box<Transcript>,
+        words: Vec<WordTiming>,
+    },
     /// Persist edited segment text (autosave / flush).
     SaveEdits { updates: Vec<(u32, String)> },
     /// Load a transcript from the store into the editor.
@@ -2024,6 +2045,7 @@ impl AppState {
             WorkerEvent::Segments { .. } => Vec::new(),
             WorkerEvent::Finished {
                 transcript,
+                words,
                 engine_used,
                 warnings,
                 ..
@@ -2040,7 +2062,10 @@ impl AppState {
                 }
                 self.set_status(status, false);
                 let mut effects = self.open_editor((*transcript).clone());
-                effects.push(Effect::SaveTranscript(transcript));
+                // M15.6: the job's own word timing, current by construction.
+                let alignment = WordAlignment::from_words(&words);
+                self.on_word_alignment_loaded(transcript.id, alignment);
+                effects.push(Effect::SaveTranscript { transcript, words });
                 effects
             }
             WorkerEvent::Error { message, .. } => {
@@ -3117,6 +3142,7 @@ mod tests {
         WorkerEvent::Finished {
             job_id: 1,
             transcript: Box::new(transcript),
+            words: Vec::new(),
             engine_used: EngineId::Cpu,
             warnings: Vec::new(),
         }
@@ -3148,7 +3174,10 @@ mod tests {
         let done = transcript("happy.wav");
         let id = done.id;
         let effects = state.on_worker_event(finished_event(done.clone()));
-        assert!(matches!(effects.as_slice(), [Effect::SaveTranscript(_)]));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::SaveTranscript { .. }]
+        ));
         assert_eq!(state.route, Route::Editor);
         assert!(!state.busy(), "a finished job must release the tick");
         assert_eq!(state.last_engine, Some(EngineId::Cpu));
@@ -5163,6 +5192,34 @@ mod tests {
         let mut state = AppState::new();
         state.on_transcript_loaded(transcript);
         state
+    }
+
+    #[test]
+    fn typing_into_a_row_drops_its_word_timing_before_the_save_lands() {
+        let mut state = editor_with(&["selamat pagi semua"]);
+        // Seed a current alignment for the row (as an open transcript would).
+        let mut alignment = WordAlignment::default();
+        alignment.current.insert(
+            0,
+            vec![WordTiming {
+                segment_idx: 0,
+                word_idx: 0,
+                start_ms: 0,
+                end_ms: 400,
+                text: "selamat".to_string(),
+            }],
+        );
+        let id = state.editor.as_ref().unwrap().transcript.id;
+        state.on_word_alignment_loaded(id, alignment);
+        assert!(state.editor.as_ref().unwrap().words.segment(0).is_some());
+
+        // A real edit: the strip must not keep offering a seek target for text
+        // it no longer describes (the store re-marks it on save; this is the
+        // same rule, immediately).
+        state.edit_segment(0, "selamat pagi semuanya".to_string(), Instant::now());
+        let words = &state.editor.as_ref().unwrap().words;
+        assert!(words.segment(0).is_none());
+        assert!(words.stale.contains(&0));
     }
 
     #[test]

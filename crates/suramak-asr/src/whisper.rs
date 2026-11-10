@@ -27,16 +27,18 @@ use std::sync::{Once, OnceLock};
 
 use suramak_core::models;
 use suramak_core::settings::LangMode;
-use suramak_core::transcript::Segment;
+use suramak_core::transcript::{Segment, WordTiming};
 use suramak_core::SuramakError;
 use tracing::warn;
 use whisper_rs::whisper_rs_sys::{ggml_log_level, whisper_context, whisper_state};
 use whisper_rs::{
-    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
+    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperSegment,
+    WhisperState,
 };
 
 use crate::cancel::CancelToken;
 use crate::engine::{EngineAvailability, EngineDecision, EngineId};
+use crate::words::{self, TokenSpan};
 
 /// Errors raised by the ASR layer.
 ///
@@ -556,6 +558,9 @@ impl ContextCache {
 #[derive(Debug, Clone)]
 pub struct TranscribeOutcome {
     pub segments: Vec<Segment>,
+    /// Per-word estimated timing (M15.6) for the segments whose token stream
+    /// spells exactly the stored text; empty for the rest.
+    pub words: Vec<WordTiming>,
     /// Engine that actually ran. Core ML only when whisper.cpp loaded the encoder.
     pub engine_used: EngineId,
     /// Non-fatal notes: engine downgrades, Core ML fallback, ignored requests.
@@ -701,6 +706,7 @@ pub fn transcribe(
     }
 
     let mut segments = Vec::with_capacity(n_segments as usize);
+    let mut words = Vec::new();
     for (i, seg) in state.as_iter().enumerate() {
         let text = match seg.to_str() {
             Ok(s) => s.trim().to_string(),
@@ -712,19 +718,66 @@ pub fn transcribe(
                 .trim()
                 .to_string(),
         };
+        let start_ms = seg.start_timestamp() * 10;
+        let end_ms = seg.end_timestamp() * 10;
+        // M15.6: the same run's token spans, mapped onto whole words. Reading
+        // them changes nothing about the inference — `token_timestamps` was
+        // already on (params above), so whisper.cpp computed them anyway.
+        let spans = segment_token_spans(ctx, &seg);
+        words.extend(words::words_for_segment(
+            i as u32, &text, start_ms, end_ms, &spans,
+        ));
         segments.push(Segment {
             idx: i as u32,
             // Centiseconds → milliseconds.
-            start_ms: seg.start_timestamp() * 10,
-            end_ms: seg.end_timestamp() * 10,
+            start_ms,
+            end_ms,
             text,
         });
     }
     Ok(TranscribeOutcome {
         segments,
+        words,
         engine_used,
         warnings,
     })
+}
+
+/// One segment's text tokens with their estimated spans (M15.6).
+///
+/// Special tokens are skipped: whisper's vocabulary puts every text token
+/// below `whisper_token_eot`, and the timestamp/special tokens at or above it
+/// spell no text (`whisper-rs` 0.16 `WhisperContext::token_eot`, or
+/// `whisper.h`'s `whisper_token_eot`). Token bytes, not `&str`, because a
+/// multi-byte character can be split across tokens. Token times are
+/// centiseconds → milliseconds; a negative value means "unknown" and is
+/// carried through so the mapper can refuse the segment rather than invent a
+/// boundary.
+fn segment_token_spans(ctx: &WhisperContext, seg: &WhisperSegment<'_>) -> Vec<TokenSpan> {
+    let eot = ctx.token_eot();
+    let mut spans = Vec::new();
+    for index in 0..seg.n_tokens() {
+        let Some(token) = seg.get_token(index) else {
+            continue;
+        };
+        if token.token_id() >= eot {
+            continue;
+        }
+        let Ok(bytes) = token.to_bytes() else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        let data = token.token_data();
+        spans.push(TokenSpan::new(
+            bytes.to_vec(),
+            data.t0 * 10,
+            data.t1 * 10,
+            data.p,
+        ));
+    }
+    spans
 }
 
 #[cfg(test)]

@@ -12,6 +12,29 @@ pub struct Segment {
     pub text: String,
 }
 
+/// One word of a segment with its estimated time range (M15.6).
+///
+/// This is **estimated alignment**, not forced alignment: the times are
+/// whisper's token-level timestamp estimates (10 ms granularity) mapped onto
+/// whole words, and they exist only for text the engine itself produced. An
+/// edited segment has no usable word timing until it is re-aligned — the
+/// store says so with a sticky stale marker, and the UI falls back to
+/// segment seeking. Nothing in the product may present these as exact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WordTiming {
+    /// The segment this word belongs to.
+    pub segment_idx: u32,
+    /// Position of the word inside its segment, dense from 0.
+    pub word_idx: u32,
+    /// Estimated start in milliseconds, inside the segment's own span.
+    pub start_ms: i64,
+    /// Estimated end in milliseconds (`>= start_ms`, inside the segment span).
+    pub end_ms: i64,
+    /// The word exactly as it appears in the segment text (punctuation
+    /// attached, whitespace removed).
+    pub text: String,
+}
+
 /// Where the audio came from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

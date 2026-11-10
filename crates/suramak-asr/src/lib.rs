@@ -31,6 +31,7 @@ pub mod pipeline;
 pub mod prompt_budget;
 pub mod speech_transcriber;
 pub mod whisper;
+pub mod words;
 pub mod worker;
 
 pub use cancel::CancelToken;

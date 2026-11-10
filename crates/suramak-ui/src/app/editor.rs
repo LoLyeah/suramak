@@ -33,7 +33,7 @@ use crate::theme::{self, Tokens};
 
 use super::polish::{PolishState, POLISH_SETUP_NOTE};
 use super::views::{pane_caption, PANE_PAD_X};
-use super::{export, format_transport, AppState, Effect};
+use super::{count_noun, export, format_transport, AppState, Effect};
 
 /// The deck band's height (workorder §3: ~96 px).
 pub const DECK_HEIGHT: f32 = 96.0;
@@ -864,6 +864,40 @@ fn badge_color(level: Level, tokens: &Tokens) -> egui::Color32 {
     }
 }
 
+/// The index of the word the playhead is in (M15.6).
+///
+/// The last word whose estimate starts at or before `position_ms`; `None`
+/// before the first word. Karaoke holds the word it just read through the
+/// pause that follows it instead of blinking off between words — the strip is
+/// only drawn for the segment the playhead is inside, so there is no risk of a
+/// stale highlight leaking into another row.
+pub(crate) fn word_at(
+    words: &[suramak_core::transcript::WordTiming],
+    position_ms: i64,
+) -> Option<usize> {
+    let after = words.partition_point(|word| word.start_ms <= position_ms);
+    after.checked_sub(1)
+}
+
+impl AppState {
+    /// Adopts a transcript's stored word timing (M15.6) — after a load, a
+    /// structural edit, an autosave or a fresh job. Only the transcript that is
+    /// actually open is affected; a late read for another id is ignored.
+    pub fn on_word_alignment_loaded(
+        &mut self,
+        id: uuid::Uuid,
+        alignment: suramak_core::store::WordAlignment,
+    ) {
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+        if editor.transcript.id != id {
+            return;
+        }
+        editor.words = alignment;
+    }
+}
+
 /// The transcript as clean rows: mono gutter + serif body at the ~68 % measure,
 /// hover wash, active segment = 3 pt accent edge bar + faint tint (the tint
 /// crossfades with the fast token), and the row `TextEdit` editing as before.
@@ -910,6 +944,29 @@ fn transcript_rows(
         .as_ref()
         .and_then(|editor| segment_index_at(&editor.transcript.segments, position_ms));
 
+    // M15.6: the words of the row the playhead is in, when their timing is
+    // current. One row's worth per frame — the strip below the active line is
+    // the karaoke surface, and a transcript whose rows are stale or missing
+    // simply has none (segment seeking stays the whole fallback).
+    let active_words: Vec<suramak_core::transcript::WordTiming> = active
+        .and_then(|index| rows.get(index))
+        .and_then(|(idx, _, _)| {
+            state
+                .editor
+                .as_ref()
+                .and_then(|editor| editor.words.segment(*idx))
+        })
+        .map(<[_]>::to_vec)
+        .unwrap_or_default();
+    let current_word = word_at(&active_words, position_ms);
+    // How many rows lost their timing to an edit (a per-row marker would be
+    // noise; one honest line, only when it is true).
+    let stale_rows = state
+        .editor
+        .as_ref()
+        .map(|editor| editor.words.stale.len())
+        .unwrap_or_default();
+
     let mut seek_to: Option<u32> = None;
     // M15.3: the caret of whichever row has focus this frame, and the row
     // action the user pressed (applied after the scroll closure, when the
@@ -933,6 +990,23 @@ fn transcript_rows(
                     );
                 });
                 return;
+            }
+            // M15.6: word timing is not a promise. When edits invalidated some
+            // rows, say so once — those rows fall back to segment seeking (the
+            // timestamp in the gutter, and the waveform strip, still work).
+            if stale_rows > 0 {
+                ui.horizontal(|ui| {
+                    ui.add_space(PANE_PAD_X - 8.0);
+                    pane_caption(
+                        ui,
+                        &format!(
+                            "word timing stale on {} — those rows seek by segment",
+                            count_noun(stale_rows, "segment")
+                        ),
+                        tokens,
+                        false,
+                    );
+                });
             }
             let mut edited: Option<(u32, String)> = None;
             let Some(editor) = &mut state.editor else {
@@ -1185,6 +1259,91 @@ fn transcript_rows(
                 }
                 if let Some((idx, text)) = translation_edited {
                     translation_edited_out = Some((idx, text));
+                }
+
+                // M15.6: the word strip under the row the playhead is in — the
+                // karaoke surface. Each word is a seek target; the word the
+                // playhead is inside carries the accent, and its underline
+                // springs in (Reduce Motion snaps it in — the state stays).
+                if is_active && !active_words.is_empty() {
+                    let mut strip_bottom = content_rect.bottom();
+                    ui.horizontal_top(|ui| {
+                        ui.add_space(PANE_PAD_X - 8.0 + gutter_w);
+                        ui.vertical(|ui| {
+                            ui.set_max_width(text_w);
+                            let strip = ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing.x = 2.0;
+                                ui.spacing_mut().button_padding = vec2(4.0, 1.5);
+                                for (word_index, word) in active_words.iter().enumerate() {
+                                    let current = following && current_word == Some(word_index);
+                                    let id =
+                                        egui::Id::new(("suramak-word", *idx, word_index));
+                                    let highlight =
+                                        motion.highlight_spring(ui.ctx(), id, current);
+                                    let response = ui.add(
+                                        egui::Button::new(
+                                            egui::RichText::new(&word.text)
+                                                .font(FontId::new(
+                                                    13.0,
+                                                    FontFamily::Proportional,
+                                                ))
+                                                .color(motion::lerp_color(
+                                                    tokens.ink_soft,
+                                                    tokens.ink,
+                                                    highlight,
+                                                )),
+                                        )
+                                        // `frame(true)` + `frame_when_inactive`
+                                        // so the accent tint is painted even
+                                        // when the chip is not hovered — with
+                                        // `frame(false)` egui drops `fill`.
+                                        .frame(true)
+                                        .frame_when_inactive(true)
+                                        .fill(motion::tint_over(
+                                            egui::Color32::TRANSPARENT,
+                                            tokens.accent_tint,
+                                            highlight,
+                                        ))
+                                        .stroke(Stroke::NONE)
+                                        .corner_radius(CornerRadius::same(3)),
+                                    );
+                                    if highlight > 0.01 {
+                                        // The spring's geometry: the underline
+                                        // grows from the word's centre.
+                                        let bar = Rect::from_center_size(
+                                            pos2(
+                                                response.rect.center().x,
+                                                response.rect.bottom() + 0.5,
+                                            ),
+                                            vec2(response.rect.width() * highlight, 2.0),
+                                        );
+                                        ui.painter().rect_filled(
+                                            bar,
+                                            CornerRadius::same(1),
+                                            tokens.accent.gamma_multiply(highlight),
+                                        );
+                                    }
+                                    if response.clicked() {
+                                        seek_to = Some(
+                                            word.start_ms
+                                                .clamp(0, i64::from(u32::MAX))
+                                                as u32,
+                                        );
+                                    }
+                                    response.on_hover_text(format!(
+                                        "{} · {} — estimated word timing; click to play from here",
+                                        word.text,
+                                        suramak_core::time::fmt_plain(word.start_ms)
+                                    ));
+                                }
+                            });
+                            strip_bottom = strip.response.rect.bottom();
+                        });
+                    });
+                    content_rect = Rect::from_min_max(
+                        content_rect.min,
+                        pos2(content_rect.max.x, strip_bottom),
+                    );
                 }
 
                 // The row surface: full-width, padded around the content.
@@ -1952,5 +2111,66 @@ mod tests {
         assert_eq!(badge_color(Level::Warning, &tokens), tokens.warn);
         assert_eq!(badge_color(Level::Error, &tokens), tokens.record_red_text);
         assert_eq!(badge_color(Level::Ok, &tokens), tokens.warn);
+    }
+
+    // ---- M15.6: the karaoke word strip -------------------------------------
+
+    fn word(index: u32, start_ms: i64, end_ms: i64) -> suramak_core::transcript::WordTiming {
+        suramak_core::transcript::WordTiming {
+            segment_idx: 0,
+            word_idx: index,
+            start_ms,
+            end_ms,
+            text: format!("w{index}"),
+        }
+    }
+
+    #[test]
+    fn the_current_word_is_the_last_one_that_started() {
+        let words = vec![word(0, 100, 300), word(1, 300, 600), word(2, 700, 900)];
+        assert_eq!(word_at(&words, 0), None, "before the first word");
+        assert_eq!(word_at(&words, 100), Some(0));
+        assert_eq!(word_at(&words, 299), Some(0));
+        assert_eq!(word_at(&words, 300), Some(1));
+        // A pause after a word keeps that word highlighted (karaoke holds).
+        assert_eq!(word_at(&words, 650), Some(1));
+        assert_eq!(word_at(&words, 900), Some(2), "past the last end holds too");
+        assert_eq!(word_at(&[], 500), None);
+    }
+
+    #[test]
+    fn a_loaded_alignment_replaces_the_open_transcripts_words_and_ignores_other_ids() {
+        use suramak_core::transcript::{Segment, Source, Transcript};
+
+        let mut state = AppState::new();
+        let t = Transcript::new(
+            "words.wav".to_string(),
+            Source::File {
+                name: "words.wav".to_string(),
+            },
+            "tiny".to_string(),
+            Some("en".to_string()),
+            None,
+            vec![Segment {
+                idx: 0,
+                start_ms: 0,
+                end_ms: 900,
+                text: "w0".to_string(),
+            }],
+        );
+        let id = t.id;
+        state.open_editor(t);
+
+        let mut alignment = suramak_core::store::WordAlignment::default();
+        alignment.current.insert(0, vec![word(0, 0, 500)]);
+        state.on_word_alignment_loaded(id, alignment.clone());
+        assert_eq!(
+            state.editor.as_ref().unwrap().words.segment(0).unwrap()[0].end_ms,
+            500
+        );
+
+        // A read for some other transcript must not land in this editor.
+        state.on_word_alignment_loaded(uuid::Uuid::new_v4(), Default::default());
+        assert!(!state.editor.as_ref().unwrap().words.is_empty());
     }
 }
