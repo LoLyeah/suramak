@@ -177,15 +177,15 @@ jobs:
           UNSIGNED=$(ls android/app/build/outputs/apk/release/*.apk | head -1)
           OUT="suramak-${TAG}-android-arm64-v8a.apk"
           cp "$UNSIGNED" "$OUT"
-          "$(ls -d ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/*/bin | head -1)"/../bin/apksigner sign \
-            --ks "$SURAMAK_KEYSTORE" --ks-key-alias suramak \
-            --ks-pass "pass:$SURAMAK_KEYSTORE_PASS" --key-pass "pass:$SURAMAK_KEYSTORE_PASS" \
-            --out "$OUT" "$OUT" || \
-          "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/apksigner" sign \
+          # r27d's NDK does not ship apksigner; it lives in the SDK's
+          # build-tools (preinstalled on the runner). Latest version wins.
+          APKSIGNER="$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V | tail -1)apksigner"
+          [ -x "$APKSIGNER" ] || fail "no apksigner under $ANDROID_HOME/build-tools"
+          "$APKSIGNER" sign \
             --ks "$SURAMAK_KEYSTORE" --ks-key-alias suramak \
             --ks-pass "pass:$SURAMAK_KEYSTORE_PASS" --key-pass "pass:$SURAMAK_KEYSTORE_PASS" \
             --out "$OUT" "$OUT"
-          "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/apksigner" verify --print-certs "$OUT"
+          "$APKSIGNER" verify --print-certs "$OUT"
           sha256sum "$OUT" > "${OUT}.sha256"
 
       - uses: actions/upload-artifact@v7
