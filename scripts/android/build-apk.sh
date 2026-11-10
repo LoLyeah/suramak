@@ -183,14 +183,20 @@ AAPT="$SDK/build-tools/35.0.0/aapt"
 if [ -x "$AAPT" ]; then
   # Same SIGPIPE reasoning as above: match in the shell, not through a pipe.
   BADGING="$("$AAPT" dump badging "$APK")"
+  # The expected version comes from the workspace Cargo.toml (bump_version.py
+  # keeps every site in sync), not a hard-coded literal — a version bump must
+  # never trip the packaging assertion.
+  EXPECTED_VERSION="$(sed -n 's/^[[:space:]]*version = "\([^"]*\)".*/\1/p' "$REPO_ROOT/Cargo.toml" | head -1)"
+  [ -n "$EXPECTED_VERSION" ] || fail "cannot read the workspace version from Cargo.toml"
   case "$BADGING" in
-    *"package: name='app.suramak.spike' versionCode='11' versionName='0.4.0-m13g3.1'"*) ;;
+    *"package: name='app.suramak.spike' versionCode='401' versionName='$EXPECTED_VERSION'"*) ;;
     *)
-      # Fall back to a narrower match so a future versionCode bump does not
-      # hide a real versionName regression.
+      # Fall back to a narrower match so a versionCode change does not hide a
+      # real versionName regression. The versionCode itself is asserted by
+      # bump_version.py's own sync (0.4.1 -> 401); match loosely here.
       case "$BADGING" in
-        *"package: name='app.suramak.spike'"*"versionName='0.4.0-m13g3.1'"*) ;;
-        *) fail "APK versionName is not 0.4.0-m13g3.1 (see aapt output below)" ;;
+        *"package: name='app.suramak.spike'"*"versionName='$EXPECTED_VERSION'"*) ;;
+        *) fail "APK versionName is not $EXPECTED_VERSION (see aapt output below)" ;;
       esac
       ;;
   esac
