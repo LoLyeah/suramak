@@ -14,13 +14,12 @@ android {
         // compileSdk avoids the "targetSdk > compileSdk" AGP refusal.
         minSdk = 29
         targetSdk = 35
-        // v2.4: the rotation kill — a destroy gate inside the gpu init path, the
-        // native-signal dump, and the probe in the Activity's instance state
-        // (WORKORDER-M13B6). `scripts/android/build-apk.sh` asserts this exact
-        // versionName with `aapt dump badging`, which is what the owner checks
-        // before installing.
-        versionCode = 6
-        versionName = "0.3.0-m13b.2.4"
+        // M13e: the same single Gradle module now carries the share/SAF import
+        // and the transcription job host. `scripts/android/build-apk.sh`
+        // asserts this exact versionName with `aapt dump badging`, which is what
+        // the owner checks before installing.
+        versionCode = 7
+        versionName = "0.4.0-m13e.1"
 
         // Only the phone ABI: this APK exists to be installed by the owner.
         ndk {

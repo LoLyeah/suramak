@@ -20,4 +20,43 @@
     <string name="model_download_failed">Unduhan gagal</string>
     <string name="model_download_refused">Unduhan tidak dimulai</string>
     <string name="model_download_timed_out">Unduhan dijeda (batas waktu)</string>
+
+    <!-- M13e: notifikasi layanan transkripsi dan alur impor. -->
+    <string name="transcribe_channel">Transkripsi</string>
+    <string name="transcribe_channel_desc">Kemajuan saat berkas ditranskripsi</string>
+    <string name="transcribe_done_channel">Transkrip selesai</string>
+    <string name="transcribe_done_channel_desc">Satu notifikasi per berkas yang selesai</string>
+    <string name="transcribe_starting">Menyiapkan transkripsi…</string>
+    <string name="transcribe_progress_title">Mentranskripsi %1$s</string>
+    <string name="transcribe_progress">%1$d%% · %2$d menunggu</string>
+    <string name="transcribe_cancel">Batalkan</string>
+    <string name="transcribe_done_title">Transkrip siap</string>
+    <string name="transcribe_done_body">%1$s · %2$d segmen</string>
+    <string name="transcribe_failed_title">Transkripsi gagal</string>
+    <string name="transcribe_failed_body">Berkas ini tidak dapat ditranskripsi.</string>
+    <string name="transcribe_refused_title">Impor ditolak</string>
+    <string name="transcribe_no_model_title">Belum ada model</string>
+    <string name="transcribe_no_model_body">Unduh model ucapan dulu — transkripsi membutuhkan model di ponsel ini.</string>
+    <string name="transcribe_paused_title">Transkripsi dijeda</string>
+    <string name="transcribe_paused_body">Transkripsi dilanjutkan dari salinan yang diimpor saat Suramak dibuka lagi.</string>
+    <string name="transcribe_timed_out_body">Batas waktu sistem menghentikannya. Saat Suramak dibuka lagi, Anda ditawari untuk melanjutkan.</string>
+    <string name="transcribe_cancelled_title">Transkripsi dibatalkan</string>
+    <string name="transcribe_cancelled_body">Salinan impor dihapus; tidak ada yang ditambahkan ke pustaka.</string>
+    <string name="transcribe_recovery_title">Transkripsi belum selesai</string>
+    <string name="transcribe_recovery_resume">Lanjutkan</string>
+    <string name="transcribe_recovery_discard">Buang</string>
+    <string name="transcribe_recovery_resume_line">%1$s — %2$d%% tersalin dan tertranskripsi sebelum berhenti</string>
+    <string name="transcribe_recovery_discard_line">%1$s — %2$s</string>
+    <string name="transcribe_opened">Transkrip siap: %1$s (%2$d segmen)</string>
+    <string name="transcribe_open_missing">Transkrip itu sudah tidak ada di pustaka</string>
+    <string name="transcribe_share_empty">Tidak ada yang bisa ditranskripsi dari bagikan itu</string>
+    <string name="transcribe_schedule_failed">Tidak dapat memulai tugas transkripsi</string>
+    <string name="transcribe_unnamed">Catatan suara</string>
+    <plurals name="transcribe_queued">
+        <item quantity="one">Mentranskripsi %1$d berkas dengan %2$s</item>
+        <item quantity="other">Mentranskripsi %1$d berkas dengan %2$s</item>
+    </plurals>
+    <!-- M13e: pintasan peluncur untuk membuka pemilih SAF. -->
+    <string name="shortcut_import_short">Impor</string>
+    <string name="shortcut_import_long">Impor berkas audio</string>
 </resources>

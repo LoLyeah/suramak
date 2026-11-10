@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Suramak — M13b/M13d: build the installable debug APK for the Android shell.
+# Suramak — M13b/M13d/M13e: build the installable debug APK for the shell.
 #
 #   scripts/android/build-apk.sh
 #
@@ -7,12 +7,13 @@
 #   1. discovers the pinned toolchain (NDK r27d, a full JDK 17, the Android SDK);
 #   2. cross-builds both Rust cdylibs for arm64-v8a with cargo-ndk, dropping
 #      libsuramak_android_spike.so (the M13b shell) and libsuramak_android.so
-#      (the M13d model host the JobService calls) into
+#      (the M13d model host + M13e import/transcription host) into
 #      android/app/src/main/jniLibs/;
 #   3. runs ./gradlew assembleDebug (Kotlin shim + manifest + jniLibs → APK);
 #   4. asserts the APK exists and really contains both .so files, the right
-#      version, the crash-log FileProvider and the M13d download service, then
-#      prints its path, size and sha256.
+#      version, the crash-log FileProvider, the M13d download service, the M13e
+#      share matrix / SAF / transcription service and both bridges' JNI symbols,
+#      then prints its path, size and sha256.
 #
 # It installs nothing and needs no sudo. Environment (all optional):
 #   ANDROID_HOME / ANDROID_SDK_ROOT   SDK root (default ~/android-sdk)
@@ -169,13 +170,13 @@ if [ -x "$AAPT" ]; then
   # Same SIGPIPE reasoning as above: match in the shell, not through a pipe.
   BADGING="$("$AAPT" dump badging "$APK")"
   case "$BADGING" in
-    *"package: name='app.suramak.spike' versionCode='6' versionName='0.3.0-m13b.2.4'"*) ;;
+    *"package: name='app.suramak.spike' versionCode='7' versionName='0.4.0-m13e.1'"*) ;;
     *)
       # Fall back to a narrower match so a future versionCode bump does not
       # hide a real versionName regression.
       case "$BADGING" in
-        *"package: name='app.suramak.spike'"*"versionName='0.3.0-m13b.2.4'"*) ;;
-        *) fail "APK versionName is not 0.3.0-m13b.2.4 (see aapt output below)" ;;
+        *"package: name='app.suramak.spike'"*"versionName='0.4.0-m13e.1'"*) ;;
+        *) fail "APK versionName is not 0.4.0-m13e.1 (see aapt output below)" ;;
       esac
       ;;
   esac
@@ -227,6 +228,69 @@ if [ -x "$AAPT" ]; then
     *"app.suramak.models.CancelModelDownloadReceiver"*) ;;
     *) fail "APK manifest declares no cancel receiver for the download notification" ;;
   esac
+  # M13e: the share matrix. A missing action or mime type means the app never
+  # appears in the share sheet for that voice note — the one place the owner
+  # cannot see a log line.
+  case "$MANIFEST_TREE" in
+    *"android.intent.action.SEND_MULTIPLE"*) ;;
+    *) fail "APK manifest declares no ACTION_SEND_MULTIPLE filter" ;;
+  esac
+  case "$MANIFEST_TREE" in
+    *"android.intent.action.SEND"*) ;;
+    *) fail "APK manifest declares no ACTION_SEND filter" ;;
+  esac
+  for MIME in "audio/*" "application/ogg" "application/x-ogg" "audio/opus" "audio/ogg" "audio/webm" "video/webm" "video/mp4" "video/x-matroska"; do
+    case "$MANIFEST_TREE" in
+      *"mimeType(0x01010026)=\"$MIME\""*) ;;
+      *) fail "APK share matrix is missing $MIME" ;;
+    esac
+  done
+  case "$MANIFEST_TREE" in
+    *"android.intent.action.OPEN_DOCUMENT"*) ;;
+    *) fail "APK manifest declares no ACTION_OPEN_DOCUMENT (SAF) filter" ;;
+  esac
+  # M13e: the transcription service, both foreground types and the wake lock.
+  case "$MANIFEST_TREE" in
+    *"app.suramak.transcribe.TranscriptionJobService"*) ;;
+    *) fail "APK manifest declares no app.suramak.transcribe.TranscriptionJobService" ;;
+  esac
+  case "$MANIFEST_TREE" in
+    *"foregroundServiceType"*"0x2001"*) ;;
+    *) fail "the transcription service does not declare mediaProcessing|dataSync (0x2001)" ;;
+  esac
+  case "$MANIFEST_TREE" in
+    *"FOREGROUND_SERVICE_MEDIA_PROCESSING"*) ;;
+    *) fail "APK manifest does not declare FOREGROUND_SERVICE_MEDIA_PROCESSING" ;;
+  esac
+  case "$MANIFEST_TREE" in
+    *"android.permission.WAKE_LOCK"*) ;;
+    *) fail "APK manifest does not declare WAKE_LOCK — the screen-off job would stall" ;;
+  esac
+  case "$MANIFEST_TREE" in
+    *"app.suramak.transcribe.CancelTranscriptionReceiver"*) ;;
+    *) fail "APK manifest declares no cancel receiver for the transcription notification" ;;
+  esac
+  case "$MANIFEST_TREE" in
+    *"android.app.shortcuts"*) ;;
+    *) fail "APK manifest does not register the launcher shortcuts (SAF import entry)" ;;
+  esac
+
+  # M13e: the JNI symbols both JobServices call. A missing symbol is an
+  # UnsatisfiedLinkError the first time a job starts, on the phone only.
+  LLVM_NM="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+  if [ -x "$LLVM_NM" ]; then
+    SYMBOLS="$("$LLVM_NM" -D --defined-only "$APP_SO")"
+    case "$SYMBOLS" in
+      *"Java_app_suramak_models_ModelsBridge_nativeCommand"*) ;;
+      *) fail "$APP_SO exports no ModelsBridge.nativeCommand symbol" ;;
+    esac
+    case "$SYMBOLS" in
+      *"Java_app_suramak_transcribe_TranscribeBridge_nativeCommand"*) ;;
+      *) fail "$APP_SO exports no TranscribeBridge.nativeCommand symbol" ;;
+    esac
+  else
+    fail "no llvm-nm at $LLVM_NM (cannot verify the JNI symbols)"
+  fi
   printf '%s\n' "$BADGING" | grep -E "^(package|sdkVersion|targetSdkVersion|launchable-activity|native-code)" || true
 fi
 

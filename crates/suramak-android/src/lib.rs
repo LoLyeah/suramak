@@ -10,14 +10,23 @@
 //! so it runs (and is tested) on the host; only the JNI wrapper is
 //! `cfg(target_os = "android")`.
 //!
+//! **M13e:** adds the import + transcription host ([`jobs`]) behind the same
+//! one-function JSON pattern (`TranscribeBridge.nativeCommand`): the journal
+//! that survives a process kill, the bounded copy-progress channel, and the
+//! M16.1 `QueueDriver` that guarantees one inference slot. The service, the
+//! notification, the wake lock and the SAF descriptor stay in Kotlin.
+//!
 //! Keep this crate thin: the app shell (`android_main`, the compact Deck) lands
 //! in M13g — see `docs/PLAN-M13-ANDROID.md` §3.
 
 use std::ffi::{c_char, CString};
+use std::path::Path;
 use std::sync::OnceLock;
 
+pub mod jobs;
 pub mod model_host;
 
+use jobs::{AndroidJobHost, HostDirs};
 use model_host::ModelHost;
 
 /// The crate version (the workspace version, e.g. `0.4.0`).
@@ -32,6 +41,48 @@ pub fn version() -> &'static str {
 pub fn host() -> &'static ModelHost {
     static HOST: OnceLock<ModelHost> = OnceLock::new();
     HOST.get_or_init(ModelHost::new)
+}
+
+/// The process-wide import/transcription host (M13e).
+///
+/// Created on the first `init` command, because it needs the app's `filesDir`
+/// before it can own a media directory, a journal and the library path. Later
+/// commands never create it: a job protocol call before `init` fails closed
+/// rather than writing to a guessed directory.
+pub fn jobs_host() -> Option<&'static AndroidJobHost> {
+    JOBS_HOST.get()
+}
+
+/// The one process-wide job host; `init` fills it, every other command reads it.
+static JOBS_HOST: OnceLock<AndroidJobHost> = OnceLock::new();
+
+/// Handles the job protocol, including the one command that runs before the
+/// host exists (`init`).
+pub fn dispatch_jobs(request: &str) -> String {
+    let value = match serde_json::from_str::<serde_json::Value>(request) {
+        Ok(value) => value,
+        Err(_) => return r#"{"ok":false,"error":"invalid JSON request"}"#.to_string(),
+    };
+    let op = value.get("op").and_then(|v| v.as_str()).unwrap_or_default();
+    if op == "init" {
+        let root = value
+            .get("root")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if root.is_empty() {
+            return r#"{"ok":false,"error":"init needs the app files directory"}"#.to_string();
+        }
+        #[cfg(target_os = "android")]
+        suramak_core::android::set_data_dir(std::path::PathBuf::from(root));
+        let host =
+            JOBS_HOST.get_or_init(|| AndroidJobHost::production(HostDirs::under(Path::new(root))));
+        return host.dispatch(r#"{"op":"status"}"#);
+    }
+    match jobs_host() {
+        Some(host) => host.dispatch(request),
+        None => r#"{"ok":false,"error":"the job host has not been initialised (send init first)"}"#
+            .to_string(),
+    }
 }
 
 /// NUL-terminated form of [`version`], initialised once for the C ABI.
@@ -94,6 +145,47 @@ mod jni_surface {
         }))
         .unwrap_or_else(|_| {
             "{\"ok\":false,\"error\":\"internal error in the model host\"}".to_string()
+        });
+
+        match env.new_string(reply) {
+            Ok(string) => string.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+}
+
+/// The M13e JNI surface: one function, same shape as the model bridge.
+///
+/// Kotlin (`app.suramak.transcribe.TranscribeBridge`) declares
+/// `private external fun nativeCommand(request: String): String`. Every call
+/// goes through [`crate::dispatch_jobs`], which owns the `init` special case.
+#[cfg(target_os = "android")]
+mod jni_transcribe {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    use jni::objects::{JObject, JString};
+    use jni::sys::jstring;
+    use jni::JNIEnv;
+
+    /// `TranscribeBridge.nativeCommand(String): String`.
+    #[no_mangle]
+    pub extern "system" fn Java_app_suramak_transcribe_TranscribeBridge_nativeCommand<'local>(
+        mut env: JNIEnv<'local>,
+        _this: JObject<'local>,
+        request: JString<'local>,
+    ) -> jstring {
+        let reply = catch_unwind(AssertUnwindSafe(|| {
+            let input: String = match env.get_string(&request) {
+                Ok(text) => text.into(),
+                Err(_) => {
+                    return "{\"ok\":false,\"error\":\"could not read the request string\"}"
+                        .to_string()
+                }
+            };
+            crate::dispatch_jobs(&input)
+        }))
+        .unwrap_or_else(|_| {
+            "{\"ok\":false,\"error\":\"internal error in the job host\"}".to_string()
         });
 
         match env.new_string(reply) {

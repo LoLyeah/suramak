@@ -17,6 +17,11 @@ suramak-asr = { path = "../suramak-asr" }
 # M13d: the JSON command protocol between Kotlin and the model host. Already a
 # workspace dependency of `suramak-core` — no new package.
 serde_json = { workspace = true }
+# M13e: the job journal's on-disk shape (derive only).
+serde = { workspace = true }
+# M13e: `uuid::Uuid::parse_str` for the notification's transcript id. Already in
+# the lock and the graph through `suramak-core`; this is an edge, not a package.
+uuid = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # M13d: the one JNI entry point. `jni` 0.21 is already in Cargo.lock and in the

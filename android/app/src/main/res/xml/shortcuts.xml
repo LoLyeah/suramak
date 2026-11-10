@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  M13e — the "Import audio" launcher shortcut.
+
+  Long-press the Suramak icon → "Import audio" → the system document picker
+  (ACTION_OPEN_DOCUMENT, audio/* + video/*). This is the SAF entry point; it
+  deliberately adds no in-app button, because the spike's four checks own the
+  egui surface until M13G's compact UI replaces it.
+
+  The intent targets MainActivity with a private action; MainActivity maps it to
+  the Activity Result contract and the rest of the flow is the same one the
+  share sheet uses (copy → journal → foreground service → library row).
+-->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:enabled="true"
+        android:icon="@android:drawable/ic_btn_speak_now"
+        android:shortcutId="import_audio"
+        android:shortcutLongLabel="@string/shortcut_import_long"
+        android:shortcutShortLabel="@string/shortcut_import_short">
+        <intent
+            android:action="app.suramak.action.IMPORT_AUDIO"
+            android:targetClass="app.suramak.spike.MainActivity"
+            android:targetPackage="app.suramak.spike" />
+    </shortcut>
+</shortcuts>

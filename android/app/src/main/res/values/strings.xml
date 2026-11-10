@@ -24,4 +24,43 @@
     <string name="model_download_failed">Download failed</string>
     <string name="model_download_refused">Download not started</string>
     <string name="model_download_timed_out">Download paused (time limit)</string>
+
+    <!-- M13e: the transcription service's notifications and the import flow. -->
+    <string name="transcribe_channel">Transcription</string>
+    <string name="transcribe_channel_desc">Progress while a file transcribes</string>
+    <string name="transcribe_done_channel">Finished transcripts</string>
+    <string name="transcribe_done_channel_desc">One notification per finished file</string>
+    <string name="transcribe_starting">Preparing the transcription…</string>
+    <string name="transcribe_progress_title">Transcribing %1$s</string>
+    <string name="transcribe_progress">%1$d%% · %2$d waiting</string>
+    <string name="transcribe_cancel">Cancel</string>
+    <string name="transcribe_done_title">Transcript ready</string>
+    <string name="transcribe_done_body">%1$s · %2$d segments</string>
+    <string name="transcribe_failed_title">Transcription failed</string>
+    <string name="transcribe_failed_body">The file could not be transcribed.</string>
+    <string name="transcribe_refused_title">Import refused</string>
+    <string name="transcribe_no_model_title">No model installed</string>
+    <string name="transcribe_no_model_body">Download a speech model first — transcribing needs one on this phone.</string>
+    <string name="transcribe_paused_title">Transcription paused</string>
+    <string name="transcribe_paused_body">It resumes from the imported copy the next time Suramak opens.</string>
+    <string name="transcribe_timed_out_body">The system time limit stopped it. The next time Suramak opens it offers to resume.</string>
+    <string name="transcribe_cancelled_title">Transcription cancelled</string>
+    <string name="transcribe_cancelled_body">The imported copy was removed; nothing was added to the library.</string>
+    <string name="transcribe_recovery_title">Unfinished transcription</string>
+    <string name="transcribe_recovery_resume">Resume</string>
+    <string name="transcribe_recovery_discard">Discard</string>
+    <string name="transcribe_recovery_resume_line">%1$s — %2$d%% copied and transcribed before the stop</string>
+    <string name="transcribe_recovery_discard_line">%1$s — %2$s</string>
+    <string name="transcribe_opened">Transcript ready: %1$s (%2$d segments)</string>
+    <string name="transcribe_open_missing">That transcript is no longer in the library</string>
+    <string name="transcribe_share_empty">Nothing to transcribe in that share</string>
+    <string name="transcribe_schedule_failed">Could not start the transcription job</string>
+    <string name="transcribe_unnamed">Voice note</string>
+    <plurals name="transcribe_queued">
+        <item quantity="one">Transcribing %1$d file with %2$s</item>
+        <item quantity="other">Transcribing %1$d files with %2$s</item>
+    </plurals>
+    <!-- M13e: the launcher shortcut that opens the SAF picker. -->
+    <string name="shortcut_import_short">Import</string>
+    <string name="shortcut_import_long">Import an audio file</string>
 </resources>

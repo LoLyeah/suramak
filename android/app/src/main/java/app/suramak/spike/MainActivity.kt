@@ -1,7 +1,10 @@
 package app.suramak.spike
 
+import android.Manifest
 import android.content.ClipData
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
 import android.graphics.Typeface
 import android.os.Build
 import android.os.Bundle
@@ -23,11 +26,19 @@ import android.widget.TextView
 import android.widget.Toast
 import android.window.OnBackInvokedDispatcher
 import androidx.activity.OnBackPressedCallback
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.core.content.FileProvider
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import app.suramak.transcribe.ImportSource
+import app.suramak.transcribe.ModelChoice
+import app.suramak.transcribe.Notify
+import app.suramak.transcribe.TranscribeBridge
+import app.suramak.transcribe.TranscriptionJobService
 import com.google.androidgamesdk.GameActivity
 import com.google.androidgamesdk.gametextinput.State
+import org.json.JSONArray
 
 /**
  * M13b shell spike v2.4 — the entire Kotlin surface.
@@ -108,6 +119,19 @@ class MainActivity : GameActivity() {
     /** Uptime of the last counted back press, for cross-path dedupe. */
     private var lastBackAtMs = 0L
 
+    /**
+     * M13e — the SAF picker. `ACTION_OPEN_DOCUMENT` with the two mime families
+     * the shared decoder accepts; the picker grants a per-URI read permission
+     * that the service consumes immediately by copying the bytes.
+     */
+    private val importLauncher =
+        registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+            enqueueImport(uris)
+        }
+
+    /** One recovery prompt per Activity instance (a rotation would repeat it). */
+    private var recoveryShown = false
+
     private external fun nativeInit(filesDir: String)
 
     private external fun nativeSetInsets(
@@ -173,6 +197,12 @@ class MainActivity : GameActivity() {
          * in `nativeSaveProbe` / `nativeRestoreProbe`.
          */
         private const val KEY_PROBE = "app.suramak.spike.probe"
+
+        /** M13e — the launcher shortcut's action (`res/xml/shortcuts.xml`). */
+        const val ACTION_IMPORT_AUDIO = "app.suramak.action.IMPORT_AUDIO"
+
+        /** M13e — the POST_NOTIFICATIONS request code. */
+        private const val REQUEST_NOTIFICATIONS = 4301
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -218,6 +248,28 @@ class MainActivity : GameActivity() {
         installInsetsListener()
         installBackHandler()
         showCrashOverlayIfPresent("launch", force = false)
+
+        // M13e: the job host needs `filesDir` before any job command, and the
+        // share/SAF landing has to be handled on the launch intent.
+        try {
+            TranscribeBridge.init(this)
+            Notify.ensureChannels(this)
+        } catch (t: Throwable) {
+            Log.e(TAG, "the transcription host did not initialise", t)
+        }
+        requestNotificationPermission()
+        handleLaunchIntent(intent)
+        offerRecovery()
+    }
+
+    /**
+     * A second share/notification tap arrives here (the Activity is
+     * `singleTask`): the same handler as `onCreate`, so there is one path.
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleLaunchIntent(intent)
     }
 
     override fun onStart() {
@@ -298,6 +350,176 @@ class MainActivity : GameActivity() {
             Log.e(TAG, "nativeActivityDestroyed failed", t)
         }
         super.onDestroy()
+    }
+
+    // --- M13e: import, recovery and the notification landing -----------------
+
+    /**
+     * The one place an incoming intent is interpreted.
+     *
+     * * a share (`ACTION_SEND` / `ACTION_SEND_MULTIPLE`) or a picker result
+     *   becomes a transcription job;
+     * * the launcher shortcut's `ACTION_IMPORT_AUDIO` opens the SAF picker;
+     * * the completion notification's tap carries a transcript id and lands
+     *   here: today a toast naming the row (there is no compact library yet —
+     *   M13G replaces the toast, the intent stays the same).
+     */
+    private fun handleLaunchIntent(intent: Intent?) {
+        if (intent == null) return
+        when (intent.action) {
+            Intent.ACTION_SEND, Intent.ACTION_SEND_MULTIPLE -> {
+                val uris = ImportSource.urisFrom(intent)
+                if (uris.isEmpty()) {
+                    Toast.makeText(this, getString(R.string.transcribe_share_empty), Toast.LENGTH_LONG)
+                        .show()
+                } else {
+                    enqueueImport(uris)
+                }
+            }
+            ACTION_IMPORT_AUDIO -> importLauncher.launch(arrayOf("audio/*", "video/*"))
+            Notify.ACTION_OPEN_TRANSCRIPT -> {
+                val id = intent.getStringExtra(Notify.EXTRA_TRANSCRIPT_ID)
+                if (id != null) showTranscript(id)
+            }
+        }
+    }
+
+    /** Schedules the foreground job for these URIs, or says why it cannot. */
+    private fun enqueueImport(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        val model = ModelChoice.forJob(this, "auto")
+        if (model == null) {
+            Toast.makeText(this, getString(R.string.transcribe_no_model_body), Toast.LENGTH_LONG)
+                .show()
+            logToRust("import: no model installed")
+            Notify.show(
+                this,
+                Notify.STATUS_ID,
+                Notify.status(
+                    this,
+                    getString(R.string.transcribe_no_model_title),
+                    getString(R.string.transcribe_no_model_body),
+                ),
+            )
+            return
+        }
+        val scheduled = TranscriptionJobService.enqueue(this, uris)
+        if (scheduled) {
+            Toast.makeText(
+                this,
+                resources.getQuantityString(
+                    R.plurals.transcribe_queued,
+                    uris.size,
+                    uris.size,
+                    model,
+                ),
+                Toast.LENGTH_LONG,
+            ).show()
+            logToRust("import: ${uris.size} file(s) queued with $model")
+        } else {
+            Toast.makeText(this, getString(R.string.transcribe_schedule_failed), Toast.LENGTH_LONG)
+                .show()
+            logToRust("import: the platform refused to schedule the job")
+        }
+    }
+
+    /**
+     * The launch-time recovery prompt: a journaled job that a process kill cut
+     * before it finished is offered as **Resume** (the copy completed) or
+     * **Discard**. A job whose copy was cut short has no resume: its bytes
+     * cannot be read again, so the prompt says that and only offers Discard.
+     */
+    private fun offerRecovery() {
+        if (recoveryShown) return
+        recoveryShown = true
+        val jobs: JSONArray = try {
+            TranscribeBridge.recover().optJSONArray("jobs") ?: return
+        } catch (t: Throwable) {
+            Log.w(TAG, "recovery could not read the journal", t)
+            return
+        }
+        if (jobs.length() == 0) return
+
+        val resumable = mutableListOf<String>()
+        val lines = mutableListOf<String>()
+        for (index in 0 until jobs.length()) {
+            val job = jobs.optJSONObject(index) ?: continue
+            val title = job.optString("title").ifEmpty { getString(R.string.transcribe_unnamed) }
+            if (job.optBoolean("resumable")) {
+                resumable.add(job.optString("key"))
+                lines.add(getString(R.string.transcribe_recovery_resume_line, title, job.optInt("percent")))
+            } else {
+                lines.add(
+                    getString(
+                        R.string.transcribe_recovery_discard_line,
+                        title,
+                        job.optString("reason"),
+                    ),
+                )
+            }
+        }
+        val builder = AlertDialog.Builder(this)
+            .setTitle(getString(R.string.transcribe_recovery_title))
+            .setMessage(lines.joinToString("\n"))
+            .setCancelable(false)
+            .setNegativeButton(getString(R.string.transcribe_recovery_discard)) { _, _ ->
+                for (index in 0 until jobs.length()) {
+                    jobs.optJSONObject(index)?.optString("key")?.let(TranscribeBridge::discard)
+                }
+                logToRust("recovery: discarded ${jobs.length()} job(s)")
+            }
+        if (resumable.isNotEmpty()) {
+            builder.setPositiveButton(getString(R.string.transcribe_recovery_resume)) { _, _ ->
+                resumable.forEach { TranscribeBridge.resume(it) }
+                TranscriptionJobService.resumePending(this)
+                logToRust("recovery: resuming ${resumable.size} job(s)")
+            }
+        }
+        builder.show()
+    }
+
+    /**
+     * The completion notification's tap. One path, everywhere: the intent
+     * carries the transcript id and the host looks the row up in the library.
+     * With no compact UI (M13G) the landing is a toast that names the row; it is
+     * deliberately a no-op-with-a-message when the row is gone, never a crash.
+     */
+    private fun showTranscript(id: String) {
+        val reply = try {
+            TranscribeBridge.openTranscript(id)
+        } catch (t: Throwable) {
+            Log.w(TAG, "the transcript could not be opened", t)
+            null
+        }
+        if (reply != null && reply.optBoolean("ok") && reply.optBoolean("found")) {
+            Toast.makeText(
+                this,
+                getString(
+                    R.string.transcribe_opened,
+                    reply.optString("title"),
+                    reply.optInt("segments"),
+                ),
+                Toast.LENGTH_LONG,
+            ).show()
+            logToRust("open transcript: ${reply.optString("title")} (${reply.optInt("segments")} segments)")
+        } else {
+            Toast.makeText(this, getString(R.string.transcribe_open_missing), Toast.LENGTH_LONG).show()
+            logToRust("open transcript: $id not in the library")
+        }
+    }
+
+    /**
+     * Android 13+ needs the runtime notification permission for the progress
+     * and completion notifications. Without it the job still runs — the
+     * notification is silent — so a refusal is not an error, only a quieter
+     * run; the toast explains it once.
+     */
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT < 33) return
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
+            return
+        }
+        requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICATIONS)
     }
 
     // --- Android surface timeline -------------------------------------------

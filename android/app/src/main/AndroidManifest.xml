@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  M13b spike manifest.
+  Suramak Android manifest.
 
   * configChanges is deliberately narrow: only the hardware-keyboard entries,
     which the soft IME does not touch. Rotation, font scale, density, dark mode
@@ -8,9 +8,6 @@
     needs to observe.
   * screenOrientation="unspecified": the owner can rotate the phone; the
     recreation is part of the test.
-  * No permissions: this spike does no I/O beyond its own files dirs. The crash
-    files moved to app-specific external storage in v2.1, which needs no
-    permission either.
   * The FileProvider is the crash banner's "Share log" route: it hands
     spike-last-crash.txt to the share sheet as a content:// URI with a one-shot
     read grant. `androidx.core.content.FileProvider` ships in androidx.core
@@ -18,6 +15,21 @@
 
   The activity extends com.google.androidgamesdk.GameActivity, so the theme must
   be an AppCompat descendant (GameActivity extends AppCompatActivity).
+
+  M13e adds the two ways a file enters the app and the service that turns it
+  into a library row:
+
+  * ACTION_SEND / ACTION_SEND_MULTIPLE with the voice-note mime matrix below
+    (WhatsApp sends `audio/ogg` for its Opus voice notes; Telegram sends
+    `audio/ogg` for `.opus` and `audio/webm` for WebM notes);
+  * ACTION_OPEN_DOCUMENT, launched by the app's "Import audio" launcher
+    shortcut (res/xml/shortcuts.xml) with `audio/*` and `video/*`;
+  * the `mediaProcessing`/`dataSync` foreground service and its cancel receiver.
+
+  `mediaProcessing` requires compileSdk 35 and the
+  FOREGROUND_SERVICE_MEDIA_PROCESSING permission; `dataSync` is the API 34
+  type. Both are declared so one APK covers 29–35+; the service picks the type
+  per API level at startForeground time (the rule is unit-tested in Rust).
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
@@ -30,6 +42,12 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <!-- M13e: transcription keeps the CPU awake with the screen off. The
+         mediaProcessing type is Android 15's type for on-device media work and
+         needs its own permission from API 35. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING" />
 
     <application
         android:name=".SpikeApp"
@@ -49,6 +67,72 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
+            <!-- M13e — the share matrix. Every `<data>` inside one filter is
+                 OR'd, so this is one "accept these types" list.
+
+                 Accepted, and why:
+                   audio/*            every audio type the picker/share sheet
+                                      offers (WhatsApp's `audio/ogg` voice
+                                      notes, mp3, m4a, wav, flac)
+                   application/ogg    the non-audio spelling of Ogg some
+                                      providers use for .opus files
+                   application/x-ogg  the older spelling Telegram and some
+                                      file managers still send
+                   audio/opus         explicit: Telegram `.opus` documents
+                   audio/ogg          explicit: WhatsApp Ptt voice notes
+                   audio/webm         explicit: Telegram WebM notes
+                   video/webm         the container the decode path also accepts
+                   video/mp4          screen recordings and video notes (the
+                                      decoder reads the first audio track)
+                   video/x-matroska   .mkv/.mka files
+                 Deliberately NOT accepted: application/octet-stream. It would
+                 claim every binary file on the share sheet for a decode that
+                 can only fail. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="audio/*" />
+                <data android:mimeType="application/ogg" />
+                <data android:mimeType="application/x-ogg" />
+                <data android:mimeType="audio/opus" />
+                <data android:mimeType="audio/ogg" />
+                <data android:mimeType="audio/webm" />
+                <data android:mimeType="video/webm" />
+                <data android:mimeType="video/mp4" />
+                <data android:mimeType="video/x-matroska" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="audio/*" />
+                <data android:mimeType="application/ogg" />
+                <data android:mimeType="application/x-ogg" />
+                <data android:mimeType="audio/opus" />
+                <data android:mimeType="audio/ogg" />
+                <data android:mimeType="audio/webm" />
+                <data android:mimeType="video/webm" />
+                <data android:mimeType="video/mp4" />
+                <data android:mimeType="video/x-matroska" />
+            </intent-filter>
+
+            <!-- M13e — the SAF picker's return trip. ACTION_OPEN_DOCUMENT is
+                 sent by the app itself (the launcher shortcut), so the filter
+                 exists for documentation and for tools that introspect the
+                 manifest; the platform does not route it from other apps. -->
+            <intent-filter>
+                <action android:name="android.intent.action.OPEN_DOCUMENT" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="audio/*" />
+                <data android:mimeType="video/*" />
+            </intent-filter>
+
+            <!-- The launcher long-press shortcut ("Import audio") needs no
+                 permission and no in-app button: the spike's egui screens stay
+                 exactly as the four checks expect them. -->
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
         </activity>
 
         <provider
@@ -76,6 +160,21 @@
         <!-- M13d: the progress notification's Cancel action. -->
         <receiver
             android:name="app.suramak.models.CancelModelDownloadReceiver"
+            android:exported="false" />
+
+        <!-- M13e: the transcription job host. Both foreground types are
+             declared: `mediaProcessing` (API 35+) and `dataSync` (API 34); below
+             34 the service calls the untyped startForeground. The type passed
+             at runtime must be one of these or startForeground throws. -->
+        <service
+            android:name="app.suramak.transcribe.TranscriptionJobService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProcessing|dataSync"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
+
+        <!-- M13e: the transcription notification's Cancel action. -->
+        <receiver
+            android:name="app.suramak.transcribe.CancelTranscriptionReceiver"
             android:exported="false" />
     </application>
 
