@@ -51,6 +51,7 @@ pub mod models;
 pub mod polish;
 pub mod quit_confirm;
 pub mod record;
+pub mod search;
 pub mod settings;
 pub mod settings_form;
 pub mod transcribe;
@@ -883,6 +884,9 @@ pub struct AppState {
     /// budget, seeded by the runtime so the plan shown here matches what a job
     /// will send.
     pub prompt_base: Option<String>,
+    /// M15.7: the library search box, its debounced results and the seek a
+    /// clicked result asked for.
+    pub search: search::SearchState,
     /// M15.3: a structural edit waiting for the dirty text to save. It is emitted
     /// only after the save lands, so a split never partitions stale text and a
     /// failed save never silently discards what the reader typed.
@@ -993,6 +997,9 @@ pub enum Effect {
     /// M15.5: measure `model_id`'s prompt budget on a background thread (opens
     /// the model read-only; never on the UI thread).
     MeasurePromptBudget { model_id: String },
+    /// M15.7: run the library search against the store's FTS5 index. The
+    /// runtime answers through [`AppState::on_search_results`].
+    Search { query: String },
 }
 
 impl Default for AppState {
@@ -1051,6 +1058,7 @@ impl AppState {
             measuring_prompt: false,
             prompt_plan: None,
             prompt_base: None,
+            search: search::SearchState::default(),
             pending_structural: None,
         }
     }
@@ -1998,7 +2006,17 @@ impl AppState {
 
     /// Transcript loaded from the store.
     pub fn on_transcript_loaded(&mut self, transcript: Transcript) -> Vec<Effect> {
-        self.open_editor(transcript)
+        let id = transcript.id;
+        let mut effects = self.open_editor(transcript);
+        // M15.7: a clicked search result asked for this transcript — park the
+        // playhead now that the transport has been rebuilt for it.
+        if let Some((pending, ms)) = self.search.pending_seek.take() {
+            if pending == id {
+                effects.extend(self.seek_playback(ms));
+                self.note_search_seek(ms);
+            }
+        }
+        effects
     }
 
     /// Trash confirmed in the editor header (M4.5): delete the open transcript.
@@ -2015,6 +2033,9 @@ impl AppState {
     /// route goes Home when the transcript it was showing is the one that was
     /// deleted. Errors surface through the status line and change nothing.
     pub fn on_transcript_deleted(&mut self, id: Uuid, result: Result<(), String>) -> Vec<Effect> {
+        // M15.7: an open search may still list rows of the deleted transcript;
+        // re-running it drops them instead of leaving a dead result.
+        self.search.invalidate();
         // The title for the status line: the open editor first, else the
         // library row (both are read before any state changes).
         let title = self
@@ -2071,33 +2092,40 @@ impl AppState {
 
     /// The periodic tick: recording clock + autosave debounce.
     pub fn tick(&mut self, now: Instant) -> Vec<Effect> {
+        let mut effects = Vec::new();
         if let RecordState::Recording(recording) = &mut self.record {
             recording.elapsed = now.saturating_duration_since(recording.started_at);
         }
+        // M15.7: the search debounce runs with or without an open editor.
+        effects.extend(self.poll_search(now));
         let Some(editor) = &mut self.editor else {
-            return Vec::new();
+            return effects;
         };
         if !editor.dirty {
-            return Vec::new();
+            return effects;
         }
         let Some(last_edit) = editor.last_edit else {
-            return Vec::new();
+            return effects;
         };
         if now.duration_since(last_edit) < AUTOSAVE_DEBOUNCE {
-            return Vec::new();
+            return effects;
         }
         let updates = editor.pending_updates();
         if updates.is_empty() {
             editor.dirty = false;
-            return Vec::new();
+            return effects;
         }
         // Throttle retries: the debounce clock restarts even on failure.
         editor.last_edit = Some(now);
-        vec![Effect::SaveEdits { updates }]
+        effects.push(Effect::SaveEdits { updates });
+        effects
     }
 
     /// Result of an autosave/flush.
     pub fn on_edits_saved(&mut self, at: Instant, result: Result<(), String>) -> Vec<Effect> {
+        // M15.7: the stored text is what the index holds — an open search must
+        // re-run rather than keep snippets of the previous revision.
+        self.search.invalidate();
         // M15.3: a structural edit requested while the text was dirty waits here.
         let pending = self.pending_structural.take();
         let on_editor = self.route == Route::Editor;
@@ -2395,6 +2423,8 @@ impl AppState {
         kind: EditKind,
         transcript: Transcript,
     ) {
+        // M15.7: a structural edit rewrote the index rows for this transcript.
+        self.search.invalidate();
         if self
             .editor
             .as_ref()

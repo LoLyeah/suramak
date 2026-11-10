@@ -11,8 +11,7 @@
 //! - `source_text` is backfilled from `text` and survives editor/polish rewrites;
 //! - backup (`VACUUM INTO`) → mutate → restore round-trips every row;
 //! - corrupt backups are refused without touching the live library;
-//! - the search behaviour that pre-exists is pinned (literal, ASCII-case-
-//!   insensitive substring over title + current segment text; no FTS5).
+//! - the search contract: FTS5 tokens (M15.7), not the old LIKE substring scan.
 
 use std::path::{Path, PathBuf};
 
@@ -176,10 +175,14 @@ fn opening_a_populated_v1_library_upgrades_it_in_place_without_losing_text() {
 
     let store = Store::open(&path).expect("v1 must open");
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
-    // v1 → v2 (source_text + backfill) → v3 (derived marker, M15.5 tables): the
-    // upgrade walks the whole chain in one open.
-    assert_eq!(SCHEMA_VERSION, 3);
+    // v1 → v2 (source_text + backfill) → v3 (derived marker, M15.5 tables) →
+    // v4 (the FTS5 search index): the upgrade walks the whole chain in one open.
+    assert_eq!(SCHEMA_VERSION, 4);
     assert_eq!(store.integrity_check().unwrap(), "ok");
+    // v4 backfilled the search index for the rows the fixture carried.
+    let stats = store.search_index_stats().expect("stats");
+    assert_eq!(stats.segments, 5, "every v1 segment is searchable");
+    assert_eq!(stats.titles, 2);
 
     // Every byte of source text survives the upgrade, in both languages.
     let transcripts = store.list_transcripts().expect("list");
@@ -391,11 +394,15 @@ fn a_corrupt_backup_is_refused_and_the_live_library_is_untouched() {
 }
 
 #[test]
-fn search_stays_the_shipped_literal_ascii_case_insensitive_scan() {
-    // The M15.1 findings, pinned so a later search slice changes them on purpose:
-    // substring LIKE over title + the CURRENT segment text, ASCII-only case
-    // folding, wildcards literal (the escape rule is covered in tests/store.rs),
-    // and no FTS index to keep in sync.
+fn search_is_fts5_tokens_not_a_like_scan() {
+    // M15.7 replaces the M15.1 LIKE scan with FTS5. This test pins the
+    // *changed* contract deliberately (the M15.1 test said so):
+    // - tokens, not substrings: `anggara` no longer finds `anggaran`;
+    // - case-insensitive for ASCII and accented Latin (`unicode61`);
+    // - no stemming: `rapat` does not find `rapatnya`;
+    // - FTS5 operators are ordinary words (every query word is quoted), so a
+    //   query can never be a syntax error or an accidental OR;
+    // - both `text` and `source_text` are searchable.
     let store = Store::open_in_memory().expect("store");
     let t = sample(
         "Rapat Senin.wav",
@@ -406,34 +413,45 @@ fn search_stays_the_shipped_literal_ascii_case_insensitive_scan() {
     );
     store.insert_transcript(&t).expect("insert");
 
-    // Case-insensitive for ASCII (Indonesian is Latin script)…
     assert_eq!(store.search("SELAMAT").unwrap().len(), 1);
-    assert_eq!(store.search("rapat").unwrap().len(), 1, "title hit");
+    assert_eq!(store.search("rapat").unwrap().len(), 1, "title + segment");
+    assert_eq!(store.search("rapatnya").unwrap().len(), 0, "no stemming");
     assert_eq!(
         store.search("anggara").unwrap().len(),
-        1,
-        "substring, not word"
+        0,
+        "whole tokens, not substrings"
     );
-    // …but not for non-ASCII case pairs (no Unicode folding in SQLite's LIKE).
+    assert_eq!(store.search("anggaran").unwrap().len(), 1);
+
+    // Accented Latin folds both ways now (the LIKE scan could not).
     let accented = sample("café.txt", &["Éclair notes"]);
     store.insert_transcript(&accented).unwrap();
-    assert!(store.search("éclair").unwrap().is_empty());
-    assert_eq!(store.search("Éclair").unwrap().len(), 1);
+    assert_eq!(store.search("éclair").unwrap().len(), 1);
+    assert_eq!(store.search("ÉCLAIR").unwrap().len(), 1);
+    assert_eq!(
+        store.search("eclair").unwrap().len(),
+        1,
+        "diacritics folded"
+    );
+    assert_eq!(store.search("cafe").unwrap().len(), 1, "title café");
 
-    // FTS5-style syntax is not interpreted — it is literal text.
-    assert!(store.search("\"Selamat\"").unwrap().is_empty());
+    // FTS5 syntax is not interpreted: `OR`, quotes and `-` are words or
+    // punctuation, never operators, and no query is a syntax error.
+    assert_eq!(store.search("\"Selamat\"").unwrap().len(), 1);
     assert!(store.search("Selamat OR jadwal").unwrap().is_empty());
+    assert!(store.search("-").unwrap().is_empty());
+    assert!(store.search("NEAR(selamat)").unwrap().is_empty());
 
-    // Editing a segment out of the searchable text removes it from results: the
-    // pre-M15.1 scan only reads `segments.text`, not the provenance column.
+    // Both columns are searched: an edit that removes a word from the current
+    // text still finds the segment through the preserved inference text.
     store
         .update_segment_text(t.id, 1, "Kita bahas cuaca.")
         .expect("edit");
-    assert!(store.search("anggaran").unwrap().is_empty());
+    assert_eq!(store.search("cuaca").unwrap().len(), 1);
+    assert_eq!(store.search("anggaran").unwrap().len(), 1);
     assert_eq!(
         store.segment_source_text(t.id, 1).unwrap().as_deref(),
-        Some("Kita bahas anggaran dan jadwal."),
-        "the original is still stored, just not searched yet"
+        Some("Kita bahas anggaran dan jadwal.")
     );
 }
 

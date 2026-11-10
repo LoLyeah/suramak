@@ -136,6 +136,11 @@ No other source-loss path exists; no further migration is needed for M15.
 
 ## 7. Search — what pre-exists (M15.1 finding)
 
+> **Superseded by M15.7.** Everything below describes the tree at M15.1 (schema
+> v2). The live search is now an FTS5 index (`search_fts` + `search_docs`,
+> schema v4) with snippets and timestamps; see `docs/reports/M15c-search.md`.
+> The section is kept as the audit that motivated the slice.
+
 `Store::search(query)` is the only search code:
 
 - SQL: `SELECT DISTINCT t.* FROM transcripts t LEFT JOIN segments s ON … WHERE

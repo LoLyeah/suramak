@@ -566,6 +566,18 @@ impl Runtime {
                     let (items, error) = self.list();
                     state.on_library_loaded(items, error);
                 }
+                // M15.7: one bounded FTS5 query on the UI thread (measured at
+                // ~12 ms for 10k segments on this VPS), debounced by the state
+                // machine so typing is not a query per keystroke.
+                Effect::Search { query } => {
+                    let result = match &self.store {
+                        Some(store) => store
+                            .search_hits(&query, suramak_core::search::SearchOptions::default())
+                            .map_err(|err| err.to_string()),
+                        None => Err("library database unavailable".to_string()),
+                    };
+                    state.on_search_results(query, result);
+                }
                 Effect::Export {
                     transcript,
                     format,

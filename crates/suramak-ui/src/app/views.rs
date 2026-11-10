@@ -657,6 +657,64 @@ mod tests {
         );
     }
 
+    /// M15.7 (frame-level): the library search panel paints what the hit
+    /// carries — the segment's timestamp and its snippet — inside the existing
+    /// sidebar, with no new screen.
+    #[test]
+    fn the_library_search_panel_paints_timestamps_and_snippets() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut state = AppState::new();
+        let id = uuid::Uuid::new_v4();
+        state.search.query = "anggaran".to_string();
+        state.search.applied = Some("anggaran".to_string());
+        state.search.total = 1;
+        state.search.results = vec![suramak_core::search::SearchHit {
+            kind: suramak_core::search::HitKind::Segment,
+            transcript_id: Some(id),
+            title: Some("Rapat Senin.wav".to_string()),
+            segment_idx: Some(3),
+            start_ms: Some(83_000),
+            end_ms: Some(84_500),
+            snippet: "kita bahas anggaran rumah tangga".to_string(),
+            highlight: Some((10, 8)),
+            from_source_text: false,
+        }];
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                draw(ctx, &mut state);
+            },
+        );
+        let painted: Vec<String> = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(shape) => Some(shape.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            painted.iter().any(|text| text == "1:23"),
+            "the segment's start is painted: {painted:?}"
+        );
+        assert!(
+            painted
+                .iter()
+                .any(|text| text.contains("kita bahas anggaran")),
+            "the snippet is painted: {painted:?}"
+        );
+        assert!(
+            painted.iter().any(|text| text == "Rapat Senin.wav"),
+            "the transcript title is painted: {painted:?}"
+        );
+    }
+
     /// M9d item 1 (frame-level): the pill's spring is a scale around the float
     /// rect's centre — at rest the drawn body is the M8.5 rect, and the spring
     /// and morph dip are the only scale sources. The geometry contract (one

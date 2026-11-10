@@ -1,13 +1,44 @@
 use chrono::Utc;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use std::collections::HashSet;
 use std::path::Path;
 use uuid::Uuid;
 
 use crate::export::ZeroDuration;
+use crate::search::{self, HitKind, SearchHit, SearchOptions, SearchResults};
 use crate::segment_edit::{merge_rows, split_rows, EditError, SegmentRow, SegmentSnapshot};
 use crate::textrules::{Correction, Dictionary, Glossary, PromptMeasurement, TextSettings};
 use crate::transcript::{Segment, Transcript};
 use crate::SuramakError;
+
+/// How many documents one backfill/rebuild transaction writes. A 100k-segment
+/// library is indexed as ~200 bounded transactions instead of one giant write,
+/// so a crash mid-backfill loses at most one chunk and the cursor resumes.
+const SEARCH_BACKFILL_CHUNK: usize = 500;
+
+/// The FTS5 table. `unicode61` is SQLite's Unicode-aware tokenizer with **no
+/// stemming** (unlike `porter`, which would conflate Indonesian words);
+/// `remove_diacritics 1` folds accents, so `cafe` finds `café` and `ÉCLAIR`
+/// finds `éclair`. `body` is the current text, `original` the preserved
+/// inference text (NULL when identical, so it is not indexed twice).
+const SEARCH_FTS_DDL: &str = "CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
+        body,
+        original,
+        tokenize = 'unicode61 remove_diacritics 1'
+    );";
+
+/// The metadata side of the index: one row per indexed document, keyed by a
+/// stable string (`seg:<uuid>:<idx>`, `title:<uuid>`, `glossary:<pos>`,
+/// `dict:<pos>`) and carrying the FTS rowid. The mapping is what makes a
+/// delete or an edit O(log n) instead of a scan of the FTS content table.
+const SEARCH_DOCS_DDL: &str = "CREATE TABLE IF NOT EXISTS search_docs (
+        rowid         INTEGER PRIMARY KEY,
+        doc_key       TEXT NOT NULL UNIQUE,
+        kind          TEXT NOT NULL,
+        transcript_id TEXT,
+        segment_idx   INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS search_docs_transcript ON search_docs(transcript_id);";
 
 /// The library schema this build writes and reads.
 ///
@@ -20,7 +51,10 @@ use crate::SuramakError;
 ///   `text` came to be (`split`/`merge`/…); `glossary_terms`,
 ///   `dictionary_entries`, `text_prefs` and `prompt_budgets` hold M15.5's own
 ///   data. No table is dropped or rebuilt.
-pub const SCHEMA_VERSION: i64 = 3;
+/// - **v4** — M15.7, additive only: `search_fts` (the FTS5 index) and
+///   `search_docs` (its document map). Existing tables are untouched; the index
+///   is backfilled in bounded chunks and can be rebuilt deterministically.
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// SQLite-backed transcript library with WAL mode.
 pub struct Store {
@@ -36,6 +70,22 @@ pub struct Checkpoint {
     pub log_frames: i64,
     /// Frames copied into the database file by this call.
     pub checkpointed_frames: i64,
+}
+
+/// How many documents of each kind the search index holds (M15.7).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SearchIndexStats {
+    pub segments: i64,
+    pub titles: i64,
+    pub glossary: i64,
+    pub dictionary: i64,
+}
+
+impl SearchIndexStats {
+    /// Every indexed document, all kinds.
+    pub fn total(&self) -> i64 {
+        self.segments + self.titles + self.glossary + self.dictionary
+    }
 }
 
 impl Store {
@@ -109,9 +159,25 @@ impl Store {
                  n_text_ctx  INTEGER NOT NULL,
                  cap_tokens  INTEGER NOT NULL,
                  measured_at TEXT NOT NULL
-             );",
+             );
+             -- M15.7: the search index. The virtual table and its document map
+             -- are additive; the backfill below fills them for an older library.
+             CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
+                 body,
+                 original,
+                 tokenize = 'unicode61 remove_diacritics 1'
+             );
+             CREATE TABLE IF NOT EXISTS search_docs (
+                 rowid         INTEGER PRIMARY KEY,
+                 doc_key       TEXT NOT NULL UNIQUE,
+                 kind          TEXT NOT NULL,
+                 transcript_id TEXT,
+                 segment_idx   INTEGER
+             );
+             CREATE INDEX IF NOT EXISTS search_docs_transcript ON search_docs(transcript_id);",
         )?;
-        self.migrate()
+        self.migrate()?;
+        self.ensure_search_index()
     }
 
     /// Brings an existing library up to [`SCHEMA_VERSION`], in place.
@@ -134,8 +200,9 @@ impl Store {
             .optional()?;
 
         let version = match version {
-            // A fresh database (the DDL above already created v3) or a very old
-            // one without the marker: both are brought forward step by step.
+            // A fresh database (the DDL above already created the current
+            // schema) or a very old one without the marker: both are brought
+            // forward step by step.
             None => 0,
             Some(raw) => raw.parse::<i64>().map_err(|_| {
                 SuramakError::Schema(format!(
@@ -155,6 +222,9 @@ impl Store {
         }
         if version < 3 {
             self.upgrade_to_v3()?;
+        }
+        if version < 4 {
+            self.upgrade_to_v4()?;
         }
         Ok(())
     }
@@ -214,10 +284,579 @@ impl Store {
         tx.execute(
             "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params!["3"],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// v3 → v4: the FTS5 index and its document map, then a bounded backfill.
+    ///
+    /// Three phases, so a crash can never leave a half-stamped schema:
+    ///
+    /// 1. the objects, one transaction (`IF NOT EXISTS`, so a re-run is a
+    ///    no-op);
+    /// 2. the backfill, [`SEARCH_BACKFILL_CHUNK`] documents per transaction,
+    ///    with a `meta` cursor committed **with** each chunk — an interrupted
+    ///    backfill resumes at the last committed document instead of redoing
+    ///    the corpus, and a crash loses at most one chunk;
+    /// 3. the v4 stamp, one transaction, only once every document is in.
+    ///
+    /// An interrupted upgrade is therefore still a coherent v3 library (the
+    /// version is raised last), which this build's next open continues and an
+    /// older build can still open.
+    fn upgrade_to_v4(&self) -> Result<(), SuramakError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(SEARCH_FTS_DDL)?;
+        tx.execute_batch(SEARCH_DOCS_DDL)?;
+        tx.commit()?;
+
+        self.backfill_search_index()?;
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM meta WHERE key IN ('search_backfill_segments', 'search_backfill_titles')",
+            [],
+        )?;
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![SCHEMA_VERSION.to_string()],
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    // ---- M15.7: the search index ------------------------------------------
+
+    /// The key of one segment document (`idx` zero-padded so a string cursor
+    /// orders exactly like the integer it encodes).
+    fn segment_doc_key(id: Uuid, idx: u32) -> String {
+        format!("seg:{id}:{idx:010}")
+    }
+
+    /// The key of one transcript-title document.
+    fn title_doc_key(id: Uuid) -> String {
+        format!("title:{id}")
+    }
+
+    fn meta_value(&self, key: &str) -> Result<Option<String>, SuramakError> {
+        let value = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(value)
+    }
+
+    /// Writes (or rewrites) one index document and points its rowid at it.
+    ///
+    /// The document map is inserted first (that is where the rowid comes
+    /// from); any stale FTS row with that rowid is removed before the new one
+    /// lands, so an edit can never leave two versions of a document behind.
+    #[allow(clippy::too_many_arguments)]
+    fn put_search_doc(
+        conn: &Connection,
+        doc_key: &str,
+        kind: HitKind,
+        transcript_id: Option<&str>,
+        segment_idx: Option<u32>,
+        body: &str,
+        original: Option<&str>,
+    ) -> Result<(), SuramakError> {
+        conn.execute(
+            "INSERT INTO search_docs(doc_key, kind, transcript_id, segment_idx)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(doc_key) DO UPDATE SET
+                 kind          = excluded.kind,
+                 transcript_id = excluded.transcript_id,
+                 segment_idx   = excluded.segment_idx",
+            params![doc_key, kind.as_str(), transcript_id, segment_idx],
+        )?;
+        let rowid: i64 = conn.query_row(
+            "SELECT rowid FROM search_docs WHERE doc_key = ?1",
+            params![doc_key],
+            |row| row.get(0),
+        )?;
+        conn.execute("DELETE FROM search_fts WHERE rowid = ?1", params![rowid])?;
+        conn.execute(
+            "INSERT INTO search_fts(rowid, body, original) VALUES (?1, ?2, ?3)",
+            params![rowid, body, original],
+        )?;
+        Ok(())
+    }
+
+    /// Removes one document (both halves: the map row and the FTS row).
+    fn delete_search_doc(conn: &Connection, doc_key: &str) -> Result<(), SuramakError> {
+        let rowid = conn
+            .query_row(
+                "SELECT rowid FROM search_docs WHERE doc_key = ?1",
+                params![doc_key],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if let Some(rowid) = rowid {
+            conn.execute("DELETE FROM search_fts WHERE rowid = ?1", params![rowid])?;
+            conn.execute("DELETE FROM search_docs WHERE rowid = ?1", params![rowid])?;
+        }
+        Ok(())
+    }
+
+    /// Deletes the FTS rows whose `search_docs` rows match `select`, then the
+    /// map rows themselves. One helper so no caller can delete half a document.
+    fn delete_docs_matching(
+        conn: &Connection,
+        select: &str,
+        param: &dyn rusqlite::ToSql,
+    ) -> Result<usize, SuramakError> {
+        let rowids: Vec<i64> = {
+            let mut stmt = conn.prepare(select)?;
+            let rows = stmt.query_map([param], |row| row.get::<_, i64>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for rowid in &rowids {
+            conn.execute("DELETE FROM search_fts WHERE rowid = ?1", params![rowid])?;
+        }
+        Ok(rowids.len())
+    }
+
+    /// Every segment document of one transcript (used when a structural edit
+    /// rewrites the whole row set and indices shift).
+    fn delete_all_segment_docs(conn: &Connection, id: Uuid) -> Result<(), SuramakError> {
+        let id = id.to_string();
+        Self::delete_docs_matching(
+            conn,
+            "SELECT rowid FROM search_docs WHERE transcript_id = ?1 AND kind = 'segment'",
+            &id,
+        )?;
+        conn.execute(
+            "DELETE FROM search_docs WHERE transcript_id = ?1 AND kind = 'segment'",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Segment documents at or after `from_idx` (the stale tail of an upsert).
+    fn delete_segment_docs_from(
+        conn: &Connection,
+        id: Uuid,
+        from_idx: u32,
+    ) -> Result<(), SuramakError> {
+        let id = id.to_string();
+        let rowids: Vec<i64> = {
+            let mut stmt = conn.prepare(
+                "SELECT rowid FROM search_docs
+                 WHERE transcript_id = ?1 AND kind = 'segment' AND segment_idx >= ?2",
+            )?;
+            let rows = stmt.query_map(params![id, from_idx], |row| row.get::<_, i64>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for rowid in &rowids {
+            conn.execute("DELETE FROM search_fts WHERE rowid = ?1", params![rowid])?;
+        }
+        conn.execute(
+            "DELETE FROM search_docs
+             WHERE transcript_id = ?1 AND kind = 'segment' AND segment_idx >= ?2",
+            params![id, from_idx],
+        )?;
+        Ok(())
+    }
+
+    /// Everything a transcript owns — its segment documents and its title.
+    fn delete_docs_for_transcript(conn: &Connection, id: Uuid) -> Result<(), SuramakError> {
+        let id = id.to_string();
+        Self::delete_docs_matching(
+            conn,
+            "SELECT rowid FROM search_docs WHERE transcript_id = ?1",
+            &id,
+        )?;
+        conn.execute(
+            "DELETE FROM search_docs WHERE transcript_id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a stored text is searchable at all (M15.7's empty rule).
+    ///
+    /// One predicate for Rust and SQL: ASCII whitespace only, which is what a
+    /// transcript's empty rows actually contain. It is deliberately *not*
+    /// `str::trim` (Unicode) — the consistency check runs the same test in SQL
+    /// (`length(trim(text, char(9)||char(10)||char(13)||' ')) > 0`), and the
+    /// two must agree exactly or every open would see a phantom mismatch.
+    fn has_searchable_text(text: &str) -> bool {
+        !text
+            .trim_matches(|c: char| c.is_ascii_whitespace())
+            .is_empty()
+    }
+
+    /// Re-indexes one segment from the row the store now holds.
+    ///
+    /// Reads the row back instead of trusting the caller: `source_text` is
+    /// `COALESCE`-preserved by the upsert, so only the stored value tells the
+    /// truth about what the original column now says.
+    fn sync_segment_doc(conn: &Connection, id: Uuid, idx: u32) -> Result<(), SuramakError> {
+        let row = conn
+            .query_row(
+                "SELECT text, source_text FROM segments WHERE transcript_id = ?1 AND idx = ?2",
+                params![id.to_string(), idx],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        let Some((text, source)) = row else {
+            return Ok(());
+        };
+        let key = Self::segment_doc_key(id, idx);
+        if !Self::has_searchable_text(&text) {
+            // M15.7 empty rule: a segment with no current text is not a result.
+            return Self::delete_search_doc(conn, &key);
+        }
+        let original = source
+            .as_deref()
+            .filter(|source| Self::has_searchable_text(source) && *source != text);
+        Self::put_search_doc(
+            conn,
+            &key,
+            HitKind::Segment,
+            Some(&id.to_string()),
+            Some(idx),
+            &text,
+            original,
+        )
+    }
+
+    /// Re-indexes the glossary + dictionary corpus (small, replaced wholesale).
+    fn sync_corpus_docs(conn: &Connection) -> Result<usize, SuramakError> {
+        let rowids: Vec<i64> = {
+            let mut stmt = conn.prepare(
+                "SELECT rowid FROM search_docs WHERE kind IN ('glossary', 'dictionary')",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for rowid in &rowids {
+            conn.execute("DELETE FROM search_fts WHERE rowid = ?1", params![rowid])?;
+        }
+        conn.execute(
+            "DELETE FROM search_docs WHERE kind IN ('glossary', 'dictionary')",
+            [],
+        )?;
+
+        let mut written = 0;
+        let terms: Vec<(i64, String)> = {
+            let mut stmt =
+                conn.prepare("SELECT position, term FROM glossary_terms ORDER BY position")?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (position, term) in terms {
+            if !Self::has_searchable_text(&term) {
+                continue;
+            }
+            Self::put_search_doc(
+                conn,
+                &format!("glossary:{position:010}"),
+                HitKind::Glossary,
+                None,
+                None,
+                &term,
+                None,
+            )?;
+            written += 1;
+        }
+        let entries: Vec<(i64, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT position, from_text, to_text FROM dictionary_entries ORDER BY position",
+            )?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (position, from_text, to_text) in entries {
+            if !Self::has_searchable_text(&from_text) && !Self::has_searchable_text(&to_text) {
+                continue;
+            }
+            Self::put_search_doc(
+                conn,
+                &format!("dict:{position:010}"),
+                HitKind::Dictionary,
+                None,
+                None,
+                &from_text,
+                Some(to_text.as_str())
+                    .filter(|to| Self::has_searchable_text(to) && **to != from_text),
+            )?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    /// Fills the index for everything the store holds, in bounded chunks.
+    ///
+    /// Resumes from the `meta` cursors the last committed chunk left, so both
+    /// the migration and a manual [`Store::rebuild_search_index`] share it.
+    fn backfill_search_index(&self) -> Result<usize, SuramakError> {
+        let mut written = 0;
+        let mut cursor = self.meta_value("search_backfill_segments")?;
+        loop {
+            let (count, next) = self.index_segment_chunk(cursor.as_deref())?;
+            if count == 0 {
+                break;
+            }
+            written += count;
+            cursor = next;
+        }
+        let mut cursor = self.meta_value("search_backfill_titles")?;
+        loop {
+            let (count, next) = self.index_title_chunk(cursor.as_deref())?;
+            if count == 0 {
+                break;
+            }
+            written += count;
+            cursor = next;
+        }
+        written += self.index_corpus_docs()?;
+        Ok(written)
+    }
+
+    /// Indexes one bounded chunk of segments, after `after` (a doc key).
+    fn index_segment_chunk(
+        &self,
+        after: Option<&str>,
+    ) -> Result<(usize, Option<String>), SuramakError> {
+        let rows: Vec<(String, i64, String, Option<String>, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT transcript_id, idx, text, source_text,
+                        ('seg:' || transcript_id || ':' || printf('%010d', idx))
+                 FROM segments
+                 WHERE length(trim(text, char(9) || char(10) || char(13) || ' ')) > 0
+                   AND (?1 IS NULL
+                        OR ('seg:' || transcript_id || ':' || printf('%010d', idx)) > ?1)
+                 ORDER BY ('seg:' || transcript_id || ':' || printf('%010d', idx))
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![after, SEARCH_BACKFILL_CHUNK as i64], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let Some(last) = rows.last().map(|row| row.4.clone()) else {
+            return Ok((0, None));
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        for (transcript_id, idx, text, source, key) in &rows {
+            let original = source
+                .as_deref()
+                .filter(|source| !source.trim().is_empty() && *source != *text);
+            Self::put_search_doc(
+                &tx,
+                key,
+                HitKind::Segment,
+                Some(transcript_id),
+                Some(*idx as u32),
+                text,
+                original,
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES ('search_backfill_segments', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![last],
+        )?;
+        tx.commit()?;
+        Ok((rows.len(), Some(last)))
+    }
+
+    /// Indexes one bounded chunk of transcript titles, after `after`.
+    fn index_title_chunk(
+        &self,
+        after: Option<&str>,
+    ) -> Result<(usize, Option<String>), SuramakError> {
+        let rows: Vec<(String, String, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, title, ('title:' || id)
+                 FROM transcripts
+                 WHERE (?1 IS NULL OR ('title:' || id) > ?1)
+                 ORDER BY ('title:' || id)
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![after, SEARCH_BACKFILL_CHUNK as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let Some(last) = rows.last().map(|row| row.2.clone()) else {
+            return Ok((0, None));
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        for (id, title, key) in &rows {
+            Self::put_search_doc(&tx, key, HitKind::Title, Some(id), None, title, None)?;
+        }
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES ('search_backfill_titles', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![last],
+        )?;
+        tx.commit()?;
+        Ok((rows.len(), Some(last)))
+    }
+
+    /// Indexes the glossary + dictionary corpus, one transaction.
+    fn index_corpus_docs(&self) -> Result<usize, SuramakError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let written = Self::sync_corpus_docs(&tx)?;
+        tx.commit()?;
+        Ok(written)
+    }
+
+    /// Drops the index and builds it again from the store rows.
+    ///
+    /// Deterministic on purpose: a corrupt or partial index is never "repaired
+    /// in place", it is replaced. The drop/recreate is one transaction, the
+    /// backfill then runs in bounded chunks like the migration's.
+    pub fn rebuild_search_index(&self) -> Result<usize, SuramakError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch("DROP TABLE IF EXISTS search_fts;")?;
+        tx.execute_batch(SEARCH_FTS_DDL)?;
+        tx.execute("DELETE FROM search_docs", [])?;
+        tx.execute(
+            "DELETE FROM meta WHERE key IN ('search_backfill_segments', 'search_backfill_titles')",
+            [],
+        )?;
+        tx.commit()?;
+        self.backfill_search_index()
+    }
+
+    /// Whether the index agrees with the store rows and passes FTS5's own
+    /// integrity check.
+    ///
+    /// The count comparison catches a document that went missing (an
+    /// interrupted old build, a killed process) or a document left behind by a
+    /// deleted row; the FTS5 `integrity-check` command catches structural
+    /// damage inside the index. A healthy store answers `true` on every open —
+    /// the tests pin that, so the empty-text predicate and the sync path can
+    /// never drift into a rebuild-every-open loop.
+    pub fn search_index_consistent(&self) -> Result<bool, SuramakError> {
+        let expected: [(i64, i64); 4] = [
+            (
+                self.conn.query_row(
+                    "SELECT count(*) FROM segments
+                     WHERE length(trim(text, char(9) || char(10) || char(13) || ' ')) > 0",
+                    [],
+                    |row| row.get(0),
+                )?,
+                self.conn.query_row(
+                    "SELECT count(*) FROM search_docs WHERE kind = 'segment'",
+                    [],
+                    |row| row.get(0),
+                )?,
+            ),
+            (
+                self.conn
+                    .query_row("SELECT count(*) FROM transcripts", [], |row| row.get(0))?,
+                self.conn.query_row(
+                    "SELECT count(*) FROM search_docs WHERE kind = 'title'",
+                    [],
+                    |row| row.get(0),
+                )?,
+            ),
+            (
+                self.conn.query_row(
+                    "SELECT count(*) FROM glossary_terms
+                     WHERE length(trim(term, char(9) || char(10) || char(13) || ' ')) > 0",
+                    [],
+                    |row| row.get(0),
+                )?,
+                self.conn.query_row(
+                    "SELECT count(*) FROM search_docs WHERE kind = 'glossary'",
+                    [],
+                    |row| row.get(0),
+                )?,
+            ),
+            (
+                self.conn.query_row(
+                    "SELECT count(*) FROM dictionary_entries
+                     WHERE length(trim(from_text, char(9) || char(10) || char(13) || ' ')) > 0
+                        OR length(trim(to_text, char(9) || char(10) || char(13) || ' ')) > 0",
+                    [],
+                    |row| row.get(0),
+                )?,
+                self.conn.query_row(
+                    "SELECT count(*) FROM search_docs WHERE kind = 'dictionary'",
+                    [],
+                    |row| row.get(0),
+                )?,
+            ),
+        ];
+        if expected.iter().any(|(want, got)| want != got) {
+            return Ok(false);
+        }
+        // The map and the FTS half must agree too: a dropped/recreated index or
+        // a document whose FTS row went missing is a partial index even when
+        // every map row is present.
+        let documents: i64 =
+            self.conn
+                .query_row("SELECT count(*) FROM search_docs", [], |row| row.get(0))?;
+        let indexed: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM search_fts", [], |row| row.get(0))?;
+        if documents != indexed {
+            return Ok(false);
+        }
+        match self
+            .conn
+            .execute_batch("INSERT INTO search_fts(search_fts) VALUES('integrity-check')")
+        {
+            Ok(()) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// The self-repair gate every [`Store::open`] passes through: an index that
+    /// disagrees with the store — or fails FTS5's integrity check — is rebuilt
+    /// once, with a single log line naming why.
+    fn ensure_search_index(&self) -> Result<(), SuramakError> {
+        match self.search_index_consistent() {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                tracing::warn!(
+                    "search index disagrees with the library; rebuilding it from the store rows"
+                );
+                self.rebuild_search_index()?;
+                Ok(())
+            }
+            Err(err) => {
+                tracing::warn!("search index is unreadable ({err}); rebuilding it");
+                self.rebuild_search_index()?;
+                Ok(())
+            }
+        }
+    }
+
+    /// How many documents of each kind the index holds (the report's and the
+    /// tests' window into the index).
+    pub fn search_index_stats(&self) -> Result<SearchIndexStats, SuramakError> {
+        let count = |kind: &str| -> Result<i64, SuramakError> {
+            Ok(self.conn.query_row(
+                "SELECT count(*) FROM search_docs WHERE kind = ?1",
+                params![kind],
+                |row| row.get(0),
+            )?)
+        };
+        Ok(SearchIndexStats {
+            segments: count("segment")?,
+            titles: count("title")?,
+            glossary: count("glossary")?,
+            dictionary: count("dictionary")?,
+        })
     }
 
     /// Whether `table` has `column` (the upgrade's idempotence guard).
@@ -275,6 +914,17 @@ impl Store {
         // The row writer only: the caller's `updated_at` is authoritative on
         // insert, so the public `upsert_segments` wrapper is deliberately bypassed.
         self.write_segments(t.id, &t.segments)?; // same connection → joins the transaction
+                                                 // M15.7: the title is a search document of its own (a title-only match
+                                                 // must still find the transcript).
+        Self::put_search_doc(
+            &tx,
+            &Self::title_doc_key(t.id),
+            HitKind::Title,
+            Some(&t.id.to_string()),
+            None,
+            &t.title,
+            None,
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -336,11 +986,17 @@ impl Store {
                      source_text = COALESCE(segments.source_text, excluded.source_text)",
                 params![id.to_string(), seg.idx, seg.start_ms, seg.end_ms, seg.text],
             )?;
+            // M15.7: read the row back — `source_text` is COALESCE-preserved,
+            // so the upserted value is not necessarily what `seg` carried.
+            Self::sync_segment_doc(&self.conn, id, seg.idx)?;
         }
-        self.conn.execute(
+        let deleted = self.conn.execute(
             "DELETE FROM segments WHERE transcript_id = ?1 AND idx >= ?2",
             params![id.to_string(), segments.len() as i64],
         )?;
+        if deleted > 0 {
+            Self::delete_segment_docs_from(&self.conn, id, segments.len() as u32)?;
+        }
         Ok(())
     }
 
@@ -413,6 +1069,9 @@ impl Store {
                 "UPDATE segments SET text = ?1 WHERE transcript_id = ?2 AND idx = ?3",
                 params![text, transcript_id.to_string(), idx],
             )?;
+            // M15.7: the index follows the same transaction — an edit that
+            // fails to reindex must fail as a whole, not leave search stale.
+            Self::sync_segment_doc(&self.conn, transcript_id, idx)?;
             self.conn.execute(
                 "UPDATE transcripts SET updated_at = ?1 WHERE id = ?2",
                 params![now, transcript_id.to_string()],
@@ -468,6 +1127,11 @@ impl Store {
             "DELETE FROM segments WHERE transcript_id = ?1",
             params![id.to_string()],
         )?;
+        // M15.7: a structural edit rewrites every index that follows an `idx`
+        // (a split shifts the tail down, a merge up), so the transcript's
+        // segment documents are replaced with the new row set in one go. The
+        // title document is untouched (same id, same title).
+        Self::delete_all_segment_docs(conn, id)?;
         let mut stmt = conn.prepare(
             "INSERT INTO segments(transcript_id, idx, start_ms, end_ms, text, source_text, derived)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -482,6 +1146,22 @@ impl Store {
                 row.source_text,
                 row.derived,
             ])?;
+            if !Self::has_searchable_text(&row.text) {
+                continue;
+            }
+            let original = row
+                .source_text
+                .as_deref()
+                .filter(|source| Self::has_searchable_text(source) && *source != row.text);
+            Self::put_search_doc(
+                conn,
+                &Self::segment_doc_key(id, row.idx),
+                HitKind::Segment,
+                Some(&id.to_string()),
+                Some(row.idx),
+                &row.text,
+                original,
+            )?;
         }
         Ok(())
     }
@@ -699,6 +1379,9 @@ impl Store {
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 params![settings.merge_separator],
             )?;
+            // M15.7: the glossary/dictionary corpus is searchable too; it is
+            // small, so it is re-indexed wholesale inside this transaction.
+            Self::sync_corpus_docs(&self.conn)?;
             Ok(())
         })();
         match written {
@@ -896,73 +1579,165 @@ impl Store {
         Ok(result)
     }
 
-    /// Full-text search over transcript titles and segment text.
+    /// Full-text search over transcript titles, segment text and the text-rule
+    /// corpus (M15.7).
     ///
-    /// The query is a **literal** substring, not a pattern (SUR-LOW-02): `%`, `_`
-    /// and `\` are escaped and the statement says `ESCAPE '\'`, so searching for
-    /// "100%" finds that text instead of matching every title starting with "100".
+    /// Returns transcript headers only, newest first — the shape the pre-M15.7
+    /// LIKE scan returned, so existing callers keep working. [`Store::search_hits`]
+    /// is the richer surface the library view uses: snippets, timestamps and
+    /// the glossary/dictionary rows.
+    ///
+    /// A hit is a **document**, not a transcript: one transcript with three
+    /// matching segments yields three rows in `search_hits` and appears once
+    /// here. Both `segments.text` and `segments.source_text` are indexed: an
+    /// edit that removes a word still finds the segment through the preserved
+    /// inference text (the hit says which column matched).
     pub fn search(&self, query: &str) -> Result<Vec<Transcript>, SuramakError> {
-        let escaped = query
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let pattern = format!("%{escaped}%");
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT t.id, t.title, t.created_at, t.updated_at, t.source_json,
-                    t.model, t.language, t.audio_path
-             FROM transcripts t
-             LEFT JOIN segments s ON s.transcript_id = t.id
-             WHERE t.title LIKE ?1 ESCAPE '\\' OR s.text LIKE ?1 ESCAPE '\\'
-             ORDER BY t.created_at DESC",
+        let Some(query) = search::match_query(query) else {
+            return Ok(Vec::new());
+        };
+        let ids: HashSet<Uuid> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT DISTINCT d.transcript_id
+                 FROM search_fts
+                 JOIN search_docs d ON d.rowid = search_fts.rowid
+                 WHERE search_fts MATCH ?1 AND d.transcript_id IS NOT NULL",
+            )?;
+            let rows = stmt.query_map(params![query.expression], |row| row.get::<_, String>(0))?;
+            let mut ids = HashSet::new();
+            for row in rows {
+                let raw = row.map_err(SuramakError::Sqlite)?;
+                if let Ok(id) = Uuid::parse_str(&raw) {
+                    ids.insert(id);
+                }
+            }
+            ids
+        };
+        let mut list = self.list_transcripts()?;
+        list.retain(|transcript| ids.contains(&transcript.id));
+        Ok(list)
+    }
+
+    /// The library search: ranked hits with snippets, timestamps and corpus
+    /// rows (M15.7).
+    ///
+    /// Every result is one document — a segment (with the transcript title and
+    /// its start/end), a transcript title, or a glossary/dictionary entry —
+    /// ordered by FTS5's `bm25` (best first). `total` is the number of matches
+    /// before `options.limit`, so a caller can say "showing 50 of 214".
+    ///
+    /// A segment's snippet prefers the current `text`; when only the preserved
+    /// `source_text` matches, the snippet comes from that column and
+    /// [`SearchHit::from_source_text`] says so.
+    pub fn search_hits(
+        &self,
+        query_text: &str,
+        options: SearchOptions,
+    ) -> Result<SearchResults, SuramakError> {
+        let Some(query) = search::match_query(query_text) else {
+            return Ok(SearchResults::default());
+        };
+        let context = options.context();
+        let limit = options.limit() as i64;
+        let total: i64 = self.conn.query_row(
+            "SELECT count(*) FROM search_fts WHERE search_fts MATCH ?1",
+            params![query.expression],
+            |row| row.get(0),
         )?;
-        let rows = stmt.query_map(params![pattern], |row| {
+
+        let mut stmt = self.conn.prepare(
+            "SELECT d.kind, d.transcript_id, d.segment_idx, t.title,
+                    search_fts.body, search_fts.original,
+                    s.start_ms, s.end_ms
+             FROM search_fts
+             JOIN search_docs d ON d.rowid = search_fts.rowid
+             LEFT JOIN transcripts t ON t.id = d.transcript_id
+             LEFT JOIN segments s
+                    ON s.transcript_id = d.transcript_id AND s.idx = d.segment_idx
+             WHERE search_fts MATCH ?1
+             ORDER BY bm25(search_fts)
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![query.expression, limit], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<u32>>(2)?,
+                row.get::<_, Option<String>>(3)?,
                 row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
             ))
         })?;
 
-        let mut result = Vec::new();
+        let mut hits = Vec::new();
         for row in rows {
-            let (id_str, title, created_at, updated_at, source_json, model, language, audio_path) =
+            let (kind, transcript_id, segment_idx, title, body, original, start_ms, end_ms) =
                 row.map_err(SuramakError::Sqlite)?;
-            let id = Uuid::parse_str(&id_str)
-                .map_err(|_| SuramakError::TranscriptNotFound(id_str.clone()))?;
-            result.push(Transcript {
-                id,
+            let Some(kind) = HitKind::parse(&kind) else {
+                continue;
+            };
+            let mut from_source_text = false;
+            let mut found = search::snippet(&body, &query.terms, context);
+            if found.highlight.is_none() {
+                if let Some(original) = original.as_deref() {
+                    let alternative = search::snippet(original, &query.terms, context);
+                    if alternative.highlight.is_some() {
+                        found = alternative;
+                        from_source_text = true;
+                    }
+                }
+            }
+            hits.push(SearchHit {
+                kind,
+                transcript_id: transcript_id.and_then(|raw| Uuid::parse_str(&raw).ok()),
                 title,
-                created_at: created_at.parse().map_err(|_| {
-                    SuramakError::Sqlite(rusqlite::Error::InvalidColumnName("created_at".into()))
-                })?,
-                updated_at: updated_at.parse().map_err(|_| {
-                    SuramakError::Sqlite(rusqlite::Error::InvalidColumnName("updated_at".into()))
-                })?,
-                source: serde_json::from_str(&source_json)?,
-                model,
-                language,
-                audio_path: audio_path.map(std::path::PathBuf::from),
-                segments: Vec::new(),
+                segment_idx,
+                start_ms,
+                end_ms,
+                snippet: found.text,
+                highlight: found.highlight,
+                from_source_text,
             });
         }
-        Ok(result)
+        Ok(SearchResults {
+            hits,
+            total: total as usize,
+        })
     }
 
     /// Deletes a transcript and its segments (cascade).
     pub fn delete_transcript(&self, id: Uuid) -> Result<(), SuramakError> {
-        let n = self.conn.execute(
-            "DELETE FROM transcripts WHERE id = ?1",
-            params![id.to_string()],
-        )?;
-        if n == 0 {
-            return Err(SuramakError::TranscriptNotFound(id.to_string()));
+        // M15.7: the FTS rows have no foreign key to cascade through, so the
+        // delete is one savepoint: index documents and the header row go
+        // together or not at all.
+        self.conn.execute_batch("SAVEPOINT delete_transcript")?;
+        let deleted = (|| -> Result<usize, SuramakError> {
+            Self::delete_docs_for_transcript(&self.conn, id)?;
+            Ok(self.conn.execute(
+                "DELETE FROM transcripts WHERE id = ?1",
+                params![id.to_string()],
+            )?)
+        })();
+        match deleted {
+            Ok(0) => {
+                let _ = self
+                    .conn
+                    .execute_batch("ROLLBACK TO delete_transcript; RELEASE delete_transcript");
+                Err(SuramakError::TranscriptNotFound(id.to_string()))
+            }
+            Ok(_) => {
+                self.conn.execute_batch("RELEASE delete_transcript")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self
+                    .conn
+                    .execute_batch("ROLLBACK TO delete_transcript; RELEASE delete_transcript");
+                Err(err)
+            }
         }
-        Ok(())
     }
 
     /// SQLite's own integrity report for the open database (`"ok"` when sound).
@@ -1445,7 +2220,7 @@ mod tests {
         assert_eq!(store.search("pagi").unwrap().len(), 1, "before the split");
 
         // Split: both halves are in the same transcript, so the transcript is
-        // still one hit; the scanner reads the new rows, not a stale index.
+        // still one hit; the index reads the new rows, not a stale set.
         store
             .split_segment(t.id, 1, 7, None, ZeroDuration::OneFrame)
             .unwrap();
@@ -1459,13 +2234,27 @@ mod tests {
         );
         assert_eq!(store.search("selamat").unwrap().len(), 1);
 
-        // A word only an edited row had before is gone from search once the
-        // edit removes it — no index is holding the old text.
+        // A word the edit removes from the current text is still findable
+        // through the preserved inference text (M15.7's "either column"), and
+        // the hit says which column it came from.
         store.update_segment_text(t.id, 0, "hai").unwrap();
-        assert!(store.search("halo").unwrap().is_empty());
-        assert_eq!(store.search("hai").unwrap().len(), 1);
+        let hits = store
+            .search_hits("halo", SearchOptions::default())
+            .expect("search");
+        assert_eq!(hits.total, 1, "the preserved original still matches");
+        assert!(hits.hits[0].from_source_text);
+        assert!(
+            hits.hits[0].snippet.contains("halo"),
+            "the snippet comes from the column that matched: {}",
+            hits.hits[0].snippet
+        );
+        let current = store
+            .search_hits("hai", SearchOptions::default())
+            .expect("search");
+        assert_eq!(current.total, 1);
+        assert!(!current.hits[0].from_source_text);
 
-        // Merge the two halves back: the joined text is searchable as one row.
+        // Merge the two halves back: the joined text is one row again.
         store.merge_segments(t.id, 1, 2, " ").unwrap();
         assert_eq!(store.search("pagi semua").unwrap().len(), 1);
         assert_eq!(store.search("selamat pagi").unwrap().len(), 1);

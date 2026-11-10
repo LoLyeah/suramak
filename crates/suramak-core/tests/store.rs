@@ -110,9 +110,11 @@ fn search_by_segment_text() {
 }
 
 #[test]
-fn search_treats_wildcards_as_literal_text() {
-    // SUR-LOW-02: `%` and `_` used to act as LIKE wildcards, so "100%" matched
-    // every title beginning with "100" (and "_" matched any single character).
+fn search_has_no_implicit_wildcards_and_one_explicit_prefix() {
+    // M15.7: FTS5 token matching replaces the LIKE scan, so `%` and `_` are no
+    // longer wildcards *or* literal characters — they are separators. "100%"
+    // is the token `100`, which finds both titles that start with it; that is
+    // the documented change (the old ESCAPE rule is gone with the LIKE scan).
     let store = Store::open_in_memory().unwrap();
     let literal = make_transcript("100% done");
     let wildcard_lookalike = make_transcript("100 items done");
@@ -122,18 +124,20 @@ fn search_treats_wildcards_as_literal_text() {
         store.insert_transcript(t).unwrap();
     }
 
-    let results = store.search("100%").unwrap();
-    assert_eq!(results.len(), 1, "percent must be literal, got {results:?}");
-    assert_eq!(results[0].title, "100% done");
+    assert_eq!(
+        store.search("100%").unwrap().len(),
+        2,
+        "`%` separates, it does not restrict"
+    );
+    assert_eq!(store.search("a_b").unwrap().len(), 1);
+    assert_eq!(store.search("axb").unwrap().len(), 1);
 
-    let results = store.search("a_b").unwrap();
-    assert_eq!(results.len(), 1, "underscore must be literal");
-    assert_eq!(results[0].title, "a_b notes");
-
-    // A backslash is literal too (it is the escape character; it must be doubled).
-    let backslash = make_transcript(r"path\to\file");
-    store.insert_transcript(&backslash).unwrap();
-    assert_eq!(store.search(r"path\to").unwrap().len(), 1);
+    // The one wildcard left is an explicit trailing `*` (prefix search).
+    let long = make_transcript("Pegawairungu signed the letter");
+    store.insert_transcript(&long).unwrap();
+    assert_eq!(store.search("pegawai").unwrap().len(), 0, "exact token");
+    assert_eq!(store.search("pegawai*").unwrap().len(), 1, "prefix");
+    assert_eq!(store.search("Pegawairungu").unwrap().len(), 1, "literal");
 }
 
 #[test]
