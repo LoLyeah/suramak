@@ -1,7 +1,7 @@
 // M14b: the GUI binary is a Windows-subsystem app so launching it never opens a
 // console window (the CLI, `suramak-cli`, stays a console binary). Off Windows
-// the attribute is absent — `cfg_attr` keeps one source root for both.
-#![cfg_attr(windows, windows_subsystem = "windows")]
+// the attribute is absent; the attribute lives at the crate root (main.rs) —
+// the split made desktop.rs a module, and inner attributes are crate-root-only.
 
 //! Suramak app entry point (M1 shell + M2 wiring).
 //!
