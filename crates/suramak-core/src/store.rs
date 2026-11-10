@@ -2454,7 +2454,15 @@ impl Store {
         }
         let tmp = db.with_extension("restore-tmp");
         std::fs::copy(backup, &tmp)?;
-        std::fs::File::open(&tmp)?.sync_all()?;
+        // Windows note: `File::open` (read-only) then `sync_all` fails with
+        // ERROR_ACCESS_DENIED — Windows requires GENERIC_WRITE for
+        // FlushFileBuffers. Open read+write so the durability fence is real on
+        // every platform (the file is ours as of the copy a line above).
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&tmp)?
+            .sync_all()?;
 
         // The old file's WAL belongs to the old database; leaving it beside the
         // restored file would replay unrelated frames into the new one.
