@@ -314,6 +314,24 @@ jobs:
       - name: Add Android targets
         run: rustup target add aarch64-linux-android x86_64-linux-android
 
+      # M13d: the model download must never cross-build OpenSSL. reqwest is
+      # pinned to its rustls backend in the workspace; this asserts the Android
+      # feature graph still resolves to rustls and that no native-tls/openssl
+      # package can enter it (a flip would fail much later, inside a C build).
+      - name: TLS graph (android target) is rustls-only
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          cargo tree -p suramak-core --target aarch64-linux-android -e features > build/android-tls-tree.txt
+          grep -q 'reqwest feature "rustls-tls"' build/android-tls-tree.txt
+          grep -q 'rustls feature "ring"' build/android-tls-tree.txt
+          if grep -Eqi 'native-tls|openssl' build/android-tls-tree.txt; then
+            echo "error: a non-rustls TLS backend entered the Android graph:" >&2
+            grep -Ei 'native-tls|openssl' build/android-tls-tree.txt >&2
+            exit 1
+          fi
+          echo "TLS-OK: rustls only (no native-tls, no openssl)"
+
       - name: Install cargo-ndk (pinned 4.1.2)
         run: cargo install cargo-ndk --version 4.1.2 --locked
 

@@ -14,3 +14,12 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 suramak-core = { path = "../suramak-core" }
 suramak-asr = { path = "../suramak-asr" }
+# M13d: the JSON command protocol between Kotlin and the model host. Already a
+# workspace dependency of `suramak-core` — no new package.
+serde_json = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# M13d: the one JNI entry point. `jni` 0.21 is already in Cargo.lock and in the
+# Android build graph (the M13b spike crate uses the same version), so this adds
+# no package and no version bump.
+jni = "0.21"

@@ -26,6 +26,7 @@ use suramak_core::settings::{Appearance, EngineSetting, RecordSource};
 
 use crate::app::controls::{self, Tier};
 use crate::app::fast_engine;
+use crate::hud::InsertionPreference;
 use crate::motion::Motion;
 use crate::theme::Tokens;
 
@@ -48,6 +49,11 @@ const UPDATES_COMPILED: bool = crate::updates::compiled();
 /// build is layout-truth. The code path stays compiled everywhere (so the host
 /// build type-checks it) and simply never runs elsewhere.
 const REVEAL_IN_FOLDER: bool = cfg!(windows);
+
+/// M16B: the Compact HUD is a macOS integration (Carbon hotkey + Accessibility
+/// paste). The section still renders everywhere — its caption says what this
+/// build can do — so the setting is visible before the owner's Mac pass.
+const HUD_SUPPORTED: bool = cfg!(target_os = "macos");
 
 const ROW_H: f32 = 26.0;
 const LABEL_W: f32 = 150.0;
@@ -191,6 +197,9 @@ fn form(
         dirty |= updates_section(ui, tokens, form);
     }
     dirty |= text_rules_section(ui, tokens, motion, state, effects);
+    // M16B: the Compact HUD section applies itself (a hotkey must not wait for
+    // the form's Save); it never contributes to `dirty`.
+    compact_hud_section(ui, tokens, motion, state, effects);
 
     // ---- actions ------------------------------------------------------------
     ui.add_space(10.0);
@@ -1158,6 +1167,207 @@ fn updates_section(ui: &mut egui::Ui, tokens: &Tokens, form: &mut SettingsForm) 
     dirty
 }
 
+/// M16B — the Compact HUD: enable, chord, insertion preference.
+///
+/// Applies **immediately** (the `Effect::Hud(Save)` path): a global chord should
+/// not sit unregistered until the whole form is saved. A chord conflict is
+/// detected at registration and reported here, under the field, in the exact
+/// Carbon/Settings wording; the pre-validated system and app-menu collisions
+/// never even reach the backend.
+fn compact_hud_section(
+    ui: &mut egui::Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    state: &mut AppState,
+    effects: &mut Vec<Effect>,
+) {
+    section(ui, tokens, "Compact HUD");
+
+    row(ui, tokens, "Dictation HUD", |ui| {
+        let mut enabled = state.hud_settings.enabled;
+        let response = ui.add_enabled(
+            HUD_SUPPORTED,
+            egui::Checkbox::new(&mut enabled, "Floating card + global hotkey"),
+        );
+        if response.changed() {
+            effects.extend(state.set_hud_enabled(enabled));
+        }
+    });
+    row_caption(
+        ui,
+        tokens,
+        if HUD_SUPPORTED {
+            "Opt-in. The chord is a Carbon global hotkey: it needs no permission and is \
+             intercepted before the focused app sees it. The card appears over the app you \
+             are in and never takes focus until you click it."
+        } else {
+            "macOS only in this build. The setting is stored and takes effect in the macOS \
+             build; this platform has no Carbon hotkey and no Accessibility insertion."
+        },
+        false,
+    );
+
+    // ---- chord -------------------------------------------------------------
+    row(ui, tokens, "Hotkey", |ui| {
+        ui.add_enabled_ui(HUD_SUPPORTED, |ui| {
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut state.hud_chord_input)
+                    .desired_width(150.0)
+                    .hint_text("⇧⌘Space")
+                    .font(egui::TextStyle::Monospace),
+            );
+            let apply = controls::button(
+                ui,
+                tokens,
+                motion,
+                "settings-hud-chord-apply",
+                "Apply",
+                Tier::Secondary,
+                true,
+            );
+            if apply.clicked()
+                || (edit.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+            {
+                effects.extend(state.apply_hud_chord_input());
+            }
+            if controls::button(
+                ui,
+                tokens,
+                motion,
+                "settings-hud-chord-reset",
+                "Reset",
+                Tier::Tertiary,
+                true,
+            )
+            .clicked()
+            {
+                effects.extend(state.reset_hud_chord());
+            }
+            if needs_canonical_hint(&state.hud_chord_input) {
+                ui.label(
+                    egui::RichText::new("press Apply to normalise")
+                        .size(11.0)
+                        .color(tokens.ink_faint),
+                );
+            }
+        });
+    });
+    row_caption(
+        ui,
+        tokens,
+        &format!(
+            "Now: {}. Default: {} — avoids {}.",
+            state.hud_settings.chord().label(),
+            suramak_taps::hotkey::DEFAULT_HOTKEY.label(),
+            crate::hud::settings::AVOIDED_SYSTEM_CHORDS
+                .iter()
+                .map(|(chord, owner)| format!("{chord} ({owner})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        false,
+    );
+    if let Some(err) = &state.hud_chord_error {
+        row_caption(ui, tokens, err, true);
+    }
+    row_caption(
+        ui,
+        tokens,
+        "Suramak's own menu shortcuts (⌘Q, ⌘W, ⌘H, ⌘M) are refused as chords too — a global \
+         hotkey would intercept them everywhere, not just in this app.",
+        false,
+    );
+    if let Some(owner) = suramak_taps::hotkey::advisory_collision(&state.hud_settings.chord()) {
+        row_caption(
+            ui,
+            tokens,
+            &format!(
+                "Heads-up: this chord shadows {owner} while Suramak runs. The system-reserved \
+                 chords above are refused outright."
+            ),
+            false,
+        );
+    }
+    if let Some(err) = &state.hud_hotkey_error {
+        row_caption(ui, tokens, &format!("Registration failed: {err}"), true);
+    }
+    if let Some(note) = state.hud_settings.sanitize_note() {
+        row_caption(ui, tokens, &note, true);
+    }
+
+    // ---- insertion ---------------------------------------------------------
+    row(ui, tokens, "On result", |ui| {
+        let mut insertion = state.hud_settings.insertion;
+        let options: Vec<(InsertionPreference, &str)> = InsertionPreference::ALL
+            .iter()
+            .map(|option| (*option, option.label()))
+            .collect();
+        if controls::segmented(
+            ui,
+            tokens,
+            motion,
+            "settings-hud-insertion",
+            &mut insertion,
+            &options,
+        ) {
+            effects.extend(state.set_hud_insertion(insertion));
+        }
+    });
+    row_caption(ui, tokens, state.hud_settings.insertion.caption(), false);
+    row_caption(
+        ui,
+        tokens,
+        "Disclosure: Copy writes the transcript to your clipboard. Insert writes the same text \
+         and presses ⌘V in the app you were in — it needs macOS Accessibility and never reads \
+         your clipboard.",
+        false,
+    );
+    row_caption(
+        ui,
+        tokens,
+        &format!(
+            "Common app shortcuts a global chord would shadow: {}.",
+            crate::hud::settings::AVOIDED_APP_CHORDS
+                .iter()
+                .map(|(chord, owner)| format!("{chord} ({owner})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        false,
+    );
+
+    if state.hud_accessibility && HUD_SUPPORTED {
+        row_caption(
+            ui,
+            tokens,
+            "Accessibility is granted — Insert is available.",
+            false,
+        );
+    } else if HUD_SUPPORTED && state.hud_settings.enabled {
+        row_caption(
+            ui,
+            tokens,
+            "Accessibility is not granted — Insert stays disabled and Copy is primary. The card \
+             links straight to System Settings › Privacy & Security › Accessibility.",
+            false,
+        );
+    }
+    if let Some(note) = &state.hud_loaded_note {
+        row_caption(ui, tokens, note, false);
+    }
+    if let Some((note, error)) = &state.hud_status {
+        row_caption(ui, tokens, note, *error);
+    }
+    ui.add_space(12.0);
+}
+
+/// Whether the chord field's text differs from its canonical spelling (the
+/// "press Apply to normalise" hint). Invalid text is covered by the field's
+/// error after Apply, not hinted per keystroke.
+fn needs_canonical_hint(text: &str) -> bool {
+    crate::hud::settings::needs_canonicalization(text)
+}
+
 /// Model dropdown options as `(value, display label)` pairs: `auto` + every
 /// manifest id (human-labelled) + a custom value if the settings carry one.
 fn model_options(current: &str) -> Vec<(String, String)> {
@@ -1903,9 +2113,11 @@ mod tests {
             0.2,
             vec![
                 egui::Event::PointerMoved(pos2(550.0, 300.0)),
+                // M16B: the form gained the Compact HUD section, so the tail
+                // needs a longer scroll than the M9e measurement assumed.
                 egui::Event::MouseWheel {
                     unit: egui::MouseWheelUnit::Point,
-                    delta: egui::vec2(0.0, -900.0),
+                    delta: egui::vec2(0.0, -1_600.0),
                     modifiers: egui::Modifiers::default(),
                 },
             ],

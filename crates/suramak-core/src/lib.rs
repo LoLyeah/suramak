@@ -3,6 +3,7 @@
 #[cfg(target_os = "android")]
 pub mod android;
 pub mod decode;
+pub mod device;
 pub mod diagnostics;
 pub mod download;
 pub mod error;

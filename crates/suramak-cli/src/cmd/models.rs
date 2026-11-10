@@ -11,7 +11,7 @@
 //! `<models-dir>/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/` and layout-checked.
 //! `download parakeet` / `remove parakeet` work like the whisper ids.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
@@ -282,7 +282,7 @@ fn remove(id: &str) -> Result<()> {
     let dest = models_dir.join(info.hf_file);
 
     let mut removed_any = false;
-    for path in [dest.clone(), part_path(&dest)] {
+    for path in [dest.clone(), download::part_path(&dest)] {
         if path.exists() {
             std::fs::remove_file(&path)
                 .with_context(|| format!("cannot remove {}", path.display()))?;
@@ -344,11 +344,4 @@ fn remove_parakeet() -> Result<()> {
 fn find_model(id: &str) -> Result<&'static models::ModelInfo> {
     models::find_model(id)
         .ok_or_else(|| anyhow::anyhow!("unknown model '{id}' (available: {})", model_ids()))
-}
-
-/// `<dest>.part` — the same temporary path the core downloader uses.
-fn part_path(dest: &Path) -> PathBuf {
-    let mut raw = dest.as_os_str().to_owned();
-    raw.push(".part");
-    PathBuf::from(raw)
 }

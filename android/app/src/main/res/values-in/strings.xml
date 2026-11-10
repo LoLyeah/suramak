@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- M13d: Indonesian copy. The landing note is the owner's steer: Indonesian
+     users are pushed to base/small and away from tiny. -->
+<resources>
+    <string name="model_landing_title">Model untuk ponsel ini</string>
+    <string name="model_landing_body">base dan small adalah pilihan bawaan di perangkat; tiny hanya untuk uji cepat. Ponsel dengan RAM 8 GB atau lebih paling baik menjalankan small.</string>
+    <string name="model_landing_id_note">Bahasa Indonesia: hindari tiny — akurasinya untuk bahasa Indonesia jauh lebih rendah. Gunakan base atau small.</string>
+    <string name="model_landing_floor_note">Suramak membutuhkan ponsel ARM 64-bit dengan RAM minimal 4 GB. Di bawah itu hanya tiny yang bisa berjalan.</string>
+
+    <string name="model_download_channel">Unduhan model</string>
+    <string name="model_download_channel_desc">Progres saat model ucapan sedang diunduh</string>
+    <string name="model_download_title">Mengunduh %1$s</string>
+    <string name="model_download_starting">Memulai %1$s…</string>
+    <string name="model_download_progress">%1$d%% — %2$d dari %3$d MB</string>
+    <string name="model_download_cancel">Batal</string>
+    <string name="model_download_done">Model siap</string>
+    <string name="model_download_done_body">Model selesai diunduh dan checksum-nya terverifikasi.</string>
+    <string name="model_download_paused">Unduhan dijeda</string>
+    <string name="model_download_paused_body">Unduhan dilanjutkan dari titik berhenti saat Suramak dijalankan lagi.</string>
+    <string name="model_download_failed">Unduhan gagal</string>
+    <string name="model_download_refused">Unduhan tidak dimulai</string>
+    <string name="model_download_timed_out">Unduhan dijeda (batas waktu)</string>
+</resources>

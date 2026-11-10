@@ -1,4 +1,9 @@
 //! Model manifest (ggml decoder files + optional Core ML encoder packages).
+//!
+//! M13d adds [`PhoneGuidance`]: additive, per-model phone rules. Desktop code
+//! ignores the field; the Android landing screen and the download refusal path
+//! derive their answers from it (see [`crate::device`]), so a pin and its phone
+//! guidance cannot drift apart.
 
 use std::path::{Path, PathBuf};
 
@@ -16,6 +21,22 @@ pub struct EncoderPackage {
     pub sha256: &'static str,
 }
 
+/// Phone guidance for one model (M13d). Additive: every desktop consumer
+/// ignores it, and the Android side reads it through [`crate::device`].
+#[derive(Debug, Clone, Copy)]
+pub struct PhoneGuidance {
+    /// Minimum total device RAM, in bytes, for this model on a phone.
+    /// `0` means it runs even below the supported floor (quick tests only);
+    /// `u64::MAX` means it is never offered on a phone.
+    pub min_ram_bytes: u64,
+    /// The model becomes the phone default once the device has at least this
+    /// much RAM. `0` = never a default.
+    pub default_from_ram_bytes: u64,
+    /// Honest one-line phone guidance. Also the refusal reason for models
+    /// that carry no RAM requirement (e.g. "not offered on phones").
+    pub note: &'static str,
+}
+
 /// A model available for download from HuggingFace.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelInfo {
@@ -27,6 +48,8 @@ pub struct ModelInfo {
     /// Official Core ML encoder package; `None` when upstream ships no encoder for
     /// this model (every model in this manifest has one).
     pub encoder: Option<EncoderPackage>,
+    /// Phone rules (M13d) — additive; desktop ignores them.
+    pub phone: PhoneGuidance,
 }
 
 /// HuggingFace base URL for the whisper.cpp model repository.
@@ -58,6 +81,11 @@ pub static MODELS: &[ModelInfo] = &[
             size_bytes: 15_037_446,
             sha256: "c88cbd2648e1f5415092bcf5256add463a0f19943e6938f46e8d4ffdebd47739",
         }),
+        phone: PhoneGuidance {
+            min_ram_bytes: 0,
+            default_from_ram_bytes: 0,
+            note: "quick tests only — Indonesian accuracy is poor",
+        },
     },
     ModelInfo {
         id: "base",
@@ -70,6 +98,11 @@ pub static MODELS: &[ModelInfo] = &[
             size_bytes: 37_922_638,
             sha256: "7e6ab77041942572f239b5b602f8aaa1c3ed29d73e3d8f20abea03a773541089",
         }),
+        phone: PhoneGuidance {
+            min_ram_bytes: crate::device::FLOOR_RAM_BYTES,
+            default_from_ram_bytes: crate::device::FLOOR_RAM_BYTES,
+            note: "the smaller pinned model; the phone default on 4–6 GB devices",
+        },
     },
     ModelInfo {
         id: "small",
@@ -82,6 +115,11 @@ pub static MODELS: &[ModelInfo] = &[
             size_bytes: 163_083_239,
             sha256: "de43fb9fed471e95c19e60ae67575c2bf09e8fb607016da171b06ddad313988b",
         }),
+        phone: PhoneGuidance {
+            min_ram_bytes: crate::device::MID_RAM_BYTES,
+            default_from_ram_bytes: crate::device::HIGH_RAM_BYTES,
+            note: "better accuracy; the phone default at 8 GB and up",
+        },
     },
     ModelInfo {
         id: "turbo-q5-0",
@@ -90,6 +128,11 @@ pub static MODELS: &[ModelInfo] = &[
         sha256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
         role: "default (macOS)",
         encoder: Some(LARGE_V3_TURBO_ENCODER),
+        phone: PhoneGuidance {
+            min_ram_bytes: crate::device::HIGH_RAM_BYTES,
+            default_from_ram_bytes: 0,
+            note: "slow, high quality — for 8 GB phones",
+        },
     },
     ModelInfo {
         id: "turbo-q8-0",
@@ -98,6 +141,11 @@ pub static MODELS: &[ModelInfo] = &[
         sha256: "317eb69c11673c9de1e1f0d459b253999804ec71ac4c23c17ecf5fbe24e259a1",
         role: "high quality",
         encoder: Some(LARGE_V3_TURBO_ENCODER),
+        phone: PhoneGuidance {
+            min_ram_bytes: u64::MAX,
+            default_from_ram_bytes: 0,
+            note: "not offered on phones (874 MB, no mobile benefit over turbo-q5-0)",
+        },
     },
     ModelInfo {
         id: "turbo",
@@ -106,6 +154,11 @@ pub static MODELS: &[ModelInfo] = &[
         sha256: "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
         role: "accuracy",
         encoder: Some(LARGE_V3_TURBO_ENCODER),
+        phone: PhoneGuidance {
+            min_ram_bytes: u64::MAX,
+            default_from_ram_bytes: 0,
+            note: "not offered on phones (1.6 GB; use turbo-q5-0 on an 8 GB phone)",
+        },
     },
 ];
 

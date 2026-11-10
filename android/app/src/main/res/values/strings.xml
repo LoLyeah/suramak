@@ -1,4 +1,27 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Suramak Spike</string>
+
+    <!-- M13d: the model landing copy. The same sentences are produced by
+         `suramak_core::device` for the bridge (LANDING_EN / LANDING_ID); these
+         resources are what the compact UI will render in M13g. -->
+    <string name="model_landing_title">Models for this phone</string>
+    <string name="model_landing_body">base and small are the on-device defaults; tiny is only for quick tests. Phones with 8 GB or more run small best.</string>
+    <string name="model_landing_id_note">Indonesian: avoid tiny — its Indonesian accuracy is noticeably worse. Use base or small.</string>
+    <string name="model_landing_floor_note">Suramak needs a 64-bit ARM phone with at least 4 GB of RAM. Below that only tiny runs.</string>
+
+    <!-- M13d: the download JobService's notification. -->
+    <string name="model_download_channel">Model downloads</string>
+    <string name="model_download_channel_desc">Progress while a speech model downloads</string>
+    <string name="model_download_title">Downloading %1$s</string>
+    <string name="model_download_starting">Starting %1$s…</string>
+    <string name="model_download_progress">%1$d%% — %2$d of %3$d MB</string>
+    <string name="model_download_cancel">Cancel</string>
+    <string name="model_download_done">Model ready</string>
+    <string name="model_download_done_body">The model downloaded and its checksum verified.</string>
+    <string name="model_download_paused">Download paused</string>
+    <string name="model_download_paused_body">It resumes from where it stopped the next time Suramak runs.</string>
+    <string name="model_download_failed">Download failed</string>
+    <string name="model_download_refused">Download not started</string>
+    <string name="model_download_timed_out">Download paused (time limit)</string>
 </resources>

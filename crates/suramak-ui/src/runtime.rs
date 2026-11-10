@@ -654,6 +654,12 @@ impl Runtime {
                     let follow_ups = self.stop_capture(&title, state);
                     queue.extend(follow_ups);
                 }
+                // M16B: the HUD cancelled/closed mid-recording. Stop the streams
+                // and drop the buffers — no wav, no job, no hidden capture.
+                Effect::AbortCapture => self.abort_capture(state),
+                // M16B: the frame loop executes HUD effects (AppKit main thread
+                // + the live HUD window); the runtime never sees one.
+                Effect::Hud(_) => {}
                 Effect::DiscardRecording { path } => {
                     if let Err(err) = std::fs::remove_file(&path) {
                         tracing::warn!("could not remove {}: {err}", path.display());
@@ -1114,6 +1120,28 @@ impl Runtime {
                 self.start_live();
             }
             Err(err) => state.record_failed(err.to_string()),
+        }
+    }
+
+    /// Stops the live capture and discards it (M16B): the HUD's Cancel or a
+    /// close while recording. No wav is written and no job starts; the live
+    /// decoder is dropped with the session. Idempotent — a HUD cancel that races
+    /// a normal Stop finds no session and only resets the state.
+    fn abort_capture(&mut self, state: &mut AppState) {
+        if self.live.take().is_some() {
+            tracing::info!("HUD: recording cancelled — provisional transcript discarded");
+        }
+        if let Some(session) = self.session.take() {
+            // `stop` closes the streams and returns the buffers; dropping them
+            // here is the whole point (nothing is written).
+            let _ = session.stop();
+            tracing::info!("HUD: capture aborted — no recording was kept");
+        }
+        if matches!(state.record, RecordState::Recording(_)) {
+            state.record = RecordState::Idle;
+            if state.route == app::Route::Record {
+                state.route = app::Route::Home;
+            }
         }
     }
 

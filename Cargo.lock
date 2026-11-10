@@ -4277,6 +4277,8 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 name = "suramak-android"
 version = "0.4.0"
 dependencies = [
+ "jni 0.21.1",
+ "serde_json",
  "suramak-asr",
  "suramak-core",
 ]
@@ -4337,6 +4339,7 @@ dependencies = [
  "directories",
  "hound",
  "keyring",
+ "libc",
  "reqwest",
  "rubato",
  "rusqlite",
@@ -4403,6 +4406,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "pollster",
  "rfd",
+ "serde",
  "serde_json",
  "sha2",
  "sparkle-updater",
@@ -4410,6 +4414,8 @@ dependencies = [
  "suramak-core",
  "suramak-glass",
  "suramak-playback",
+ "suramak-taps",
+ "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
  "uuid",

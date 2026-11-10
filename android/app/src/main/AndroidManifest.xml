@@ -21,6 +21,16 @@
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- M13d: the model download is the app's first network use (HuggingFace,
+         https only). POST_NOTIFICATIONS is the API 33+ runtime permission for
+         the progress notification; without it the job still runs, silently.
+         The dataSync foreground-service type needs its own permission from
+         API 34 — declared here, harmless below. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
     <application
         android:name=".SpikeApp"
         android:allowBackup="false"
@@ -50,6 +60,23 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
+
+        <!-- M13d: the model download job. `BIND_JOB_SERVICE` is mandatory for
+             every JobService (the platform binds it); `exported=false` keeps
+             other apps out. `foregroundServiceType="dataSync"` is the type the
+             plan names — Android 15's six-hour limit and Service.onTimeout
+             apply to that type, and the service promotes itself to the
+             foreground when the job starts. -->
+        <service
+            android:name="app.suramak.models.ModelDownloadJobService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
+
+        <!-- M13d: the progress notification's Cancel action. -->
+        <receiver
+            android:name="app.suramak.models.CancelModelDownloadReceiver"
+            android:exported="false" />
     </application>
 
 </manifest>

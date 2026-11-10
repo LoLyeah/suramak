@@ -45,6 +45,10 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
+        // M13d: the Kotlin shim is small enough to stay warning-free, and the
+        // workorder makes that a gate. This turns any future warning in
+        // `android/app/src/main/java/**` into a build failure.
+        allWarningsAsErrors = true
     }
 
     buildFeatures {

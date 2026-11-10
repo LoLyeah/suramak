@@ -33,6 +33,7 @@ use suramak_playback::{
 };
 use uuid::Uuid;
 
+use crate::hud::{HudEffect, HudSettings, HudState, InsertionPreference};
 use crate::theme::AppTheme;
 
 use self::model_manager::{ModelManager, ModelRow};
@@ -1127,6 +1128,28 @@ pub struct AppState {
     pub translation_gate_reason: Option<String>,
     /// M15.8: a translation run waiting for the dirty text to save first.
     pub pending_translation: Option<(TargetLanguage, Option<Vec<u32>>)>,
+    /// M16B: the Compact HUD's six-state machine. `Idle` until the global
+    /// hotkey (or the smoke harness) drives it; the window is hidden in Idle.
+    pub hud: HudState,
+    /// M16B: the persisted HUD preferences (`hud.toml`), mirrored here so the
+    /// Settings section edits one value.
+    pub hud_settings: HudSettings,
+    /// M16B: the Settings chord field's draft while the user types (applied by
+    /// the field's Apply action / Return, never per keystroke).
+    pub hud_chord_input: String,
+    /// M16B: the chord field's inline validation message.
+    pub hud_chord_error: Option<String>,
+    /// M16B: whether macOS Accessibility is currently granted — the Insert gate.
+    /// Seeded at startup and refreshed while the HUD is visible.
+    pub hud_accessibility: bool,
+    /// M16B: why registration failed (a conflicting chord, a Carbon error), shown
+    /// by the Settings section. `None` = the chord is live (or HUD disabled).
+    pub hud_hotkey_error: Option<String>,
+    /// M16B: a load/save/registration note for the Settings section (text, error).
+    pub hud_status: Option<(String, bool)>,
+    /// M16B: the startup repair note from `hud.toml` (a corrupt or reserved
+    /// chord was reset), shown once in the section.
+    pub hud_loaded_note: Option<String>,
 }
 
 /// Which way an undo/redo row-set write moves the history cursor.
@@ -1191,6 +1214,13 @@ pub enum Effect {
     RefreshAudioProcesses,
     /// Persist the settings form (toml; keychain on macOS/Windows).
     SaveSettings { form: Box<SettingsForm> },
+    /// M16B: a Compact HUD side effect the **frame loop** executes (AppKit main
+    /// thread + the live HUD window). `Runtime::apply` never handles it.
+    Hud(HudEffect),
+    /// M16B: stop the live capture and discard its buffers (the HUD's Cancel /
+    /// close while recording). Unlike [`Effect::StopCapture`] this writes no wav
+    /// and starts no job — the user asked for nothing to be kept.
+    AbortCapture,
     /// Run the polish call for this transcript on a background thread
     /// (core's client is blocking HTTP; never the ASR worker). M4.
     PolishTranscript { transcript: Box<Transcript> },
@@ -1330,6 +1360,16 @@ impl AppState {
             // `Some` until then so the disabled surface always has a reason.
             translation_gate_reason: Some(bilingual::BILINGUAL_SETUP_NOTE.to_string()),
             pending_translation: None,
+            // M16B: opt-in; the window/stage is created only once enabled or a
+            // smoke seeds a state.
+            hud: HudState::idle(),
+            hud_settings: HudSettings::default(),
+            hud_chord_input: HudSettings::default().chord,
+            hud_chord_error: None,
+            hud_accessibility: false,
+            hud_hotkey_error: None,
+            hud_status: None,
+            hud_loaded_note: None,
         }
     }
 
@@ -2100,6 +2140,109 @@ impl AppState {
             self.settings_form.applied_at = Some(Instant::now());
         }
         self.settings_form.status = Some(result);
+    }
+
+    // ---- Compact HUD (M16B) -------------------------------------------------
+
+    /// Seeds the HUD's persisted half at startup (loaded by the frame loop) and
+    /// the permission snapshot. Idempotent.
+    pub fn seed_hud(
+        &mut self,
+        settings: HudSettings,
+        loaded_note: Option<String>,
+        accessibility: bool,
+    ) {
+        self.hud_chord_input = settings.chord.clone();
+        self.hud_settings = settings;
+        self.hud_loaded_note = loaded_note;
+        self.hud_accessibility = accessibility;
+    }
+
+    /// Applies a complete HUD settings value immediately: the section's controls
+    /// are their own Apply (a hotkey must not wait for the form's Save), so the
+    /// frame loop persists `hud.toml` and re-registers the chord.
+    pub fn save_hud_settings(&mut self, settings: HudSettings) -> Vec<Effect> {
+        self.hud_settings = settings.clone();
+        self.hud_chord_input = settings.chord.clone();
+        self.hud_hotkey_error = None;
+        vec![Effect::Hud(HudEffect::Save(settings))]
+    }
+
+    /// The enable/disable checkbox.
+    pub fn set_hud_enabled(&mut self, enabled: bool) -> Vec<Effect> {
+        let mut next = self.hud_settings.clone();
+        next.enabled = enabled;
+        self.save_hud_settings(next)
+    }
+
+    /// The insertion-preference segmented control.
+    pub fn set_hud_insertion(&mut self, insertion: InsertionPreference) -> Vec<Effect> {
+        let mut next = self.hud_settings.clone();
+        next.insertion = insertion;
+        self.save_hud_settings(next)
+    }
+
+    /// The chord field's Apply / Return. A parse or reservation error stays in
+    /// the field; nothing is persisted and registration is never attempted.
+    pub fn apply_hud_chord_input(&mut self) -> Vec<Effect> {
+        match HudSettings::parse_chord(&self.hud_chord_input) {
+            Ok(chord) => {
+                self.hud_chord_error = None;
+                let mut next = self.hud_settings.clone();
+                next.set_chord(chord);
+                self.save_hud_settings(next)
+            }
+            Err(err) => {
+                self.hud_chord_error = Some(err);
+                Vec::new()
+            }
+        }
+    }
+
+    /// Resets the chord field to the shipped default (⌘⇧Space).
+    pub fn reset_hud_chord(&mut self) -> Vec<Effect> {
+        let mut next = self.hud_settings.clone();
+        next.chord = suramak_taps::hotkey::DEFAULT_HOTKEY.canonical();
+        self.hud_chord_error = None;
+        self.save_hud_settings(next)
+    }
+
+    /// A note from the HUD's platform adapters (a failed copy, a failed paste,
+    /// a System Settings pane that would not open) — visible in the card and in
+    /// Settings, never silent.
+    pub fn set_hud_note(&mut self, note: impl Into<String>, error: bool) {
+        let note = note.into();
+        self.hud.set_note(note.clone());
+        self.hud_status = Some((note, error));
+    }
+
+    /// Registration outcome from the frame loop.
+    pub fn on_hud_registration(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                self.hud_hotkey_error = None;
+                if self.hud_settings.enabled {
+                    self.hud_status = Some((
+                        format!(
+                            "{} is registered — press it anywhere to dictate",
+                            self.hud_settings.chord().label()
+                        ),
+                        false,
+                    ));
+                }
+            }
+            Err(err) => {
+                self.hud_hotkey_error = Some(err.clone());
+                self.hud_status = Some((err, true));
+            }
+        }
+    }
+
+    /// `hud.toml` save outcome.
+    pub fn on_hud_saved(&mut self, result: Result<(), String>) {
+        if let Err(err) = result {
+            self.hud_status = Some((format!("could not save hud.toml: {err}"), true));
+        }
     }
 
     /// Reset-to-defaults (form-only until Save).
@@ -6073,5 +6216,82 @@ mod tests {
         assert!(effects.is_empty());
         assert!(state.queue.is_empty());
         assert!(state.home.error.as_deref().unwrap().contains("not found"));
+    }
+
+    // ---- M16B: the Compact HUD's settings plumbing -------------------------
+
+    #[test]
+    fn hud_settings_default_to_off_and_idle() {
+        let state = AppState::new();
+        assert_eq!(state.hud, crate::hud::HudState::Idle);
+        assert!(!state.hud_settings.enabled);
+        assert_eq!(state.hud_settings.chord, "cmd+shift+space");
+        assert!(!state.hud_accessibility);
+        assert!(state.hud_hotkey_error.is_none());
+        assert_eq!(state.hud_chord_input, "cmd+shift+space");
+    }
+
+    #[test]
+    fn hud_controls_emit_one_immediate_save_effect_each() {
+        let mut state = AppState::new();
+        let effects = state.set_hud_enabled(true);
+        assert!(state.hud_settings.enabled);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Hud(crate::hud::HudEffect::Save(settings))] if settings.enabled
+        ));
+
+        let effects = state.set_hud_insertion(crate::hud::InsertionPreference::InsertPrimary);
+        assert_eq!(
+            state.hud_settings.insertion,
+            crate::hud::InsertionPreference::InsertPrimary
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Hud(crate::hud::HudEffect::Save(settings))]
+                if settings.insertion == crate::hud::InsertionPreference::InsertPrimary
+        ));
+    }
+
+    #[test]
+    fn the_hud_chord_field_refuses_reserved_chords_without_persisting() {
+        let mut state = AppState::new();
+        state.hud_chord_input = "cmd+space".to_string();
+        let effects = state.apply_hud_chord_input();
+        assert!(effects.is_empty(), "nothing is saved for a refused chord");
+        assert_eq!(state.hud_settings.chord, "cmd+shift+space");
+        assert!(state
+            .hud_chord_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Spotlight"));
+    }
+
+    #[test]
+    fn the_hud_chord_field_normalises_and_persists_a_valid_chord() {
+        let mut state = AppState::new();
+        state.hud_chord_input = "⇧⌘R".to_string();
+        let effects = state.apply_hud_chord_input();
+        assert_eq!(state.hud_settings.chord, "cmd+shift+r");
+        assert_eq!(state.hud_chord_input, "cmd+shift+r");
+        assert!(state.hud_chord_error.is_none());
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Hud(crate::hud::HudEffect::Save(settings))] if settings.chord == "cmd+shift+r"
+        ));
+    }
+
+    #[test]
+    fn resetting_the_hud_chord_restores_the_shipped_default() {
+        let mut state = AppState::new();
+        state.hud_settings.chord = "cmd+shift+r".to_string();
+        state.hud_chord_input = "cmd+shift+r".to_string();
+        let effects = state.reset_hud_chord();
+        assert_eq!(state.hud_settings.chord, "cmd+shift+space");
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Hud(crate::hud::HudEffect::Save(settings))]
+                if settings.chord == "cmd+shift+space"
+        ));
     }
 }

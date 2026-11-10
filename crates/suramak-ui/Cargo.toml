@@ -14,6 +14,11 @@ suramak-core = { path = "../suramak-core" }
 suramak-asr = { path = "../suramak-asr" }        # default features; `capture` OFF on Linux
 suramak-glass = { path = "../suramak-glass" }
 suramak-playback = { path = "../suramak-playback" }  # M8: cpal output engine + transport
+# M16B: the Carbon global hotkey + chord grammar (pure Rust; `Unsupported` off
+# macOS). No new external crates — the Carbon bindings are hand-written there.
+suramak-taps = { path = "../suramak-taps" }
+serde = { workspace = true }                     # M16B: HudSettings (hud.toml)
+toml = { workspace = true }                      # M16B: hud.toml
 uuid = { workspace = true }                      # transcript ids in Effect::DeleteTranscript (M4.5)
 egui = { workspace = true }
 egui-winit = { workspace = true }
@@ -34,15 +39,26 @@ rfd = "0.15"
 suramak-asr = { path = "../suramak-asr", features = ["capture"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# M12: the in-app updater's dependencies — the `updates` feature turns them on.
+# M12: the in-app updater — the `updates` feature turns it on.
 # `sparkle-updater` 0.1.0 is objc2 bindings for Sparkle 2.9.6 (its build script
 # needs SPARKLE_FRAMEWORK_PATH; `scripts/fetch-sparkle.sh` fetches the pinned
-# distribution). objc2 + objc2-app-kit are for the one piece the crate does not
-# wrap: the "Check for Updates…" app-menu item (src/updates.rs, `imp`).
+# distribution).
 sparkle-updater = { version = "0.1.0", optional = true }
-objc2 = { version = "0.6", optional = true }
-objc2-foundation = { version = "0.3", optional = true, features = ["NSObject", "NSString"] }
-objc2-app-kit = { version = "0.3", optional = true, features = ["NSApplication", "NSMenu", "NSMenuItem"] }
+# M16B: objc2/AppKit are no longer feature-gated — the Compact HUD's panel
+# surgery, Accessibility check, pasteboard write and CGEvent ⌘V need them in
+# every macOS build. These crates were already macOS-only edges of the workspace
+# (`suramak-glass` and the `updates` feature use them); this is not a new
+# dependency, only a wider use of the same pinned versions.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSObject", "NSString", "NSURL"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSMenu",
+    "NSMenuItem",
+    "NSPasteboard",   # M16B: write the transcript we own
+    "NSWorkspace",    # M16B: System Settings deep links
+    "NSWindow",       # M16B: the HUD panel level / collection behaviour
+] }
 
 [target.'cfg(unix)'.dependencies]
 # Single-instance guard (flock on the data-dir lock file, `src/instance.rs`).
@@ -82,7 +98,7 @@ speech-transcriber = ["suramak-asr/speech-transcriber"]
 # + sign it (`scripts/make-app.sh` does both when SURAMAK_FEATURES contains
 # `updates`). The "Automatic updates" setting and the "Check for Updates…" menu
 # item are driven by src/updates.rs; without the feature the module is a stub.
-updates = ["dep:sparkle-updater", "dep:objc2", "dep:objc2-foundation", "dep:objc2-app-kit"]
+updates = ["dep:sparkle-updater"]
 
 [dev-dependencies]
 # M11: the UI polish tests decode the `input_audio` base64 payload back to the

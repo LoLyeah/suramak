@@ -45,6 +45,9 @@
 mod app;
 mod cadence;
 mod framestats;
+/// M16B: the Compact HUD — six-state machine, `hud.toml`, the floating card and
+/// the macOS panel/insertion adapters.
+mod hud;
 mod instance;
 /// M14b (D2): the Windows named-mutex guard; the unix `flock` path is `instance`.
 #[cfg(windows)]
@@ -105,6 +108,14 @@ pub enum UserEvent {
     AccessKit(AccessKitEnabler),
     /// M12: a repaint requested from another thread (worker/bridge).
     Repaint,
+    /// M16B: the Carbon global hotkey fired. The Carbon callback runs on the
+    /// main thread but must not touch egui directly (the M12 lock rule), so it
+    /// posts this event and the loop handles it like any other wake.
+    ///
+    /// The variant exists on every host so the whole handling path type-checks
+    /// on Linux; only the macOS registrator ever sends it.
+    #[allow(dead_code)]
+    Hotkey,
     /// M14b (D2): another launch of Suramak asked this instance to come to the
     /// front (the Windows activation event, `instance_windows`). Windows-only:
     /// no other platform has the event, and an unconstructed variant is a
@@ -164,6 +175,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.failed = true;
     }
     app.quit()
+}
+
+/// The card's chrome: the Accessibility gate, the insertion preference and the
+/// chord label its hints show (M16B).
+fn hud_chrome(app: &app::AppState, settings: &hud::HudSettings) -> hud::HudChrome {
+    hud::HudChrome::new(
+        app.hud_accessibility,
+        settings.insertion,
+        settings.chord().label(),
+    )
 }
 
 /// Starts the D2 activation watcher, first instance only (Windows).
@@ -348,10 +369,39 @@ struct App {
     /// requires a live AppKit loop and the main thread, so `App::new` must not
     /// touch it. Kept for the app's lifetime (the crate's contract).
     updates: Option<updates::Updater>,
+    /// M16B: the winit user-event proxy, kept for the Carbon hotkey callback
+    /// (the callback posts `UserEvent::Hotkey`; it never calls into egui).
+    user_proxy: Option<EventLoopProxy<UserEvent>>,
+    /// M16B: the Compact HUD's window, created lazily when enabled or when a
+    /// smoke seeds a visible state. `None` = not created (or torn down).
+    hud_window: Option<hud::window::HudWindow>,
+    /// M16B: the live HUD preferences (also mirrored in `AppState::hud_settings`
+    /// for the Settings view). Kept here so the loop can re-register the chord.
+    hud_settings: hud::HudSettings,
+    /// M16B: a settings value waiting for `about_to_wait` to persist it and
+    /// re-register the hotkey (only the loop can create/destroy windows).
+    pending_hud_settings: Option<hud::HudSettings>,
+    /// M16B: the one live Carbon registration. Dropping it unregisters. The
+    /// type exists on every host (the stub reports `Unsupported`) so the
+    /// registration path is host-type-checked.
+    hotkey: Option<suramak_taps::hotkey::HotkeyRegistration>,
+    /// M16B: the HUD's own cadence deadline (recording/processing/cancelled).
+    hud_due: Option<Instant>,
+    /// M16B: the last Accessibility poll (once a second while a result or
+    /// permission card is visible — the permission can be granted while the
+    /// app runs, and the card must notice without a restart).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    hud_accessibility_poll: Option<Instant>,
+    /// M16B: HUD actions produced while pumping (transcript arrived, job
+    /// failed); executed by the loop after the pump.
+    pending_hud_actions: Vec<hud::HudAction>,
 }
 
 impl App {
     fn new(smoke: Option<Smoke>, accesskit_proxy: Option<EventLoopProxy<UserEvent>>) -> Self {
+        // The Carbon callback needs a proxy long after the shell has consumed
+        // its own clone (M16B).
+        let user_proxy = accesskit_proxy.clone();
         // M9e smoke harness: a scripted answer for the quit confirm, only when
         // a smoke mode is active (same discipline as SURAMAK_SMOKE_RECORD).
         let smoke_quit_answer = if smoke.is_some() {
@@ -376,6 +426,503 @@ impl App {
             pending_quit: None,
             smoke_quit_answer,
             updates: None,
+            user_proxy,
+            hud_window: None,
+            hud_settings: hud::HudSettings::default(),
+            pending_hud_settings: None,
+            hotkey: None,
+            hud_due: None,
+            hud_accessibility_poll: None,
+            pending_hud_actions: Vec::new(),
+        }
+    }
+
+    /// Executes a HUD effect the frame loop owns (M16B). These need the AppKit
+    /// main thread and the live card, so they never go through `Runtime::apply`.
+    fn execute_hud_effect(&mut self, effect: hud::HudEffect) {
+        use hud::HudEffect;
+        match effect {
+            HudEffect::Save(settings) => {
+                // Persisting and re-registering happen in `about_to_wait`: only
+                // the active loop may create/destroy the HUD window.
+                self.pending_hud_settings = Some(settings);
+            }
+        }
+    }
+
+    fn hud_copy(&self, text: &str) -> Result<(), String> {
+        let ctx = self
+            .hud_window
+            .as_ref()
+            .map(|hud| hud.ctx.clone())
+            .ok_or_else(|| "the HUD is not open — use Copy in the main window".to_string())?;
+        hud::panel::copy(&ctx, text)
+    }
+
+    fn set_hud_note(&mut self, note: impl Into<String>, error: bool) {
+        if let Some(shell) = self.shell.as_mut() {
+            shell.app.set_hud_note(note, error);
+        }
+    }
+
+    /// Executes the state machine's actions in order (clipboard before paste,
+    /// start/stop through the existing M6 effects).
+    fn run_hud_actions(&mut self, actions: Vec<hud::HudAction>) {
+        use hud::HudAction;
+        let mut follow_ups = Vec::new();
+        for action in actions {
+            match action {
+                HudAction::StartCapture => {
+                    let now = Instant::now();
+                    // Never open the mic before its indicator is on screen.
+                    self.present_hud();
+                    let date = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                    let (already, can) = match self.shell.as_ref() {
+                        Some(shell) => (
+                            matches!(shell.app.record, RecordState::Recording(_)),
+                            shell.app.can_record(),
+                        ),
+                        None => (false, false),
+                    };
+                    if already {
+                        // The floating pill already opened the mic; the HUD is
+                        // attached to it and must not start a second session.
+                        continue;
+                    }
+                    if can {
+                        let effects = match self.shell.as_mut() {
+                            Some(shell) => shell.app.start_recording(now, &date),
+                            None => Vec::new(),
+                        };
+                        self.apply(effects);
+                    } else {
+                        let reason = match self.shell.as_ref() {
+                            Some(shell) if matches!(shell.app.job, Job::Running(_)) => {
+                                "A transcription is already running — try again when it finishes."
+                            }
+                            Some(shell) if !shell.app.capture_available => {
+                                "Recording is not compiled into this build."
+                            }
+                            _ => "Recording could not start.",
+                        };
+                        if let Some(shell) = self.shell.as_mut() {
+                            shell.app.hud.refuse(reason, now);
+                        }
+                    }
+                }
+                HudAction::StopCapture => {
+                    let effects = match self.shell.as_mut() {
+                        Some(shell) => shell.app.stop_recording(),
+                        None => Vec::new(),
+                    };
+                    self.apply(effects);
+                }
+                HudAction::AbortCapture => self.apply(vec![Effect::AbortCapture]),
+                HudAction::CancelJob => self.apply(vec![Effect::CancelJob]),
+                HudAction::Copy(text) => {
+                    if let Err(err) = self.hud_copy(&text) {
+                        self.set_hud_note(err, true);
+                    }
+                }
+                HudAction::Insert(text) => {
+                    let Some(ctx) = self.hud_window.as_ref().map(|hud| hud.ctx.clone()) else {
+                        self.set_hud_note("the HUD is not open — use Copy", true);
+                        continue;
+                    };
+                    let result = hud::panel::insert(&ctx, &text);
+                    if let Err(err) = &result {
+                        tracing::warn!("HUD insert: {err}");
+                    }
+                    if let Some(shell) = self.shell.as_mut() {
+                        follow_ups.extend(shell.app.hud.on_insert_result(result, Instant::now()));
+                    }
+                }
+                HudAction::OpenAccessibilitySettings => {
+                    if let Err(err) = hud::panel::open_accessibility_settings() {
+                        self.set_hud_note(err, true);
+                    }
+                }
+                HudAction::OpenMicrophoneSettings => {
+                    if let Err(err) = hud::panel::open_microphone_settings() {
+                        self.set_hud_note(err, true);
+                    }
+                }
+                HudAction::FocusHud => {
+                    if let Some(hud) = &self.hud_window {
+                        hud.focus();
+                    }
+                }
+            }
+        }
+        if !follow_ups.is_empty() {
+            self.run_hud_actions(follow_ups);
+        }
+    }
+
+    /// Applies the card's button/keyboard intents and presents the result.
+    fn apply_hud_intents(&mut self, intents: Vec<hud::HudIntent>) {
+        if intents.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let (chrome, baseline) = match self.shell.as_ref() {
+            Some(shell) => (
+                hud_chrome(&shell.app, &self.hud_settings),
+                shell
+                    .app
+                    .last_insert
+                    .as_ref()
+                    .map(|outcome| outcome.transcript.id),
+            ),
+            None => return,
+        };
+        let actions = match self.shell.as_mut() {
+            Some(shell) => intents
+                .into_iter()
+                .flat_map(|intent| shell.app.hud.on_intent(intent, &chrome, baseline, now))
+                .collect(),
+            None => Vec::new(),
+        };
+        self.run_hud_actions(actions);
+        self.present_hud();
+    }
+
+    /// The Carbon callback's landing point (M16B). The chord is a toggle:
+    /// Idle → record, Recording → stop, Result → focus the card for keyboard
+    /// use, PermissionFailure → retry.
+    fn on_hotkey(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.hud_settings.enabled {
+            return;
+        }
+        let now = Instant::now();
+        let (baseline, attached) = match self.shell.as_mut() {
+            Some(shell) => {
+                let baseline = shell
+                    .app
+                    .last_insert
+                    .as_ref()
+                    .map(|outcome| outcome.transcript.id);
+                let attached = if matches!(shell.app.hud, hud::HudState::Idle) {
+                    if let RecordState::Recording(recording) = &shell.app.record {
+                        shell.app.hud.attach_to_recording(
+                            recording.elapsed,
+                            recording.rms,
+                            recording.started_at,
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                (baseline, attached)
+            }
+            None => return,
+        };
+        let actions = if attached {
+            Vec::new()
+        } else {
+            match self.shell.as_mut() {
+                Some(shell) => shell.app.hud.hotkey(now, baseline),
+                None => Vec::new(),
+            }
+        };
+        // The indicator comes first: the state is already `Recording`, so the
+        // card is created/presented *before* the microphone opens.
+        self.sync_hud(event_loop);
+        self.present_hud();
+        self.run_hud_actions(actions);
+        self.sync_hud(event_loop);
+        self.present_hud();
+        if let Some(hud) = &self.hud_window {
+            hud.window.request_redraw();
+        }
+    }
+
+    /// The HUD window's close button / Cmd-W while it is focused: the same
+    /// dismissal as Esc, which aborts a live capture and cancels a job.
+    fn dismiss_hud(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        let (chrome, baseline) = match self.shell.as_ref() {
+            Some(shell) => (
+                hud_chrome(&shell.app, &self.hud_settings),
+                shell
+                    .app
+                    .last_insert
+                    .as_ref()
+                    .map(|outcome| outcome.transcript.id),
+            ),
+            None => return,
+        };
+        let actions = match self.shell.as_mut() {
+            Some(shell) => shell
+                .app
+                .hud
+                .on_intent(hud::HudIntent::Dismiss, &chrome, baseline, now),
+            None => Vec::new(),
+        };
+        self.run_hud_actions(actions);
+        self.sync_hud(event_loop);
+        self.present_hud();
+        if let Some(hud) = &self.hud_window {
+            hud.window.request_redraw();
+        }
+    }
+
+    /// Creates/destroys the HUD window and keeps the Carbon registration in
+    /// step with the settings. Cheap when nothing changed.
+    fn sync_hud(&mut self, event_loop: &ActiveEventLoop) {
+        let (visible, enabled, gpu, theme, reduce) = match self.shell.as_ref() {
+            Some(shell) => (
+                shell.app.hud.is_visible(),
+                self.hud_settings.enabled,
+                shell.gpu_handles(),
+                shell.app.theme,
+                shell.app.reduce_motion,
+            ),
+            None => return,
+        };
+        let supported = cfg!(target_os = "macos");
+        let want_window = visible || (supported && enabled);
+        if want_window && self.hud_window.is_none() {
+            match hud::window::HudWindow::new(
+                event_loop,
+                gpu,
+                self.user_proxy.clone(),
+                theme,
+                reduce,
+            ) {
+                Ok(window) => {
+                    tracing::info!(
+                        "compact HUD window created ({}x{})",
+                        hud::HUD_WIDTH,
+                        hud::HUD_HEIGHT
+                    );
+                    self.hud_window = Some(window);
+                }
+                Err(err) => {
+                    tracing::warn!("compact HUD window unavailable: {err}");
+                    self.set_hud_note(err, true);
+                }
+            }
+        } else if !want_window && self.hud_window.is_some() {
+            self.hud_window = None;
+        }
+
+        // A global chord is only registered while the card window it controls
+        // actually exists: a hotkey that opens the mic with no HUD would be a
+        // hidden recording path.
+        if self.hud_window.is_some() {
+            self.sync_hotkey();
+        } else if self.hotkey.is_some() {
+            self.hotkey = None;
+        }
+
+        self.present_hud();
+    }
+
+    /// Re-registers the chord when it changed (and unregisters when the HUD is
+    /// disabled). A conflict is reported in Settings, never fatal. On a
+    /// non-macOS host the backend answers `Unsupported`, which is reported the
+    /// same way (the UI only enables the section on macOS).
+    fn sync_hotkey(&mut self) {
+        use suramak_taps::hotkey::{register_hotkey, HotkeyRegistration};
+        if !self.hud_settings.enabled {
+            if self.hotkey.take().is_some() {
+                tracing::info!("compact HUD disabled — hotkey unregistered");
+            }
+            return;
+        }
+        let chord = self.hud_settings.chord();
+        if self.hotkey.as_ref().and_then(HotkeyRegistration::chord) == Some(chord) {
+            return;
+        }
+        // Dropping the old registration unregisters it first (Carbon has no
+        // atomic replace); `register_hotkey` then installs the new chord.
+        self.hotkey = None;
+        let proxy = self.user_proxy.clone();
+        let handler = std::sync::Arc::new(move || {
+            if let Some(proxy) = &proxy {
+                let _ = proxy.send_event(UserEvent::Hotkey);
+            }
+        });
+        match register_hotkey(chord, handler) {
+            Ok(registration) => {
+                tracing::info!(chord = %chord.label(), "compact HUD hotkey registered");
+                self.hotkey = Some(registration);
+                if let Some(shell) = self.shell.as_mut() {
+                    shell.app.on_hud_registration(Ok(()));
+                }
+            }
+            Err(err) => {
+                tracing::warn!(chord = %chord.label(), error = %err, "compact HUD hotkey refused");
+                if let Some(shell) = self.shell.as_mut() {
+                    shell.app.on_hud_registration(Err(err.to_string()));
+                }
+            }
+        }
+    }
+
+    /// Persists a HUD settings change, then re-syncs the window and hotkey. A
+    /// disable while the mic is open cancels the capture first — never a hidden
+    /// recording, never a leaked session.
+    fn drain_hud_settings(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(settings) = self.pending_hud_settings.take() else {
+            return;
+        };
+        let mut actions = Vec::new();
+        if !settings.enabled {
+            let now = Instant::now();
+            if let Some(shell) = self.shell.as_ref() {
+                let chrome = hud_chrome(&shell.app, &settings);
+                let baseline = shell
+                    .app
+                    .last_insert
+                    .as_ref()
+                    .map(|outcome| outcome.transcript.id);
+                let live = shell.app.hud.capture_live()
+                    || matches!(shell.app.hud, hud::HudState::Processing(_));
+                if live {
+                    if let Some(shell) = self.shell.as_mut() {
+                        actions = shell.app.hud.on_intent(
+                            hud::HudIntent::Dismiss,
+                            &chrome,
+                            baseline,
+                            now,
+                        );
+                    }
+                }
+            }
+        }
+        self.run_hud_actions(actions);
+        self.hud_settings = settings.clone();
+        if let Some(shell) = self.shell.as_mut() {
+            shell.app.hud_settings = settings.clone();
+            shell.app.hud_chord_input = settings.chord.clone();
+        }
+        match settings.save() {
+            Ok(()) => {
+                if let Some(shell) = self.shell.as_mut() {
+                    shell.app.on_hud_saved(Ok(()));
+                }
+            }
+            Err(err) => {
+                tracing::warn!("hud.toml save failed: {err}");
+                if let Some(shell) = self.shell.as_mut() {
+                    shell.app.on_hud_saved(Err(err));
+                }
+            }
+        }
+        self.sync_hud(event_loop);
+    }
+
+    /// Re-reads Accessibility once a second while a result/permission card is
+    /// up: the user can grant the permission in System Settings and come back,
+    /// and the Insert button must light up without a restart.
+    fn poll_hud_accessibility(&mut self) {
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Accessibility is a macOS permission; nothing to poll.
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let wanted = match self.shell.as_ref() {
+                Some(shell) => {
+                    shell.app.hud.is_visible()
+                        && matches!(
+                            shell.app.hud.phase(),
+                            hud::HudPhase::Result | hud::HudPhase::PermissionFailure
+                        )
+                }
+                None => false,
+            };
+            if !wanted {
+                self.hud_accessibility_poll = None;
+                return;
+            }
+            let now = Instant::now();
+            if self
+                .hud_accessibility_poll
+                .is_some_and(|last| now.saturating_duration_since(last) < Duration::from_secs(1))
+            {
+                return;
+            }
+            self.hud_accessibility_poll = Some(now);
+            let granted = hud::panel::accessibility_granted();
+            let changed = self
+                .shell
+                .as_ref()
+                .is_some_and(|shell| shell.app.hud_accessibility != granted);
+            if changed {
+                tracing::info!(
+                    granted,
+                    "Accessibility permission changed while the HUD is open"
+                );
+                if let Some(shell) = self.shell.as_mut() {
+                    shell.app.hud_accessibility = granted;
+                }
+                if let Some(hud) = &self.hud_window {
+                    hud.window.request_redraw();
+                }
+            }
+        }
+    }
+
+    fn present_hud(&mut self) {
+        let visible = self
+            .shell
+            .as_ref()
+            .is_some_and(|shell| shell.app.hud.is_visible());
+        let state = self.shell.as_ref().map(|shell| shell.app.hud.clone());
+        if let Some(hud) = self.hud_window.as_mut() {
+            if let Some(state) = state.as_ref() {
+                hud.fit(state);
+            }
+            hud.present(visible);
+        }
+    }
+
+    fn redraw_hud(&mut self) {
+        let intents = {
+            let Some(hud) = self.hud_window.as_mut() else {
+                return;
+            };
+            let Some(shell) = self.shell.as_ref() else {
+                return;
+            };
+            let chrome = hud_chrome(&shell.app, &self.hud_settings);
+            hud.render(&shell.app.hud, &chrome)
+        };
+        self.apply_hud_intents(intents);
+    }
+
+    fn hud_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        let mut close = false;
+        let mut redraw = false;
+        {
+            let Some(hud) = self.hud_window.as_mut() else {
+                return;
+            };
+            let response = hud.egui_state.on_window_event(&hud.window, &event);
+            if response.repaint && !matches!(event, WindowEvent::RedrawRequested) {
+                hud.window.request_redraw();
+            }
+            match &event {
+                WindowEvent::CloseRequested => close = true,
+                WindowEvent::Resized(size) => {
+                    hud.resize(*size);
+                    hud.window.request_redraw();
+                }
+                WindowEvent::RedrawRequested => redraw = true,
+                _ => {}
+            }
+        }
+        if close {
+            self.dismiss_hud(event_loop);
+        }
+        if redraw {
+            self.redraw_hud();
         }
     }
 
@@ -431,6 +978,12 @@ impl App {
             return;
         }
         self.shutdown_done = true;
+        // M16B: release the global chord and the HUD window before the runtime
+        // teardown. `HotkeyRegistration::drop` unregisters from Carbon; dropping
+        // the window orders it out (the process is about to _exit anyway, but
+        // this keeps the smoke exit path orderly).
+        self.hotkey = None;
+        self.hud_window = None;
         let Some(runtime) = self.runtime.as_mut() else {
             return;
         };
@@ -595,6 +1148,26 @@ impl App {
             }
         }
 
+        // M16B: pull the HUD back in line with the app's own recording/job
+        // state — a capture failure becomes the permission card, a saved
+        // transcript becomes the result. The actions are executed by the loop
+        // after the pump (they can start/stop the capture, which applies more
+        // effects).
+        if let Some(shell) = self.shell.as_mut() {
+            let chrome = hud_chrome(&shell.app, &self.hud_settings);
+            let now = Instant::now();
+            let actions = shell.app.hud.sync_from_app(
+                &shell.app.record,
+                &shell.app.job,
+                shell.app.last_insert.as_ref(),
+                &chrome,
+                now,
+            );
+            self.pending_hud_actions.extend(actions);
+            let tick_actions = shell.app.hud.tick(now);
+            self.pending_hud_actions.extend(tick_actions);
+        }
+
         let effects = match self.shell.as_mut() {
             Some(shell) => shell.app.tick(Instant::now()),
             None => return changed,
@@ -615,27 +1188,45 @@ impl App {
     /// can exit the process — and parked in `pending_quit` for
     /// [`App::drain_quit`] at the end of the event handler.
     fn apply(&mut self, effects: Vec<Effect>) {
-        let (Some(shell), Some(runtime)) = (self.shell.as_mut(), self.runtime.as_mut()) else {
-            return;
-        };
         let mut quit = None;
-        let rest: Vec<Effect> = effects
-            .into_iter()
-            .filter_map(|effect| match effect {
-                Effect::Quit(outcome) => {
-                    quit = Some(outcome);
-                    None
-                }
-                other => Some(other),
-            })
-            .collect();
-        runtime.apply(rest, &mut shell.app);
-        shell.sync_appearance(runtime.appearance());
-        // M12: a settings save may have flipped "Automatic updates" — re-apply
-        // the policy to the updater (a no-op when unchanged or when the
-        // updater is off in this run).
-        if let Some(updater) = self.updates.as_mut() {
-            updater.set_automatic_checks(runtime.updates_auto_check());
+        let mut hud_effects = Vec::new();
+        {
+            let (Some(shell), Some(runtime)) = (self.shell.as_mut(), self.runtime.as_mut()) else {
+                return;
+            };
+            let rest: Vec<Effect> = effects
+                .into_iter()
+                .filter_map(|effect| match effect {
+                    Effect::Quit(outcome) => {
+                        quit = Some(outcome);
+                        None
+                    }
+                    Effect::Hud(effect) => {
+                        hud_effects.push(effect);
+                        None
+                    }
+                    other => Some(other),
+                })
+                .collect();
+            runtime.apply(rest, &mut shell.app);
+            shell.sync_appearance(runtime.appearance());
+            // M16B: a settings save may have resolved a new theme / Reduce
+            // Motion; the HUD has its own egui context and must follow.
+            if let Some(hud) = self.hud_window.as_mut() {
+                hud.sync_appearance(shell.app.theme, shell.app.reduce_motion);
+            }
+            // M12: a settings save may have flipped "Automatic updates" —
+            // re-apply the policy to the updater (a no-op when unchanged or
+            // when the updater is off in this run).
+            if let Some(updater) = self.updates.as_mut() {
+                updater.set_automatic_checks(runtime.updates_auto_check());
+            }
+        }
+        // M16B: HUD effects need the whole `self` (they may re-enter `apply`
+        // via an Insert failure), so they run after the runtime/shell borrows
+        // end.
+        for effect in hud_effects {
+            self.execute_hud_effect(effect);
         }
         if quit.is_some() {
             self.pending_quit = quit;
@@ -906,6 +1497,15 @@ impl ApplicationHandler<UserEvent> for App {
         if self.shell.is_some() {
             return;
         }
+        // M16B: the HUD's persisted half is its own file (hud.toml). A corrupt
+        // or reserved chord is repaired to the default with a visible note.
+        let (hud_settings, hud_note) = hud::HudSettings::load();
+        let hud_accessibility = if cfg!(target_os = "macos") {
+            hud::panel::accessibility_granted()
+        } else {
+            false
+        };
+        self.hud_settings = hud_settings.clone();
         match Shell::new(event_loop, &self.egui_ctx, self.accesskit_proxy.take()) {
             Ok(mut shell) => {
                 let mut runtime = Runtime::new(self.egui_ctx.clone());
@@ -916,6 +1516,11 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 // The settings screen opens on the persisted values (M3).
                 shell.app.settings_form = runtime.settings_form();
+                // M16B: seed the HUD's settings/permission snapshot before the
+                // first frame (the section reads them, the card needs them).
+                shell
+                    .app
+                    .seed_hud(hud_settings.clone(), hud_note.clone(), hud_accessibility);
                 // M9a: resolve + apply the persisted appearance (System follows
                 // the OS theme; forced modes override) before the first frame.
                 shell.sync_appearance(runtime.appearance());
@@ -994,6 +1599,19 @@ impl ApplicationHandler<UserEvent> for App {
                         // headless Settings shot shows real rows, not blanks.
                         shell.app.refresh_fast_engine();
                     }
+                    // M16B harness: seed one named HUD state so the floating
+                    // card can be captured headlessly (Linux layout truth).
+                    if let Ok(which) = std::env::var("SURAMAK_SMOKE_HUD") {
+                        // The recording card mirrors a live session; without a
+                        // matching app state the HUD would (correctly) cancel
+                        // itself because no mic is open.
+                        if which == "recording" {
+                            shell.app.seed_demo_recording();
+                        }
+                        let chrome = hud_chrome(&shell.app, &self.hud_settings);
+                        shell.app.hud.seed_demo(&which, &chrome, Instant::now());
+                        tracing::info!(state = %which, "smoke: seeded the compact HUD");
+                    }
                     if let Some(input) = smoke.job.clone() {
                         let effects = shell.app.begin_import(input);
                         runtime.apply(effects, &mut shell.app);
@@ -1016,6 +1634,10 @@ impl ApplicationHandler<UserEvent> for App {
                 shell.window.request_redraw();
                 self.shell = Some(shell);
                 self.runtime = Some(runtime);
+                // M16B: create/register if the HUD is enabled (or a smoke seeded
+                // a visible state). This is the first moment the window and the
+                // GPU handles both exist.
+                self.sync_hud(event_loop);
             }
             Err(err) => {
                 eprintln!("suramak: cannot start: {err}");
@@ -1026,7 +1648,16 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // M16B: the card is a separate winit window with its own egui state.
+        if self
+            .hud_window
+            .as_ref()
+            .is_some_and(|hud| hud.window_id() == id)
+        {
+            self.hud_window_event(event_loop, event);
+            return;
+        }
         let Some(shell) = self.shell.as_mut() else {
             return;
         };
@@ -1094,13 +1725,24 @@ impl ApplicationHandler<UserEvent> for App {
     /// action requests — a screen reader "pressing" a node — go back into the
     /// egui state, which turns them into `Event::AccessKitActionRequest`s for
     /// the next pass; the initial-tree request just needs a frame.
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        // M16B: the Carbon callback's only job is this wake. It is handled
+        // before the shell lookup: a hotkey can arrive while the main window is
+        // gone (startup/teardown) and must not panic.
+        if matches!(event, UserEvent::Hotkey) {
+            self.on_hotkey(event_loop);
+            return;
+        }
         let Some(shell) = self.shell.as_mut() else {
             return;
         };
         let enabler = match event {
             UserEvent::Repaint => {
                 shell.window.request_redraw();
+                // The HUD has its own context and frame; wake it too.
+                if let Some(hud) = &self.hud_window {
+                    hud.window.request_redraw();
+                }
                 return;
             }
             // M14b (D2): a second launch — restore, raise and focus on the main
@@ -1111,7 +1753,26 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
             UserEvent::AccessKit(enabler) => enabler,
+            // Handled above (before the shell borrow).
+            UserEvent::Hotkey => return,
         };
+        // M16B: AccessKit events are per window; the HUD gets its own adapter
+        // and its own egui state.
+        if let Some(hud) = self.hud_window.as_mut() {
+            if enabler.0.window_id == hud.window_id() {
+                match &enabler.0.window_event {
+                    egui_winit::accesskit_winit::WindowEvent::ActionRequested(request) => {
+                        hud.egui_state.on_accesskit_action_request(request.clone());
+                        hud.window.request_redraw();
+                    }
+                    egui_winit::accesskit_winit::WindowEvent::InitialTreeRequested => {
+                        hud.window.request_redraw();
+                    }
+                    egui_winit::accesskit_winit::WindowEvent::AccessibilityDeactivated => {}
+                }
+                return;
+            }
+        }
         if enabler.0.window_id != shell.window.id() {
             return;
         }
@@ -1138,7 +1799,19 @@ impl ApplicationHandler<UserEvent> for App {
         // save + the exit itself) — before any further pumping.
         self.drain_quit(event_loop);
 
+        // M16B: apply a pending HUD settings change (persist + re-register)
+        // before the frame reads the new state.
+        self.drain_hud_settings(event_loop);
+
         let changed = self.pump();
+
+        // M16B: execute what the HUD state machine asked for during the pump
+        // (a transcript arrived, a capture failed), then re-read Accessibility
+        // and make the window match the state.
+        let hud_actions = std::mem::take(&mut self.pending_hud_actions);
+        self.run_hud_actions(hud_actions);
+        self.poll_hud_accessibility();
+        self.sync_hud(event_loop);
 
         let smoke_active = self.smoke.as_ref().is_some_and(|smoke| !smoke.finished);
         let snapshot = self
@@ -1188,14 +1861,42 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
 
+        // M16B: the card's own cadence (recording/processing breathe; an idle
+        // or result card asks for nothing — the M9 budget rule).
+        let hud_cadence = self
+            .shell
+            .as_ref()
+            .and_then(|shell| shell.app.hud.cadence());
+        let mut hud_repaint = changed;
+        match hud_cadence {
+            Some(interval) => {
+                let due = self.hud_due.unwrap_or(now + interval);
+                if now >= due {
+                    hud_repaint = true;
+                    self.hud_due = Some(now + interval);
+                } else {
+                    self.hud_due = Some(due);
+                }
+            }
+            None => self.hud_due = None,
+        }
+        if hud_repaint {
+            if let Some(hud) = &self.hud_window {
+                hud.window.request_redraw();
+            }
+        }
+
         // The wake schedule: the smoke watchdogs need 50 ms granularity (they
         // check deadlines here, not in a frame); the app otherwise sleeps until
-        // its cadence deadline or the next event.
-        let wake = if smoke_active {
+        // its cadence deadline or the next event. The HUD's cadence joins it.
+        let mut wake = if smoke_active {
             Some(Duration::from_millis(50))
         } else {
             cadence.interval()
         };
+        if let Some(hud_interval) = hud_cadence {
+            wake = Some(wake.map_or(hud_interval, |current| current.min(hud_interval)));
+        }
         match wake {
             Some(interval) => {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(now + interval));

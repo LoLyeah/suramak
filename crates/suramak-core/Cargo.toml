@@ -27,6 +27,12 @@ base64 = { workspace = true }
 # read path is enabled; flate2's backend is zlib-rs, a pure-Rust zlib (no C toolchain).
 zip = { version = "7", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
+# M13d: `statvfs` for the free-space preflight. `libc` is already in the
+# workspace graph on every target (ring/getrandom, chrono, sha2) and pinned in
+# Cargo.lock — declaring it adds no package and no version.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
 

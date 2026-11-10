@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# Suramak — M13b: build the installable debug APK for the Android shell spike.
+# Suramak — M13b/M13d: build the installable debug APK for the Android shell.
 #
 #   scripts/android/build-apk.sh
 #
 # What it does, in order (one source of truth; CI runs this exact file):
 #   1. discovers the pinned toolchain (NDK r27d, a full JDK 17, the Android SDK);
-#   2. cross-builds the Rust cdylib for arm64-v8a with cargo-ndk, dropping
-#      libsuramak_android_spike.so into android/app/src/main/jniLibs/;
+#   2. cross-builds both Rust cdylibs for arm64-v8a with cargo-ndk, dropping
+#      libsuramak_android_spike.so (the M13b shell) and libsuramak_android.so
+#      (the M13d model host the JobService calls) into
+#      android/app/src/main/jniLibs/;
 #   3. runs ./gradlew assembleDebug (Kotlin shim + manifest + jniLibs → APK);
-#   4. asserts the APK exists and really contains the .so, the right version
-#      and the crash-log FileProvider, then prints its path, size and sha256.
+#   4. asserts the APK exists and really contains both .so files, the right
+#      version, the crash-log FileProvider and the M13d download service, then
+#      prints its path, size and sha256.
 #
 # It installs nothing and needs no sudo. Environment (all optional):
 #   ANDROID_HOME / ANDROID_SDK_ROOT   SDK root (default ~/android-sdk)
@@ -27,8 +30,10 @@ PINNED_NDK_REVISION="27.3.13750724"   # r27d — docs/android.md
 PINNED_NDK_DIRNAME="android-ndk-r27d"
 PLATFORM="${SURAMAK_ANDROID_PLATFORM:-29}"   # minSdk 29 (PLAN-M13-ANDROID §4)
 ABI="arm64-v8a"
-CRATE="suramak-android-spike"
-LIB_NAME="libsuramak_android_spike.so"
+SPIKE_CRATE="suramak-android-spike"
+SPIKE_LIB="libsuramak_android_spike.so"
+APP_CRATE="suramak-android"
+APP_LIB="libsuramak_android.so"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
@@ -89,22 +94,40 @@ echo "   java:       $JAVA_HOME ($("$JAVA_HOME/bin/java" -version 2>&1 | head -1
 echo "   cargo-ndk:  $(cargo-ndk --version)"
 echo "   abi:        $ABI (platform $PLATFORM)"
 
-# --- 1. Rust cdylib -----------------------------------------------------------
+# --- 1. Rust cdylibs ----------------------------------------------------------
 # RUSTFLAGS is scoped to this invocation on purpose: the desktop crates never
 # inherit an Android linker flag from an ambient environment.
-echo "== cargo ndk build ($CRATE, release) =="
+echo "== cargo ndk build ($SPIKE_CRATE, release) =="
 RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384" \
   cargo ndk -t "$ABI" --platform "$PLATFORM" \
     -o android/app/src/main/jniLibs \
-    build --release -p "$CRATE"
+    build --release -p "$SPIKE_CRATE"
 
-SO="android/app/src/main/jniLibs/$ABI/$LIB_NAME"
+# M13d: the real app crate. Its `libsuramak_android.so` carries the model-host
+# JNI symbol the JobService calls. Both libraries share `target/`, so this is a
+# link — the whisper/ggml archives are built once.
+echo "== cargo ndk build ($APP_CRATE, release) =="
+RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384" \
+  cargo ndk -t "$ABI" --platform "$PLATFORM" \
+    -o android/app/src/main/jniLibs \
+    build --release -p "$APP_CRATE"
+
+SO="android/app/src/main/jniLibs/$ABI/$SPIKE_LIB"
 [ -f "$SO" ] || fail "cargo-ndk did not produce $SO"
 echo "   $SO ($(stat -c %s "$SO") bytes)"
 FILE_INFO="$(file "$SO")"
 case "$FILE_INFO" in
   *"ELF 64-bit"*) ;;
   *) fail "$SO is not an ELF64 object: $FILE_INFO" ;;
+esac
+
+APP_SO="android/app/src/main/jniLibs/$ABI/$APP_LIB"
+[ -f "$APP_SO" ] || fail "cargo-ndk did not produce $APP_SO"
+echo "   $APP_SO ($(stat -c %s "$APP_SO") bytes)"
+FILE_INFO="$(file "$APP_SO")"
+case "$FILE_INFO" in
+  *"ELF 64-bit"*) ;;
+  *) fail "$APP_SO is not an ELF64 object: $FILE_INFO" ;;
 esac
 
 # --- 2. APK ------------------------------------------------------------------
@@ -127,12 +150,18 @@ echo "== APK assertions =="
 # (141) when grep exits at the first match, which would look like a missing .so.
 APK_LISTING="$(unzip -l "$APK")"
 case "$APK_LISTING" in
-  *"lib/$ABI/$LIB_NAME"*) ;;
-  *) fail "$APK does not contain lib/$ABI/$LIB_NAME" ;;
+  *"lib/$ABI/$SPIKE_LIB"*) ;;
+  *) fail "APK does not contain lib/$ABI/$SPIKE_LIB" ;;
+esac
+# M13d: the JobService's JNI symbols live in this library; an APK without it
+# would crash the moment a download starts.
+case "$APK_LISTING" in
+  *"lib/$ABI/$APP_LIB"*) ;;
+  *) fail "APK does not contain lib/$ABI/$APP_LIB" ;;
 esac
 case "$APK_LISTING" in
   *"AndroidManifest.xml"*) ;;
-  *) fail "$APK does not contain AndroidManifest.xml" ;;
+  *) fail "APK does not contain AndroidManifest.xml" ;;
 esac
 
 AAPT="$SDK/build-tools/35.0.0/aapt"
@@ -175,6 +204,28 @@ if [ -x "$AAPT" ]; then
   case "$MANIFEST_TREE" in
     *"enableOnBackInvokedCallback"*) ;;
     *) fail "APK manifest does not enable the OnBackInvoked (predictive back) dispatcher" ;;
+  esac
+  # M13d: the model-download job and its dataSync type. A missing service or
+  # permission turns every download into a silent no-op on the phone.
+  case "$MANIFEST_TREE" in
+    *"app.suramak.models.ModelDownloadJobService"*) ;;
+    *) fail "APK manifest declares no app.suramak.models.ModelDownloadJobService" ;;
+  esac
+  case "$MANIFEST_TREE" in
+    *"BIND_JOB_SERVICE"*) ;;
+    *) fail "APK manifest does not protect the JobService with BIND_JOB_SERVICE" ;;
+  esac
+  case "$MANIFEST_TREE" in
+    *"FOREGROUND_SERVICE_DATA_SYNC"*) ;;
+    *) fail "APK manifest does not declare FOREGROUND_SERVICE_DATA_SYNC" ;;
+  esac
+  case "$MANIFEST_TREE" in
+    *"android.permission.INTERNET"*) ;;
+    *) fail "APK manifest does not declare INTERNET — no model could download" ;;
+  esac
+  case "$MANIFEST_TREE" in
+    *"app.suramak.models.CancelModelDownloadReceiver"*) ;;
+    *) fail "APK manifest declares no cancel receiver for the download notification" ;;
   esac
   printf '%s\n' "$BADGING" | grep -E "^(package|sdkVersion|targetSdkVersion|launchable-activity|native-code)" || true
 fi

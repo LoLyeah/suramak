@@ -102,8 +102,33 @@ pub struct Shell {
     egui_ctx: egui::Context,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
+    /// Kept so the Compact HUD (M16B) creates its surface from the same
+    /// adapter/device instead of opening a second GPU device for one card.
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
     queue: wgpu::Queue,
     renderer: egui_wgpu::Renderer,
+}
+
+/// The GPU objects the Compact HUD borrows from the main window (M16B). Cloning
+/// a `wgpu` device/queue is a refcount bump; the HUD owns its own surface and
+/// its own egui renderer, but not a second device.
+pub(crate) struct GpuHandles {
+    pub instance: wgpu::Instance,
+    pub adapter: wgpu::Adapter,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+}
+
+impl GpuHandles {
+    /// The surface format every Suramak window picks: sRGB when offered.
+    pub fn pick_format(caps: &wgpu::SurfaceCapabilities) -> wgpu::TextureFormat {
+        caps.formats
+            .iter()
+            .copied()
+            .find(wgpu::TextureFormat::is_srgb)
+            .unwrap_or(caps.formats[0])
+    }
 }
 
 impl Shell {
@@ -262,6 +287,8 @@ impl Shell {
             egui_ctx: egui_ctx.clone(),
             surface: init.surface,
             device,
+            instance: init.instance,
+            adapter: init.adapter,
             queue,
             renderer,
         };
@@ -274,6 +301,16 @@ impl Shell {
             .is_some_and(|glass| glass.float_glass_available());
         shell.sync_float_rect();
         Ok(shell)
+    }
+
+    /// The shared GPU objects for a second window (the Compact HUD, M16B).
+    pub(crate) fn gpu_handles(&self) -> GpuHandles {
+        GpuHandles {
+            instance: self.instance.clone(),
+            adapter: self.adapter.clone(),
+            device: self.device.clone(),
+            queue: self.queue.clone(),
+        }
     }
 
     /// Reconfigures the surface after a resize; the floating record control's
@@ -548,17 +585,18 @@ fn handle_viewport_commands(window: &Window, output: &egui::FullOutput) {
     }
 }
 
-struct WgpuInit {
-    surface: wgpu::Surface<'static>,
-    adapter: wgpu::Adapter,
-    backend: &'static str,
+pub(crate) struct WgpuInit {
+    pub(crate) surface: wgpu::Surface<'static>,
+    pub(crate) adapter: wgpu::Adapter,
+    pub(crate) instance: wgpu::Instance,
+    pub(crate) backend: &'static str,
 }
 
 /// Explicit backend chain (Vulkan → GL on Linux, Metal on macOS, DX12 → Vulkan
 /// on Windows), overridable with `SURAMAK_WGPU_BACKENDS=vulkan,gl`. Each entry
 /// is tried with a normal and a fallback (software) adapter request, and every
 /// failure reason is printed — no silent "no adapter".
-fn init_wgpu(window: Arc<Window>) -> Result<WgpuInit, String> {
+pub(crate) fn init_wgpu(window: Arc<Window>) -> Result<WgpuInit, String> {
     let mut attempts: Vec<String> = Vec::new();
     for (backends, backend_name) in backend_chain() {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -583,6 +621,7 @@ fn init_wgpu(window: Arc<Window>) -> Result<WgpuInit, String> {
                     return Ok(WgpuInit {
                         surface,
                         adapter,
+                        instance,
                         backend: backend_name,
                     });
                 }
@@ -640,7 +679,7 @@ fn backend_chain() -> Vec<(wgpu::Backends, &'static str)> {
 /// PLAN §1 step 7: `PostMultiplied` when the surface offers it, else
 /// `PreMultiplied`, else whatever is available (Linux/Xvfb surfaces usually
 /// offer only `Opaque`, which is fine — Linux is layout-truth only).
-fn pick_alpha_mode(modes: &[wgpu::CompositeAlphaMode]) -> wgpu::CompositeAlphaMode {
+pub(crate) fn pick_alpha_mode(modes: &[wgpu::CompositeAlphaMode]) -> wgpu::CompositeAlphaMode {
     use wgpu::CompositeAlphaMode as Mode;
     [
         Mode::PostMultiplied,

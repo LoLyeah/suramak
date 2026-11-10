@@ -30,6 +30,17 @@
 //! process CoreAudio knows to have audio — so a UI can offer a per-app picker.
 //! Suramak's own process is never listed (a tap must never capture itself).
 //!
+//! ## Global hotkeys (M16B)
+//!
+//! [`hotkey`] adds a hand-written Carbon `RegisterEventHotKey` binding — the one
+//! macOS global-shortcut API that needs no TCC permission — plus the
+//! platform-neutral chord type and registration state machine. The Carbon
+//! callback only invokes the closure the caller supplied; the app's closure posts
+//! the M12 `EventLoopProxy` repaint wake, never a synchronous dispatch. The
+//! module compiles on every platform (`Unsupported` registration off macOS), so
+//! the chord grammar and the register/unregister transitions are unit-tested on
+//! the Linux host.
+//!
 //! ## Platforms
 //!
 //! The macOS implementation lives in [`macos`]; every other platform compiles a
@@ -50,6 +61,14 @@
 mod macos;
 #[cfg(not(target_os = "macos"))]
 mod stub;
+
+pub mod hotkey;
+
+pub use hotkey::{
+    advisory_collision, register_hotkey, reserved_by_app, reserved_by_system, ChordError,
+    HotkeyBackend, HotkeyChord, HotkeyError, HotkeyHandler, HotkeyKey, HotkeyRegistration,
+    DEFAULT_HOTKEY,
+};
 
 #[cfg(target_os = "macos")]
 use macos as imp;

@@ -179,10 +179,149 @@ pub fn verify_sha256(path: &Path, expected: &str) -> Result<(), SuramakError> {
     Ok(())
 }
 
-fn part_path(dest: &Path) -> PathBuf {
+/// `<dest>.part` — the partial file every download resumes from.
+///
+/// Public since M13d: the Android JobService and the resume tests inspect the
+/// bookmark at exactly this path, and the CLI no longer keeps its own copy of
+/// the rule.
+pub fn part_path(dest: &Path) -> PathBuf {
     let mut p = dest.as_os_str().to_owned();
     p.push(".part");
     PathBuf::from(p)
+}
+
+/// Headroom a download must leave free beyond the file itself (filesystem
+/// metadata and the final rename). 64 MiB is far below any model size and far
+/// above any journal's appetite.
+pub const DOWNLOAD_SPACE_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Free bytes available to this process on `dir`'s filesystem.
+///
+/// `None` when the platform cannot answer (non-unix, or `statvfs` failed) —
+/// callers treat "unknown" as "do not block the download". `libc` is already
+/// in the workspace graph on every target (ring/getrandom, chrono, sha2), so
+/// this adds no package.
+#[cfg(unix)]
+pub fn available_space_bytes(dir: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `statvfs` writes one `struct statvfs` into a properly aligned,
+    // zeroed local; the path is a valid NUL-terminated C string that outlives
+    // the call.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+
+#[cfg(not(unix))]
+pub fn available_space_bytes(_dir: &Path) -> Option<u64> {
+    None
+}
+
+/// Refuses a download when `dir`'s filesystem cannot hold `needed_bytes` plus
+/// [`DOWNLOAD_SPACE_HEADROOM_BYTES`].
+///
+/// This is the "never half-starts" preflight (M13d): it runs before the
+/// `.part` file is created, so a full phone leaves no debris and shows one
+/// clear sentence instead of failing mid-transfer.
+pub fn check_space(dir: &Path, needed_bytes: u64) -> Result<(), SuramakError> {
+    let needed = needed_bytes.saturating_add(DOWNLOAD_SPACE_HEADROOM_BYTES);
+    // The models dir may not exist yet (first launch): statvfs needs a real
+    // path, so probe the nearest existing ancestor — the filesystem is the
+    // same one the new directory will live on.
+    let Some(probe) = nearest_existing_dir(dir) else {
+        return Ok(());
+    };
+    let Some(available) = available_space_bytes(probe) else {
+        return Ok(());
+    };
+    if available >= needed {
+        return Ok(());
+    }
+    Err(SuramakError::NotEnoughSpace {
+        dir: dir.to_path_buf(),
+        needed,
+        available,
+        message: format!(
+            "not enough free space in {}: need {:.1} GB, {:.1} GB available — free up space and retry",
+            dir.display(),
+            gigabytes(needed),
+            gigabytes(available)
+        ),
+    })
+}
+
+/// `dir` if it is a directory, else its nearest existing ancestor.
+fn nearest_existing_dir(dir: &Path) -> Option<&Path> {
+    let mut current = Some(dir);
+    while let Some(path) = current {
+        if path.is_dir() {
+            return Some(path);
+        }
+        current = path.parent();
+    }
+    None
+}
+
+fn gigabytes(bytes: u64) -> f64 {
+    bytes as f64 / 1_000_000_000.0
+}
+
+/// Installs one pinned model file into `models_dir` (M13d: the app-facing
+/// entry point; the CLI keeps its own presentation around [`download`]).
+///
+/// 1. an existing file is trusted only after its sha256 verifies — a corrupt
+///    copy is removed and downloaded again instead of erroring forever;
+/// 2. the free-space preflight runs **before** the first byte;
+/// 3. the transfer resumes from `<file>.part` (including a part left by a
+///    killed process), reports byte progress, and can be stopped by returning
+///    `false` (the part is kept);
+/// 4. the finished file is size- and sha256-verified before success is
+///    claimed.
+pub fn install_file(
+    models_dir: &Path,
+    file_name: &str,
+    url: &str,
+    size_bytes: u64,
+    expected_sha256: &str,
+    mut on_progress: impl FnMut(u64) -> bool,
+) -> Result<(), SuramakError> {
+    std::fs::create_dir_all(models_dir)?;
+    let dest = models_dir.join(file_name);
+
+    if dest.is_file() {
+        match verify_sha256(&dest, expected_sha256) {
+            Ok(()) => {
+                info!("already installed and verified: {}", dest.display());
+                on_progress(size_bytes);
+                return Ok(());
+            }
+            Err(err) => {
+                warn!(
+                    "existing {} failed verification ({err}) — downloading it again",
+                    dest.display()
+                );
+                std::fs::remove_file(&dest)?;
+            }
+        }
+    }
+
+    check_space(models_dir, size_bytes)?;
+    download_with_progress_checked(url, &dest, expected_sha256, &mut on_progress)?;
+
+    let actual = std::fs::metadata(&dest)?.len();
+    if actual != size_bytes {
+        let _ = std::fs::remove_file(&dest);
+        return Err(SuramakError::Download(format!(
+            "{}: expected {size_bytes} bytes, found {actual} — removed the file; retry",
+            dest.display()
+        )));
+    }
+    verify_sha256(&dest, expected_sha256)?;
+    Ok(())
 }
 
 /// Downloads a `.zip` artifact and extracts it into `models_dir/<dest_dir_name>`.
@@ -981,5 +1120,164 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .starts_with("pkg."));
+    }
+
+    // ---- M13d: free-space preflight, install, resume after a hard kill ------
+
+    /// The phone preflight: a file that cannot fit is refused before the first
+    /// byte, so a full device gets one clear sentence and no `.part` debris.
+    #[test]
+    fn a_download_that_cannot_fit_is_refused_before_the_first_byte() {
+        let (_dest, dir) = partial_and_dest("space");
+        let err = install_file(
+            &dir,
+            "model.bin",
+            "http://127.0.0.1:1/model.bin",
+            u64::MAX,
+            &"0".repeat(64),
+            |_| true,
+        )
+        .expect_err("a file larger than the disk must be refused");
+        assert!(
+            matches!(err, SuramakError::NotEnoughSpace { .. }),
+            "got {err:?}"
+        );
+        let message = format!("{err}");
+        assert!(message.contains("free up space"), "{message}");
+        assert!(
+            !dir.join("model.bin.part").exists(),
+            "the refusal must happen before the .part is created"
+        );
+        assert!(!dir.join("model.bin").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Free-space rule: what fits passes, what cannot fit is refused with the
+    /// directory and both numbers in the message.
+    #[test]
+    fn check_space_accepts_what_fits_and_refuses_what_cannot() {
+        let (_dest, dir) = partial_and_dest("space-check");
+        check_space(&dir, 1024).expect("a small file fits");
+        let err = check_space(&dir, u64::MAX).expect_err("the disk cannot hold that");
+        assert!(matches!(err, SuramakError::NotEnoughSpace { .. }));
+        let message = format!("{err}");
+        assert!(
+            message.contains("need") && message.contains("available"),
+            "{message}"
+        );
+        assert!(message.contains(&dir.display().to_string()), "{message}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A models directory that does not exist yet (first launch) still gets a
+    /// check: statvfs runs against the nearest existing ancestor.
+    #[test]
+    fn a_missing_models_dir_still_gets_the_free_space_check() {
+        let root =
+            std::env::temp_dir().join(format!("suramak-space-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let missing = root.join("models");
+        let err = check_space(&missing, u64::MAX)
+            .expect_err("a missing directory must still be checked against its filesystem");
+        assert!(matches!(err, SuramakError::NotEnoughSpace { .. }));
+        assert!(
+            !missing.exists(),
+            "the preflight must not create the directory"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A hard kill leaves exactly one thing behind: the `.part`. A brand-new
+    /// call (no in-memory state, as after a process restart) must resume at
+    /// that bookmark, not from byte 0.
+    #[test]
+    fn resume_after_a_hard_kill_continues_from_the_bookmark() {
+        let body: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let sha = sha256_hex(&body);
+        let (dest, dir) = partial_and_dest("kill-resume");
+
+        // "Process 1" dies mid-transfer: the callback stops the stream, so the
+        // only surviving state is the partial file — what SIGKILL leaves too.
+        let url = format!("{}/model.bin", serve_many(vec![body.clone()]));
+        let err = download_with_progress_checked(&url, &dest, &sha, |written| written < 100_000)
+            .expect_err("the simulated kill must stop the transfer");
+        assert!(matches!(err, SuramakError::Cancelled), "got {err:?}");
+        let bookmark = std::fs::metadata(part_path(&dest))
+            .expect("the bookmark survives the kill")
+            .len();
+        assert!(
+            bookmark > 0 && bookmark < body.len() as u64,
+            "bookmark {bookmark} of {}",
+            body.len()
+        );
+
+        // "Process 2": a fresh call with no memory of the first one.
+        let url = serve_once(http_response(
+            "HTTP/1.1 206 Partial Content",
+            &body[bookmark as usize..],
+        ));
+        let mut first_report = None;
+        download_with_progress_checked(&url, &dest, &sha, |written| {
+            if first_report.is_none() {
+                first_report = Some(written);
+            }
+            true
+        })
+        .expect("the resumed download completes");
+        assert_eq!(
+            first_report,
+            Some(bookmark),
+            "the first report of the new process is the bookmark"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert!(!part_path(&dest).exists(), "the .part is renamed away");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An installed file is verified before it is trusted — no network call,
+    /// and the progress callback still reports the file as done.
+    #[test]
+    fn install_file_verifies_an_existing_copy_without_network() {
+        let (dest, dir) = partial_and_dest("install-existing");
+        let body = b"pinned bytes";
+        std::fs::write(&dest, body).unwrap();
+        let mut reports = Vec::new();
+        install_file(
+            &dir,
+            "model.bin",
+            "http://127.0.0.1:1/never",
+            body.len() as u64,
+            &sha256_hex(body),
+            |written| {
+                reports.push(written);
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(reports, vec![body.len() as u64]);
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A corrupt existing file does not lock the user out: it is removed and
+    /// downloaded again.
+    #[test]
+    fn install_file_replaces_a_corrupt_existing_copy() {
+        let (dest, dir) = partial_and_dest("install-corrupt");
+        let body = b"the real pinned bytes";
+        std::fs::write(&dest, b"corrupt").unwrap();
+        let url = serve_once(ok_200(body));
+        install_file(
+            &dir,
+            "model.bin",
+            &url,
+            body.len() as u64,
+            &sha256_hex(body),
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

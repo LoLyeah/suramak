@@ -53,6 +53,17 @@ pub enum SuramakError {
     #[error("cancelled")]
     Cancelled,
 
+    /// A model download was refused before the first byte because the target
+    /// filesystem cannot hold it (M13d: the phone's free-space preflight).
+    /// `message` is the user-facing sentence and names both numbers.
+    #[error("{message}")]
+    NotEnoughSpace {
+        dir: std::path::PathBuf,
+        needed: u64,
+        available: u64,
+        message: String,
+    },
+
     #[error("Model not found: {0}")]
     ModelNotFound(String),
 
