@@ -1491,6 +1491,66 @@ impl Store {
             .map_err(SuramakError::Sqlite)
     }
 
+    /// Removes a file with a short retry/backoff for Windows transient lockers
+    /// (AV scanner, search indexer) that surface as `Access is denied`;
+    /// NotFound counts as done, and unix behavior is a single attempt.
+    fn remove_file_with_retry(path: &Path) -> Result<(), SuramakError> {
+        let mut outcome: Option<std::io::Error> = None;
+        for attempt in 0..5u32 {
+            if attempt > 0 && outcome.is_some() {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    50 + u64::from(attempt) * 50,
+                ));
+            }
+            match std::fs::remove_file(path) {
+                Ok(()) => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied && attempt < 4 => {
+                    outcome = Some(err);
+                }
+                Err(err) => return Err(SuramakError::Io(err)),
+            }
+        }
+        match outcome {
+            Some(err) => Err(SuramakError::Backup(format!(
+                "remove_file({}) stayed locked: {err}",
+                path.display()
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// The Windows replace falls back to remove-then-rename; the rename can
+    /// The Windows replace falls back to remove-then-rename; the rename can
+    /// also lose a transient lock (`Access is denied` on Windows for an
+    /// existing destination), so it gets the same bounded backoff.
+    #[cfg(windows)]
+    fn rename_with_retry(from: &Path, to: &Path) -> Result<(), SuramakError> {
+        let mut outcome: Option<std::io::Error> = None;
+        for attempt in 0..5u32 {
+            if attempt > 0 && outcome.is_some() {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    50 + u64::from(attempt) * 50,
+                ));
+            }
+            match std::fs::rename(from, to) {
+                Ok(()) => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied && attempt < 4 => {
+                    outcome = Some(err);
+                }
+                Err(err) => return Err(SuramakError::Io(err)),
+            }
+        }
+        match outcome {
+            Some(err) => Err(SuramakError::Backup(format!(
+                "rename({}, {}) stayed locked: {err}",
+                from.display(),
+                to.display()
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     /// Replaces the whole row set of one transcript (inside the caller's
     /// transaction): every row is written with its own `source_text` and
     /// `derived`, never through the `COALESCE` upsert path, because a structural
@@ -2400,22 +2460,27 @@ impl Store {
         // restored file would replay unrelated frames into the new one.
         for suffix in ["-wal", "-shm"] {
             let sidecar = std::path::PathBuf::from(format!("{}{suffix}", db.display()));
-            match std::fs::remove_file(&sidecar) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(SuramakError::Io(err)),
-            }
+            Self::remove_file_with_retry(&sidecar)?;
         }
         // Unix `rename` replaces atomically. Windows `std::fs::rename` refuses
-        // an existing destination, so there the replace is remove-then-rename:
+        // an existing destination, so there the replace is remove-then-rename;
         // a crash between the two leaves the validated temp file behind, never
-        // a half-written database.
+        // a half-written database. Windows also loses the race to transient
+        // file locks (watchdog/indexer/AV briefly holding the db or the tmp
+        // copy → "Access is denied", code 5), so the fallback retries a few
+        // times with a short backoff before surfacing the error.
         match std::fs::rename(&tmp, db) {
             Ok(()) => Ok(()),
             Err(_err) if cfg!(windows) && db.exists() => {
-                std::fs::remove_file(db)?;
-                std::fs::rename(&tmp, db)?;
-                Ok(())
+                #[cfg(windows)]
+                {
+                    Self::remove_file_with_retry(db)?;
+                    Self::rename_with_retry(&tmp, db)
+                }
+                #[cfg(not(windows))]
+                {
+                    unreachable!("the fallback only runs on windows")
+                }
             }
             Err(err) => Err(SuramakError::Io(err)),
         }
