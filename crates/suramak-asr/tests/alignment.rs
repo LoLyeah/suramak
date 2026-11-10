@@ -148,7 +148,9 @@ fn run_fixture(model: &Path, wav: &str, lang: &str) -> Result<PipelineOutcome, A
         None,
         2,
         &plan,
+        None,
         &CancelToken::new(),
+        |_| {},
         |_| {},
     )
 }
@@ -292,7 +294,9 @@ fn natural_fixtures_keep_every_word_inside_its_segment() {
             None,
             2,
             &plan,
+            None,
             &CancelToken::new(),
+            |_| {},
             |_| {},
         )
         .expect("transcription");

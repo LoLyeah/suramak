@@ -596,7 +596,7 @@ impl Runtime {
         let mut queue: VecDeque<Effect> = effects.into();
         while let Some(effect) = queue.pop_front() {
             match effect {
-                Effect::SubmitJob { input } => self.submit_job(input, state),
+                Effect::SubmitJob { input } => queue.extend(self.submit_job(input, state)),
                 Effect::SaveTranscript { transcript, words } => {
                     let result = self.insert(&transcript, &words);
                     queue.extend(state.on_transcript_saved(*transcript, result));
@@ -1589,14 +1589,14 @@ impl Runtime {
     }
 
     /// Resolves model + engine plan, then hands the job to the bridge thread.
-    fn submit_job(&mut self, input: PathBuf, state: &mut AppState) {
+    ///
+    /// M16.1: returns the effects a failed submit produced — the queue may
+    /// advance to the next item (each failure is named, never a dead end).
+    fn submit_job(&mut self, input: PathBuf, state: &mut AppState) -> Vec<Effect> {
         let model_path =
             match app::resolve_model_path(&self.settings.asr.model_id, &self.models_dir) {
                 Ok(path) => path,
-                Err(err) => {
-                    state.job_failed(err);
-                    return;
-                }
+                Err(err) => return state.job_failed(err),
             };
         let lang = self.settings.asr.language.clone();
         let language = match &lang {
@@ -1635,17 +1635,20 @@ impl Runtime {
             engine: self.settings.asr.engine,
             fast_engine: self.settings.asr.fast_engine,
             cancel: cancel.clone(),
+            // M16.1: the UI's queue has no decode-ahead pool (the bridge's one
+            // job at a time is the stricter bound); the worker decodes.
+            samples: None,
         };
         if let Err(err) = self.bridge.submit(job) {
-            state.job_failed(err);
-        } else {
-            self.job_cancel = Some(cancel);
-            if duration_ms.is_none() {
-                tracing::debug!(
-                    "no duration in the container header — the progress bar stays honest (estimating)"
-                );
-            }
+            return state.job_failed(err);
         }
+        self.job_cancel = Some(cancel);
+        if duration_ms.is_none() {
+            tracing::debug!(
+                "no duration in the container header — the progress bar stays honest (estimating)"
+            );
+        }
+        Vec::new()
     }
 
     fn insert(
@@ -2170,6 +2173,7 @@ mod tests {
             engine: EngineSetting::Auto,
             fast_engine: false,
             cancel: CancelToken::new(),
+            samples: None,
         }
     }
 

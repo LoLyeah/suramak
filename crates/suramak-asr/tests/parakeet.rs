@@ -190,7 +190,9 @@ fn e2e_parakeet_transcribes_the_english_fixture() {
         &wav,
         &LangMode::Fixed("en".to_string()),
         &plan,
+        None,
         &CancelToken::new(),
+        |_| {},
         |_| {},
     )
     .expect("transcribe en.wav with Parakeet");
@@ -255,7 +257,9 @@ fn e2e_parakeet_transcribes_the_english_fixture() {
             None,
             whisper::default_threads(),
             &plan,
+            None,
             &CancelToken::new(),
+            |_| {},
             |_| {},
         )
         .expect("transcribe en.wav with whisper tiny");

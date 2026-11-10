@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use suramak_asr::capture;
-use suramak_asr::worker::WorkerEvent;
+use suramak_asr::queue::{CancelDecision, JobQueue, QueueItem};
+use suramak_asr::worker::{JobStage, WorkerEvent};
 use suramak_asr::EngineId;
 use suramak_core::diagnostics::SubtitleLimits;
 use suramak_core::export as core_export;
@@ -213,6 +214,15 @@ pub fn count_noun(count: usize, noun: &str) -> String {
     }
 }
 
+/// The display name of an imported file (its file name, or the whole path when
+/// it has none) — the queue rows and status notes use the same label.
+pub fn file_label(input: &Path) -> String {
+    input
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| input.display().to_string())
+}
+
 /// The caret a split uses when no row has focus: the byte offset of the
 /// whitespace run closest to the text's midpoint.
 ///
@@ -290,6 +300,17 @@ pub struct RunningJob {
     /// ([`suramak_core::decode::probe_duration_ms`]). `None` = unknown, and the
     /// card then says `estimating…` instead of inventing a size.
     pub duration_ms: Option<u64>,
+    /// M16.1: the item's id in [`AppState::queue`]. `None` on a job seeded
+    /// outside the queue (the headless smoke state); such a job never continues
+    /// a batch.
+    pub queue_id: Option<u64>,
+    /// M16.1: the job was auto-started from the queue (not the user's own
+    /// import). A batch result saves to the library without stealing the editor
+    /// from whatever the user is reading.
+    pub auto: bool,
+    /// M16.1: the pipeline stage the worker reported (`None` until the first
+    /// stage event). The card says `decoding…` until transcription begins.
+    pub stage: Option<JobStage>,
 }
 
 /// The transcribe card's bar state for one frame (M14e).
@@ -429,6 +450,9 @@ pub enum QuitAction {
     Proceed,
     /// A live session is recording — show the in-app confirm instead.
     ShowConfirm,
+    /// M16.1: queued transcriptions that have not started would be dropped —
+    /// show the queue confirm (the loss is never silent).
+    ShowQueueConfirm,
 }
 
 /// M9e (P1-1): the confirm's three actions (Esc = [`QuitAnswer::Keep`]).
@@ -453,11 +477,30 @@ pub enum QuitOutcome {
     SaveThenExit { title: String },
 }
 
+/// M9e (P1-1) / M16.1: why the quit confirm is up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuitPromptKind {
+    /// A live capture session is recording (the original M9e card).
+    Recording,
+    /// Queued transcriptions that have not started would be dropped on quit.
+    Queue { dropped: usize },
+}
+
 /// M9e (P1-1): the live quit confirm (the card is up; one answer only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuitPrompt {
     /// The quit path that asked (informational).
     pub source: QuitSource,
+    /// Which confirm to draw.
+    pub kind: QuitPromptKind,
+}
+
+/// M16.1: the most recent queued-item failure, kept beside the queue so the
+/// next item's progress never hides why the previous one stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueFailure {
+    pub input: PathBuf,
+    pub message: String,
 }
 
 /// Home view state.
@@ -960,6 +1003,13 @@ pub struct AppState {
     pub route: Route,
     pub home: HomeState,
     pub job: Job,
+    /// M16.1: every accepted import and its queue state. The running item is
+    /// mirrored in `job`; the whole queue (including the running item) lives
+    /// here so order, reorder and cancel operate on one model.
+    pub queue: JobQueue,
+    /// The most recent queued-item failure (name + reason). Kept while the next
+    /// item runs so a failure never vanishes with the card.
+    pub queue_failure: Option<QueueFailure>,
     pub library: LibraryState,
     pub editor: Option<Editor>,
     pub export: ExportState,
@@ -1032,6 +1082,9 @@ pub struct AppState {
     /// M9e (P1-1): the live quit-mid-recording confirm (`Some` while the card
     /// is up). Both quit paths funnel through [`AppState::request_quit`].
     pub quit_prompt: Option<QuitPrompt>,
+    /// M16.1: the last prompt's kind, kept through the card's fade-out so the
+    /// queue copy does not flip back to "Still recording" while it closes.
+    pub quit_prompt_kind: Option<QuitPromptKind>,
     /// M9e (P1-1): the wav of a pending transcription the app auto-resumed at
     /// startup (quit-mid-recording Stop & Save). Cleared once its transcript is
     /// saved — that save is what completes the pending entry.
@@ -1222,6 +1275,8 @@ impl AppState {
             route: Route::Home,
             home: HomeState::default(),
             job: Job::Idle,
+            queue: JobQueue::new(),
+            queue_failure: None,
             library: LibraryState::default(),
             editor: None,
             export: ExportState::default(),
@@ -1257,6 +1312,7 @@ impl AppState {
             reduce_motion: false,
             peaks: EditorPeaks::default(),
             quit_prompt: None,
+            quit_prompt_kind: None,
             resumed_pending: None,
             segment_history: SegmentHistory::new(),
             text_settings: TextSettings::default(),
@@ -1526,10 +1582,27 @@ impl AppState {
     /// confirm is already up are absorbed (no second card, no lost answer).
     pub fn request_quit(&mut self, source: QuitSource) -> QuitAction {
         if matches!(self.record, RecordState::Recording(_)) {
+            self.quit_prompt_kind = Some(QuitPromptKind::Recording);
             if self.quit_prompt.is_none() {
-                self.quit_prompt = Some(QuitPrompt { source });
+                self.quit_prompt = Some(QuitPrompt {
+                    source,
+                    kind: QuitPromptKind::Recording,
+                });
             }
             return QuitAction::ShowConfirm;
+        }
+        // M16.1: queued transcriptions are in-memory only — quitting drops
+        // them. Ask first, so the loss is visible and the user can stay.
+        let dropped = self.queued_on_quit();
+        if dropped > 0 {
+            self.quit_prompt_kind = Some(QuitPromptKind::Queue { dropped });
+            if self.quit_prompt.is_none() {
+                self.quit_prompt = Some(QuitPrompt {
+                    source,
+                    kind: QuitPromptKind::Queue { dropped },
+                });
+            }
+            return QuitAction::ShowQueueConfirm;
         }
         QuitAction::Proceed
     }
@@ -1544,15 +1617,28 @@ impl AppState {
     /// - `StopAndSave` → the frame loop finalizes the wav + writes the pending
     ///   entry, then exits.
     pub fn answer_quit(&mut self, answer: QuitAnswer) -> Option<QuitOutcome> {
-        self.quit_prompt.take()?;
-        Some(match answer {
-            QuitAnswer::Keep => QuitOutcome::Stay,
-            QuitAnswer::Discard => QuitOutcome::ExitNow,
-            QuitAnswer::StopAndSave => QuitOutcome::SaveThenExit {
-                title: match &self.record {
-                    RecordState::Recording(recording) => recording.title.clone(),
-                    _ => "Recording".to_string(),
+        let prompt = self.quit_prompt.take()?;
+        Some(match prompt.kind {
+            QuitPromptKind::Recording => match answer {
+                QuitAnswer::Keep => QuitOutcome::Stay,
+                QuitAnswer::Discard => QuitOutcome::ExitNow,
+                QuitAnswer::StopAndSave => QuitOutcome::SaveThenExit {
+                    title: match &self.record {
+                        RecordState::Recording(recording) => recording.title.clone(),
+                        _ => "Recording".to_string(),
+                    },
                 },
+            },
+            // The queue card offers Quit (Discard) and Keep Working (Keep).
+            // Quitting drops the waiting items here, before the frame loop
+            // starts its teardown; the running item keeps today's behavior.
+            QuitPromptKind::Queue { .. } => match answer {
+                QuitAnswer::Keep => QuitOutcome::Stay,
+                QuitAnswer::Discard => {
+                    self.abandon_queue();
+                    QuitOutcome::ExitNow
+                }
+                QuitAnswer::StopAndSave => QuitOutcome::Stay,
             },
         })
     }
@@ -1568,10 +1654,89 @@ impl AppState {
         match &mut self.job {
             Job::Running(run) if !run.cancelling => {
                 run.cancelling = true;
+                let queue_id = run.queue_id;
+                if let Some(id) = queue_id {
+                    // Records the request in the queue too (its row says
+                    // `cancelling`); the slot stays occupied.
+                    self.queue.cancel(id);
+                }
                 vec![Effect::CancelJob]
             }
             _ => Vec::new(),
         }
+    }
+
+    /// M16.1: removes one waiting row (the row's Remove control).
+    ///
+    /// Cancelling a queued item is removal — it never touches the running
+    /// item or the engine. Cancelling the running row routes to the existing
+    /// seam ([`AppState::cancel_job`]).
+    pub fn cancel_queued(&mut self, id: u64) -> Vec<Effect> {
+        if self.queue.running_id() == Some(id) {
+            return self.cancel_job();
+        }
+        let name = self.queue.item(id).map(QueueItem::name);
+        match self.queue.cancel(id) {
+            CancelDecision::Removed => {
+                if let Some(name) = name {
+                    let remaining = self.queue.waiting_count();
+                    let message = if remaining == 0 {
+                        format!("removed {name} from the queue")
+                    } else {
+                        format!(
+                            "removed {name} — {} still queued",
+                            count_noun(remaining, "file")
+                        )
+                    };
+                    self.set_status(message, false);
+                }
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// M16.1: the card's Up control — one place earlier among waiting items.
+    pub fn raise_queued(&mut self, id: u64) -> bool {
+        self.queue.raise(id)
+    }
+
+    /// M16.1: the card's Down control — one place later among waiting items.
+    pub fn lower_queued(&mut self, id: u64) -> bool {
+        self.queue.lower(id)
+    }
+
+    /// M16.1: the rows the card shows (waiting items only — the running item is
+    /// the card's subject).
+    pub fn queue_rows(&self) -> Vec<&QueueItem> {
+        self.queue.waiting_items()
+    }
+
+    /// M16.1: how many files quitting would drop (0 = no queue confirm).
+    pub fn queued_on_quit(&self) -> usize {
+        self.queue.waiting_count()
+    }
+
+    /// M16.1: drops every item that has not started and returns their names —
+    /// the quit path logs them so the loss is never silent. Idempotent.
+    pub fn abandon_queue(&mut self) -> Vec<String> {
+        let dropped: Vec<String> = self
+            .queue
+            .drop_waiting()
+            .iter()
+            .map(QueueItem::name)
+            .collect();
+        if !dropped.is_empty() {
+            // The confirm already made the loss visible; the log keeps the
+            // names for support/debugging after the window is gone.
+            tracing::info!(
+                count = dropped.len(),
+                files = ?dropped,
+                "quit: dropped queued transcriptions"
+            );
+            self.queue_failure = None;
+        }
+        dropped
     }
 
     /// Whether the transcribe screen's Esc should cancel (M9e): a job is
@@ -1952,22 +2117,62 @@ impl AppState {
     /// Import request from a drop, the dialog or the path field. Validates the
     /// path, switches to the transcribe route and asks the runtime to submit.
     pub fn begin_import(&mut self, input: PathBuf) -> Vec<Effect> {
+        self.begin_imports(vec![input])
+    }
+
+    /// M16.1: imports one or more files in order.
+    ///
+    /// With nothing running the first file starts immediately (today's single
+    /// import behavior, one `SubmitJob`); while a job is running every file is
+    /// appended to the queue and the card grows its list. The whole batch is
+    /// validated first: one missing path refuses the import rather than starting
+    /// half a batch.
+    pub fn begin_imports(&mut self, inputs: Vec<PathBuf>) -> Vec<Effect> {
         // A live recording owns the audio session: imports are ignored until it stops.
-        if matches!(self.record, RecordState::Recording(_)) {
+        if matches!(self.record, RecordState::Recording(_)) || inputs.is_empty() {
             return Vec::new();
         }
-        if !input.is_file() {
-            self.home.error = Some(format!("file not found: {}", input.display()));
+        if let Some(missing) = inputs.iter().find(|input| !input.is_file()) {
+            self.home.error = Some(format!("file not found: {}", missing.display()));
             return Vec::new();
         }
         self.home.error = None;
-        self.status = None;
-        self.last_insert = None;
-        // M8: the editor view is being left — playback stops and resets.
+        let starting = !matches!(self.job, Job::Running(_));
+        if starting {
+            self.status = None;
+            self.last_insert = None;
+            // A fresh batch never inherits the previous batch's outcome rows.
+            self.queue.retain_live();
+            self.queue_failure = None;
+            self.job = Job::Idle;
+        }
+        // M8: the editor view is being left — playback stops and resets. This is
+        // a no-op when nothing plays, so a queued import never disturbs a batch.
         let mut effects = self.stop_playback();
         self.route = Route::Transcribe;
+        let names: Vec<String> = inputs.iter().map(|input| file_label(input)).collect();
+        for input in inputs {
+            self.queue.enqueue(input);
+        }
+        if starting {
+            effects.extend(self.start_next_from_queue(false));
+        } else {
+            let noun = count_noun(names.len(), "file");
+            self.set_status(format!("added {noun} to the queue"), false);
+        }
+        effects
+    }
+
+    /// Starts the next waiting item on the single inference slot.
+    ///
+    /// `auto` is true for the batch's continuations: their result is saved to
+    /// the library but the editor is never yanked away from the user.
+    fn start_next_from_queue(&mut self, auto: bool) -> Vec<Effect> {
+        let Some(ticket) = self.queue.next_inference() else {
+            return Vec::new();
+        };
         self.job = Job::Running(RunningJob {
-            input: input.clone(),
+            input: ticket.input.clone(),
             pct: 0,
             model: None,
             requested_engine: None,
@@ -1977,9 +2182,13 @@ impl AppState {
             language: None,
             started_at: None,
             duration_ms: None,
+            queue_id: Some(ticket.id),
+            auto,
+            stage: None,
         });
-        effects.push(Effect::SubmitJob { input });
-        effects
+        vec![Effect::SubmitJob {
+            input: ticket.input,
+        }]
     }
 
     /// Import from the home path field (Enter / Import button).
@@ -2020,15 +2229,33 @@ impl AppState {
         }
     }
 
-    /// The runtime could not start the job (no model, worker gone, …).
-    pub fn job_failed(&mut self, message: String) {
-        let input = match &self.job {
-            Job::Running(run) => run.input.clone(),
-            Job::Failed { input, .. } => input.clone(),
-            Job::Idle => PathBuf::new(),
+    /// The current item could not start or failed in the worker.
+    ///
+    /// M16.1: the queue item moves to `failed(named)`, the reason is kept for
+    /// the card, and the batch continues on the next item — a failure never
+    /// cascades. Only when nothing is left does the card settle into today's
+    /// single `Job::Failed` state.
+    pub fn job_failed(&mut self, message: String) -> Vec<Effect> {
+        let (input, queue_id) = match &self.job {
+            Job::Running(run) => (run.input.clone(), run.queue_id),
+            Job::Failed { input, .. } => (input.clone(), None),
+            Job::Idle => (PathBuf::new(), None),
         };
+        if let Some(id) = queue_id {
+            self.queue.on_failed(id, message.clone());
+        }
+        self.queue_failure = Some(QueueFailure {
+            input: input.clone(),
+            message: message.clone(),
+        });
         self.set_status(message.clone(), true);
-        self.job = Job::Failed { input, message };
+        if self.queue.waiting_count() > 0 {
+            self.job = Job::Idle;
+            self.start_next_from_queue(true)
+        } else {
+            self.job = Job::Failed { input, message };
+            Vec::new()
+        }
     }
 
     /// Worker event → state transitions (+ effects).
@@ -2037,6 +2264,17 @@ impl AppState {
             WorkerEvent::Progress { pct, .. } => {
                 if let Job::Running(run) = &mut self.job {
                     run.pct = pct.min(100);
+                }
+                Vec::new()
+            }
+            // M16.1: the pipeline's front half finished (or the engine started
+            // on a decoded-ahead buffer) — the card stops saying `decoding…`.
+            WorkerEvent::Stage { stage, .. } => {
+                if let Job::Running(run) = &mut self.job {
+                    run.stage = Some(stage);
+                    if let Some(id) = run.queue_id {
+                        self.queue.on_stage(id, stage);
+                    }
                 }
                 Vec::new()
             }
@@ -2050,9 +2288,15 @@ impl AppState {
                 warnings,
                 ..
             } => {
-                if !matches!(self.job, Job::Running(_)) {
+                let Some((queue_id, auto)) = (match &self.job {
+                    Job::Running(run) => Some((run.queue_id, run.auto)),
+                    _ => None,
+                }) else {
                     // Stray event (no job in flight) — nothing to attach it to.
                     return Vec::new();
+                };
+                if let Some(id) = queue_id {
+                    self.queue.on_finished(id, engine_used, warnings.clone());
                 }
                 self.job = Job::Idle;
                 self.last_engine = Some(engine_used);
@@ -2060,30 +2304,48 @@ impl AppState {
                 if !warnings.is_empty() {
                     status.push_str(&format!(" — {}", warnings.join("; ")));
                 }
+                if auto && self.queue.waiting_count() > 0 {
+                    // A batch continuation reports its count, not just `engine:`.
+                    let counts = self.queue.counts();
+                    status.push_str(&format!(" — {} of {} done", counts.done, counts.total()));
+                }
                 self.set_status(status, false);
-                let mut effects = self.open_editor((*transcript).clone());
-                // M15.6: the job's own word timing, current by construction.
-                let alignment = WordAlignment::from_words(&words);
-                self.on_word_alignment_loaded(transcript.id, alignment);
+                let mut effects = Vec::new();
+                if !auto {
+                    effects.extend(self.open_editor((*transcript).clone()));
+                    // M15.6: the job's own word timing, current by construction.
+                    let alignment = WordAlignment::from_words(&words);
+                    self.on_word_alignment_loaded(transcript.id, alignment);
+                }
                 effects.push(Effect::SaveTranscript { transcript, words });
+                effects.extend(self.start_next_from_queue(true));
                 effects
             }
-            WorkerEvent::Error { message, .. } => {
-                self.job_failed(message);
-                Vec::new()
-            }
+            WorkerEvent::Error { message, .. } => self.job_failed(message),
             // M9e (P2-2): the worker stopped the job at a stage boundary. The
-            // job is gone (partial results were discarded by the pipeline) —
-            // home, with the shared status fade carrying the news. A stray
-            // Cancelled (no job in flight) is ignored like a stray Finished.
+            // job is gone (partial results were discarded by the pipeline).
+            // M16.1: a batch continues with the next item and stays on the
+            // card; the last item keeps today's fade home. A stray `Cancelled`
+            // (no job in flight) is ignored like a stray `Finished`.
             WorkerEvent::Cancelled { .. } => {
-                if !matches!(self.job, Job::Running(_)) {
+                let Some(queue_id) = (match &self.job {
+                    Job::Running(run) => Some(run.queue_id),
+                    _ => None,
+                }) else {
                     return Vec::new();
+                };
+                if let Some(id) = queue_id {
+                    self.queue.on_cancelled(id);
                 }
                 self.job = Job::Idle;
-                self.set_status("transcription cancelled", false);
-                self.route = Route::Home;
-                Vec::new()
+                if self.queue.waiting_count() > 0 {
+                    self.set_status("transcription cancelled — continuing with the queue", false);
+                    self.start_next_from_queue(true)
+                } else {
+                    self.set_status("transcription cancelled", false);
+                    self.route = Route::Home;
+                    Vec::new()
+                }
             }
         }
     }
@@ -5610,5 +5872,206 @@ mod tests {
             .as_ref()
             .unwrap_err()
             .contains("no bilingual variant"));
+    }
+
+    // ---- M16.1: the bounded queue ------------------------------------------
+
+    #[test]
+    fn a_second_import_joins_the_queue_instead_of_replacing_the_running_job() {
+        let mut state = AppState::new();
+        state.begin_import(temp_wav("queue-first"));
+        let effects = state.begin_import(temp_wav("queue-second"));
+        assert!(
+            effects.is_empty(),
+            "the running job keeps the single inference slot"
+        );
+        assert_eq!(state.queue.waiting_count(), 1);
+        assert!(matches!(state.job, Job::Running(_)));
+        assert_eq!(state.route, Route::Transcribe);
+        let rows = state.queue_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name(), "queue-second.wav");
+        assert_eq!(rows[0].state.label(), "queued");
+    }
+
+    #[test]
+    fn the_queue_starts_the_next_item_when_the_running_one_finishes() {
+        let mut state = AppState::new();
+        state.begin_import(temp_wav("batch-a"));
+        state.begin_import(temp_wav("batch-b"));
+        state.begin_import(temp_wav("batch-c"));
+        assert_eq!(state.queue.waiting_count(), 2);
+
+        let effects = state.on_worker_event(finished_event(transcript("batch-a.wav")));
+        assert!(
+            matches!(effects.last(), Some(Effect::SubmitJob { .. })),
+            "the next item must be submitted: {effects:?}"
+        );
+        assert!(matches!(state.job, Job::Running(_)));
+        assert_eq!(state.queue.waiting_count(), 1);
+        assert_eq!(state.queue.counts().done, 1);
+
+        // The continuation saves and never steals the view.
+        let route = state.route;
+        let effects = state.on_worker_event(finished_event(transcript("batch-b.wav")));
+        assert_eq!(state.route, route, "a batch result does not yank the view");
+        assert!(matches!(effects.last(), Some(Effect::SubmitJob { .. })));
+        assert_eq!(state.queue.waiting_count(), 0);
+    }
+
+    #[test]
+    fn cancelling_a_queued_row_removes_it_and_leaves_the_running_job_alone() {
+        let mut state = AppState::new();
+        state.begin_import(temp_wav("cancel-run"));
+        state.begin_import(temp_wav("cancel-queued"));
+        let id = state.queue_rows()[0].id;
+        let effects = state.cancel_queued(id);
+        assert!(
+            effects.is_empty(),
+            "a queued cancel is removal, not a token"
+        );
+        assert_eq!(state.queue.waiting_count(), 0);
+        assert!(matches!(state.job, Job::Running(_)));
+        assert!(state
+            .status
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("removed cancel-queued.wav"));
+    }
+
+    #[test]
+    fn queue_rows_move_with_up_and_down_and_the_running_row_is_pinned() {
+        let mut state = AppState::new();
+        state.begin_import(temp_wav("pin-running"));
+        state.begin_import(temp_wav("move-a"));
+        state.begin_import(temp_wav("move-b"));
+        let rows = state.queue_rows();
+        let (a, b) = (rows[0].id, rows[1].id);
+
+        assert!(state.raise_queued(b));
+        let names: Vec<String> = state.queue_rows().iter().map(|row| row.name()).collect();
+        assert_eq!(names, vec!["move-b.wav", "move-a.wav"]);
+        assert!(state.lower_queued(b));
+        let names: Vec<String> = state.queue_rows().iter().map(|row| row.name()).collect();
+        assert_eq!(names, vec!["move-a.wav", "move-b.wav"]);
+        assert!(!state.raise_queued(a), "the first waiting row cannot rise");
+        let running = state.queue.running_id().unwrap();
+        assert!(!state.raise_queued(running), "the running row is pinned");
+    }
+
+    #[test]
+    fn a_failed_item_names_its_reason_and_the_batch_continues() {
+        let mut state = AppState::new();
+        state.begin_import(temp_wav("fail-a"));
+        state.begin_import(temp_wav("fail-b"));
+        let effects = state.on_worker_event(WorkerEvent::Error {
+            job_id: 1,
+            message: "decode failed".to_string(),
+        });
+        assert!(
+            matches!(effects.as_slice(), [Effect::SubmitJob { .. }]),
+            "the next item starts: {effects:?}"
+        );
+        assert!(matches!(state.job, Job::Running(_)));
+        assert_eq!(
+            state
+                .queue_failure
+                .as_ref()
+                .map(|failure| failure.message.as_str()),
+            Some("decode failed")
+        );
+        assert_eq!(state.queue.counts().failed, 1);
+
+        // The last item's failure settles into today's single failure state.
+        let effects = state.on_worker_event(WorkerEvent::Error {
+            job_id: 2,
+            message: "model file not found".to_string(),
+        });
+        assert!(effects.is_empty());
+        assert!(matches!(state.job, Job::Failed { .. }));
+        assert!(!state.busy());
+    }
+
+    #[test]
+    fn cancelling_the_running_job_continues_the_queue() {
+        let mut state = AppState::new();
+        state.begin_import(temp_wav("cancel-running-a"));
+        state.begin_import(temp_wav("cancel-running-b"));
+        assert!(matches!(state.cancel_job().as_slice(), [Effect::CancelJob]));
+        assert!(matches!(&state.job, Job::Running(run) if run.cancelling));
+        let effects = state.on_worker_event(WorkerEvent::Cancelled { job_id: 1 });
+        assert!(
+            matches!(effects.as_slice(), [Effect::SubmitJob { .. }]),
+            "the queue must not wedge on a cancelled running job: {effects:?}"
+        );
+        assert!(matches!(state.job, Job::Running(_)));
+        assert_eq!(state.queue.waiting_count(), 0);
+        assert_eq!(state.route, Route::Transcribe);
+    }
+
+    #[test]
+    fn the_stage_event_moves_the_item_out_of_decoding() {
+        let mut state = AppState::new();
+        state.begin_import(temp_wav("stage"));
+        let id = state.queue.running_id().unwrap();
+        assert!(matches!(
+            state.queue.item(id).unwrap().state,
+            suramak_asr::queue::ItemState::Decoding { ready: false }
+        ));
+        state.on_worker_event(WorkerEvent::Stage {
+            job_id: 1,
+            stage: JobStage::Transcribing,
+        });
+        assert_eq!(
+            state.queue.item(id).unwrap().state,
+            suramak_asr::queue::ItemState::Transcribing
+        );
+        match &state.job {
+            Job::Running(run) => assert_eq!(run.stage, Some(JobStage::Transcribing)),
+            other => panic!("expected a running job, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quitting_with_queued_files_asks_before_dropping_them() {
+        let mut state = AppState::new();
+        state.begin_import(temp_wav("quit-a"));
+        state.begin_import(temp_wav("quit-b"));
+        assert_eq!(
+            state.request_quit(QuitSource::WindowClose),
+            QuitAction::ShowQueueConfirm
+        );
+        assert_eq!(
+            state.quit_prompt.as_ref().unwrap().kind,
+            QuitPromptKind::Queue { dropped: 1 }
+        );
+        // Keep Working keeps the whole queue.
+        assert_eq!(state.answer_quit(QuitAnswer::Keep), Some(QuitOutcome::Stay));
+        assert_eq!(state.queue.waiting_count(), 1);
+
+        assert_eq!(
+            state.request_quit(QuitSource::AppTerminate),
+            QuitAction::ShowQueueConfirm
+        );
+        assert_eq!(
+            state.answer_quit(QuitAnswer::Discard),
+            Some(QuitOutcome::ExitNow)
+        );
+        assert!(
+            state.queue.waiting_items().is_empty(),
+            "quitting drops the queued files"
+        );
+    }
+
+    #[test]
+    fn importing_a_batch_of_missing_files_starts_nothing() {
+        let mut state = AppState::new();
+        let existing = temp_wav("batch-ok");
+        let effects =
+            state.begin_imports(vec![existing, PathBuf::from("/definitely/not/here.wav")]);
+        assert!(effects.is_empty());
+        assert!(state.queue.is_empty());
+        assert!(state.home.error.as_deref().unwrap().contains("not found"));
     }
 }

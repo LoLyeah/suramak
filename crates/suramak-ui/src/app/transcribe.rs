@@ -12,7 +12,29 @@ use crate::motion::Motion;
 use crate::theme::Tokens;
 
 use super::views::{paint_card, pane_caption, pane_title, PANE_PAD_X};
-use super::{AppState, Effect, Job};
+use super::{AppState, Effect, Job, JobStage};
+
+/// The queue card's fixed geometry (Deck density): four rows visible, the rest
+/// behind a `+n more` line. Bounded rows are a design rule, not a scroll area —
+/// no hidden scrolling, no variable-height card.
+pub const QUEUE_VISIBLE_ROWS: usize = 4;
+const QUEUE_ROW_HEIGHT: f32 = 26.0;
+const QUEUE_HEADER: f32 = 28.0;
+const QUEUE_MORE_LINE: f32 = 18.0;
+const QUEUE_BUTTONS_WIDTH: f32 = 196.0;
+
+/// End-elides a file name to `max_chars` (the card never lets a long path push
+/// the state label or the controls off the row).
+pub fn elide(name: &str, max_chars: usize) -> String {
+    let max_chars = max_chars.max(4);
+    if name.chars().count() <= max_chars {
+        return name.to_string();
+    }
+    let keep = max_chars - 1;
+    let mut out: String = name.chars().take(keep).collect();
+    out.push('…');
+    out
+}
 
 pub fn ui(
     ui: &mut egui::Ui,
@@ -25,7 +47,7 @@ pub fn ui(
     let left = rect.left() + PANE_PAD_X;
     let right = rect.right() - PANE_PAD_X;
 
-    let (file_name, pct, model, planned, warnings, failure, cancelling) = match &state.job {
+    let (file_name, pct, model, planned, warnings, failure, cancelling, stage) = match &state.job {
         Job::Running(run) => (
             run.input
                 .file_name()
@@ -37,6 +59,7 @@ pub fn ui(
             run.warnings.clone(),
             None,
             run.cancelling,
+            run.stage,
         ),
         Job::Failed { input, message } => (
             input
@@ -49,8 +72,18 @@ pub fn ui(
             Vec::new(),
             Some(message.clone()),
             false,
+            None,
         ),
-        Job::Idle => ("—".to_string(), 0, None, None, Vec::new(), None, false),
+        Job::Idle => (
+            "—".to_string(),
+            0,
+            None,
+            None,
+            Vec::new(),
+            None,
+            false,
+            None,
+        ),
     };
     let running = matches!(state.job, Job::Running(_));
     // M14e: the bar moves between the engine's sparse progress events — from the
@@ -91,7 +124,12 @@ pub fn ui(
                 // M9e (P2-2): the cancel was pressed — the worker answers at
                 // its next stage boundary; the card says what is happening.
                 (None, true) => "cancelling…".to_string(),
-                (None, false) => "transcribing on this machine…".to_string(),
+                // M16.1: the per-item state machine is visible. `decoding` is
+                // the honest label until the engine actually starts.
+                (None, false) => match stage {
+                    Some(JobStage::Decoding) => "decoding the audio…".to_string(),
+                    _ => "transcribing on this machine…".to_string(),
+                },
             };
             pane_caption(ui, &caption, tokens, failure.is_some());
         });
@@ -232,6 +270,146 @@ pub fn ui(
             },
         );
     }
+
+    // ---- M16.1: the queue ---------------------------------------------------
+    // Compact, bounded, drag-free: rows are painted at fixed geometry and the
+    // controls are the house painted buttons. Nothing here animates on its own
+    // — a queue row only repaints on input or on the worker events that changed
+    // it, so the card never adds an idle frame.
+    let rows: Vec<(u64, usize, String, &'static str)> = state
+        .queue_rows()
+        .iter()
+        .map(|item| (item.id, item.seq, item.name(), item.state.label()))
+        .collect();
+    let mut bottom = y;
+    if !rows.is_empty() {
+        let top = y + 34.0;
+        let visible = rows.len().min(QUEUE_VISIBLE_ROWS);
+        let more = rows.len() - visible;
+        let height = QUEUE_HEADER
+            + visible as f32 * QUEUE_ROW_HEIGHT
+            + if more > 0 { QUEUE_MORE_LINE } else { 0.0 }
+            + 8.0;
+        let card = Rect::from_min_size(pos2(left, top), vec2(right - left, height));
+        let painter = ui.painter().clone();
+        paint_card(&painter, card, tokens);
+        painter.text(
+            pos2(card.left() + 18.0, card.top() + 15.0),
+            Align2::LEFT_CENTER,
+            format!("Up next · {}", super::count_noun(rows.len(), "file")),
+            FontId::new(11.0, FontFamily::Proportional),
+            tokens.ink_soft,
+        );
+
+        let max_chars = (((right - left) - QUEUE_BUTTONS_WIDTH - 96.0) / 7.0).max(12.0) as usize;
+        for (index, (id, seq, name, label)) in rows.iter().take(visible).enumerate() {
+            let row_top = card.top() + QUEUE_HEADER + index as f32 * QUEUE_ROW_HEIGHT;
+            painter.text(
+                pos2(card.left() + 18.0, row_top + QUEUE_ROW_HEIGHT / 2.0),
+                Align2::LEFT_CENTER,
+                format!("{seq}. {}", elide(name, max_chars)),
+                FontId::new(12.0, FontFamily::Proportional),
+                tokens.ink,
+            );
+            painter.text(
+                pos2(
+                    card.right() - 12.0 - QUEUE_BUTTONS_WIDTH - 10.0,
+                    row_top + QUEUE_ROW_HEIGHT / 2.0,
+                ),
+                Align2::RIGHT_CENTER,
+                *label,
+                FontId::new(10.5, FontFamily::Monospace),
+                tokens.ink_soft,
+            );
+            let controls_rect = Rect::from_min_size(
+                pos2(card.right() - 12.0 - QUEUE_BUTTONS_WIDTH, row_top),
+                vec2(QUEUE_BUTTONS_WIDTH, QUEUE_ROW_HEIGHT),
+            );
+            let row_id = *id;
+            let row_name = name.clone();
+            ui.scope_builder(egui::UiBuilder::new().max_rect(controls_rect), |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let remove = controls::button(
+                        ui,
+                        tokens,
+                        motion,
+                        ("queue-remove", row_id),
+                        "Remove",
+                        Tier::Tertiary,
+                        true,
+                    )
+                    .on_hover_text(format!("Remove {row_name} from the queue"));
+                    if remove.clicked() {
+                        effects.extend(state.cancel_queued(row_id));
+                    }
+                    let down = controls::button(
+                        ui,
+                        tokens,
+                        motion,
+                        ("queue-down", row_id),
+                        "Down",
+                        Tier::Tertiary,
+                        true,
+                    )
+                    .on_hover_text("Move this file one place later");
+                    if down.clicked() {
+                        state.lower_queued(row_id);
+                    }
+                    let up = controls::button(
+                        ui,
+                        tokens,
+                        motion,
+                        ("queue-up", row_id),
+                        "Up",
+                        Tier::Tertiary,
+                        true,
+                    )
+                    .on_hover_text("Move this file one place earlier");
+                    if up.clicked() {
+                        state.raise_queued(row_id);
+                    }
+                });
+            });
+        }
+        if more > 0 {
+            painter.text(
+                pos2(
+                    card.left() + 18.0,
+                    card.top() + QUEUE_HEADER + visible as f32 * QUEUE_ROW_HEIGHT + 9.0,
+                ),
+                Align2::LEFT_CENTER,
+                format!("+{more} more"),
+                FontId::new(11.0, FontFamily::Proportional),
+                tokens.ink_soft,
+            );
+        }
+        bottom = card.bottom();
+    }
+
+    // M16.1: a failed item's reason stays visible while the next one runs —
+    // the queue never hides why a file stopped. The single failure state above
+    // covers the last item (the card's main subject then).
+    if let Some(last) = &state.queue_failure {
+        if matches!(state.job, Job::Running(_)) {
+            let line = format!(
+                "failed earlier: {} — {}",
+                super::file_label(&last.input),
+                last.message
+            );
+            ui.scope_builder(
+                egui::UiBuilder::new().max_rect(Rect::from_min_size(
+                    pos2(left, bottom + 10.0),
+                    vec2(right - left, 22.0),
+                )),
+                |ui| {
+                    ui.horizontal(|ui| {
+                        pane_caption(ui, &line, tokens, true);
+                    });
+                },
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -350,5 +528,98 @@ mod tests {
         );
         // The button/cancel chrome is unchanged.
         assert!(painted.iter().any(|label| label == "Cancel"));
+    }
+
+    // ---- M16.1: the queue card ----------------------------------------------
+
+    fn queued_state(count: usize) -> AppState {
+        let mut state = AppState::new();
+        let dir = std::env::temp_dir().join(format!("suramak-m16a-q-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for index in 0..count {
+            let path = dir.join(format!("queue-{index}.wav"));
+            std::fs::write(&path, b"x").unwrap();
+            state.begin_import(path);
+        }
+        state
+    }
+
+    #[test]
+    fn the_queue_card_lists_pending_rows_with_controls_and_the_more_line() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        // Seven files: one running, six waiting; four rows + "+2 more".
+        let mut state = queued_state(7);
+        let _ = frame(&ctx, &mut state, 0.0);
+        let output = frame(&ctx, &mut state, 0.2);
+        let painted = labels(&output);
+
+        assert!(
+            painted.iter().any(|label| label == "Up next · 6 files"),
+            "the header counts the waiting rows: {painted:?}"
+        );
+        // The first waiting row is position 2 (position 1 is running).
+        assert!(
+            painted.iter().any(|label| label == "2. queue-1.wav"),
+            "rows carry their stable position: {painted:?}"
+        );
+        assert!(
+            painted.iter().any(|label| label == "+2 more"),
+            "bounded rows leave a '+n more' line: {painted:?}"
+        );
+        for control in ["Up", "Down", "Remove"] {
+            let count = painted.iter().filter(|label| *label == control).count();
+            assert_eq!(count, QUEUE_VISIBLE_ROWS, "one {control} per visible row");
+        }
+        assert!(painted.iter().any(|label| label == "queued"));
+    }
+
+    #[test]
+    fn the_queue_card_keeps_a_failed_items_reason_visible() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut state = queued_state(3);
+        // The first item fails; the second is now running.
+        state.job_failed("decode failed".to_string());
+        let _ = frame(&ctx, &mut state, 0.0);
+        let output = frame(&ctx, &mut state, 0.2);
+        let painted = labels(&output);
+        assert!(
+            painted
+                .iter()
+                .any(|label| label.starts_with("failed earlier: queue-0.wav — decode failed")),
+            "the failed reason must not vanish when the next item starts: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn the_queue_card_adds_no_idle_repaint() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut state = queued_state(4);
+        // No interpolation clock: the bar is static, the rows are static.
+        if let Job::Running(run) = &mut state.job {
+            run.started_at = None;
+        }
+        let _ = frame(&ctx, &mut state, 0.0);
+        let output = frame(&ctx, &mut state, 0.2);
+        let delay = output
+            .viewport_output
+            .values()
+            .map(|viewport| viewport.repaint_delay)
+            .min()
+            .unwrap_or(std::time::Duration::MAX);
+        assert!(
+            delay > std::time::Duration::from_secs(1),
+            "the queue must not schedule idle frames (repaint_delay {delay:?})"
+        );
+    }
+
+    #[test]
+    fn long_names_are_end_elided_so_the_controls_stay_on_the_row() {
+        assert_eq!(elide("clip.wav", 12), "clip.wav");
+        assert_eq!(elide("a-very-long-recording-name.wav", 12), "a-very-long…");
+        assert_eq!(elide("abc", 1), "abc", "a tiny budget never panics");
+        assert_eq!(elide("", 8), "");
     }
 }

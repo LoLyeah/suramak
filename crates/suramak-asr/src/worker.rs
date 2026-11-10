@@ -19,6 +19,21 @@ use crate::whisper::{self, AsrError, ContextCache};
 /// Name of the worker thread (visible in debuggers/profilers).
 pub const WORKER_THREAD_NAME: &str = "suramak-worker";
 
+/// The pipeline stage a job is in (M16.1).
+///
+/// The queue's per-item state machine mirrors these: `decoding` until the
+/// shared front half (decode + resample) is done, `transcribing` after it. A
+/// queue item with a decoded-ahead buffer skips straight to `transcribing`
+/// (the stage event is still emitted — the runner simply never observes the
+/// decoding half for it because the prefetch pool already did that work).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JobStage {
+    /// Decoding the container + resampling to 16 kHz mono.
+    Decoding,
+    /// The engine is running on the prepared samples.
+    Transcribing,
+}
+
 /// A transcription job submitted to the worker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
@@ -40,6 +55,11 @@ pub struct Job {
     /// and UI both construct jobs in-process).
     #[serde(skip)]
     pub cancel: CancelToken,
+    /// M16.1: the queue's decoded-ahead 16 kHz mono samples, when the prefetch
+    /// pool produced them. `None` = decode inside the pipeline exactly as before.
+    /// Not serialized (it is a large transient buffer, not job identity).
+    #[serde(skip)]
+    pub samples: Option<Vec<f32>>,
 }
 
 /// Events emitted by the worker.
@@ -47,6 +67,9 @@ pub struct Job {
 pub enum WorkerEvent {
     /// Decoding progress, 0–100 (from whisper's progress callback).
     Progress { job_id: u64, pct: u8 },
+    /// M16.1: the pipeline entered a stage (decode → transcribe). Lets the
+    /// queue's per-item state stop saying `decoding` when it is not decoding.
+    Stage { job_id: u64, stage: JobStage },
     /// The final segment list for the job (emitted once, just before `Finished`).
     Segments { job_id: u64, segments: Vec<Segment> },
     /// The completed transcript plus the engine that actually ran.
@@ -154,9 +177,17 @@ fn run_worker(jobs: Receiver<Job>, events: Sender<WorkerEvent>) {
     let mut cache = ContextCache::new();
     // M10A: the Parakeet recognizer cache (empty and unused without the feature).
     let mut parakeet_cache = crate::parakeet::ParakeetCache::new();
-    while let Ok(job) = jobs.recv() {
+    while let Ok(mut job) = jobs.recv() {
         let job_id = job.id;
         let _ = events.send(WorkerEvent::Progress { job_id, pct: 0 });
+        // M16.1: the pipeline reports its stage transitions; the queue mirrors
+        // them so `decoding` is never shown while the engine is already running.
+        let stage_events = events.clone();
+        let mut on_stage = move |stage| {
+            let _ = stage_events.send(WorkerEvent::Stage { job_id, stage });
+        };
+        // M16.1: a decoded-ahead buffer, when the queue prefetched this item.
+        let mut samples = job.samples.take();
 
         // M9e (P2-2): the first cooperative check point — a cancel that landed
         // before this job started (the token can be set while the job sits in
@@ -189,7 +220,9 @@ fn run_worker(jobs: Receiver<Job>, events: Sender<WorkerEvent>) {
                 &job.input,
                 &job.lang,
                 &plan,
+                samples.take(),
                 &job.cancel,
+                &mut on_stage,
                 &mut on_progress,
             ) {
                 // M9e: a cancellation is terminal, not a failure — no degrade.
@@ -212,7 +245,9 @@ fn run_worker(jobs: Receiver<Job>, events: Sender<WorkerEvent>) {
                             job.initial_prompt.as_deref(),
                             whisper::default_threads(),
                             &fallback_plan,
+                            None, // the fast-engine attempt consumed the buffer
                             &job.cancel,
+                            &mut on_stage,
                             &mut on_progress,
                         )
                         .map(|mut outcome| {
@@ -239,7 +274,9 @@ fn run_worker(jobs: Receiver<Job>, events: Sender<WorkerEvent>) {
                     &job.input,
                     &job.lang,
                     &plan,
+                    samples.take(),
                     &job.cancel,
+                    &mut on_stage,
                     &mut on_progress,
                 ),
                 Err(err) => Err(err),
@@ -254,7 +291,9 @@ fn run_worker(jobs: Receiver<Job>, events: Sender<WorkerEvent>) {
                     job.initial_prompt.as_deref(),
                     whisper::default_threads(),
                     &plan,
+                    samples.take(),
                     &job.cancel,
+                    &mut on_stage,
                     &mut on_progress,
                 ),
                 Err(err) => Err(err),
@@ -326,6 +365,7 @@ mod tests {
             engine: EngineSetting::Auto,
             fast_engine: false,
             cancel,
+            samples: None,
         }
     }
 

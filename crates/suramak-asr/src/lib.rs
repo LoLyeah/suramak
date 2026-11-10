@@ -29,6 +29,7 @@ pub mod mix;
 pub mod parakeet;
 pub mod pipeline;
 pub mod prompt_budget;
+pub mod queue;
 pub mod speech_transcriber;
 pub mod whisper;
 pub mod words;
@@ -40,8 +41,16 @@ pub use live::{LiveConfig, LiveDecodeSettings, LiveDecoder, LiveResult, LiveSess
 pub use parakeet::{ParakeetCache, ParakeetRecognizer, ParakeetResult};
 pub use pipeline::{model_id_from_path, parse_lang, transcribe_file, PipelineOutcome};
 pub use prompt_budget::{measure_model, ModelTokenizer};
+pub use queue::driver::{
+    AudioDecoder, DecodeFailure, DecodeTask, FileDecoder, InferenceBackend, JobOptions, Prefetcher,
+    QueueDriver, QueueEvent, ThreadedPrefetch,
+};
+pub use queue::{
+    CancelDecision, DecodeAdmission, DecodeTicket, InferenceTicket, ItemState, JobQueue,
+    QueueCounts, QueueItem, BYTES_PER_AUDIO_SECOND, MAX_DECODE_AHEAD, MAX_PREFETCH_BYTES,
+};
 pub use speech_transcriber::{
     SpeechTranscriberEngine, SttAssetState, SttAuthorization, SttResult, SttSpan,
 };
 pub use whisper::{coreml_compiled, metal_compiled, system_info, AsrError, ContextCache};
-pub use worker::{Job, Worker, WorkerEvent};
+pub use worker::{Job, JobStage, Worker, WorkerEvent};

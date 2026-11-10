@@ -24,6 +24,7 @@ use whisper_rs::WhisperContext;
 use crate::cancel::CancelToken;
 use crate::engine::EngineId;
 use crate::whisper::{self, AsrError};
+use crate::worker::JobStage;
 
 /// Parses a language selector string (`auto`, `en`, `id`, …) into a [`LangMode`].
 ///
@@ -74,11 +75,25 @@ pub fn stage_check(cancel: &CancelToken) -> Result<(), AsrError> {
 
 /// Decode + resample to 16 kHz mono with the stage-boundary checks — the shared
 /// front half of every engine path.
-fn prepare_samples(input: &Path, cancel: &CancelToken) -> Result<Vec<f32>, AsrError> {
+///
+/// `prepared` (M16.1) is the queue's decoded-ahead buffer: when present it is
+/// already 16 kHz mono (the prefetch pool ran the same decode + resample), so
+/// the front half only has to re-check the cancel token. Without it the file is
+/// decoded here exactly as before.
+fn prepare_samples(
+    input: &Path,
+    prepared: Option<Vec<f32>>,
+    cancel: &CancelToken,
+) -> Result<Vec<f32>, AsrError> {
     stage_check(cancel)?;
-    let buffer = decode::decode_file(input)?;
-    stage_check(cancel)?;
-    let samples = resample::to_16khz_mono(&buffer)?;
+    let samples = match prepared {
+        Some(samples) => samples,
+        None => {
+            let buffer = decode::decode_file(input)?;
+            stage_check(cancel)?;
+            resample::to_16khz_mono(&buffer)?
+        }
+    };
     stage_check(cancel)?;
     Ok(samples)
 }
@@ -128,10 +143,14 @@ pub fn transcribe_file(
     initial_prompt: Option<&str>,
     n_threads: i32,
     plan: &crate::engine::EngineDecision,
+    prepared: Option<Vec<f32>>,
     cancel: &CancelToken,
+    mut on_stage: impl FnMut(JobStage),
     on_progress: impl FnMut(u8),
 ) -> Result<PipelineOutcome, AsrError> {
-    let samples = prepare_samples(input, cancel)?;
+    on_stage(JobStage::Decoding);
+    let samples = prepare_samples(input, prepared, cancel)?;
+    on_stage(JobStage::Transcribing);
     let outcome = whisper::transcribe(
         ctx,
         model_path,
@@ -164,19 +183,24 @@ pub fn transcribe_file(
 /// `on_progress` receives two honest milestones: 50 when the audio is ready and
 /// 100 when the decode finished. A cancelled job returns
 /// [`AsrError::Cancelled`] and no partial transcript.
+#[allow(clippy::too_many_arguments)]
 pub fn transcribe_file_parakeet(
     recognizer: &mut crate::parakeet::ParakeetRecognizer,
     input: &Path,
     lang: &LangMode,
     plan: &crate::engine::EngineDecision,
+    prepared: Option<Vec<f32>>,
     cancel: &CancelToken,
+    mut on_stage: impl FnMut(JobStage),
     mut on_progress: impl FnMut(u8),
 ) -> Result<PipelineOutcome, AsrError> {
     let mut warnings = Vec::new();
     if let Some(warning) = &plan.warning {
         warnings.push(warning.clone());
     }
-    let samples = prepare_samples(input, cancel)?;
+    on_stage(JobStage::Decoding);
+    let samples = prepare_samples(input, prepared, cancel)?;
+    on_stage(JobStage::Transcribing);
     on_progress(50);
     let result = recognizer.transcribe(&samples, 16_000)?;
     stage_check(cancel)?;
@@ -206,18 +230,23 @@ pub fn transcribe_file_parakeet(
 /// asset download before the analyzer starts). A cancelled job returns
 /// [`AsrError::Cancelled`]; any other failure is the caller's cue to degrade to
 /// Whisper (the worker does that — never a hard failure).
+#[allow(clippy::too_many_arguments)]
 pub fn transcribe_file_speech_transcriber(
     input: &Path,
     lang: &LangMode,
     plan: &crate::engine::EngineDecision,
+    prepared: Option<Vec<f32>>,
     cancel: &CancelToken,
+    mut on_stage: impl FnMut(JobStage),
     mut on_progress: impl FnMut(u8),
 ) -> Result<PipelineOutcome, AsrError> {
     let mut warnings = Vec::new();
     if let Some(warning) = &plan.warning {
         warnings.push(warning.clone());
     }
-    let samples = prepare_samples(input, cancel)?;
+    on_stage(JobStage::Decoding);
+    let samples = prepare_samples(input, prepared, cancel)?;
+    on_stage(JobStage::Transcribing);
     on_progress(50);
     let code = match lang {
         LangMode::Fixed(code) => code.clone(),
@@ -273,7 +302,7 @@ mod tests {
     fn a_cancelled_token_stops_the_pipeline_before_decoding() {
         let token = CancelToken::new();
         token.cancel();
-        match prepare_samples(Path::new("/nonexistent/en.wav"), &token) {
+        match prepare_samples(Path::new("/nonexistent/en.wav"), None, &token) {
             Err(AsrError::Cancelled) => {}
             other => panic!("expected Cancelled, got {other:?}"),
         }
@@ -293,7 +322,9 @@ mod tests {
             Path::new("/nonexistent/en.wav"),
             &LangMode::Fixed("en".to_string()),
             &plan,
+            None,
             &token,
+            |_| {},
             |_| {},
         ) {
             Err(AsrError::Cancelled) => {}
@@ -319,7 +350,9 @@ mod tests {
             &en_fixture(),
             &LangMode::Auto,
             &plan,
+            None,
             &CancelToken::new(),
+            |_| {},
             |_| {},
         )
         .expect_err("auto-detect must be refused");
@@ -349,7 +382,9 @@ mod tests {
             &en_fixture(),
             &LangMode::Fixed("en".to_string()),
             &plan,
+            None,
             &CancelToken::new(),
+            |_| {},
             |_| {},
         )
         .expect_err("the stub must refuse");

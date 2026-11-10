@@ -652,8 +652,8 @@ impl App {
             .as_mut()
             .map(|shell| shell.app.request_quit(source));
         match action {
-            Some(QuitAction::ShowConfirm) => {
-                tracing::info!(?source, "quit: live recording — showing the confirm");
+            Some(QuitAction::ShowConfirm) | Some(QuitAction::ShowQueueConfirm) => {
+                tracing::info!(?source, "quit: the in-app confirm is up");
                 if let Some(shell) = &self.shell {
                     shell.window.request_redraw();
                 }

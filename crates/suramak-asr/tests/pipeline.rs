@@ -200,6 +200,7 @@ fn worker_reports_missing_model_as_error_event() {
             engine: EngineSetting::Auto,
             fast_engine: false,
             cancel: CancelToken::new(),
+            samples: None,
         })
         .expect("submit job");
 
@@ -246,7 +247,9 @@ fn e2e_en_fixture_contains_fox() {
         None,
         whisper::default_threads(),
         &plan,
+        None,
         &CancelToken::new(),
+        |_| {},
         |_| {},
     )
     .expect("transcribe en.wav");
@@ -294,7 +297,9 @@ fn e2e_id_fixture_has_non_empty_segment() {
         None,
         whisper::default_threads(),
         &plan,
+        None,
         &CancelToken::new(),
+        |_| {},
         |_| {},
     )
     .expect("transcribe id.wav");
@@ -346,7 +351,9 @@ fn e2e_video_fixture_matches_the_source_mp3_words() {
             None,
             whisper::default_threads(),
             &plan,
+            None,
             &CancelToken::new(),
+            |_| {},
             |_| {},
         )
         .unwrap_or_else(|err| panic!("transcribe {}: {err}", path.display()))
@@ -434,7 +441,9 @@ fn e2e_opus_fixtures_transcribe_the_fox_sentence() {
             None,
             whisper::default_threads(),
             &plan,
+            None,
             &CancelToken::new(),
+            |_| {},
             |_| {},
         )
         .unwrap_or_else(|err| panic!("transcribe {}: {err}", path.display()));
@@ -487,7 +496,9 @@ fn e2e_live_partials_then_the_final_pass_replaces_them() {
         None,
         whisper::default_threads(),
         &plan,
+        None,
         &CancelToken::new(),
+        |_| {},
         |_| {},
     )
     .expect("baseline final pass");
@@ -562,7 +573,9 @@ fn e2e_live_partials_then_the_final_pass_replaces_them() {
         None,
         whisper::default_threads(),
         &plan,
+        None,
         &CancelToken::new(),
+        |_| {},
         |_| {},
     )
     .expect("final pass after the live session");
@@ -659,7 +672,9 @@ fn e2e_coreml_encoder_engaged_macos() {
         None,
         whisper::default_threads(),
         &plan,
+        None,
         &CancelToken::new(),
+        |_| {},
         |_| {},
     )
     .expect("transcribe en.wav with Core ML");
@@ -705,7 +720,9 @@ fn e2e_cancel_mid_run_stops_cleanly_and_the_engine_stays_healthy() {
         None,
         whisper::default_threads(),
         &plan,
+        None,
         &token,
+        |_| {},
         move |_pct| cancel_from_progress.cancel(),
     );
     match result {
@@ -727,7 +744,9 @@ fn e2e_cancel_mid_run_stops_cleanly_and_the_engine_stays_healthy() {
         None,
         whisper::default_threads(),
         &plan,
+        None,
         &CancelToken::new(),
+        |_| {},
         |_| {},
     )
     .expect("the context must still transcribe after a cancelled run");

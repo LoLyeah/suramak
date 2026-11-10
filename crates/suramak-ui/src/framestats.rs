@@ -210,6 +210,9 @@ mod tests {
             language: Some("en".to_string()),
             started_at: None,
             duration_ms: None,
+            queue_id: None,
+            auto: false,
+            stage: None,
         });
         assert_eq!(classify(&state), FrameState::Job);
 

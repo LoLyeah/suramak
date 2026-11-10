@@ -24,7 +24,7 @@ use crate::theme::Tokens;
 
 use super::controls;
 use super::views::paint_card;
-use super::{AppState, Effect, QuitAnswer};
+use super::{AppState, Effect, QuitAnswer, QuitPromptKind};
 
 /// The card's designed size (fits the 900×600 minimum with room to spare).
 pub const CARD_WIDTH: f32 = 460.0;
@@ -45,6 +45,14 @@ pub fn ui(
     effects: &mut Vec<Effect>,
 ) {
     let open = state.quit_prompt.is_some();
+    // M16.1: the same card carries the queue-loss confirm; the prompt kind
+    // decides its copy and its actions.
+    let kind = state
+        .quit_prompt
+        .as_ref()
+        .map(|prompt| prompt.kind)
+        .or(state.quit_prompt_kind)
+        .unwrap_or(QuitPromptKind::Recording);
     // Called every frame, also while closed, so the fade id is registered at 0
     // before the first open (the sheet's discipline — a retarget from the
     // current value, never a teleport). Reduce Motion: both directions snap.
@@ -99,29 +107,53 @@ pub fn ui(
                 rect.left() + pad,
                 rect.top() + 16.0 + motion::rise(fade, 2.0),
             );
+            // M16.1: one card, two prompts. The queue variant never appears
+            // with a live recording (the recording prompt wins), so the copy
+            // stays unambiguous.
+            let (title, body, footnote) = match kind {
+                QuitPromptKind::Recording => (
+                    "Still recording".to_string(),
+                    vec![
+                        "A recording is in progress — choose what happens to it before quitting."
+                            .to_string(),
+                        "Stop & Save keeps the audio and transcribes it on the next launch."
+                            .to_string(),
+                    ],
+                    "Esc keeps recording",
+                ),
+                QuitPromptKind::Queue { dropped } => (
+                    format!("{} still queued", super::count_noun(dropped, "file")),
+                    vec![
+                        "Not started yet — quitting drops them without a transcript.".to_string(),
+                        "Finished transcripts are saved; the running file stops as before."
+                            .to_string(),
+                    ],
+                    "Esc keeps working",
+                ),
+            };
             painter.text(
                 title_pos,
                 Align2::LEFT_TOP,
-                "Still recording",
+                title,
                 FontId::new(22.0, crate::theme::serif_family()),
                 tokens.ink,
             );
             painter.text(
                 pos2(rect.left() + pad, rect.top() + 56.0),
                 Align2::LEFT_TOP,
-                "A recording is in progress — choose what happens to it before quitting.",
+                &body[0],
                 FontId::new(12.0, FontFamily::Proportional),
                 tokens.ink_soft,
             );
             painter.text(
                 pos2(rect.left() + pad, rect.top() + 74.0),
                 Align2::LEFT_TOP,
-                "Stop & Save keeps the audio and transcribes it on the next launch.",
+                &body[1],
                 FontId::new(12.0, FontFamily::Proportional),
                 tokens.ink_soft,
             );
 
-            // The three actions: capsule bodies, per the control system (the
+            // The actions: capsule bodies, per the control system (the
             // title-line cluster's treatment — the house language for in-app
             // confirms since M9c).
             let row = Rect::from_min_size(
@@ -132,43 +164,73 @@ pub fn ui(
             ui.scope_builder(egui::UiBuilder::new().max_rect(row), |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
-                    let stop_save = controls::capsule_button(
-                        ui,
-                        tokens,
-                        motion,
-                        "quit-stop-save",
-                        "Stop & Save",
-                        true,
-                    )
-                    .on_hover_text(
-                        "Stop now, keep the recording and transcribe it on the next launch",
-                    );
-                    if stop_save.clicked() {
-                        answered = Some(QuitAnswer::StopAndSave);
-                    }
-                    let discard = controls::capsule_button(
-                        ui,
-                        tokens,
-                        motion,
-                        "quit-discard",
-                        "Discard Recording",
-                        true,
-                    )
-                    .on_hover_text("Quit and throw this recording away");
-                    if discard.clicked() {
-                        answered = Some(QuitAnswer::Discard);
-                    }
-                    let keep = controls::capsule_button(
-                        ui,
-                        tokens,
-                        motion,
-                        "quit-keep",
-                        "Keep Recording",
-                        true,
-                    )
-                    .on_hover_text("Cancel the quit — the recording continues (Esc)");
-                    if keep.clicked() {
-                        answered = Some(QuitAnswer::Keep);
+                    match kind {
+                        QuitPromptKind::Recording => {
+                            let stop_save = controls::capsule_button(
+                                ui,
+                                tokens,
+                                motion,
+                                "quit-stop-save",
+                                "Stop & Save",
+                                true,
+                            )
+                            .on_hover_text(
+                                "Stop now, keep the recording and transcribe it on the next launch",
+                            );
+                            if stop_save.clicked() {
+                                answered = Some(QuitAnswer::StopAndSave);
+                            }
+                            let discard = controls::capsule_button(
+                                ui,
+                                tokens,
+                                motion,
+                                "quit-discard",
+                                "Discard Recording",
+                                true,
+                            )
+                            .on_hover_text("Quit and throw this recording away");
+                            if discard.clicked() {
+                                answered = Some(QuitAnswer::Discard);
+                            }
+                            let keep = controls::capsule_button(
+                                ui,
+                                tokens,
+                                motion,
+                                "quit-keep",
+                                "Keep Recording",
+                                true,
+                            )
+                            .on_hover_text("Cancel the quit — the recording continues (Esc)");
+                            if keep.clicked() {
+                                answered = Some(QuitAnswer::Keep);
+                            }
+                        }
+                        QuitPromptKind::Queue { .. } => {
+                            let keep = controls::capsule_button(
+                                ui,
+                                tokens,
+                                motion,
+                                "quit-keep",
+                                "Keep Working",
+                                true,
+                            )
+                            .on_hover_text("Cancel the quit — the queue keeps running (Esc)");
+                            if keep.clicked() {
+                                answered = Some(QuitAnswer::Keep);
+                            }
+                            let discard = controls::capsule_button(
+                                ui,
+                                tokens,
+                                motion,
+                                "quit-discard",
+                                "Quit and Drop",
+                                true,
+                            )
+                            .on_hover_text("Quit now — the queued files are not transcribed");
+                            if discard.clicked() {
+                                answered = Some(QuitAnswer::Discard);
+                            }
+                        }
                     }
                 });
             });
@@ -176,7 +238,7 @@ pub fn ui(
             painter.text(
                 pos2(rect.left() + pad, rect.top() + 150.0),
                 Align2::LEFT_TOP,
-                "Esc keeps recording",
+                footnote,
                 FontId::new(11.0, FontFamily::Proportional),
                 tokens.ink_soft,
             );
@@ -265,5 +327,81 @@ mod tests {
             );
         }
         assert!(matches!(state.record, RecordState::Recording(_)));
+    }
+
+    /// M16.1: the queue confirm is the same card with its own copy and two
+    /// actions — the loss is named before the window can close.
+    #[test]
+    fn the_queue_confirm_names_the_dropped_files_and_offers_keep_working() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::theme::install_fonts(&ctx);
+        let tokens = crate::theme::tokens(AppTheme::Light);
+        let motion = Motion::new(false);
+        let mut state = AppState::new();
+        let dir = std::env::temp_dir().join(format!("suramak-m16a-quit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["running.wav", "queued.wav"] {
+            let path = dir.join(name);
+            std::fs::write(&path, b"x").unwrap();
+            state.begin_import(path);
+        }
+        assert_eq!(
+            state.request_quit(QuitSource::WindowClose),
+            super::super::QuitAction::ShowQueueConfirm
+        );
+        let mut effects = Vec::new();
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
+        let run = |state: &mut AppState, effects: &mut Vec<Effect>, time: f64| {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(time),
+                ..Default::default()
+            };
+            ctx.run(input, |ctx| {
+                ui(ctx, &tokens, &motion, state, effects);
+            })
+        };
+        let _ = run(&mut state, &mut effects, 0.0);
+        let output = run(&mut state, &mut effects, 0.05);
+        let painted: Vec<String> = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            painted.iter().any(|label| label == "1 file still queued"),
+            "the title names the count: {painted:?}"
+        );
+        assert!(painted.iter().any(|label| label == "Keep Working"));
+        assert!(painted.iter().any(|label| label == "Quit and Drop"));
+        assert!(
+            !painted.iter().any(|label| label == "Stop & Save"),
+            "the recording actions must not appear on the queue card"
+        );
+
+        let update = output
+            .platform_output
+            .accesskit_update
+            .expect("an accesskit tree update");
+        let labels: Vec<String> = update
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.label().map(str::to_string))
+            .collect();
+        for expected in ["Keep Working", "Quit and Drop"] {
+            assert!(
+                labels.iter().any(|label| label == expected),
+                "missing a11y label {expected:?}; got {labels:?}"
+            );
+        }
+        assert_eq!(
+            state.answer_quit(QuitAnswer::Keep),
+            Some(super::super::QuitOutcome::Stay)
+        );
+        assert_eq!(state.queue.waiting_count(), 1);
     }
 }

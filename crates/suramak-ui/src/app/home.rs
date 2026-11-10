@@ -23,7 +23,9 @@ use super::{AppState, Effect};
 /// macOS/Windows: native open dialog (rfd). Linux: `None` — the path field is
 /// the affordance there (avoids the zbus/portal dependency chain).
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-fn pick_media_file() -> Option<PathBuf> {
+fn pick_media_files() -> Vec<PathBuf> {
+    // M16.1: a multi-selection enqueues in dialog order — the first file runs
+    // and the rest join the queue (one inference slot, bounded decode-ahead).
     rfd::FileDialog::new()
         .set_title("Import audio or video")
         .add_filter(
@@ -33,12 +35,13 @@ fn pick_media_file() -> Option<PathBuf> {
                 "opus",
             ],
         )
-        .pick_file()
+        .pick_files()
+        .unwrap_or_default()
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn pick_media_file() -> Option<PathBuf> {
-    None
+fn pick_media_files() -> Vec<PathBuf> {
+    Vec::new()
 }
 
 /// Whether this build offers the native "Choose file…" dialog.
@@ -130,13 +133,14 @@ pub fn ui(
                         tokens,
                         motion,
                         "home-choose",
-                        "Choose file…",
+                        "Choose files…",
                         Tier::Secondary,
                         true,
                     );
                     if choose.clicked() {
-                        if let Some(path) = pick_media_file() {
-                            effects.extend(state.begin_import(path));
+                        let paths = pick_media_files();
+                        if !paths.is_empty() {
+                            effects.extend(state.begin_imports(paths));
                         }
                     }
                     ui.add_space(tokens.space.xs);
