@@ -378,13 +378,13 @@ their own invocation only.
     M13E transcription batch is already showing its own progress notification;
     they use different ids and channels, and both are truthful.
 11. **A pre-existing CLI queue flake, not M13F** — FIXED by the orchestrator
-    (commit `c065e...` era, follow-up): `QueueDriver::is_idle` now counts
-    in-flight prefetch decodes explicitly (`prefetch_in_flight` replaces
-    counting only the queue's own rows — a cancelled row drops out of
+    (`3f64e8c`; see §12 for the second root cause): `QueueDriver::is_idle` now
+    counts in-flight prefetch decodes explicitly (`prefetch_in_flight`
+    replaced counting only the queue's own rows — a cancelled row drops out of
     waiting while its pool task still reads the file, so the CLI batch loop
-    could exit mid-batch). Stress-run + the full workspace run passed
-    987/0/10 with the env leak (§12) separately identified as a second source
-    of the intermittent red.
+    could exit mid-batch). Stress-runs + the full workspace run passed
+    987/0/10; the leaked CMAKE_TOOLCHAIN_FILE env (§12) was independently a
+    second source of red.
 
 ## 11. Owner-device checklist (the honest runtime boundary)
 
