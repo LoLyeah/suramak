@@ -118,6 +118,167 @@ pub fn to_vtt(t: &Transcript) -> Result<String, SuramakError> {
     Ok(out)
 }
 
+/// How an ASS export treats a cue whose `end_ms` is not after its `start_ms`.
+///
+/// ASS itself has no notion of a zero-length dialogue that reads well: a
+/// zero-duration event is either invisible or flickers for one frame depending
+/// on the renderer. The serializer therefore never writes one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ZeroDuration {
+    /// Drop the cue (its text is still in the transcript; only this export
+    /// omits it). Explicit, lossy, opt-in.
+    Skip,
+    /// Give the cue one frame at 25 fps (40 ms) — the default: the line stays
+    /// readable and the timing defect stays visible in the file.
+    #[default]
+    OneFrame,
+}
+
+/// Options for [`to_ass_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AssOptions {
+    /// What to do with cues whose end is not after their start.
+    pub zero_duration: ZeroDuration,
+}
+
+/// The one frame a zero-duration cue is widened to (25 fps, the frame rate the
+/// style's `PlayRes` assumes for deterministic rendering).
+pub const ASS_ONE_FRAME_MS: i64 = 40;
+
+/// Exports a transcript to Advanced SubStation Alpha (ASS v4.00+) with the
+/// default options (zero-duration cues widened to one frame).
+///
+/// One `Dialogue` per segment, using the same text the SRT/VTT paths read.
+/// Multiline segments become `\N` hard breaks; `[Script Info]` fixes
+/// `WrapStyle: 2`, so the renderer never re-wraps what the transcript says.
+pub fn to_ass(t: &Transcript) -> Result<String, SuramakError> {
+    to_ass_with(t, &AssOptions::default())
+}
+
+/// Exports a transcript to ASS v4.00+ with explicit options.
+///
+/// Escaping is deliberately minimal (only what the format requires):
+/// - `{` and `}` are written as `\{`/`\}` — otherwise they open/close an
+///   override block and the text inside disappears (libass 0.17 verified).
+/// - A real line break becomes `\N`; `\r\n` and `\r` normalize to one break.
+/// - A literal backslash is preserved as-is, except immediately before
+///   `N`, `n` or `h` (which the format would read as line/space escapes): there
+///   a zero-width space is inserted after the backslash, the only visually
+///   lossless way to keep the pair (ASS has no backslash escape).
+/// - Commas need no escaping: `Text` is the last field in a `Dialogue` line.
+pub fn to_ass_with(t: &Transcript, opts: &AssOptions) -> Result<String, SuramakError> {
+    let mut out = String::new();
+    writeln!(out, "[Script Info]").unwrap();
+    writeln!(out, "; Exported by Suramak").unwrap();
+    writeln!(out, "Title: {}", script_title(&t.title)).unwrap();
+    writeln!(out, "ScriptType: v4.00+").unwrap();
+    writeln!(out, "WrapStyle: 2").unwrap();
+    writeln!(out, "PlayResX: 1920").unwrap();
+    writeln!(out, "PlayResY: 1080").unwrap();
+    writeln!(out, "ScaledBorderAndShadow: yes").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "[V4+ Styles]").unwrap();
+    writeln!(
+        out,
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, \
+         BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, \
+         BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding"
+    )
+    .unwrap();
+    // White fill, black outline, bottom-centre, generous side margins at 1080p.
+    // Arial is a family name: a renderer without it falls back to its sans face.
+    writeln!(
+        out,
+        "Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,\
+         0,0,0,0,100,100,0,0,1,2,1,2,48,48,64,1"
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "[Events]").unwrap();
+    writeln!(
+        out,
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
+    )
+    .unwrap();
+
+    for seg in &t.segments {
+        let start = seg.start_ms.max(0);
+        let end = if seg.end_ms > start {
+            seg.end_ms
+        } else {
+            match opts.zero_duration {
+                ZeroDuration::Skip => continue,
+                ZeroDuration::OneFrame => start + ASS_ONE_FRAME_MS,
+            }
+        };
+        writeln!(
+            out,
+            "Dialogue: 0,{},{},Default,,0,0,0,,{}",
+            fmt_ass(start),
+            fmt_ass(end),
+            escape_ass_text(&seg.text)
+        )
+        .unwrap();
+    }
+    Ok(out)
+}
+
+/// ASS timestamps: `H:MM:SS.cc` (centiseconds, nearest).
+fn fmt_ass(ms: i64) -> String {
+    let centis = (ms.max(0) + 5) / 10;
+    let total_s = centis / 100;
+    let cs = centis % 100;
+    format!(
+        "{}:{:02}:{:02}.{:02}",
+        total_s / 3600,
+        (total_s % 3600) / 60,
+        total_s % 60,
+        cs
+    )
+}
+
+/// The `Title:` value: one line, no control characters that would end the field.
+fn script_title(title: &str) -> String {
+    title.replace(['\r', '\n'], " ").trim().to_string()
+}
+
+/// Normalizes newlines and maps them to ASS `\N`, escaping each line's text.
+fn escape_ass_text(text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut lines: Vec<&str> = normalized.split('\n').map(str::trim).collect();
+    while lines.first().is_some_and(|line| line.is_empty()) {
+        lines.remove(0);
+    }
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    lines
+        .iter()
+        .map(|line| escape_ass_line(line))
+        .collect::<Vec<_>>()
+        .join("\\N")
+}
+
+/// Escapes one line for the `Text` field (see [`to_ass_with`] for the rules).
+fn escape_ass_line(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    for (index, ch) in chars.iter().enumerate() {
+        match ch {
+            '{' => out.push_str("\\{"),
+            '}' => out.push_str("\\}"),
+            '\\' => {
+                out.push('\\');
+                if matches!(chars.get(index + 1), Some('N' | 'n' | 'h')) {
+                    out.push('\u{200B}');
+                }
+            }
+            _ => out.push(*ch),
+        }
+    }
+    out
+}
+
 fn source_label(source: &Source) -> String {
     match source {
         Source::File { name } => name.clone(),

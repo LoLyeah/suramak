@@ -1,10 +1,19 @@
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 use uuid::Uuid;
 
 use crate::transcript::{Segment, Transcript};
 use crate::SuramakError;
+
+/// The library schema this build writes and reads.
+///
+/// - **v1** — the schema shipped in app 0.3.0/0.3.1 (`meta.schema_version = 1`):
+///   transcript header + segments, no provenance column.
+/// - **v2** — M15.1, additive only: `segments.source_text` keeps the first text
+///   ever stored for a row (the inference output), while `segments.text` carries
+///   what the editor/polish may rewrite. No table is dropped or rebuilt.
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// SQLite-backed transcript library with WAL mode.
 pub struct Store {
@@ -67,11 +76,104 @@ impl Store {
                  start_ms      INTEGER NOT NULL,
                  end_ms        INTEGER NOT NULL,
                  text          TEXT    NOT NULL,
+                 source_text   TEXT,
                  PRIMARY KEY (transcript_id, idx)
-             );
-             INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '1');",
+             );",
         )?;
+        self.migrate()
+    }
+
+    /// Brings an existing library up to [`SCHEMA_VERSION`], in place.
+    ///
+    /// Only one migration exists today: v1 → v2 adds `segments.source_text` and
+    /// backfills it from `text` (the only copy of the inference output a v1
+    /// database has). It is additive — no table is rebuilt and no row is
+    /// deleted — and idempotent: a fresh database is created at v2, a v1
+    /// database is altered once, and a v2 database is left untouched.
+    ///
+    /// A database from a *newer* build is refused instead of guessed at: the
+    /// older binary must not write to a schema it does not understand.
+    fn migrate(&self) -> Result<(), SuramakError> {
+        let version: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let version = match version {
+            None => {
+                // Fresh database (the DDL above already created v2) or a very
+                // old one without the marker: `upgrade` is idempotent, so both
+                // land on v2 with the column present and backfilled.
+                self.upgrade_to_v2()?;
+                return Ok(());
+            }
+            Some(raw) => raw.parse::<i64>().map_err(|_| {
+                SuramakError::Schema(format!(
+                    "meta.schema_version is not a number ({raw:?}); refusing to guess"
+                ))
+            })?,
+        };
+
+        if version > SCHEMA_VERSION {
+            return Err(SuramakError::Schema(format!(
+                "database is schema v{version}, this build supports up to v{SCHEMA_VERSION} — \
+                 open it with the newer Suramak build"
+            )));
+        }
+        if version == SCHEMA_VERSION {
+            return Ok(());
+        }
+        self.upgrade_to_v2()
+    }
+
+    /// v0/v1 → v2, in one transaction: add `source_text` when absent, backfill it
+    /// from `text`, then stamp the version. An interrupted upgrade rolls back to
+    /// the untouched v1 database.
+    fn upgrade_to_v2(&self) -> Result<(), SuramakError> {
+        let tx = self.conn.unchecked_transaction()?;
+        if !Self::column_exists(&tx, "segments", "source_text")? {
+            tx.execute_batch("ALTER TABLE segments ADD COLUMN source_text TEXT")?;
+        }
+        tx.execute(
+            "UPDATE segments SET source_text = text WHERE source_text IS NULL",
+            [],
+        )?;
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+        tx.commit()?;
         Ok(())
+    }
+
+    /// Whether `table` has `column` (the upgrade's idempotence guard).
+    fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, SuramakError> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The schema version the open database reports (after migration: [`SCHEMA_VERSION`]).
+    pub fn schema_version(&self) -> Result<i64, SuramakError> {
+        let value: String = self.conn.query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        value
+            .parse()
+            .map_err(|_| SuramakError::Schema(format!("schema_version is not a number: {value:?}")))
     }
 
     /// Inserts a new transcript (header + segments) atomically.
@@ -148,15 +250,21 @@ impl Store {
     }
 
     /// The segment rows themselves: upsert every row, then drop the stale tail.
+    ///
+    /// `source_text` is written only when the row does not exist yet and is
+    /// never overwritten afterwards (`COALESCE(segments.source_text, …)`): a
+    /// polish pass or an editor save rewrites `text`, while the first stored
+    /// text — the inference output — stays readable as provenance.
     fn write_segments(&self, id: Uuid, segments: &[Segment]) -> Result<(), SuramakError> {
         for seg in segments {
             self.conn.execute(
-                "INSERT INTO segments(transcript_id, idx, start_ms, end_ms, text)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO segments(transcript_id, idx, start_ms, end_ms, text, source_text)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)
                  ON CONFLICT(transcript_id, idx) DO UPDATE SET
-                     start_ms = excluded.start_ms,
-                     end_ms   = excluded.end_ms,
-                     text     = excluded.text",
+                     start_ms    = excluded.start_ms,
+                     end_ms      = excluded.end_ms,
+                     text        = excluded.text,
+                     source_text = COALESCE(segments.source_text, excluded.source_text)",
                 params![id.to_string(), seg.idx, seg.start_ms, seg.end_ms, seg.text],
             )?;
         }
@@ -165,6 +273,28 @@ impl Store {
             params![id.to_string(), segments.len() as i64],
         )?;
         Ok(())
+    }
+
+    /// The first text ever stored for a segment (the inference output), even
+    /// after the editor or a polish pass rewrote `text`.
+    ///
+    /// `None` when the transcript or the index does not exist. A v1 database
+    /// upgraded by [`Store::open`] answers with the text it carried at upgrade
+    /// time — the only copy that ever existed there.
+    pub fn segment_source_text(
+        &self,
+        transcript_id: Uuid,
+        idx: u32,
+    ) -> Result<Option<String>, SuramakError> {
+        let text = self
+            .conn
+            .query_row(
+                "SELECT source_text FROM segments WHERE transcript_id = ?1 AND idx = ?2",
+                params![transcript_id.to_string(), idx],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(text.flatten())
     }
 
     /// Flushes the write-ahead log back into the database file.
@@ -196,6 +326,11 @@ impl Store {
     }
 
     /// Updates a single segment's text and touches `updated_at` on the transcript.
+    ///
+    /// The two statements are one savepoint: a failure after the text write (a
+    /// constraint, a crash) must not leave the row rewritten while the
+    /// transcript still claims its old `updated_at`. The caller's text is the
+    /// *current* text; `source_text` is deliberately not touched (M15.1).
     pub fn update_segment_text(
         &self,
         transcript_id: Uuid,
@@ -203,15 +338,30 @@ impl Store {
         text: &str,
     ) -> Result<(), SuramakError> {
         let now = Utc::now().to_rfc3339();
-        self.conn.execute(
-            "UPDATE segments SET text = ?1 WHERE transcript_id = ?2 AND idx = ?3",
-            params![text, transcript_id.to_string(), idx],
-        )?;
-        self.conn.execute(
-            "UPDATE transcripts SET updated_at = ?1 WHERE id = ?2",
-            params![now, transcript_id.to_string()],
-        )?;
-        Ok(())
+        self.conn.execute_batch("SAVEPOINT update_segment_text")?;
+        let written = (|| -> Result<(), SuramakError> {
+            self.conn.execute(
+                "UPDATE segments SET text = ?1 WHERE transcript_id = ?2 AND idx = ?3",
+                params![text, transcript_id.to_string(), idx],
+            )?;
+            self.conn.execute(
+                "UPDATE transcripts SET updated_at = ?1 WHERE id = ?2",
+                params![now, transcript_id.to_string()],
+            )?;
+            Ok(())
+        })();
+        match written {
+            Ok(()) => {
+                self.conn.execute_batch("RELEASE update_segment_text")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self
+                    .conn
+                    .execute_batch("ROLLBACK TO update_segment_text; RELEASE update_segment_text");
+                Err(err)
+            }
+        }
     }
 
     /// Returns a transcript by id (with all segments).
@@ -406,6 +556,121 @@ impl Store {
         }
         Ok(())
     }
+
+    /// SQLite's own integrity report for the open database (`"ok"` when sound).
+    pub fn integrity_check(&self) -> Result<String, SuramakError> {
+        let report: String = self
+            .conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        Ok(report)
+    }
+
+    /// Writes a consistent, single-file snapshot of the library to `dest`.
+    ///
+    /// `VACUUM INTO` reads through the live connection (WAL included) inside one
+    /// read transaction, so the copy is a coherent database even while the app
+    /// keeps writing; it also compacts the file and leaves no `-wal`/`-shm`
+    /// sidecars behind. `dest` must not exist yet — an existing file is refused
+    /// rather than silently overwritten.
+    ///
+    /// This is a library API (M15.1); no UI surface calls it yet.
+    pub fn backup_to(&self, dest: &Path) -> Result<(), SuramakError> {
+        if dest.exists() {
+            return Err(SuramakError::Backup(format!(
+                "refusing to overwrite the existing backup {}",
+                dest.display()
+            )));
+        }
+        if let Some(parent) = dest.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let dest = dest.to_str().ok_or_else(|| {
+            SuramakError::Backup("the backup path is not valid UTF-8".to_string())
+        })?;
+        self.conn.execute("VACUUM INTO ?1", params![dest])?;
+        Ok(())
+    }
+
+    /// Restores `backup` over `db`, atomically, after validating the backup.
+    ///
+    /// The caller must have **no open [`Store`]** for `db`: replace a database
+    /// file under a live connection and SQLite would keep writing to the old
+    /// inode. The sequence is: open the backup read-only, run
+    /// `PRAGMA integrity_check`, refuse a schema newer than this build, copy to
+    /// a sibling temporary file, fsync it, drop the target's stale `-wal`/`-shm`
+    /// sidecars, then rename the temporary file over the target (atomic on one
+    /// filesystem). A failure before the rename leaves the target untouched.
+    ///
+    /// The restored file keeps the backup's schema; the next [`Store::open`]
+    /// runs the ordinary in-place migration if the backup is older.
+    pub fn restore_from(backup: &Path, db: &Path) -> Result<(), SuramakError> {
+        let conn = Connection::open_with_flags(backup, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(
+            |err| SuramakError::Backup(format!("cannot open {}: {err}", backup.display())),
+        )?;
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .map_err(|err| SuramakError::Backup(format!("integrity check failed: {err}")))?;
+        if integrity != "ok" {
+            return Err(SuramakError::Backup(format!(
+                "{} failed its integrity check: {integrity}",
+                backup.display()
+            )));
+        }
+        let version: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| SuramakError::Backup(format!("cannot read the backup schema: {err}")))?;
+        if let Some(raw) = version {
+            let version: i64 = raw.parse().map_err(|_| {
+                SuramakError::Backup(format!("backup schema version is not a number: {raw:?}"))
+            })?;
+            if version > SCHEMA_VERSION {
+                return Err(SuramakError::Backup(format!(
+                    "backup is schema v{version}, this build supports up to v{SCHEMA_VERSION}"
+                )));
+            }
+        }
+        drop(conn);
+
+        if let Some(parent) = db.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let tmp = db.with_extension("restore-tmp");
+        std::fs::copy(backup, &tmp)?;
+        std::fs::File::open(&tmp)?.sync_all()?;
+
+        // The old file's WAL belongs to the old database; leaving it beside the
+        // restored file would replay unrelated frames into the new one.
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = std::path::PathBuf::from(format!("{}{suffix}", db.display()));
+            match std::fs::remove_file(&sidecar) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(SuramakError::Io(err)),
+            }
+        }
+        // Unix `rename` replaces atomically. Windows `std::fs::rename` refuses
+        // an existing destination, so there the replace is remove-then-rename:
+        // a crash between the two leaves the validated temp file behind, never
+        // a half-written database.
+        match std::fs::rename(&tmp, db) {
+            Ok(()) => Ok(()),
+            Err(_err) if cfg!(windows) && db.exists() => {
+                std::fs::remove_file(db)?;
+                std::fs::rename(&tmp, db)?;
+                Ok(())
+            }
+            Err(err) => Err(SuramakError::Io(err)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -556,6 +821,36 @@ mod tests {
             got.updated_at > t.updated_at,
             "a standalone upsert must touch updated_at (got {})",
             got.updated_at
+        );
+    }
+
+    #[test]
+    fn a_failed_segment_edit_rolls_back_the_text_and_the_stamp() {
+        // M15.1: the edit is two statements; a failure on the second must not
+        // leave the new text behind with the old `updated_at`.
+        let store = Store::open_in_memory().expect("store");
+        let t = sample("edit-rollback.wav");
+        store.insert_transcript(&t).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER refuse_transcript_touch BEFORE UPDATE ON transcripts
+                 BEGIN SELECT RAISE(ABORT, 'no stamp'); END;",
+            )
+            .unwrap();
+
+        let err = store
+            .update_segment_text(t.id, 0, "must not stick")
+            .expect_err("the trigger must abort the edit");
+        assert!(format!("{err}").contains("no stamp"), "{err}");
+        assert_eq!(
+            store.get_transcript(t.id).unwrap().segments[0].text,
+            "first",
+            "the first statement must be rolled back"
+        );
+        assert_eq!(
+            store.segment_source_text(t.id, 0).unwrap().as_deref(),
+            Some("first")
         );
     }
 

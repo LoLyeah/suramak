@@ -222,9 +222,11 @@ fn contents(
         }
         None => {
             ui.label(
-                egui::RichText::new("Markdown, plain text, JSON, SRT or WebVTT — written locally.")
-                    .size(11.5)
-                    .color(tokens.ink_soft),
+                egui::RichText::new(
+                    "Markdown, plain text, JSON, SRT, WebVTT or ASS — written locally.",
+                )
+                .size(11.5)
+                .color(tokens.ink_soft),
             );
         }
     }

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use suramak_asr::capture;
 use suramak_asr::worker::WorkerEvent;
 use suramak_asr::EngineId;
+use suramak_core::diagnostics::SubtitleLimits;
 use suramak_core::export as core_export;
 use suramak_core::models as core_models;
 use suramak_core::settings::{Appearance, EngineSetting, RecordSource};
@@ -587,15 +588,17 @@ pub enum ExportFormat {
     Json,
     Srt,
     Vtt,
+    Ass,
 }
 
 impl ExportFormat {
-    pub const ALL: [ExportFormat; 5] = [
+    pub const ALL: [ExportFormat; 6] = [
         ExportFormat::Md,
         ExportFormat::Txt,
         ExportFormat::Json,
         ExportFormat::Srt,
         ExportFormat::Vtt,
+        ExportFormat::Ass,
     ];
 
     pub fn extension(self) -> &'static str {
@@ -605,6 +608,7 @@ impl ExportFormat {
             ExportFormat::Json => "json",
             ExportFormat::Srt => "srt",
             ExportFormat::Vtt => "vtt",
+            ExportFormat::Ass => "ass",
         }
     }
 
@@ -615,6 +619,7 @@ impl ExportFormat {
             ExportFormat::Json => "JSON",
             ExportFormat::Srt => "SRT",
             ExportFormat::Vtt => "VTT",
+            ExportFormat::Ass => "ASS",
         }
     }
 
@@ -626,6 +631,7 @@ impl ExportFormat {
             ExportFormat::Json => core_export::to_json(transcript),
             ExportFormat::Srt => core_export::to_srt(transcript),
             ExportFormat::Vtt => core_export::to_vtt(transcript),
+            ExportFormat::Ass => core_export::to_ass(transcript),
         };
         rendered.map_err(|err| err.to_string())
     }
@@ -700,6 +706,10 @@ pub struct AppState {
     pub library: LibraryState,
     pub editor: Option<Editor>,
     pub export: ExportState,
+    /// M15.4: advisory CPL/CPS thresholds for the segment badges. The defaults
+    /// are the documented 37/42 CPL and 17/20 CPS; a settings surface can
+    /// replace this value without touching the counting code.
+    pub subtitle_limits: SubtitleLimits,
     pub status: Option<Status>,
     /// Engine that actually ran for the most recent job (M1.5 outcome reporting).
     pub last_engine: Option<EngineId>,
@@ -858,6 +868,7 @@ impl AppState {
             library: LibraryState::default(),
             editor: None,
             export: ExportState::default(),
+            subtitle_limits: SubtitleLimits::default(),
             status: None,
             last_engine: None,
             last_insert: None,

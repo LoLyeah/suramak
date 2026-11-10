@@ -59,6 +59,15 @@ pub enum SuramakError {
     #[error("Transcript not found: {0}")]
     TranscriptNotFound(String),
 
+    /// A library database carries a schema this build cannot upgrade or read
+    /// (a newer build's version, or an unreadable version marker).
+    #[error("database schema error: {0}")]
+    Schema(String),
+
+    /// A library backup could not be written, validated or restored.
+    #[error("library backup error: {0}")]
+    Backup(String),
+
     #[error("Polish backend error: {0}")]
     Polish(String),
 
@@ -67,6 +76,25 @@ pub enum SuramakError {
 
     #[error("No audio data in file")]
     NoAudioData,
+
+    /// A container that declares its length, but the bytes ended before that
+    /// length was decoded (a cut-off download, a half-copied voice note).
+    /// Distinct from [`SuramakError::UnsupportedFormat`]: the file *is* the
+    /// right format, it is incomplete.
+    #[error(
+        "cannot decode {name}: the file is truncated ({detail}) — \
+         download or copy it again"
+    )]
+    Truncated { name: String, detail: String },
+
+    /// A third-party decoder panicked on malformed input. The decode boundary
+    /// catches the unwind and reports this instead of taking the app down; the
+    /// file is corrupt or not what its extension claims.
+    #[error(
+        "cannot decode {name}: the audio decoder failed unexpectedly \
+         (the file may be corrupt) — {detail}"
+    )]
+    DecoderPanic { name: String, detail: String },
 
     /// A file the decode path cannot handle — an unsupported container or an
     /// audio codec without a decoder (e.g. Opus in WebM/MKV). The message is

@@ -22,6 +22,7 @@ use std::time::Instant;
 
 use egui::{pos2, vec2, Align2, CornerRadius, FontFamily, FontId, Rect, Stroke, StrokeKind, Vec2};
 
+use suramak_core::diagnostics::{diagnose, Level, SubtitleLimits};
 use suramak_playback::segment_index_at;
 use suramak_playback::Peaks;
 
@@ -340,7 +341,7 @@ fn deck_band(
             state.editor.is_some(),
             EXPORT_SIZE,
         )
-        .on_hover_text("Export the transcript (Markdown, text, JSON, SRT, WebVTT)");
+        .on_hover_text("Export the transcript (Markdown, text, JSON, SRT, WebVTT, ASS)");
         if response.clicked() {
             state.toggle_export();
         }
@@ -838,6 +839,30 @@ fn polish_actions(
     }
 }
 
+/// The advisory badge for one segment row: `(text, severity)` when a threshold
+/// is crossed, `None` when the line and its pace are comfortable.
+///
+/// The counting itself lives in `suramak_core::diagnostics` (grapheme-aware,
+/// documented rules); this only maps the result to what the row paints.
+pub(crate) fn segment_badge(
+    text: &str,
+    start_ms: i64,
+    end_ms: i64,
+    limits: &SubtitleLimits,
+) -> Option<(String, Level)> {
+    let metrics = diagnose(text, start_ms, end_ms, limits);
+    metrics.badge().map(|badge| (badge, metrics.level()))
+}
+
+/// Badge ink: amber for a warning, the text-safe record red for an error (both
+/// clear WCAG AA on every ladder's card surface).
+fn badge_color(level: Level, tokens: &Tokens) -> egui::Color32 {
+    match level {
+        Level::Error => tokens.record_red_text,
+        Level::Ok | Level::Warning => tokens.warn,
+    }
+}
+
 /// The transcript as clean rows: mono gutter + serif body at the ~68 % measure,
 /// hover wash, active segment = 3 pt accent edge bar + faint tint (the tint
 /// crossfades with the fast token), and the row `TextEdit` editing as before.
@@ -848,7 +873,7 @@ fn transcript_rows(
     state: &mut AppState,
     effects: &mut Vec<Effect>,
 ) {
-    let rows: Vec<(u32, i64)> = state
+    let rows: Vec<(u32, i64, i64)> = state
         .editor
         .as_ref()
         .map(|editor| {
@@ -856,10 +881,13 @@ fn transcript_rows(
                 .transcript
                 .segments
                 .iter()
-                .map(|seg| (seg.idx, seg.start_ms))
+                .map(|seg| (seg.idx, seg.start_ms, seg.end_ms))
                 .collect()
         })
         .unwrap_or_default();
+    // M15.4: the advisory thresholds are app state (defaults 37/42 CPL,
+    // 17/20 CPS), so the badge and a future settings surface share one value.
+    let limits = state.subtitle_limits;
 
     // M8: the active segment is the one containing the playhead, and the list
     // only follows it **while playing** — a paused playhead never yanks the
@@ -892,7 +920,7 @@ fn transcript_rows(
             let Some(editor) = &mut state.editor else {
                 return;
             };
-            for (index, (idx, start_ms)) in rows.iter().enumerate() {
+            for (index, (idx, start_ms, end_ms)) in rows.iter().enumerate() {
                 let is_active = active == Some(index);
                 let active_f = motion.factor(
                     ui.ctx(),
@@ -966,6 +994,24 @@ fn transcript_rows(
                     );
                     if response.changed() {
                         edited = Some((*idx, editor.buffers[index].clone()));
+                    }
+                    // M15.4: advisory CPL/CPS badge, in the row's spare width.
+                    // It reads the editable buffer (what the reader sees), not
+                    // the persisted text, so it updates while typing.
+                    if let Some((label, level)) =
+                        segment_badge(&editor.buffers[index], *start_ms, *end_ms, &limits)
+                    {
+                        ui.add_space(tokens.space.xs);
+                        ui.label(
+                            egui::RichText::new(label)
+                                .font(FontId::new(10.5, FontFamily::Proportional))
+                                .color(badge_color(level, tokens)),
+                        )
+                        .on_hover_text(
+                            "Advisory subtitle pace — CPL is the longest line's \
+                             graphemes, CPS is graphemes per second (37/42 CPL, \
+                             17/20 CPS). Nothing is shortened or blocked.",
+                        );
                     }
                     content_rect = response.rect;
                     row_focused = response.has_focus();
@@ -1640,5 +1686,52 @@ mod tests {
                 "the editor's a11y tree must carry {expected:?}; got {labels:?}"
             );
         }
+    }
+
+    /// M15.4: the badge is advisory and only names the crossed dimension.
+    #[test]
+    fn the_segment_badge_counts_graphemes_and_maps_severity() {
+        let limits = SubtitleLimits::default();
+        assert_eq!(segment_badge("short line", 0, 4_000, &limits), None);
+
+        // 40 graphemes on one line: past 37 (warning), not past 42 (error).
+        let (label, level) = segment_badge(&"a".repeat(40), 0, 10_000, &limits).expect("badge");
+        assert_eq!(label, "CPL 40");
+        assert_eq!(level, Level::Warning);
+        // 44: past the error line.
+        let (label, level) = segment_badge(&"a".repeat(44), 0, 10_000, &limits).expect("badge");
+        assert_eq!(label, "CPL 44");
+        assert_eq!(level, Level::Error);
+
+        // Dense but short: CPS only (10 graphemes / 0.4 s = 25 CPS).
+        let (label, level) = segment_badge("halo dunia", 0, 400, &limits).expect("badge");
+        assert_eq!(label, "CPS 25.0");
+        assert_eq!(level, Level::Error);
+
+        // Grapheme-aware: 20 × "café" with a combining acute is 80 graphemes,
+        // not 100 chars — the badge must not inflate a decomposed accent.
+        let decomposed = "cafe\u{301}".repeat(20);
+        let (label, _) = segment_badge(&decomposed, 0, 10_000, &limits).expect("badge");
+        assert_eq!(label, "CPL 80");
+
+        // A long Indonesian word counts every letter; no spaceless trick.
+        assert_eq!(
+            segment_badge("pertanggungjawaban", 0, 2_000, &limits),
+            None,
+            "18 CPL and 9 CPS are both comfortable"
+        );
+        let (label, level) =
+            segment_badge("pertanggungjawaban", 0, 800, &limits).expect("18 / 0.8 s = 22.5 CPS");
+        assert_eq!(label, "CPS 22.5");
+        assert_eq!(level, Level::Error);
+    }
+
+    /// The badge colours are the theme's text-safe warning/error inks.
+    #[test]
+    fn the_badge_ink_uses_the_text_safe_tokens() {
+        let tokens = crate::theme::tokens(crate::theme::AppTheme::Light);
+        assert_eq!(badge_color(Level::Warning, &tokens), tokens.warn);
+        assert_eq!(badge_color(Level::Error, &tokens), tokens.record_red_text);
+        assert_eq!(badge_color(Level::Ok, &tokens), tokens.warn);
     }
 }
