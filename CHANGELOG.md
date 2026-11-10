@@ -4,6 +4,22 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased]
 
+## 0.4.0 - 2026-11-10
+
+### Added
+- **M15 Transcript Workbench (all eight slices)** — the transcript correction/search/export surface becomes a real workbench:
+  - **Source text is immutable** (schema v2 `segments.source_text`): any edit, polish or rewrite preserves the model's original inference text (the only text that could be permanently lost was editable segments overwriting it — fixed with an additive migration; older libraries upgrade in place, losing nothing).
+  - **Split/merge as real transactions** (M15.3): word-boundary/caret-validated splits with bounded undo/redo (20 steps, reset per transcript), Cmd+Shift+S/M + Cmd+Shift+Z / Cmd+Z (Ctrl equivalents on Linux/Windows), zero-duration handled per the export policy; search stays consistent after every mutation.
+  - **Subtitle diagnostics + basic ASS export** (M15.4): grapheme-aware CPL/CPS advisory badges (configurable 37/42 + 17/20 defaults) on every segment row, and the ASS serializer joins SRT/VTT as the sixth export format (documented escaping; zero-duration cues become one frame or skip, configurable).
+  - **Measured glossary + reversible rules** (M15.5): a 64-term glossary is fed into the Whisper initial prompt against a token cap **measured from your actual model at runtime** (`suramak-cli prompt-budget` — e.g. ggml-tiny = 224 tokens; overflow shows exactly how many terms were dropped); a separate deterministic post-correction dictionary applies to a derived layer only (idempotent, reversible); seven opt-in Indonesian normalization rules guarded against code-switching; Clean/Verbatim export with a previewed diff and an explicit apply.
+  - **FTS5 search** (M15.7): ranked results over the full corpus (+timestamps and snippet text), unicode61 tokenizer — no stemming anywhere, Indonesian retrieval stays exact; every mutation path updates the index in the same transaction; a corrupted index rebuilds itself on open; the migration backfills in chunks and resumes cleanly.
+  - **Opt-in bilingual export** (M15.8): explicit per-transcript translation through the configured Polish endpoint (bounded batches, per-segment failure naming, retry, cancellation), results stored editable with full provenance, staleness tracked through every edit/split/merge, stacked bilingual SRT/VTT/ASS output with per-line CPL/CPS advisories; **zero endpoint traffic unless you enable it** — asserted by tests.
+  - **Word-level timings + karaoke playback** (M15.6): word timing comes from whisper's token timestamps (read-only — no inference change); measured start errors on the pinned tiny model: **EN median 11 ms, ID median 112 ms**. Word chips are click-to-seekable, the current word highlights with a spring during playback (Reduce Motion removes only the spring), and any edit marks the timing stale (sticky across undo) with a segment-seek fallback when stale.
+- **Decode parity** (M15.2): the WebM/Ogg-Opus/mkv-opus import path is pinned by sha256-tagged fixtures (EN + Indonesian) and fails cleanly on truncated containers; the Android import path will reuse this same interface (M13c).
+
+### Changed
+- Schema v1 → v6 additive migrations; every mutation keeps the original inference text; corpus of 10k segments searches at <16 ms worst case on a 2-core machine.
+
 ## [0.3.1] - 2026-10-21
 
 ### Fixed
