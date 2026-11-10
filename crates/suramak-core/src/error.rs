@@ -68,6 +68,11 @@ pub enum SuramakError {
     #[error("library backup error: {0}")]
     Backup(String),
 
+    /// A segment split/merge was refused by the pure validation rules; the
+    /// database was not touched.
+    #[error("segment edit refused: {0}")]
+    SegmentEdit(#[from] crate::segment_edit::EditError),
+
     #[error("Polish backend error: {0}")]
     Polish(String),
 

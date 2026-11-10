@@ -6,6 +6,7 @@ pub mod export;
 pub mod library;
 pub mod models;
 pub mod polish;
+pub mod prompt_budget;
 pub mod transcribe;
 
 use std::path::PathBuf;

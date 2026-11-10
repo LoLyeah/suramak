@@ -14,7 +14,7 @@ use crate::app::controls::{self, Tier};
 use crate::motion::Motion;
 use crate::theme::Tokens;
 
-use super::{AppState, Effect, ExportFormat};
+use super::{AppState, Effect, ExportFormat, ExportTextMode};
 
 /// The sheet's designed width.
 pub const SHEET_WIDTH: f32 = 460.0;
@@ -151,6 +151,21 @@ fn contents(
 
     ui.add_space(tokens.space.m);
 
+    // ---- M15.5: verbatim | clean, and the preview gate ----------------------
+    let mut mode = state.export.mode;
+    let options = [
+        (ExportTextMode::Verbatim, "Verbatim"),
+        (ExportTextMode::Clean, "Clean"),
+    ];
+    if controls::segmented(ui, tokens, motion, "export-text-mode", &mut mode, &options) {
+        state.set_export_mode(mode);
+    }
+    if state.export.mode == ExportTextMode::Clean {
+        clean_section(ui, tokens, motion, state);
+    }
+
+    ui.add_space(tokens.space.m);
+
     // ---- destination --------------------------------------------------------
     ui.label(
         egui::RichText::new("Destination")
@@ -195,7 +210,11 @@ fn contents(
             tokens,
             motion,
             "export-run",
-            "Export",
+            if state.export.mode == ExportTextMode::Clean && state.export.preview.is_some() {
+                "Apply & export"
+            } else {
+                "Export"
+            },
             Tier::Primary,
             state.editor.is_some(),
         );
@@ -226,6 +245,116 @@ fn contents(
                     "Markdown, plain text, JSON, SRT, WebVTT or ASS — written locally.",
                 )
                 .size(11.5)
+                .color(tokens.ink_soft),
+            );
+        }
+    }
+}
+
+/// The clean-export controls: three opt-in transforms, the Preview action, and
+/// the diff the preview produced.
+///
+/// The diff is the only thing between the toggle and a cleaned file: Export is
+/// refused (and says so) until a preview exists, and the preview is dropped
+/// whenever the transcript or an option changes. Nothing here writes.
+fn clean_section(ui: &mut egui::Ui, tokens: &Tokens, motion: &Motion, state: &mut AppState) {
+    ui.add_space(tokens.space.s);
+    let mut clean = state.export.clean;
+    let mut changed = false;
+    for (label, flag, hint) in [
+        (
+            "Post-correction dictionary",
+            &mut clean.dictionary,
+            "Apply the stored dictionary to a derived copy — the transcript is not rewritten",
+        ),
+        (
+            "Indonesian normalization",
+            &mut clean.normalize,
+            "Opt-in colloquial → standard rewrites (word boundaries, code-switch aware)",
+        ),
+        (
+            "Collapse whitespace",
+            &mut clean.collapse_whitespace,
+            "Trim each line and fold runs of spaces — typography only",
+        ),
+    ] {
+        if ui.checkbox(flag, label).on_hover_text(hint).changed() {
+            changed = true;
+        }
+    }
+    if changed {
+        state.set_clean_options(clean);
+    }
+
+    ui.add_space(tokens.space.xs);
+    ui.horizontal(|ui| {
+        let preview = controls::button(
+            ui,
+            tokens,
+            motion,
+            "export-preview",
+            "Preview",
+            Tier::Secondary,
+            state.editor.is_some() && state.export.clean.any(),
+        );
+        if preview.clicked() {
+            let changed = state.preview_clean_export();
+            if !changed {
+                state.export.result = Some(Ok(
+                    "nothing to clean — the preview is empty; export verbatim instead".to_string(),
+                ));
+            }
+        }
+        if !state.export.clean.any() {
+            ui.label(
+                egui::RichText::new("choose at least one transform")
+                    .size(11.0)
+                    .color(tokens.ink_soft),
+            );
+        }
+    });
+
+    match &state.export.preview {
+        Some(preview) => {
+            ui.add_space(tokens.space.xs);
+            ui.label(
+                egui::RichText::new(preview.summary())
+                    .size(11.0)
+                    .color(tokens.ink_soft),
+            );
+            egui::ScrollArea::vertical()
+                .id_salt("export-clean-diff")
+                .max_height(150.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for row in preview.rows.iter().filter(|row| row.changed()) {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{} ", row.idx + 1))
+                                    .size(10.5)
+                                    .monospace()
+                                    .color(tokens.ink_soft),
+                            );
+                            ui.label(
+                                egui::RichText::new(&row.before)
+                                    .size(11.0)
+                                    .strikethrough()
+                                    .color(tokens.ink_soft),
+                            );
+                            ui.label(egui::RichText::new("→").size(11.0).color(tokens.ink_soft));
+                            ui.label(egui::RichText::new(&row.after).size(11.0).color(tokens.ink));
+                        });
+                    }
+                });
+        }
+        None => {
+            ui.add_space(tokens.space.xs);
+            ui.label(
+                egui::RichText::new(
+                    "Clean exports are previewed first: choose the transforms, press Preview, \
+                     then Apply & export.",
+                )
+                .size(11.0)
                 .color(tokens.ink_soft),
             );
         }

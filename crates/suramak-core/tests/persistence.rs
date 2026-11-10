@@ -176,7 +176,9 @@ fn opening_a_populated_v1_library_upgrades_it_in_place_without_losing_text() {
 
     let store = Store::open(&path).expect("v1 must open");
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
-    assert_eq!(SCHEMA_VERSION, 2);
+    // v1 → v2 (source_text + backfill) → v3 (derived marker, M15.5 tables): the
+    // upgrade walks the whole chain in one open.
+    assert_eq!(SCHEMA_VERSION, 3);
     assert_eq!(store.integrity_check().unwrap(), "ok");
 
     // Every byte of source text survives the upgrade, in both languages.
@@ -229,12 +231,19 @@ fn opening_a_populated_v1_library_upgrades_it_in_place_without_losing_text() {
     // The column now exists physically, and a second open is a no-op.
     drop(store);
     assert!(columns(&path).contains(&"source_text".to_string()));
+    assert!(
+        columns(&path).contains(&"derived".to_string()),
+        "the v3 marker is physically present"
+    );
     let again = Store::open(&path).expect("re-open");
     assert_eq!(again.schema_version().unwrap(), SCHEMA_VERSION);
     assert_eq!(
         again.get_transcript(loaded.id).unwrap().segments[2].text,
         "Emoji survives: 🎙️ and café (e + combining acute)."
     );
+    // The v3 tables were created for an upgraded library too.
+    assert!(again.glossary_terms().unwrap().is_empty());
+    assert!(again.prompt_measurement("tiny").unwrap().is_none());
 }
 
 #[test]

@@ -190,6 +190,7 @@ fn form(
         dirty |= polish_section(ui, tokens, form);
         dirty |= updates_section(ui, tokens, form);
     }
+    dirty |= text_rules_section(ui, tokens, motion, state, effects);
 
     // ---- actions ------------------------------------------------------------
     ui.add_space(10.0);
@@ -1215,6 +1216,235 @@ fn row_caption(ui: &mut egui::Ui, tokens: &Tokens, text: &str, error: bool) {
             pane_caption(ui, text, tokens, error);
         });
     });
+}
+
+/// The dictionary field's visible rows.
+const DICTIONARY_ROWS: usize = 5;
+/// The glossary field's visible rows.
+const GLOSSARY_ROWS: usize = 5;
+
+/// M15.5 — the Text rules section: glossary, measured prompt budget, the
+/// post-correction dictionary, the two opt-ins and the merge separator.
+///
+/// Everything here is stored in the **library** (`Store::save_text_settings`),
+/// not `settings.toml`, so it travels with a library backup and is read back by
+/// the transcription path that builds the prompt. Returns whether a field
+/// changed (the form's dirty marker).
+fn text_rules_section(
+    ui: &mut egui::Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    state: &mut AppState,
+    effects: &mut Vec<Effect>,
+) -> bool {
+    section(ui, tokens, "Text rules");
+    row_caption(
+        ui,
+        tokens,
+        "Stored in the library, not settings.toml — a library backup carries them. \
+         The inference text is never rewritten: these rules build derived text.",
+        false,
+    );
+
+    let mut dirty = false;
+    let budget = state.prompt_budget.clone();
+
+    // ---- glossary -----------------------------------------------------------
+    row(ui, tokens, "Glossary", |ui| {
+        let response = ui.add_sized(
+            [field_width(ui), 18.0 * GLOSSARY_ROWS as f32],
+            egui::TextEdit::multiline(&mut state.settings_form.glossary_text)
+                .hint_text("one term per line — names, places, agencies")
+                .desired_rows(GLOSSARY_ROWS)
+                .text_color(tokens.ink),
+        );
+        if response.changed() {
+            dirty = true;
+            state.refresh_prompt_plan();
+        }
+    });
+    let glossary = suramak_core::textrules::Glossary::parse(&state.settings_form.glossary_text);
+    let mut caption = format!(
+        "{} {} · one per line, up to {} · {} characters each",
+        glossary.len(),
+        if glossary.len() == 1 { "term" } else { "terms" },
+        suramak_core::textrules::DEFAULT_GLOSSARY_CAP,
+        suramak_core::textrules::MAX_TERM_CHARS
+    );
+    if !glossary.rejected().is_empty() {
+        caption.push_str(&format!(
+            " · {} line(s) refused (too long)",
+            glossary.rejected().len()
+        ));
+    }
+    if glossary.over_cap() > 0 {
+        caption.push_str(&format!(" · {} over the term cap", glossary.over_cap()));
+    }
+    row_caption(ui, tokens, &caption, !glossary.rejected().is_empty());
+
+    // ---- prompt budget + the truncation report ------------------------------
+    row(ui, tokens, "Prompt budget", |ui| {
+        ui.vertical(|ui| {
+            ui.label(
+                egui::RichText::new(budget.caption())
+                    .size(11.5)
+                    .color(tokens.ink_soft),
+            );
+            ui.horizontal(|ui| {
+                let measure = controls::button(
+                    ui,
+                    tokens,
+                    motion,
+                    "settings-measure-prompt",
+                    if state.measuring_prompt {
+                        "Measuring…"
+                    } else {
+                        "Measure model"
+                    },
+                    Tier::Secondary,
+                    !state.measuring_prompt,
+                );
+                if measure.clicked() {
+                    effects.push(Effect::MeasurePromptBudget {
+                        model_id: state.settings_form.model_id.clone(),
+                    });
+                }
+                if state.measuring_prompt {
+                    ui.label(
+                        egui::RichText::new("loading the model to count its tokens…")
+                            .size(11.0)
+                            .color(tokens.ink_soft),
+                    );
+                }
+            });
+        });
+    });
+
+    if let Some(plan) = &state.prompt_plan {
+        match plan.feedback() {
+            Some(feedback) => row_caption(ui, tokens, &feedback, true),
+            None => row_caption(
+                ui,
+                tokens,
+                &format!(
+                    "the prompt uses ~{} of {} tokens — every term fits",
+                    plan.used_tokens, plan.cap_tokens
+                ),
+                false,
+            ),
+        }
+        if !plan.dropped.is_empty() {
+            let dropped = plan.dropped.iter().take(6).cloned().collect::<Vec<_>>();
+            let more = plan.dropped.len().saturating_sub(dropped.len());
+            let mut line = format!("dropped: {}", dropped.join(", "));
+            if more > 0 {
+                line.push_str(&format!(" … and {more} more"));
+            }
+            row_caption(ui, tokens, &line, false);
+        }
+    }
+
+    // ---- dictionary ---------------------------------------------------------
+    row(ui, tokens, "Dictionary", |ui| {
+        let response = ui.add_sized(
+            [field_width(ui), 18.0 * DICTIONARY_ROWS as f32],
+            egui::TextEdit::multiline(&mut state.settings_form.dictionary_text)
+                .hint_text("BPJS = Badan Penyelenggara Jaminan Sosial")
+                .desired_rows(DICTIONARY_ROWS)
+                .text_color(tokens.ink),
+        );
+        if response.changed() {
+            dirty = true;
+        }
+    });
+    let dictionary =
+        suramak_core::textrules::Dictionary::parse(&state.settings_form.dictionary_text);
+    let mut caption = format!(
+        "{} {} · whole words, case-sensitive, applied after inference to a derived copy",
+        dictionary.len(),
+        if dictionary.len() == 1 {
+            "rule"
+        } else {
+            "rules"
+        }
+    );
+    if !dictionary.rejected().is_empty() {
+        caption.push_str(&format!(
+            " · {} line(s) refused (empty, equal, too long, or would chain)",
+            dictionary.rejected().len()
+        ));
+    }
+    row_caption(ui, tokens, &caption, !dictionary.rejected().is_empty());
+
+    // ---- opt-ins ------------------------------------------------------------
+    ui.horizontal(|ui| {
+        ui.add_space(LABEL_W);
+        if ui
+            .checkbox(
+                &mut state.settings_form.normalize,
+                "Indonesian normalization (opt-in, reversible)",
+            )
+            .on_hover_text(
+                "gak → tidak, kalo → kalau, … — whole words only, never next to a determiner \
+                 or at a clause end. Applied to a derived copy; the transcript text is not rewritten.",
+            )
+            .changed()
+        {
+            dirty = true;
+            state.refresh_prompt_plan();
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.add_space(LABEL_W);
+        if ui
+            .checkbox(
+                &mut state.settings_form.clean_dictionary,
+                "Clean exports use the dictionary by default",
+            )
+            .changed()
+        {
+            dirty = true;
+        }
+        ui.add_space(tokens.space.s);
+        if ui
+            .checkbox(
+                &mut state.settings_form.clean_whitespace,
+                "…and collapse whitespace",
+            )
+            .changed()
+        {
+            dirty = true;
+        }
+    });
+
+    // ---- merge separator ----------------------------------------------------
+    row(ui, tokens, "Merge separator", |ui| {
+        let response = ui.add_sized(
+            [120.0, ROW_H],
+            egui::TextEdit::singleline(&mut state.settings_form.merge_separator)
+                .hint_text("space")
+                .font(FontId::new(12.0, egui::FontFamily::Monospace))
+                .text_color(tokens.ink),
+        );
+        if response.changed() {
+            dirty = true;
+        }
+        ui.label(
+            egui::RichText::new("used by ⌘⇧M and the row's Merge")
+                .size(11.0)
+                .color(tokens.ink_soft),
+        );
+    });
+
+    if dirty {
+        state.settings_form.dirty = true;
+    }
+    dirty
+}
+
+/// The field column's width inside a settings row.
+fn field_width(ui: &egui::Ui) -> f32 {
+    (ui.clip_rect().right() - ui.cursor().left() - 8.0).max(160.0)
 }
 
 #[cfg(test)]

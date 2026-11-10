@@ -510,6 +510,19 @@ impl App {
             self.apply(effects);
         }
 
+        // M15.5: the prompt-budget measurement (a model load on its own thread).
+        let measured = self
+            .runtime
+            .as_mut()
+            .and_then(|runtime| runtime.prompt_status());
+        if let Some(result) = measured {
+            changed = true;
+            if let Some(shell) = self.shell.as_mut() {
+                shell.app.on_prompt_measured(result);
+                shell.app.refresh_prompt_plan();
+            }
+        }
+
         // Waveform peaks (M9b: decoded once per source load, off this thread).
         let peaks = self
             .runtime
@@ -892,6 +905,14 @@ impl ApplicationHandler<UserEvent> for App {
                 shell.sync_appearance(runtime.appearance());
                 // Polish availability is derived from the settings + key policy (M4).
                 shell.app.polish_configured = runtime.polish_configured();
+                // M15.5: the stored glossary/dictionary/opt-ins and the model's
+                // cached prompt measurement seed the settings surface; the plan
+                // they produce is what the truncation feedback shows.
+                shell.app.seed_text_rules(
+                    runtime.text_settings(),
+                    runtime.prompt_budget(),
+                    runtime.prompt_base(),
+                );
                 let initial = shell.app.initial_effects();
                 runtime.apply(initial, &mut shell.app);
 

@@ -12,8 +12,10 @@ pub mod models;
 pub mod paths;
 pub mod polish;
 pub mod resample;
+pub mod segment_edit;
 pub mod settings;
 pub mod store;
+pub mod textrules;
 pub mod time;
 pub mod transcript;
 

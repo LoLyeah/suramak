@@ -16,7 +16,13 @@ use suramak_asr::EngineId;
 use suramak_core::diagnostics::SubtitleLimits;
 use suramak_core::export as core_export;
 use suramak_core::models as core_models;
+use suramak_core::segment_edit::{
+    EditKind, SegmentHistory, SegmentRow, SegmentSnapshot, UNDO_DEPTH,
+};
 use suramak_core::settings::{Appearance, EngineSetting, RecordSource};
+use suramak_core::textrules::{
+    CleanOptions, ExportPreview, PromptBudget, PromptMeasurement, TextSettings,
+};
 use suramak_core::transcript::{Segment, Transcript};
 use suramak_playback::{
     resolve_playback_source, transcript_duration_ms, Command as PlaybackCommand, Peaks, Playback,
@@ -194,6 +200,32 @@ pub fn count_noun(count: usize, noun: &str) -> String {
     } else {
         format!("{count} {noun}s")
     }
+}
+
+/// The caret a split uses when no row has focus: the byte offset of the
+/// whitespace run closest to the text's midpoint.
+///
+/// Pure and deterministic; the store validates it again (a segment with no
+/// whitespace is refused there, not silently cut mid-word). An empty text
+/// returns 0, which the builder refuses as an empty half.
+pub fn midpoint_word_boundary(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    let middle = text.len() / 2;
+    let mut best: Option<(usize, usize)> = None;
+    for (offset, ch) in text.char_indices() {
+        if !ch.is_whitespace() {
+            continue;
+        }
+        let distance = offset.abs_diff(middle);
+        if best.is_none_or(|(_, best_distance)| distance < best_distance) {
+            best = Some((offset, distance));
+        }
+    }
+    // A caret on a whitespace run is a valid "split here" input: the builder
+    // treats the run under the caret as the boundary.
+    best.map(|(offset, _)| offset).unwrap_or(middle.max(1))
 }
 
 /// A human label for an engine id (`cpu` → `CPU`, `coreml` → `Core ML`) —
@@ -502,6 +534,11 @@ pub struct Editor {
     /// Trash affordance armed in the editor header (M4.5): the next frame draws
     /// the in-place confirm step; cleared on cancel, on delete and on open.
     pub confirm_delete: bool,
+    /// M15.3: the byte caret of the focused row's text edit (`idx`, offset),
+    /// read from egui's `TextEditState` each frame. Split-at-caret is the only
+    /// thing that reads it; `None` when no row has focus, in which case the
+    /// split acts on the row's midpoint boundary.
+    pub caret: Option<(u32, usize)>,
 }
 
 impl Editor {
@@ -516,6 +553,31 @@ impl Editor {
             last_saved: None,
             save_error: None,
             confirm_delete: false,
+            caret: None,
+        }
+    }
+
+    /// Replaces the segment set after a committed structural edit (split/merge
+    /// or its undo) and rebuilds the buffers from it.
+    ///
+    /// The persisted rows are the source of truth: any text the user had typed
+    /// but not yet saved is flushed *before* the structural edit is requested,
+    /// so rebuilding here cannot lose an edit.
+    pub fn on_segments_changed(&mut self, transcript: Transcript) {
+        self.buffers = transcript
+            .segments
+            .iter()
+            .map(|segment| segment.text.clone())
+            .collect();
+        self.transcript = transcript;
+        self.dirty = false;
+        self.last_edit = None;
+        self.save_error = None;
+        if self
+            .caret
+            .is_some_and(|(idx, _)| idx as usize >= self.transcript.segments.len())
+        {
+            self.caret = None;
         }
     }
 
@@ -650,6 +712,25 @@ pub struct ExportState {
     /// open. The old fixed bottom band is gone — it collided with the floating
     /// record pill (critique P1/H8).
     pub open: bool,
+    /// M15.5: verbatim (the stored text, untouched) or clean (the previewed
+    /// derived text). Verbatim is the default.
+    pub mode: ExportTextMode,
+    /// Which clean transforms the preview applies.
+    pub clean: CleanOptions,
+    /// The last computed preview. `None` until the user asks for one, and
+    /// cleared whenever the text it described changed — a preview can never
+    /// describe a transcript that no longer exists.
+    pub preview: Option<ExportPreview>,
+}
+
+/// How an export treats the text (M15.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExportTextMode {
+    /// The stored/edited text exactly as it is.
+    #[default]
+    Verbatim,
+    /// The clean pipeline, only after a preview and an explicit apply.
+    Clean,
 }
 
 impl Default for ExportState {
@@ -660,6 +741,9 @@ impl Default for ExportState {
             follows_default: true,
             result: None,
             open: false,
+            mode: ExportTextMode::Verbatim,
+            clean: CleanOptions::default(),
+            preview: None,
         }
     }
 }
@@ -779,6 +863,37 @@ pub struct AppState {
     /// startup (quit-mid-recording Stop & Save). Cleared once its transcript is
     /// saved — that save is what completes the pending entry.
     pub resumed_pending: Option<PathBuf>,
+    /// M15.3: the bounded in-memory undo/redo log for structural edits of the
+    /// OPEN transcript. Cleared when the editor closes or switches transcripts
+    /// (a fresh app session never offers undo for edits it did not witness).
+    pub segment_history: SegmentHistory,
+    /// M15.5: the stored glossary / dictionary / opt-ins (loaded from the store
+    /// at startup and after each save).
+    pub text_settings: TextSettings,
+    /// M15.5: the prompt budget the builder uses. `Set` from the store's cached
+    /// measurement for the current model, else the documented fallback.
+    pub prompt_budget: PromptBudget,
+    /// M15.5: a measurement running on a background thread — the settings row
+    /// disables Measure while it is true.
+    pub measuring_prompt: bool,
+    /// M15.5: the last prompt plan the settings surface computed (its dropped
+    /// terms are the visible truncation feedback).
+    pub prompt_plan: Option<suramak_core::textrules::PromptPlan>,
+    /// M15.5: `settings.asr.initial_prompt` — the other consumer of the prompt
+    /// budget, seeded by the runtime so the plan shown here matches what a job
+    /// will send.
+    pub prompt_base: Option<String>,
+    /// M15.3: a structural edit waiting for the dirty text to save. It is emitted
+    /// only after the save lands, so a split never partitions stale text and a
+    /// failed save never silently discards what the reader typed.
+    pub pending_structural: Option<Effect>,
+}
+
+/// Which way an undo/redo row-set write moves the history cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryStep {
+    Undo,
+    Redo,
 }
 
 /// Side effects the runtime executes after a frame (or an event).
@@ -851,6 +966,33 @@ pub enum Effect {
     /// M9e (P1-1): the quit confirm was answered — executed by the frame loop
     /// (only it can exit the process), never by the runtime.
     Quit(QuitOutcome),
+    /// M15.3: split segment `idx` at a byte caret of its current text. The
+    /// runtime runs the store transaction and answers with
+    /// [`AppState::on_segment_edit`].
+    SplitSegment {
+        transcript: Uuid,
+        idx: u32,
+        caret: usize,
+    },
+    /// M15.3: merge `count` contiguous rows from `first`. The runtime runs the
+    /// store transaction and answers with [`AppState::on_segment_edit`].
+    MergeSegments {
+        transcript: Uuid,
+        first: u32,
+        count: u32,
+        separator: String,
+    },
+    /// M15.3: write a recorded row set back (undo/redo of a structural edit).
+    RestoreSegments {
+        transcript: Uuid,
+        rows: Vec<SegmentRow>,
+        step: HistoryStep,
+    },
+    /// M15.5: persist the glossary / dictionary / opt-ins through the store.
+    SaveTextSettings { settings: Box<TextSettings> },
+    /// M15.5: measure `model_id`'s prompt budget on a background thread (opens
+    /// the model read-only; never on the UI thread).
+    MeasurePromptBudget { model_id: String },
 }
 
 impl Default for AppState {
@@ -901,6 +1043,15 @@ impl AppState {
             peaks: EditorPeaks::default(),
             quit_prompt: None,
             resumed_pending: None,
+            segment_history: SegmentHistory::new(),
+            text_settings: TextSettings::default(),
+            // Replaced by the runtime at startup from the store's measurement
+            // (or left as the documented fallback, whose caption says so).
+            prompt_budget: PromptBudget::unmeasured(),
+            measuring_prompt: false,
+            prompt_plan: None,
+            prompt_base: None,
+            pending_structural: None,
         }
     }
 
@@ -1536,9 +1687,19 @@ impl AppState {
 
     /// Save pressed: the runtime applies the form (toml write + keychain).
     pub fn save_settings(&mut self) -> Vec<Effect> {
-        vec![Effect::SaveSettings {
+        let mut effects = vec![Effect::SaveSettings {
             form: Box::new(self.settings_form.clone()),
-        }]
+        }];
+        // M15.5: the glossary / dictionary / opt-ins live in the library store,
+        // not settings.toml, so they travel as their own effect. Only a real
+        // change is written (an untouched form never rewrites the tables).
+        let text = self.settings_form.text_settings();
+        if text != self.text_settings {
+            effects.push(Effect::SaveTextSettings {
+                settings: Box::new(text),
+            });
+        }
+        effects
     }
 
     /// Save result from the runtime.
@@ -1555,6 +1716,11 @@ impl AppState {
     /// Reset-to-defaults (form-only until Save).
     pub fn reset_settings_form(&mut self) {
         self.settings_form.reset();
+        // The text rules are part of the same surface; resetting means "back to
+        // the stored rules", not "silently delete them" — the fields are
+        // re-seeded from what the store holds.
+        let settings = self.text_settings.clone();
+        self.settings_form.seed_text_rules(&settings);
     }
 
     // ---- import (M2) --------------------------------------------------------
@@ -1932,20 +2098,39 @@ impl AppState {
 
     /// Result of an autosave/flush.
     pub fn on_edits_saved(&mut self, at: Instant, result: Result<(), String>) -> Vec<Effect> {
-        let Some(editor) = &mut self.editor else {
-            return Vec::new();
+        // M15.3: a structural edit requested while the text was dirty waits here.
+        let pending = self.pending_structural.take();
+        let on_editor = self.route == Route::Editor;
+        let dropped = {
+            let Some(editor) = self.editor.as_mut() else {
+                return Vec::new();
+            };
+            match result {
+                Ok(()) => {
+                    editor.apply_buffers();
+                    editor.dirty = false;
+                    editor.last_saved = Some(at);
+                    editor.save_error = None;
+                    // The text is stored: the transaction may now partition it —
+                    // but only if the editor is still the one that asked (the
+                    // reader may have left while the save was in flight).
+                    if !on_editor {
+                        return Vec::new();
+                    }
+                    return pending.into_iter().collect();
+                }
+                Err(err) => {
+                    editor.save_error = Some(err);
+                    editor.last_edit = Some(at);
+                    pending.is_some()
+                }
+            }
         };
-        match result {
-            Ok(()) => {
-                editor.apply_buffers();
-                editor.dirty = false;
-                editor.last_saved = Some(at);
-                editor.save_error = None;
-            }
-            Err(err) => {
-                editor.save_error = Some(err);
-                editor.last_edit = Some(at);
-            }
+        if dropped {
+            self.set_status(
+                "the text could not be saved — the split/merge was not applied",
+                true,
+            );
         }
         Vec::new()
     }
@@ -1965,6 +2150,12 @@ impl AppState {
     /// under the button — never a bottom band over the floating pill).
     pub fn toggle_export(&mut self) {
         self.export.open = !self.export.open;
+        if self.export.open {
+            // M15.5: the sheet opens with the stored clean defaults; the preview
+            // is always recomputed by an explicit Preview press.
+            self.seed_clean_options();
+            self.export.preview = None;
+        }
     }
 
     /// Destination typed/edited by the user (or set by the save dialog).
@@ -1975,6 +2166,10 @@ impl AppState {
     }
 
     /// Export button: render + write (pending edits are flushed alongside).
+    ///
+    /// M15.5: in **Clean** mode nothing is written unless a preview exists —
+    /// and the preview was computed from the current text, since every edit
+    /// clears it. The preview is the only path to a cleaned export.
     pub fn start_export(&mut self) -> Vec<Effect> {
         let Some(editor) = &self.editor else {
             self.export.result = Some(Err("no transcript open".to_string()));
@@ -1985,7 +2180,19 @@ impl AppState {
             self.export.result = Some(Err("choose a destination first".to_string()));
             return Vec::new();
         }
-        let transcript = editor.snapshot();
+        let snapshot = editor.snapshot();
+        let transcript = match self.export.mode {
+            ExportTextMode::Verbatim => snapshot,
+            ExportTextMode::Clean => match &self.export.preview {
+                Some(preview) => preview.apply(&snapshot),
+                None => {
+                    self.export.result = Some(Err(
+                        "preview the clean-up first — nothing is exported without it".to_string(),
+                    ));
+                    return Vec::new();
+                }
+            },
+        };
         self.export.result = None;
         let mut effects = self.flush_edits();
         effects.push(Effect::Export {
@@ -1996,12 +2203,330 @@ impl AppState {
         effects
     }
 
+    /// M15.5: computes the clean preview for the open transcript. Pure: it reads
+    /// the editors' buffers and returns whether anything would change. Nothing
+    /// is written and the transcript is untouched.
+    pub fn preview_clean_export(&mut self) -> bool {
+        let Some(editor) = &self.editor else {
+            self.export.preview = None;
+            return false;
+        };
+        let transcript = editor.snapshot();
+        let preview = suramak_core::textrules::preview(
+            &transcript,
+            &self.text_settings.rules(),
+            &self.export.clean,
+        );
+        let changed = preview.changed;
+        self.export.preview = Some(preview);
+        changed > 0
+    }
+
+    /// M15.5: switches the export text mode; leaving Clean drops the preview so
+    /// a later switch back cannot reuse an old one.
+    pub fn set_export_mode(&mut self, mode: ExportTextMode) {
+        if self.export.mode != mode {
+            self.export.mode = mode;
+            self.export.preview = None;
+            self.export.result = None;
+        }
+    }
+
+    /// M15.5: one clean option toggled — invalidates the preview.
+    pub fn set_clean_options(&mut self, clean: CleanOptions) {
+        if self.export.clean != clean {
+            self.export.clean = clean;
+            self.export.preview = None;
+        }
+    }
+
+    /// M15.5: seeds the sheet's clean options from the stored settings (called
+    /// when the sheet opens).
+    pub fn seed_clean_options(&mut self) {
+        let clean = self.text_settings.clean_options();
+        self.set_clean_options(clean);
+    }
+
     /// Result of an export write.
     pub fn on_export_done(&mut self, dest: &Path, result: Result<(), String>) {
         self.export.result = Some(match result {
             Ok(()) => Ok(format!("wrote {}", dest.display())),
             Err(err) => Err(format!("export failed: {err}")),
         });
+    }
+
+    // ---- M15.3: structural edits -------------------------------------------
+
+    /// Records an edit through the editor *and* invalidates the clean preview,
+    /// which described the text before this keystroke.
+    pub fn edit_segment(&mut self, idx: u32, text: String, now: Instant) {
+        if let Some(editor) = self.editor.as_mut() {
+            editor.edit(idx, text, now);
+        }
+        self.export.preview = None;
+    }
+
+    /// The row index a structural command acts on: the focused row when it still
+    /// exists, else the first row. `None` without an editor.
+    pub fn active_segment(&self) -> Option<u32> {
+        let editor = self.editor.as_ref()?;
+        if let Some((idx, _)) = editor.caret {
+            if editor
+                .transcript
+                .segments
+                .iter()
+                .any(|segment| segment.idx == idx)
+            {
+                return Some(idx);
+            }
+        }
+        editor
+            .transcript
+            .segments
+            .first()
+            .map(|segment| segment.idx)
+    }
+
+    /// Split-at-caret: the caret when the focused row is `idx`, else the row's
+    /// midpoint (the builder's default cut). Pending text is flushed first so
+    /// the transaction partitions what the user sees.
+    pub fn split_segment(&mut self, idx: u32) -> Vec<Effect> {
+        let Some(editor) = &self.editor else {
+            return Vec::new();
+        };
+        let Some(text) = editor.buffers.get(idx as usize) else {
+            return Vec::new();
+        };
+        let caret = match editor.caret {
+            Some((caret_idx, offset)) if caret_idx == idx => offset,
+            _ => midpoint_word_boundary(text),
+        };
+        let id = editor.transcript.id;
+        let dirty = editor.dirty;
+        let effect = Effect::SplitSegment {
+            transcript: id,
+            idx,
+            caret,
+        };
+        self.queue_structural(effect, dirty)
+    }
+
+    /// Merge `idx` with the row after it, using the configured separator.
+    pub fn merge_with_next(&mut self, idx: u32) -> Vec<Effect> {
+        let Some(editor) = &self.editor else {
+            return Vec::new();
+        };
+        let segments = &editor.transcript.segments;
+        let Some(position) = segments.iter().position(|segment| segment.idx == idx) else {
+            return Vec::new();
+        };
+        if position + 1 >= segments.len() {
+            return Vec::new();
+        }
+        let id = editor.transcript.id;
+        let separator = self.text_settings.merge_separator.clone();
+        let dirty = editor.dirty;
+        let effect = Effect::MergeSegments {
+            transcript: id,
+            first: idx,
+            count: 2,
+            separator,
+        };
+        self.queue_structural(effect, dirty)
+    }
+
+    /// Queues a structural effect: immediately when the text is clean, or behind
+    /// the flush that stores it (see [`AppState::on_edits_saved`]).
+    fn queue_structural(&mut self, effect: Effect, dirty: bool) -> Vec<Effect> {
+        if !dirty {
+            return vec![effect];
+        }
+        let flush = self.flush_edits();
+        if flush.is_empty() {
+            // The dirty flag was stale (no buffer actually differs): nothing to
+            // wait for.
+            return vec![effect];
+        }
+        self.pending_structural = Some(effect);
+        flush
+    }
+
+    /// Undo the newest structural edit (`None` → nothing to do).
+    pub fn undo_segment_edit(&mut self) -> Vec<Effect> {
+        let Some(editor) = &self.editor else {
+            return Vec::new();
+        };
+        let id = editor.transcript.id;
+        let Some((kind, snapshot)) = self.segment_history.next_undo() else {
+            self.set_status("nothing to undo", false);
+            return Vec::new();
+        };
+        self.set_status(format!("undoing the last {kind}"), false);
+        vec![Effect::RestoreSegments {
+            transcript: id,
+            rows: snapshot.before,
+            step: HistoryStep::Undo,
+        }]
+    }
+
+    /// Redo the newest undone structural edit.
+    pub fn redo_segment_edit(&mut self) -> Vec<Effect> {
+        let Some(editor) = &self.editor else {
+            return Vec::new();
+        };
+        let id = editor.transcript.id;
+        let Some((kind, snapshot)) = self.segment_history.next_redo() else {
+            self.set_status("nothing to redo", false);
+            return Vec::new();
+        };
+        self.set_status(format!("redoing the {kind}"), false);
+        vec![Effect::RestoreSegments {
+            transcript: id,
+            rows: snapshot.after,
+            step: HistoryStep::Redo,
+        }]
+    }
+
+    /// A split/merge committed: push it on the bounded log and adopt the stored
+    /// rows (the buffers are rebuilt from them).
+    pub fn on_segment_edit(
+        &mut self,
+        snapshot: SegmentSnapshot,
+        kind: EditKind,
+        transcript: Transcript,
+    ) {
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.transcript.id == transcript.id)
+        {
+            self.segment_history.push(kind, snapshot);
+            if let Some(editor) = self.editor.as_mut() {
+                editor.on_segments_changed(transcript);
+            }
+            self.export.preview = None;
+            self.set_status(
+                format!(
+                    "{kind} applied — {} (⌘Z undoes it)",
+                    count_noun(
+                        self.editor
+                            .as_ref()
+                            .map(|editor| editor.transcript.segments.len())
+                            .unwrap_or(0),
+                        "segment"
+                    )
+                ),
+                false,
+            );
+        }
+    }
+
+    /// A structural edit was refused: nothing changed, and the log stays put.
+    pub fn on_segment_edit_failed(&mut self, message: String) {
+        self.set_status(format!("segment edit refused: {message}"), true);
+    }
+
+    /// An undo/redo row set was written: move the log cursor and adopt the rows.
+    pub fn on_segments_restored(&mut self, step: HistoryStep, transcript: Transcript) {
+        match step {
+            HistoryStep::Undo => {
+                self.segment_history.undo();
+            }
+            HistoryStep::Redo => {
+                self.segment_history.redo();
+            }
+        }
+        if let Some(editor) = self.editor.as_mut() {
+            if editor.transcript.id == transcript.id {
+                editor.on_segments_changed(transcript);
+            }
+        }
+        self.export.preview = None;
+        let remaining = self.segment_history.depth();
+        self.set_status(
+            format!(
+                "{} — {remaining} of {UNDO_DEPTH} undo steps left",
+                match step {
+                    HistoryStep::Undo => "undone",
+                    HistoryStep::Redo => "redone",
+                }
+            ),
+            false,
+        );
+    }
+
+    /// The M15.5 settings were saved: adopt them and re-seed the export sheet.
+    pub fn on_text_settings_saved(&mut self, settings: TextSettings, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                self.text_settings = settings;
+                self.export.preview = None;
+                self.set_status("text rules saved", false);
+            }
+            Err(err) => self.set_status(format!("text rules not saved: {err}"), true),
+        }
+    }
+
+    /// A model measurement landed (or failed): the budget is what the builder
+    /// uses from now on; a failure keeps the documented fallback.
+    pub fn on_prompt_measured(&mut self, result: Result<PromptMeasurement, String>) {
+        self.measuring_prompt = false;
+        match result {
+            Ok(measurement) => {
+                self.prompt_budget = measurement.budget();
+                self.set_status(
+                    format!(
+                        "prompt budget measured: {} tokens ({})",
+                        measurement.cap_tokens, measurement.model_id
+                    ),
+                    false,
+                );
+            }
+            Err(err) => {
+                self.set_status(format!("prompt budget not measured: {err}"), true);
+            }
+        }
+    }
+
+    /// Recomputes the prompt plan the settings surface shows (the truncation
+    /// feedback). Cheap: one count per candidate term.
+    pub fn refresh_prompt_plan(&mut self) {
+        let base = self.prompt_base.clone();
+        self.prompt_plan = Some(suramak_core::textrules::build_prompt(
+            base.as_deref(),
+            &self.text_settings.glossary,
+            &self.prompt_budget,
+            &suramak_core::textrules::EstimatedTokens,
+        ));
+    }
+
+    /// M15.5: the stored rules changed (or were first loaded) — the plan the
+    /// settings surface shows must be recomputed from them.
+    pub fn on_initial_prompt_changed(&mut self) {
+        self.settings_form.seed_text_rules(&self.text_settings);
+        self.refresh_prompt_plan();
+    }
+
+    /// M15.5: the measured budget changed (a model switch) — recompute the plan
+    /// without touching the form's text fields.
+    pub fn on_prompt_budget_changed(&mut self, budget: PromptBudget) {
+        self.prompt_budget = budget;
+        self.refresh_prompt_plan();
+    }
+
+    /// M15.5: seeds everything the settings surface needs from the runtime's
+    /// copies (startup and after the runtime reloads them).
+    pub fn seed_text_rules(
+        &mut self,
+        settings: TextSettings,
+        budget: PromptBudget,
+        prompt_base: Option<String>,
+    ) {
+        self.settings_form.seed_text_rules(&settings);
+        self.text_settings = settings;
+        self.prompt_budget = budget;
+        self.prompt_base = prompt_base;
+        self.refresh_prompt_plan();
     }
 
     /// Flushes dirty buffers immediately (leaving the editor, switching
@@ -2037,6 +2562,11 @@ impl AppState {
         // transcript must never inherit it (M4).
         self.polish = PolishState::Idle;
         self.polish_undo = None;
+        // M15.3: the structural edit log belongs to the transcript that was
+        // open; a different one starts with no history.
+        self.segment_history.clear();
+        self.export.preview = None;
+        self.pending_structural = None;
         self.route = Route::Editor;
         // M8: the transport is rebuilt for this transcript's source (a previous
         // transcript's playback never leaks across).
@@ -4296,5 +4826,337 @@ mod tests {
         assert!(effects.is_empty());
         assert!(state.resumed_pending.is_none());
         assert!(matches!(state.job, Job::Idle));
+    }
+
+    // ---- M15.3: structural edits -------------------------------------------
+
+    fn editor_with(lines: &[&str]) -> AppState {
+        let transcript = Transcript::new(
+            "split.wav".to_string(),
+            Source::File {
+                name: "split.wav".to_string(),
+            },
+            "tiny".to_string(),
+            Some("id".to_string()),
+            None,
+            lines
+                .iter()
+                .enumerate()
+                .map(|(idx, text)| segment(idx as u32, text))
+                .collect(),
+        );
+        let mut state = AppState::new();
+        state.on_transcript_loaded(transcript);
+        state
+    }
+
+    #[test]
+    fn split_at_caret_uses_the_caret_and_flushes_uncommitted_text_first() {
+        let mut state = editor_with(&["selamat pagi semua"]);
+        state.edit_segment(0, "selamat pagi semuanya".to_string(), Instant::now());
+        state.editor.as_mut().unwrap().caret = Some((0, 7));
+
+        let effects = state.split_segment(0);
+        // The save goes first, and the split waits for it: the transaction must
+        // partition what the user typed, not the stale row.
+        assert!(
+            matches!(effects.as_slice(), [Effect::SaveEdits { .. }]),
+            "{effects:?}"
+        );
+        let deferred = state.on_edits_saved(Instant::now(), Ok(()));
+        match deferred.as_slice() {
+            [Effect::SplitSegment { idx, caret, .. }] => {
+                assert_eq!(*idx, 0);
+                assert_eq!(*caret, 7);
+            }
+            other => panic!("expected a deferred SplitSegment effect, got {other:?}"),
+        }
+        assert!(state.pending_structural.is_none());
+    }
+
+    #[test]
+    fn a_failed_text_save_cancels_the_waiting_structural_edit() {
+        let mut state = editor_with(&["selamat pagi semua"]);
+        state.edit_segment(0, "selamat pagi semuanya".to_string(), Instant::now());
+        let _ = state.split_segment(0);
+        assert!(state.pending_structural.is_some());
+
+        // The save fails: no split, and the typed text is still in the buffer.
+        let effects = state.on_edits_saved(Instant::now(), Err("disk full".to_string()));
+        assert!(
+            effects.is_empty(),
+            "no structural edit may run: {effects:?}"
+        );
+        assert!(state.pending_structural.is_none());
+        assert_eq!(
+            state.editor.as_ref().unwrap().buffers[0],
+            "selamat pagi semuanya",
+            "the reader's text is not replaced by the stored row"
+        );
+        assert_eq!(
+            state.status.as_ref().map(|status| status.text.as_str()),
+            Some("the text could not be saved — the split/merge was not applied")
+        );
+    }
+
+    #[test]
+    fn a_split_without_a_caret_uses_the_nearest_word_boundary_to_the_middle() {
+        // "the quick brown fox": the whitespace nearest the midpoint (offset 9
+        // is the space itself).
+        assert_eq!(midpoint_word_boundary("the quick brown fox"), 9);
+        // A single word has no boundary: the midpoint comes back and the store
+        // refuses it (no word boundary to cut).
+        assert_eq!(midpoint_word_boundary("pertanggungjawaban"), 9);
+        assert_eq!(midpoint_word_boundary(""), 0);
+
+        let mut state = editor_with(&["the quick brown fox"]);
+        let effects = state.split_segment(0);
+        match effects.last() {
+            Some(Effect::SplitSegment { caret, .. }) => assert_eq!(*caret, 9),
+            other => panic!("expected a SplitSegment effect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_applied_split_rebuilds_the_buffers_and_records_one_undo_step() {
+        let mut state = editor_with(&["selamat pagi semua", "terima kasih"]);
+        let before: Vec<SegmentRow> = vec![
+            SegmentRow::new(0, 0, 900, "selamat pagi semua"),
+            SegmentRow::new(1, 1_000, 1_900, "terima kasih"),
+        ];
+        let after: Vec<SegmentRow> = vec![
+            SegmentRow::new(0, 0, 450, "selamat"),
+            SegmentRow::new(1, 450, 900, "pagi semua"),
+            SegmentRow::new(2, 1_000, 1_900, "terima kasih"),
+        ];
+        let id = state.editor.as_ref().unwrap().transcript.id;
+        let mut stored = state.editor.as_ref().unwrap().transcript.clone();
+        stored.segments = vec![
+            segment(0, "selamat"),
+            segment(1, "pagi semua"),
+            segment(2, "terima kasih"),
+        ];
+        let snapshot = SegmentSnapshot {
+            transcript_id: id,
+            before,
+            after,
+        };
+        state.on_segment_edit(snapshot, EditKind::Split, stored);
+
+        let editor = state.editor.as_ref().unwrap();
+        assert_eq!(editor.transcript.segments.len(), 3);
+        assert_eq!(
+            editor.buffers,
+            vec!["selamat", "pagi semua", "terima kasih"]
+        );
+        assert!(
+            !editor.dirty,
+            "the store is the source of truth after an apply"
+        );
+        assert_eq!(state.segment_history.depth(), 1);
+        assert!(state.segment_history.can_undo());
+    }
+
+    #[test]
+    fn undo_requests_the_recorded_rows_and_moves_the_log_only_on_success() {
+        let mut state = editor_with(&["selamat pagi semua"]);
+        let id = state.editor.as_ref().unwrap().transcript.id;
+        let before = vec![SegmentRow::new(0, 0, 900, "selamat pagi semua")];
+        let after = vec![
+            SegmentRow::new(0, 0, 450, "selamat"),
+            SegmentRow::new(1, 450, 900, "pagi semua"),
+        ];
+        state.segment_history.push(
+            EditKind::Split,
+            SegmentSnapshot {
+                transcript_id: id,
+                before: before.clone(),
+                after: after.clone(),
+            },
+        );
+
+        let effects = state.undo_segment_edit();
+        match effects.as_slice() {
+            [Effect::RestoreSegments { rows, step, .. }] => {
+                assert_eq!(*step, HistoryStep::Undo);
+                assert_eq!(rows, &before);
+            }
+            other => panic!("expected a RestoreSegments effect, got {other:?}"),
+        }
+        // The log has NOT moved yet: only a successful write may move it.
+        assert!(state.segment_history.can_undo());
+        assert!(!state.segment_history.can_redo());
+
+        // The write landed: the cursor moves, redo becomes available.
+        let mut restored = state.editor.as_ref().unwrap().transcript.clone();
+        restored.segments = vec![segment(0, "selamat pagi semua")];
+        state.on_segments_restored(HistoryStep::Undo, restored);
+        assert!(!state.segment_history.can_undo());
+        assert!(state.segment_history.can_redo());
+        assert_eq!(state.editor.as_ref().unwrap().buffers.len(), 1);
+    }
+
+    #[test]
+    fn undo_with_an_empty_log_is_a_status_line_not_an_effect() {
+        let mut state = editor_with(&["satu dua"]);
+        let effects = state.undo_segment_edit();
+        assert!(effects.is_empty());
+        assert_eq!(
+            state.status.as_ref().map(|status| status.text.as_str()),
+            Some("nothing to undo")
+        );
+    }
+
+    // ---- M15.5: the clean-export state machine ------------------------------
+
+    fn clean_state() -> AppState {
+        let mut state = editor_with(&["Kartu BPJS aku gak tahu"]);
+        state.text_settings = TextSettings {
+            dictionary: suramak_core::textrules::Dictionary::parse(
+                "BPJS = Badan Penyelenggara Jaminan Sosial",
+            ),
+            normalize: true,
+            merge_separator: " ".to_string(),
+            ..TextSettings::default()
+        };
+        state.export.dest = "/tmp/out.srt".to_string();
+        state.export.mode = ExportTextMode::Clean;
+        state.export.clean = CleanOptions {
+            dictionary: true,
+            normalize: true,
+            collapse_whitespace: false,
+        };
+        state
+    }
+
+    #[test]
+    fn a_clean_export_is_refused_until_a_preview_exists() {
+        let mut state = clean_state();
+        let effects = state.start_export();
+        assert!(effects.is_empty(), "nothing is written without a preview");
+        let message = match &state.export.result {
+            Some(Err(message)) => message.clone(),
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        assert!(message.contains("preview"), "{message}");
+
+        // The preview is a computation: it reports the change and writes nothing.
+        assert!(state.preview_clean_export());
+        let preview = state.export.preview.as_ref().expect("preview");
+        assert_eq!(preview.changed, 1);
+        assert_eq!(
+            preview.rows[0].after,
+            "Kartu Badan Penyelenggara Jaminan Sosial aku tidak tahu"
+        );
+        assert_eq!(
+            state.editor.as_ref().unwrap().buffers[0],
+            "Kartu BPJS aku gak tahu",
+            "the editor text is untouched by the preview"
+        );
+
+        // Only the explicit export action produces the write, with the cleaned
+        // derived transcript.
+        let effects = state.start_export();
+        match effects.last() {
+            Some(Effect::Export { transcript, .. }) => {
+                assert_eq!(
+                    transcript.segments[0].text,
+                    "Kartu Badan Penyelenggara Jaminan Sosial aku tidak tahu"
+                );
+            }
+            other => panic!("expected an Export effect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn any_edit_or_option_change_drops_the_preview() {
+        let mut state = clean_state();
+        state.preview_clean_export();
+        assert!(state.export.preview.is_some());
+
+        // A keystroke invalidates it: the preview described the old text.
+        state.edit_segment(0, "Kartu BPJS aku tidak tahu".to_string(), Instant::now());
+        assert!(state.export.preview.is_none());
+        assert!(state.start_export().is_empty(), "no preview, no write");
+
+        // Re-preview, then flip a transform: invalid too.
+        state.preview_clean_export();
+        assert!(state.export.preview.is_some());
+        state.set_clean_options(CleanOptions {
+            dictionary: false,
+            normalize: true,
+            collapse_whitespace: false,
+        });
+        assert!(state.export.preview.is_none());
+    }
+
+    #[test]
+    fn verbatim_mode_exports_the_stored_text_without_a_preview() {
+        let mut state = clean_state();
+        state.set_export_mode(ExportTextMode::Verbatim);
+        let effects = state.start_export();
+        match effects.last() {
+            Some(Effect::Export { transcript, .. }) => {
+                assert_eq!(transcript.segments[0].text, "Kartu BPJS aku gak tahu");
+            }
+            other => panic!("expected an Export effect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_carries_the_text_rules_only_when_they_changed() {
+        let mut state = AppState::new();
+        let effects = state.save_settings();
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::SaveTextSettings { .. })),
+            "an untouched form does not rewrite the text-rule tables"
+        );
+
+        state.settings_form.glossary_text = "Kecamatan Cilandak".to_string();
+        let effects = state.save_settings();
+        match effects
+            .iter()
+            .find(|effect| matches!(effect, Effect::SaveTextSettings { .. }))
+        {
+            Some(Effect::SaveTextSettings { settings }) => {
+                assert_eq!(settings.glossary.len(), 1);
+            }
+            other => panic!("expected a SaveTextSettings effect, got {other:?}"),
+        }
+
+        // A successful save adopts the rules; the form no longer differs.
+        let saved = TextSettings {
+            glossary: suramak_core::textrules::Glossary::parse("Kecamatan Cilandak"),
+            ..TextSettings::default()
+        };
+        state.on_text_settings_saved(saved, Ok(()));
+        assert!(!state
+            .save_settings()
+            .iter()
+            .any(|effect| matches!(effect, Effect::SaveTextSettings { .. })));
+    }
+
+    #[test]
+    fn the_prompt_plan_reports_the_dropped_terms_against_the_budget() {
+        let mut state = AppState::new();
+        state.prompt_budget = suramak_core::textrules::PromptBudget::measured("tiny", 448);
+        state.prompt_base = None;
+        state.text_settings.glossary = suramak_core::textrules::Glossary::parse(
+            &(0..64)
+                .map(|i| format!("Kecamatan {i}\n"))
+                .collect::<String>(),
+        );
+        state.refresh_prompt_plan();
+        let plan = state.prompt_plan.as_ref().expect("plan");
+        assert_eq!(plan.cap_tokens, 224);
+        assert!(plan.used_tokens <= plan.cap_tokens);
+        assert!(
+            !plan.dropped.is_empty(),
+            "64 terms cannot fit 224 estimated tokens"
+        );
+        assert_eq!(plan.included.len() + plan.dropped.len(), 64);
+        assert!(plan.feedback().is_some());
     }
 }

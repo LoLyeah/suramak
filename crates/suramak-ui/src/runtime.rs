@@ -40,6 +40,9 @@ use suramak_core::polish::{OpenAiCompat, PolishBackend, PolishOutcome};
 use suramak_core::resample;
 use suramak_core::settings::{LangMode, PolishSettings, RecordSource, Settings};
 use suramak_core::store::Store;
+use suramak_core::textrules::{
+    build_prompt, EstimatedTokens, PromptBudget, PromptMeasurement, TextSettings,
+};
 use suramak_core::transcript::Transcript;
 use suramak_playback::{
     peaks, Command as PlaybackCommand, Engine, Peaks, Status as PlaybackStatus,
@@ -92,6 +95,23 @@ pub struct Runtime {
     /// when the job's terminal event is drained (the next job gets a fresh
     /// token).
     job_cancel: Option<CancelToken>,
+    /// M15.5: the stored glossary / dictionary / opt-ins, read once at startup
+    /// and after every save. The transcription path merges the glossary into
+    /// the initial prompt from this copy.
+    text_settings: TextSettings,
+    /// M15.5: the budget the prompt builder uses — the cached measurement for
+    /// the current model, else the documented fallback.
+    prompt_budget: PromptBudget,
+    /// M15.5: a measurement running on a detached thread (the UI polls it).
+    prompt_job: Option<PromptJob>,
+}
+
+/// A prompt-budget measurement on a detached thread; the UI polls it.
+///
+/// Loading a model to tokenize it costs hundreds of milliseconds (tiny) to
+/// seconds (large-v3), so it never runs on the UI thread.
+struct PromptJob {
+    result: Arc<Mutex<Option<Result<PromptMeasurement, String>>>>,
 }
 
 /// A waveform-peaks decode running on a detached thread; the UI polls it.
@@ -177,6 +197,23 @@ impl Runtime {
             Ok(store) => (Some(store), None),
             Err(err) => (None, Some(err)),
         };
+        // M15.5: the text rules and the model's cached prompt measurement. A
+        // failure here is non-fatal: the defaults are the honest "nothing
+        // stored yet" state and the budget stays the documented fallback.
+        let text_settings = store
+            .as_ref()
+            .and_then(|store| store.text_settings().ok())
+            .unwrap_or_default();
+        let prompt_budget = store
+            .as_ref()
+            .and_then(|store| {
+                store
+                    .prompt_measurement(&settings.asr.model_id)
+                    .ok()
+                    .flatten()
+            })
+            .map(|measurement| measurement.budget())
+            .unwrap_or_else(PromptBudget::unmeasured);
         Self {
             store,
             settings,
@@ -193,7 +230,56 @@ impl Runtime {
             playback_error: None,
             peaks: None,
             job_cancel: None,
+            text_settings,
+            prompt_budget,
+            prompt_job: None,
         }
+    }
+
+    /// M15.5: the stored text rules (the settings form seeds from this).
+    pub fn text_settings(&self) -> TextSettings {
+        self.text_settings.clone()
+    }
+
+    /// M15.5: the budget the next job's prompt will be built with.
+    pub fn prompt_budget(&self) -> PromptBudget {
+        self.prompt_budget.clone()
+    }
+
+    /// M15.5: `settings.asr.initial_prompt` — the other consumer of the budget.
+    pub fn prompt_base(&self) -> Option<String> {
+        self.settings
+            .asr
+            .initial_prompt
+            .clone()
+            .filter(|text| !text.trim().is_empty())
+    }
+
+    /// M15.5: the initial prompt a job should send: the configured prompt plus
+    /// the glossary, within the measured budget.
+    ///
+    /// This is the **only** place the two are combined; both transcription call
+    /// sites (live and file jobs) read it, so a term list can never reach one
+    /// path and not the other. `None` when there is nothing to send.
+    fn initial_prompt(&self) -> Option<String> {
+        let plan = build_prompt(
+            self.settings.asr.initial_prompt.as_deref(),
+            &self.text_settings.glossary,
+            &self.prompt_budget,
+            &EstimatedTokens,
+        );
+        plan.prompt().map(str::to_string)
+    }
+
+    /// M15.5: the measurement thread's outcome, once (terminal-once like the
+    /// download and polish polls).
+    pub fn prompt_status(&mut self) -> Option<Result<PromptMeasurement, String>> {
+        let job = self.prompt_job.as_ref()?;
+        let result = job.result.lock().ok().and_then(|guard| guard.clone());
+        if result.is_some() {
+            self.prompt_job = None;
+        }
+        result
     }
 
     /// Whether the Polish action may run: a configured base URL and an API key
@@ -525,6 +611,110 @@ impl Runtime {
                     let result = self.delete_transcript(id);
                     queue.extend(state.on_transcript_deleted(id, result));
                 }
+                // M15.3: one store transaction per structural edit. On success
+                // the UI adopts the stored rows and records the snapshot; on a
+                // refusal nothing changed and the status line says why.
+                Effect::SplitSegment {
+                    transcript,
+                    idx,
+                    caret,
+                } => {
+                    let outcome = self
+                        .store
+                        .as_ref()
+                        .ok_or_else(|| "no library database is open".to_string())
+                        .and_then(|store| {
+                            store
+                                .split_segment(
+                                    transcript,
+                                    idx,
+                                    caret,
+                                    None,
+                                    suramak_core::export::ZeroDuration::OneFrame,
+                                )
+                                .map_err(|err| err.to_string())
+                        });
+                    match outcome {
+                        Ok(snapshot) => match self.transcript(transcript) {
+                            Ok(loaded) => state.on_segment_edit(
+                                snapshot,
+                                suramak_core::segment_edit::EditKind::Split,
+                                loaded,
+                            ),
+                            Err(err) => state.on_segment_edit_failed(err),
+                        },
+                        Err(err) => state.on_segment_edit_failed(err),
+                    }
+                }
+                Effect::MergeSegments {
+                    transcript,
+                    first,
+                    count,
+                    separator,
+                } => {
+                    let outcome = self
+                        .store
+                        .as_ref()
+                        .ok_or_else(|| "no library database is open".to_string())
+                        .and_then(|store| {
+                            store
+                                .merge_segments(transcript, first, count, &separator)
+                                .map_err(|err| err.to_string())
+                        });
+                    match outcome {
+                        Ok(snapshot) => match self.transcript(transcript) {
+                            Ok(loaded) => state.on_segment_edit(
+                                snapshot,
+                                suramak_core::segment_edit::EditKind::Merge,
+                                loaded,
+                            ),
+                            Err(err) => state.on_segment_edit_failed(err),
+                        },
+                        Err(err) => state.on_segment_edit_failed(err),
+                    }
+                }
+                Effect::RestoreSegments {
+                    transcript,
+                    rows,
+                    step,
+                } => {
+                    let outcome = self
+                        .store
+                        .as_ref()
+                        .ok_or_else(|| "no library database is open".to_string())
+                        .and_then(|store| {
+                            store
+                                .restore_segment_rows(transcript, &rows)
+                                .map_err(|err| err.to_string())
+                        });
+                    match outcome {
+                        Ok(()) => match self.transcript(transcript) {
+                            Ok(loaded) => state.on_segments_restored(step, loaded),
+                            Err(err) => state.set_status(err, true),
+                        },
+                        Err(err) => state.set_status(format!("undo failed: {err}"), true),
+                    }
+                }
+                // M15.5: the text rules live in the store, not settings.toml.
+                Effect::SaveTextSettings { settings } => {
+                    let outcome = match self.store.as_ref() {
+                        Some(store) => store
+                            .save_text_settings(&settings)
+                            .map_err(|err| err.to_string()),
+                        None => Err("no library database is open".to_string()),
+                    };
+                    if outcome.is_ok() {
+                        self.text_settings = (*settings).clone();
+                        state.on_initial_prompt_changed();
+                    }
+                    state.on_text_settings_saved(*settings, outcome);
+                }
+                // M15.5: measure on a detached thread; the UI polls
+                // `prompt_status` (never a model load on the UI thread).
+                Effect::MeasurePromptBudget { model_id } => {
+                    self.start_prompt_measurement(&model_id);
+                    state.measuring_prompt = true;
+                }
                 Effect::SetDefaultModel { id } => {
                     let result = self.set_default(&id);
                     queue.extend(state.on_default_set(&id, result));
@@ -561,7 +751,24 @@ impl Runtime {
                     // The form may have changed the polish base URL/key note —
                     // refresh the action's enable from the new snapshot.
                     state.polish_configured = self.polish_configured();
+                    // M15.5: a new default model has its own measured budget (or
+                    // none — then the documented fallback, which says so).
+                    self.prompt_budget = self
+                        .store
+                        .as_ref()
+                        .and_then(|store| {
+                            store
+                                .prompt_measurement(&self.settings.asr.model_id)
+                                .ok()
+                                .flatten()
+                        })
+                        .map(|measurement| measurement.budget())
+                        .unwrap_or_else(PromptBudget::unmeasured);
                     state.on_settings_saved(result);
+                    // The budget changed; the plan shown must follow. The form's
+                    // text fields are not touched here — their own save path
+                    // owns them.
+                    state.on_prompt_budget_changed(self.prompt_budget.clone());
                 }
                 Effect::PolishTranscript { transcript } => {
                     if let Err(err) = self.start_polish(*transcript) {
@@ -721,7 +928,7 @@ impl Runtime {
             live::LiveDecodeSettings {
                 model_path,
                 lang,
-                initial_prompt: self.settings.asr.initial_prompt.clone(),
+                initial_prompt: self.initial_prompt(),
                 plan,
                 n_threads: suramak_asr::whisper::default_threads(),
             },
@@ -1195,7 +1402,7 @@ impl Runtime {
             input,
             model_path,
             lang,
-            initial_prompt: self.settings.asr.initial_prompt.clone(),
+            initial_prompt: self.initial_prompt(),
             engine: self.settings.asr.engine,
             fast_engine: self.settings.asr.fast_engine,
             cancel: cancel.clone(),
@@ -1218,6 +1425,50 @@ impl Runtime {
             .ok_or_else(|| "library database unavailable".to_string())?
             .insert_transcript(transcript)
             .map_err(|err| err.to_string())
+    }
+
+    /// The stored transcript, read back after a committed structural edit.
+    fn transcript(&self, id: Uuid) -> Result<Transcript, String> {
+        self.store
+            .as_ref()
+            .ok_or_else(|| "library database unavailable".to_string())?
+            .get_transcript(id)
+            .map_err(|err| err.to_string())
+    }
+
+    /// Starts a prompt-budget measurement on a detached thread. A second
+    /// request while one is running is ignored (the settings control is
+    /// disabled anyway).
+    fn start_prompt_measurement(&mut self, model_id: &str) {
+        if self.prompt_job.is_some() {
+            return;
+        }
+        let Some(path) = suramak_asr::prompt_budget::model_path_for(model_id) else {
+            // No file → report the failure through the same poll path so the UI
+            // has exactly one place to read the outcome.
+            let slot: Arc<Mutex<Option<Result<PromptMeasurement, String>>>> = Arc::new(Mutex::new(
+                Some(Err(format!("no model file on disk for {model_id}"))),
+            ));
+            self.prompt_job = Some(PromptJob { result: slot });
+            return;
+        };
+        let slot: Arc<Mutex<Option<Result<PromptMeasurement, String>>>> =
+            Arc::new(Mutex::new(None));
+        let result = slot.clone();
+        let id = model_id.to_string();
+        let ctx = self.ctx.clone();
+        thread::Builder::new()
+            .name("suramak-prompt-budget".to_string())
+            .spawn(move || {
+                let measured = suramak_asr::prompt_budget::measure_model(&path, &id)
+                    .map_err(|err| err.to_string());
+                if let Ok(mut guard) = result.lock() {
+                    *guard = Some(measured);
+                }
+                ctx.request_repaint();
+            })
+            .ok();
+        self.prompt_job = Some(PromptJob { result: slot });
     }
 
     /// Deletes a transcript from the store (its segments cascade).

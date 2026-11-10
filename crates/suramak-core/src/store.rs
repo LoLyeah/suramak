@@ -3,6 +3,9 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 use uuid::Uuid;
 
+use crate::export::ZeroDuration;
+use crate::segment_edit::{merge_rows, split_rows, EditError, SegmentRow, SegmentSnapshot};
+use crate::textrules::{Correction, Dictionary, Glossary, PromptMeasurement, TextSettings};
 use crate::transcript::{Segment, Transcript};
 use crate::SuramakError;
 
@@ -13,7 +16,11 @@ use crate::SuramakError;
 /// - **v2** — M15.1, additive only: `segments.source_text` keeps the first text
 ///   ever stored for a row (the inference output), while `segments.text` carries
 ///   what the editor/polish may rewrite. No table is dropped or rebuilt.
-pub const SCHEMA_VERSION: i64 = 2;
+/// - **v3** — M15.3/M15.5, additive only: `segments.derived` marks how a row's
+///   `text` came to be (`split`/`merge`/…); `glossary_terms`,
+///   `dictionary_entries`, `text_prefs` and `prompt_budgets` hold M15.5's own
+///   data. No table is dropped or rebuilt.
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// SQLite-backed transcript library with WAL mode.
 pub struct Store {
@@ -77,7 +84,31 @@ impl Store {
                  end_ms        INTEGER NOT NULL,
                  text          TEXT    NOT NULL,
                  source_text   TEXT,
+                 derived       TEXT    NOT NULL DEFAULT '',
                  PRIMARY KEY (transcript_id, idx)
+             );
+             -- M15.5: the user's own data. Additive; nothing here is derived
+             -- from a transcript.
+             CREATE TABLE IF NOT EXISTS glossary_terms (
+                 position   INTEGER PRIMARY KEY,
+                 term       TEXT NOT NULL,
+                 created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS dictionary_entries (
+                 position   INTEGER PRIMARY KEY,
+                 from_text  TEXT NOT NULL,
+                 to_text    TEXT NOT NULL,
+                 created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS text_prefs (
+                 key   TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS prompt_budgets (
+                 model_id    TEXT PRIMARY KEY,
+                 n_text_ctx  INTEGER NOT NULL,
+                 cap_tokens  INTEGER NOT NULL,
+                 measured_at TEXT NOT NULL
              );",
         )?;
         self.migrate()
@@ -85,11 +116,10 @@ impl Store {
 
     /// Brings an existing library up to [`SCHEMA_VERSION`], in place.
     ///
-    /// Only one migration exists today: v1 → v2 adds `segments.source_text` and
-    /// backfills it from `text` (the only copy of the inference output a v1
-    /// database has). It is additive — no table is rebuilt and no row is
-    /// deleted — and idempotent: a fresh database is created at v2, a v1
-    /// database is altered once, and a v2 database is left untouched.
+    /// Every step is additive and idempotent: no table is rebuilt and no row is
+    /// deleted. Each step runs in its own transaction and stamps the version it
+    /// reaches, so an interrupted upgrade lands on a coherent older schema that
+    /// the next open continues from (never a half-altered one).
     ///
     /// A database from a *newer* build is refused instead of guessed at: the
     /// older binary must not write to a schema it does not understand.
@@ -104,13 +134,9 @@ impl Store {
             .optional()?;
 
         let version = match version {
-            None => {
-                // Fresh database (the DDL above already created v2) or a very
-                // old one without the marker: `upgrade` is idempotent, so both
-                // land on v2 with the column present and backfilled.
-                self.upgrade_to_v2()?;
-                return Ok(());
-            }
+            // A fresh database (the DDL above already created v3) or a very old
+            // one without the marker: both are brought forward step by step.
+            None => 0,
             Some(raw) => raw.parse::<i64>().map_err(|_| {
                 SuramakError::Schema(format!(
                     "meta.schema_version is not a number ({raw:?}); refusing to guess"
@@ -124,10 +150,13 @@ impl Store {
                  open it with the newer Suramak build"
             )));
         }
-        if version == SCHEMA_VERSION {
-            return Ok(());
+        if version < 2 {
+            self.upgrade_to_v2()?;
         }
-        self.upgrade_to_v2()
+        if version < 3 {
+            self.upgrade_to_v3()?;
+        }
+        Ok(())
     }
 
     /// v0/v1 → v2, in one transaction: add `source_text` when absent, backfill it
@@ -141,6 +170,46 @@ impl Store {
         tx.execute(
             "UPDATE segments SET source_text = text WHERE source_text IS NULL",
             [],
+        )?;
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params!["2"],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// v2 → v3, in one transaction: the `derived` marker plus M15.5's own
+    /// tables. All additive; `CREATE TABLE IF NOT EXISTS` makes a database
+    /// created by this build's DDL a no-op here.
+    fn upgrade_to_v3(&self) -> Result<(), SuramakError> {
+        let tx = self.conn.unchecked_transaction()?;
+        if !Self::column_exists(&tx, "segments", "derived")? {
+            tx.execute_batch("ALTER TABLE segments ADD COLUMN derived TEXT NOT NULL DEFAULT ''")?;
+        }
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS glossary_terms (
+                 position   INTEGER PRIMARY KEY,
+                 term       TEXT NOT NULL,
+                 created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS dictionary_entries (
+                 position   INTEGER PRIMARY KEY,
+                 from_text  TEXT NOT NULL,
+                 to_text    TEXT NOT NULL,
+                 created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS text_prefs (
+                 key   TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS prompt_budgets (
+                 model_id    TEXT PRIMARY KEY,
+                 n_text_ctx  INTEGER NOT NULL,
+                 cap_tokens  INTEGER NOT NULL,
+                 measured_at TEXT NOT NULL
+             );",
         )?;
         tx.execute(
             "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
@@ -362,6 +431,345 @@ impl Store {
                 Err(err)
             }
         }
+    }
+
+    // ---- M15.3: transactional segment structure ---------------------------
+
+    /// Every row of a transcript, provenance included, in `idx` order.
+    pub fn segment_rows(&self, id: Uuid) -> Result<Vec<SegmentRow>, SuramakError> {
+        Self::read_rows(&self.conn, id)
+    }
+
+    fn read_rows(conn: &Connection, id: Uuid) -> Result<Vec<SegmentRow>, SuramakError> {
+        let mut stmt = conn.prepare(
+            "SELECT idx, start_ms, end_ms, text, source_text, derived FROM segments
+             WHERE transcript_id = ?1 ORDER BY idx",
+        )?;
+        let rows = stmt.query_map(params![id.to_string()], |row| {
+            Ok(SegmentRow {
+                idx: row.get(0)?,
+                start_ms: row.get(1)?,
+                end_ms: row.get(2)?,
+                text: row.get(3)?,
+                source_text: row.get(4)?,
+                derived: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(SuramakError::Sqlite)
+    }
+
+    /// Replaces the whole row set of one transcript (inside the caller's
+    /// transaction): every row is written with its own `source_text` and
+    /// `derived`, never through the `COALESCE` upsert path, because a structural
+    /// edit has already decided the provenance of each resulting row.
+    fn replace_rows(conn: &Connection, id: Uuid, rows: &[SegmentRow]) -> Result<(), SuramakError> {
+        conn.execute(
+            "DELETE FROM segments WHERE transcript_id = ?1",
+            params![id.to_string()],
+        )?;
+        let mut stmt = conn.prepare(
+            "INSERT INTO segments(transcript_id, idx, start_ms, end_ms, text, source_text, derived)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
+        for row in rows {
+            stmt.execute(params![
+                id.to_string(),
+                row.idx,
+                row.start_ms,
+                row.end_ms,
+                row.text,
+                row.source_text,
+                row.derived,
+            ])?;
+        }
+        Ok(())
+    }
+
+    /// The one transactional frame every structural edit shares.
+    ///
+    /// Reads the row set, lets `mutate` derive the next one (pure, fallible),
+    /// then writes it back with the `updated_at` touch **in one savepoint**. A
+    /// refusal from `mutate` returns before any write; a write failure rolls the
+    /// whole set back. Either way the transcript is the old set or the new one,
+    /// never a mix — and a fresh app session reads exactly one of them, because
+    /// SQLite commits the savepoint atomically.
+    fn transact_rows<F>(&self, id: Uuid, mutate: F) -> Result<SegmentSnapshot, SuramakError>
+    where
+        F: FnOnce(&[SegmentRow]) -> Result<Vec<SegmentRow>, EditError>,
+    {
+        self.conn.execute_batch("SAVEPOINT segment_tx")?;
+        let written = (|| -> Result<SegmentSnapshot, SuramakError> {
+            let before = Self::read_rows(&self.conn, id)?;
+            if before.is_empty() {
+                // An unknown transcript and an empty one are the same refusal:
+                // nothing to edit, nothing to write.
+                return Err(SuramakError::SegmentEdit(EditError::NotFound(0)));
+            }
+            let after = mutate(&before)?;
+            Self::replace_rows(&self.conn, id, &after)?;
+            self.conn.execute(
+                "UPDATE transcripts SET updated_at = ?1 WHERE id = ?2",
+                params![Utc::now().to_rfc3339(), id.to_string()],
+            )?;
+            Ok(SegmentSnapshot {
+                transcript_id: id,
+                before,
+                after,
+            })
+        })();
+        match written {
+            Ok(snapshot) => {
+                self.conn.execute_batch("RELEASE segment_tx")?;
+                Ok(snapshot)
+            }
+            Err(err) => {
+                let _ = self
+                    .conn
+                    .execute_batch("ROLLBACK TO segment_tx; RELEASE segment_tx");
+                Err(err)
+            }
+        }
+    }
+
+    /// Splits segment `idx` at a byte caret in its **current** text, in one
+    /// transaction, and returns the before/after rows for the undo log.
+    ///
+    /// All validation is [`crate::segment_edit::split_rows`]'s; a refusal writes
+    /// nothing. `at_ms` defaults to the span midpoint; a zero/negative-duration
+    /// segment follows `policy` (the exporter's own [`ZeroDuration`]).
+    pub fn split_segment(
+        &self,
+        id: Uuid,
+        idx: u32,
+        caret: usize,
+        at_ms: Option<i64>,
+        policy: ZeroDuration,
+    ) -> Result<SegmentSnapshot, SuramakError> {
+        self.transact_rows(id, |rows| split_rows(rows, idx, caret, at_ms, policy))
+    }
+
+    /// Merges `count` contiguous rows starting at `first`, in one transaction.
+    pub fn merge_segments(
+        &self,
+        id: Uuid,
+        first: u32,
+        count: u32,
+        separator: &str,
+    ) -> Result<SegmentSnapshot, SuramakError> {
+        self.transact_rows(id, |rows| merge_rows(rows, first, count, separator))
+    }
+
+    /// Writes a row set back verbatim (undo/redo of a [`SegmentSnapshot`]).
+    ///
+    /// This is the exact inverse of a structural edit: the rows are the ones the
+    /// transaction recorded, so no re-derivation can drift. One savepoint,
+    /// `updated_at` touched like any other modification.
+    pub fn restore_segment_rows(&self, id: Uuid, rows: &[SegmentRow]) -> Result<(), SuramakError> {
+        self.conn.execute_batch("SAVEPOINT segment_restore")?;
+        let written = (|| -> Result<(), SuramakError> {
+            Self::replace_rows(&self.conn, id, rows)?;
+            self.conn.execute(
+                "UPDATE transcripts SET updated_at = ?1 WHERE id = ?2",
+                params![Utc::now().to_rfc3339(), id.to_string()],
+            )?;
+            Ok(())
+        })();
+        match written {
+            Ok(()) => {
+                self.conn.execute_batch("RELEASE segment_restore")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self
+                    .conn
+                    .execute_batch("ROLLBACK TO segment_restore; RELEASE segment_restore");
+                Err(err)
+            }
+        }
+    }
+
+    // ---- M15.5: the stored text rules --------------------------------------
+
+    /// The stored glossary terms, in stored order.
+    pub fn glossary_terms(&self) -> Result<Vec<String>, SuramakError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT term FROM glossary_terms ORDER BY position")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(SuramakError::Sqlite)
+    }
+
+    /// The stored dictionary entries, in stored order.
+    pub fn dictionary_entries(&self) -> Result<Vec<Correction>, SuramakError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT from_text, to_text FROM dictionary_entries ORDER BY position")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Correction {
+                from: row.get(0)?,
+                to: row.get(1)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(SuramakError::Sqlite)
+    }
+
+    /// Reads a text preference (`None` when it was never set).
+    pub fn text_pref(&self, key: &str) -> Result<Option<String>, SuramakError> {
+        let value = self
+            .conn
+            .query_row(
+                "SELECT value FROM text_prefs WHERE key = ?1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(value)
+    }
+
+    /// Writes a text preference (upsert).
+    pub fn set_text_pref(&self, key: &str, value: &str) -> Result<(), SuramakError> {
+        self.conn.execute(
+            "INSERT INTO text_prefs(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Every M15.5 setting, in one read.
+    pub fn text_settings(&self) -> Result<TextSettings, SuramakError> {
+        let glossary = Glossary::parse(&self.glossary_terms()?.join("\n"));
+        let dictionary = Dictionary::parse(
+            &self
+                .dictionary_entries()?
+                .iter()
+                .map(|entry| format!("{} = {}", entry.from, entry.to))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        Ok(TextSettings {
+            glossary,
+            dictionary,
+            normalize: self.text_pref("normalize")?.as_deref() == Some("1"),
+            clean_dictionary: self.text_pref("clean_dictionary")?.as_deref() == Some("1"),
+            clean_whitespace: self.text_pref("clean_whitespace")?.as_deref() == Some("1"),
+            merge_separator: self
+                .text_pref("merge_separator")?
+                .unwrap_or_else(|| " ".to_string()),
+        })
+    }
+
+    /// Replaces every M15.5 setting in one transaction (form save).
+    pub fn save_text_settings(&self, settings: &TextSettings) -> Result<(), SuramakError> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute_batch("SAVEPOINT text_settings")?;
+        let written = (|| -> Result<(), SuramakError> {
+            self.conn.execute("DELETE FROM glossary_terms", params![])?;
+            for (position, term) in settings.glossary.terms().iter().enumerate() {
+                self.conn.execute(
+                    "INSERT INTO glossary_terms(position, term, created_at) VALUES (?1, ?2, ?3)",
+                    params![position as i64, term, now],
+                )?;
+            }
+            self.conn
+                .execute("DELETE FROM dictionary_entries", params![])?;
+            for (position, entry) in settings.dictionary.entries().iter().enumerate() {
+                self.conn.execute(
+                    "INSERT INTO dictionary_entries(position, from_text, to_text, created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![position as i64, entry.from, entry.to, now],
+                )?;
+            }
+            for (key, value) in [
+                ("normalize", settings.normalize),
+                ("clean_dictionary", settings.clean_dictionary),
+                ("clean_whitespace", settings.clean_whitespace),
+            ] {
+                self.conn.execute(
+                    "INSERT INTO text_prefs(key, value) VALUES (?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![key, if value { "1" } else { "0" }],
+                )?;
+            }
+            self.conn.execute(
+                "INSERT INTO text_prefs(key, value) VALUES ('merge_separator', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![settings.merge_separator],
+            )?;
+            Ok(())
+        })();
+        match written {
+            Ok(()) => {
+                self.conn.execute_batch("RELEASE text_settings")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self
+                    .conn
+                    .execute_batch("ROLLBACK TO text_settings; RELEASE text_settings");
+                Err(err)
+            }
+        }
+    }
+
+    /// The cached prompt-budget measurement for `model_id`, when one exists.
+    pub fn prompt_measurement(
+        &self,
+        model_id: &str,
+    ) -> Result<Option<PromptMeasurement>, SuramakError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT n_text_ctx, cap_tokens, measured_at FROM prompt_budgets WHERE model_id = ?1",
+                params![model_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i32>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((n_text_ctx, cap_tokens, measured_at)) = row else {
+            return Ok(None);
+        };
+        let measured_at = measured_at.parse().map_err(|_| {
+            SuramakError::Schema(format!(
+                "prompt_budgets.measured_at is not a timestamp ({measured_at:?})"
+            ))
+        })?;
+        Ok(Some(PromptMeasurement {
+            model_id: model_id.to_string(),
+            n_text_ctx,
+            cap_tokens: cap_tokens as usize,
+            measured_at,
+        }))
+    }
+
+    /// Records a measurement (upsert; one row per model).
+    pub fn record_prompt_measurement(
+        &self,
+        measurement: &PromptMeasurement,
+    ) -> Result<(), SuramakError> {
+        self.conn.execute(
+            "INSERT INTO prompt_budgets(model_id, n_text_ctx, cap_tokens, measured_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(model_id) DO UPDATE SET
+                 n_text_ctx  = excluded.n_text_ctx,
+                 cap_tokens  = excluded.cap_tokens,
+                 measured_at = excluded.measured_at",
+            params![
+                measurement.model_id,
+                measurement.n_text_ctx,
+                measurement.cap_tokens as i64,
+                measurement.measured_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
     }
 
     /// Returns a transcript by id (with all segments).
@@ -938,5 +1346,409 @@ mod tests {
 
         // Deleting again reports not-found instead of silently succeeding.
         assert!(store.delete_transcript(doomed.id).is_err());
+    }
+
+    // ---- M15.3: transactional split/merge -----------------------------------
+
+    /// A three-row transcript whose texts all contain searchable words.
+    fn split_sample() -> Transcript {
+        Transcript::new(
+            "split.wav".to_string(),
+            Source::File {
+                name: "split.wav".to_string(),
+            },
+            "tiny".to_string(),
+            Some("id".to_string()),
+            None,
+            vec![
+                Segment {
+                    idx: 0,
+                    start_ms: 0,
+                    end_ms: 1_000,
+                    text: "halo dunia".to_string(),
+                },
+                Segment {
+                    idx: 1,
+                    start_ms: 1_000,
+                    end_ms: 2_000,
+                    text: "selamat pagi semua".to_string(),
+                },
+                Segment {
+                    idx: 2,
+                    start_ms: 2_000,
+                    end_ms: 3_000,
+                    text: "terima kasih".to_string(),
+                },
+            ],
+        )
+    }
+
+    fn row_texts(rows: &[SegmentRow]) -> Vec<&str> {
+        rows.iter().map(|row| row.text.as_str()).collect()
+    }
+
+    #[test]
+    fn a_split_persists_two_rows_and_leaves_every_other_row_untouched() {
+        let store = Store::open_in_memory().expect("store");
+        let t = split_sample();
+        store.insert_transcript(&t).unwrap();
+        let before = store.segment_rows(t.id).unwrap();
+
+        let snapshot = store
+            .split_segment(t.id, 1, 7, Some(1_500), ZeroDuration::OneFrame)
+            .expect("split");
+        assert_eq!(
+            snapshot.before, before,
+            "the snapshot is the pre-edit row set"
+        );
+        assert_eq!(snapshot.after.len(), 4);
+        assert_eq!(snapshot.delta(), 1);
+
+        let rows = store.segment_rows(t.id).unwrap();
+        assert_eq!(
+            row_texts(&rows),
+            vec!["halo dunia", "selamat", "pagi semua", "terima kasih"]
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.idx).collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        assert_eq!((rows[1].start_ms, rows[1].end_ms), (1_000, 1_500));
+        assert_eq!((rows[2].start_ms, rows[2].end_ms), (1_500, 2_000));
+        assert_eq!(rows[1].derived, "split");
+        assert_eq!(
+            rows[1].source_text.as_deref(),
+            Some("selamat pagi semua"),
+            "the parent's inference text survives on the left half"
+        );
+        assert_eq!(
+            rows[2].source_text.as_deref(),
+            Some("selamat pagi semua"),
+            "…and on the right half"
+        );
+        // Unrelated rows are byte-identical, provenance included.
+        assert_eq!(rows[0], before[0]);
+        assert_eq!(rows[3].text, before[2].text);
+        assert_eq!(rows[3].source_text, before[2].source_text);
+
+        // The store's own read path agrees with the row read.
+        let reread = store.get_transcript(t.id).unwrap();
+        assert_eq!(reread.segments.len(), 4);
+        assert_eq!(reread.segments[2].text, "pagi semua");
+    }
+
+    #[test]
+    fn search_stays_consistent_after_each_structural_edit() {
+        let store = Store::open_in_memory().expect("store");
+        let t = split_sample();
+        store.insert_transcript(&t).unwrap();
+        assert_eq!(store.search("pagi").unwrap().len(), 1, "before the split");
+
+        // Split: both halves are in the same transcript, so the transcript is
+        // still one hit; the scanner reads the new rows, not a stale index.
+        store
+            .split_segment(t.id, 1, 7, None, ZeroDuration::OneFrame)
+            .unwrap();
+        let hits = store.search("pagi").unwrap();
+        assert_eq!(hits.len(), 1);
+        let rows = store.segment_rows(t.id).unwrap();
+        assert_eq!(
+            rows.iter().filter(|row| row.text.contains("pagi")).count(),
+            1,
+            "the word still lives in exactly one row after the split"
+        );
+        assert_eq!(store.search("selamat").unwrap().len(), 1);
+
+        // A word only an edited row had before is gone from search once the
+        // edit removes it — no index is holding the old text.
+        store.update_segment_text(t.id, 0, "hai").unwrap();
+        assert!(store.search("halo").unwrap().is_empty());
+        assert_eq!(store.search("hai").unwrap().len(), 1);
+
+        // Merge the two halves back: the joined text is searchable as one row.
+        store.merge_segments(t.id, 1, 2, " ").unwrap();
+        assert_eq!(store.search("pagi semua").unwrap().len(), 1);
+        assert_eq!(store.search("selamat pagi").unwrap().len(), 1);
+        assert_eq!(store.segment_rows(t.id).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_refused_split_writes_nothing_and_reports_the_rule() {
+        let store = Store::open_in_memory().expect("store");
+        let t = split_sample();
+        store.insert_transcript(&t).unwrap();
+        let before = store.segment_rows(t.id).unwrap();
+
+        // No whitespace in the whole text: no word boundary to cut.
+        store
+            .update_segment_text(t.id, 2, "pertanggungjawaban")
+            .unwrap();
+        let after_edit = store.segment_rows(t.id).unwrap();
+        let err = store
+            .split_segment(t.id, 2, 5, None, ZeroDuration::OneFrame)
+            .expect_err("no boundary");
+        assert!(
+            matches!(err, SuramakError::SegmentEdit(EditError::NoWordBoundary)),
+            "{err}"
+        );
+        assert_eq!(store.segment_rows(t.id).unwrap(), after_edit);
+
+        // A caret outside the text is an empty half, not a panic.
+        let err = store
+            .split_segment(t.id, 1, 0, None, ZeroDuration::OneFrame)
+            .expect_err("empty side");
+        assert!(matches!(
+            err,
+            SuramakError::SegmentEdit(EditError::EmptySide)
+        ));
+        // A cut outside the span is a crossing, not a negative cue.
+        let err = store
+            .split_segment(t.id, 1, 7, Some(9_000), ZeroDuration::OneFrame)
+            .expect_err("crossing");
+        assert!(matches!(
+            err,
+            SuramakError::SegmentEdit(EditError::CrossingBoundary { .. })
+        ));
+        assert_eq!(
+            store.segment_rows(t.id).unwrap()[..2],
+            before[..2],
+            "refusals leave the transcript exactly as it was"
+        );
+    }
+
+    #[test]
+    fn a_zero_duration_segment_follows_the_skip_policy_in_the_store() {
+        let store = Store::open_in_memory().expect("store");
+        let mut t = split_sample();
+        t.segments[1].end_ms = t.segments[1].start_ms;
+        store.insert_transcript(&t).unwrap();
+
+        let err = store
+            .split_segment(t.id, 1, 7, None, ZeroDuration::Skip)
+            .expect_err("Skip refuses");
+        assert!(matches!(
+            err,
+            SuramakError::SegmentEdit(EditError::ZeroDuration { .. })
+        ));
+        // OneFrame widens to 40 ms and splits it.
+        let snapshot = store
+            .split_segment(t.id, 1, 7, None, ZeroDuration::OneFrame)
+            .expect("OneFrame splits");
+        let rows = &snapshot.after;
+        assert_eq!(rows[1].start_ms, 1_000);
+        assert_eq!(rows[2].end_ms, 1_040);
+    }
+
+    #[test]
+    fn a_merge_persists_one_row_and_keeps_provenance() {
+        let store = Store::open_in_memory().expect("store");
+        let t = split_sample();
+        store.insert_transcript(&t).unwrap();
+
+        let snapshot = store.merge_segments(t.id, 0, 2, "\n").expect("merge");
+        assert_eq!(snapshot.after.len(), 2);
+        let rows = store.segment_rows(t.id).unwrap();
+        assert_eq!(
+            row_texts(&rows),
+            vec!["halo dunia\nselamat pagi semua", "terima kasih"]
+        );
+        assert_eq!((rows[0].start_ms, rows[0].end_ms), (0, 2_000));
+        assert_eq!(rows[0].derived, "merge");
+        assert_eq!(
+            rows[0].source_text.as_deref(),
+            Some("halo dunia\nselamat pagi semua")
+        );
+        // The tail row's content is untouched; only its idx shifted down.
+        assert_eq!(rows[1].text, snapshot.before[2].text);
+        assert_eq!(rows[1].start_ms, snapshot.before[2].start_ms);
+        assert_eq!(rows[1].source_text, snapshot.before[2].source_text);
+        assert_eq!(rows[1].derived, "");
+    }
+
+    #[test]
+    fn undo_restores_the_exact_rows_and_redo_puts_them_back() {
+        let store = Store::open_in_memory().expect("store");
+        let t = split_sample();
+        store.insert_transcript(&t).unwrap();
+        let original = store.segment_rows(t.id).unwrap();
+
+        let split = store
+            .split_segment(t.id, 0, 5, None, ZeroDuration::OneFrame)
+            .unwrap();
+        let split_rows_now = store.segment_rows(t.id).unwrap();
+        assert_eq!(split_rows_now.len(), 4);
+
+        // Undo = write the recorded `before` set verbatim.
+        store.restore_segment_rows(t.id, &split.before).unwrap();
+        assert_eq!(store.segment_rows(t.id).unwrap(), original);
+        // The transcript is still one row set for search and reads.
+        assert_eq!(store.get_transcript(t.id).unwrap().segments.len(), 3);
+
+        // Redo = write the recorded `after` set.
+        store.restore_segment_rows(t.id, &split.after).unwrap();
+        assert_eq!(store.segment_rows(t.id).unwrap(), split_rows_now);
+
+        // A merge's snapshot round-trips the same way.
+        let merged = store.merge_segments(t.id, 0, 3, " ").unwrap();
+        store.restore_segment_rows(t.id, &merged.before).unwrap();
+        assert_eq!(store.segment_rows(t.id).unwrap(), split_rows_now);
+    }
+
+    #[test]
+    fn a_failed_structural_write_rolls_the_whole_set_back() {
+        let store = Store::open_in_memory().expect("store");
+        let t = split_sample();
+        store.insert_transcript(&t).unwrap();
+        let before = store.segment_rows(t.id).unwrap();
+
+        // Abort the *second* insert: the delete and the first row are already
+        // written when the trigger fires.
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER refuse_second_row BEFORE INSERT ON segments
+                 WHEN NEW.idx = 2 BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )
+            .unwrap();
+        let err = store
+            .split_segment(t.id, 1, 7, None, ZeroDuration::OneFrame)
+            .expect_err("the trigger aborts the split");
+        assert!(format!("{err}").contains("boom"), "{err}");
+        assert_eq!(
+            store.segment_rows(t.id).unwrap(),
+            before,
+            "no partially-applied transaction may survive"
+        );
+    }
+
+    #[test]
+    fn a_reopened_store_reads_only_committed_rows() {
+        // The "fresh app session" gate: a split is committed or it is not, and
+        // a second connection sees exactly the committed set.
+        let dir = std::env::temp_dir().join(format!("suramak-split-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("suramak.db");
+
+        let t = split_sample();
+        {
+            let store = Store::open(&path).expect("store");
+            store.insert_transcript(&t).unwrap();
+            store
+                .split_segment(t.id, 1, 7, Some(1_500), ZeroDuration::OneFrame)
+                .unwrap();
+            store.checkpoint().unwrap();
+        }
+        let reopened = Store::open(&path).expect("reopen");
+        let rows = reopened.segment_rows(t.id).unwrap();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[1].text, "selamat");
+        assert_eq!(rows[2].text, "pagi semua");
+        assert_eq!(reopened.get_transcript(t.id).unwrap().segments.len(), 4);
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_v2_database_upgrades_to_v3_additively() {
+        let dir = std::env::temp_dir().join(format!("suramak-v2v3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v2.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE transcripts (
+                     id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at TEXT NOT NULL,
+                     updated_at TEXT NOT NULL, source_json TEXT NOT NULL,
+                     model TEXT NOT NULL, language TEXT, audio_path TEXT);
+                 CREATE TABLE segments (
+                     transcript_id TEXT NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
+                     idx INTEGER NOT NULL, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL,
+                     text TEXT NOT NULL, source_text TEXT,
+                     PRIMARY KEY (transcript_id, idx));
+                 INSERT INTO meta(key, value) VALUES ('schema_version', '2');
+                 INSERT INTO transcripts VALUES (
+                     '00000000-0000-0000-0000-000000000001', 'old.wav',
+                     '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00',
+                     '{\"type\":\"file\",\"name\":\"old.wav\"}', 'tiny', 'id', NULL);
+                 INSERT INTO segments VALUES (
+                     '00000000-0000-0000-0000-000000000001', 0, 0, 1000, 'halo', 'halo');",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).expect("upgrade");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let rows = store
+            .segment_rows(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap())
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "halo");
+        assert_eq!(rows[0].source_text.as_deref(), Some("halo"));
+        assert_eq!(rows[0].derived, "", "existing rows start unmarked");
+        // The v3 tables exist and answer.
+        assert!(store.glossary_terms().unwrap().is_empty());
+        assert!(store.text_settings().unwrap().dictionary.is_empty());
+        assert_eq!(store.prompt_measurement("tiny").unwrap(), None);
+
+        // Idempotent: a second open is a no-op at the same version.
+        drop(store);
+        let again = Store::open(&path).expect("reopen");
+        assert_eq!(again.schema_version().unwrap(), SCHEMA_VERSION);
+        drop(again);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- M15.5: stored text rules -------------------------------------------
+
+    #[test]
+    fn the_text_settings_round_trip_through_the_store() {
+        let store = Store::open_in_memory().expect("store");
+        let settings = TextSettings {
+            glossary: Glossary::parse("Kecamatan Cilandak\nBPJS Kesehatan"),
+            dictionary: Dictionary::parse("BPJS = Badan Penyelenggara Jaminan Sosial"),
+            normalize: true,
+            clean_dictionary: true,
+            clean_whitespace: false,
+            merge_separator: " · ".to_string(),
+        };
+        store.save_text_settings(&settings).unwrap();
+        let loaded = store.text_settings().unwrap();
+        assert_eq!(loaded, settings);
+
+        // Replacing is a replacement, not an append.
+        let replaced = TextSettings {
+            glossary: Glossary::parse("Jakarta"),
+            ..TextSettings::default()
+        };
+        store.save_text_settings(&replaced).unwrap();
+        assert_eq!(store.glossary_terms().unwrap(), ["Jakarta"]);
+        assert!(store.dictionary_entries().unwrap().is_empty());
+        assert!(!store.text_settings().unwrap().normalize);
+    }
+
+    #[test]
+    fn a_prompt_measurement_round_trips_and_upserts() {
+        let store = Store::open_in_memory().expect("store");
+        assert_eq!(store.prompt_measurement("ggml-tiny").unwrap(), None);
+
+        let first = PromptMeasurement::new("ggml-tiny", 448);
+        store.record_prompt_measurement(&first).unwrap();
+        let loaded = store.prompt_measurement("ggml-tiny").unwrap().expect("row");
+        assert_eq!(loaded.n_text_ctx, 448);
+        assert_eq!(loaded.cap_tokens, 224);
+        assert_eq!(loaded.budget().cap_tokens(), 224);
+        assert_eq!(loaded.model_id, "ggml-tiny");
+
+        // A re-measurement overwrites the row rather than duplicating it.
+        let second = PromptMeasurement::new("ggml-tiny", 448);
+        store.record_prompt_measurement(&second).unwrap();
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM prompt_budgets", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

@@ -28,6 +28,7 @@ pub mod live;
 pub mod mix;
 pub mod parakeet;
 pub mod pipeline;
+pub mod prompt_budget;
 pub mod speech_transcriber;
 pub mod whisper;
 pub mod worker;
@@ -37,6 +38,7 @@ pub use engine::{resolve_engine, resolve_for, EngineAvailability, EngineDecision
 pub use live::{LiveConfig, LiveDecodeSettings, LiveDecoder, LiveResult, LiveSession, LiveWindow};
 pub use parakeet::{ParakeetCache, ParakeetRecognizer, ParakeetResult};
 pub use pipeline::{model_id_from_path, parse_lang, transcribe_file, PipelineOutcome};
+pub use prompt_budget::{measure_model, ModelTokenizer};
 pub use speech_transcriber::{
     SpeechTranscriberEngine, SttAssetState, SttAuthorization, SttResult, SttSpan,
 };

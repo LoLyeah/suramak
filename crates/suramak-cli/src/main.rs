@@ -33,6 +33,8 @@ enum Command {
     Export(cmd::export::ExportArgs),
     /// Polish a stored transcript with an OpenAI-compatible LLM
     Polish(cmd::polish::PolishArgs),
+    /// Measure a model's Whisper prompt budget and tokenize text with it
+    PromptBudget(cmd::prompt_budget::PromptBudgetArgs),
     /// Check data dir, database, models and settings (creates missing dirs)
     Doctor,
     /// List input audio devices (requires a build with the `capture` feature)
@@ -58,6 +60,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Library(cmd) => cmd::library::run(cmd),
         Command::Export(args) => cmd::export::run(args),
         Command::Polish(args) => cmd::polish::run(args),
+        Command::PromptBudget(args) => cmd::prompt_budget::run(args),
         Command::Doctor => cmd::doctor::run(),
         Command::Devices => cmd::devices::run(),
     }

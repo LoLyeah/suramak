@@ -142,6 +142,19 @@ pub struct SettingsForm {
     /// M9c: when the last successful save landed — the view plays the one-shot
     /// "applied" confirm pulse around Save, then clears this.
     pub applied_at: Option<std::time::Instant>,
+    // ---- M15.5: the text rules (stored in the library, not settings.toml) ---
+    /// Glossary field: one term per line.
+    pub glossary_text: String,
+    /// Dictionary field: one `from = to` rule per line.
+    pub dictionary_text: String,
+    /// Opt-in Indonesian normalization.
+    pub normalize: bool,
+    /// Default for the export sheet's dictionary tick.
+    pub clean_dictionary: bool,
+    /// Default for the export sheet's whitespace tick.
+    pub clean_whitespace: bool,
+    /// The separator a merge joins with (may be empty, a space, a newline…).
+    pub merge_separator: String,
 }
 
 impl SettingsForm {
@@ -190,6 +203,39 @@ impl SettingsForm {
             dirty: false,
             status: None,
             applied_at: None,
+            // M15.5: filled by `seed_text_rules` (the store, not settings.toml).
+            glossary_text: String::new(),
+            dictionary_text: String::new(),
+            normalize: false,
+            clean_dictionary: false,
+            clean_whitespace: false,
+            merge_separator: " ".to_string(),
+        }
+    }
+
+    /// M15.5: copies the stored text rules into the form's fields.
+    pub fn seed_text_rules(&mut self, settings: &suramak_core::textrules::TextSettings) {
+        self.glossary_text = settings.glossary.to_field();
+        self.dictionary_text = settings.dictionary.to_field();
+        self.normalize = settings.normalize;
+        self.clean_dictionary = settings.clean_dictionary;
+        self.clean_whitespace = settings.clean_whitespace;
+        self.merge_separator = settings.merge_separator.clone();
+    }
+
+    /// M15.5: parses the fields into the value the store persists.
+    ///
+    /// Parsing is lossy in the documented way (a too-long term or a chaining
+    /// dictionary entry is refused by the parser), so the section's caption
+    /// shows what was refused rather than letting a Save silently drop it.
+    pub fn text_settings(&self) -> suramak_core::textrules::TextSettings {
+        suramak_core::textrules::TextSettings {
+            glossary: suramak_core::textrules::Glossary::parse(&self.glossary_text),
+            dictionary: suramak_core::textrules::Dictionary::parse(&self.dictionary_text),
+            normalize: self.normalize,
+            clean_dictionary: self.clean_dictionary,
+            clean_whitespace: self.clean_whitespace,
+            merge_separator: self.merge_separator.clone(),
         }
     }
 

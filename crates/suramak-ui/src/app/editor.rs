@@ -900,6 +900,12 @@ fn transcript_rows(
         .and_then(|editor| segment_index_at(&editor.transcript.segments, position_ms));
 
     let mut seek_to: Option<u32> = None;
+    // M15.3: the caret of whichever row has focus this frame, and the row
+    // action the user pressed (applied after the scroll closure, when the
+    // editor borrow has ended).
+    let mut caret_update: Option<(u32, usize)> = None;
+    let mut row_action: Option<RowAction> = None;
+    let mut edited_out: Option<(u32, String)> = None;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -995,6 +1001,20 @@ fn transcript_rows(
                     if response.changed() {
                         edited = Some((*idx, editor.buffers[index].clone()));
                     }
+                    // Whether the row's text edit holds focus *this* frame — the
+                    // caret, and the structural actions, belong to that row.
+                    let focused_now = response.has_focus();
+                    // M15.3: the split command needs the row's caret. egui's
+                    // cursor is char-indexed; the builder wants a byte offset,
+                    // so it is converted here against the buffer the caret is
+                    // in. `None` (no cursor yet) leaves the midpoint default.
+                    if response.has_focus() {
+                        if let Some(offset) =
+                            caret_byte_offset(ui.ctx(), response.id, &editor.buffers[index])
+                        {
+                            caret_update = Some((*idx, offset));
+                        }
+                    }
                     // M15.4: advisory CPL/CPS badge, in the row's spare width.
                     // It reads the editable buffer (what the reader sees), not
                     // the persisted text, so it updates while typing.
@@ -1012,6 +1032,39 @@ fn transcript_rows(
                              graphemes, CPS is graphemes per second (37/42 CPL, \
                              17/20 CPS). Nothing is shortened or blocked.",
                         );
+                    }
+                    // M15.3: the structural row actions, only on the row the
+                    // reader is in (focused) — they act where the caret is.
+                    if focused_now {
+                        ui.add_space(tokens.space.xs);
+                        if controls::button(
+                            ui,
+                            tokens,
+                            motion,
+                            ("row-split", *idx),
+                            "Split",
+                            Tier::Tertiary,
+                            true,
+                        )
+                        .on_hover_text("Split this segment at the caret (⌘⇧S)")
+                        .clicked()
+                        {
+                            row_action = Some(RowAction::Split(*idx));
+                        }
+                        if controls::button(
+                            ui,
+                            tokens,
+                            motion,
+                            ("row-merge", *idx),
+                            "Merge",
+                            Tier::Tertiary,
+                            true,
+                        )
+                        .on_hover_text("Merge this segment with the next one (⌘⇧M)")
+                        .clicked()
+                        {
+                            row_action = Some(RowAction::Merge(*idx));
+                        }
                     }
                     content_rect = response.rect;
                     row_focused = response.has_focus();
@@ -1081,12 +1134,54 @@ fn transcript_rows(
                 ui.add_space(tokens.space.xs);
             }
             if let Some((idx, text)) = edited {
-                editor.edit(idx, text, Instant::now());
+                edited_out = Some((idx, text));
             }
         });
+    // M15.5: every edit invalidates the clean preview; the caret is what the
+    // split command reads. Both are applied here, after the scroll closure's
+    // editor borrow ended.
+    if let Some((idx, text)) = edited_out {
+        state.edit_segment(idx, text, Instant::now());
+    }
+    if let Some(caret) = caret_update {
+        if let Some(editor) = state.editor.as_mut() {
+            editor.caret = Some(caret);
+        }
+    }
+    match row_action {
+        Some(RowAction::Split(idx)) => effects.extend(state.split_segment(idx)),
+        Some(RowAction::Merge(idx)) => effects.extend(state.merge_with_next(idx)),
+        None => {}
+    }
     if let Some(ms) = seek_to {
         effects.extend(state.seek_playback(ms));
     }
+}
+
+/// One row's structural action, collected in the row loop and applied after the
+/// scroll area's editor borrow ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowAction {
+    Split(u32),
+    Merge(u32),
+}
+
+/// The byte offset of the caret inside a focused row's text edit.
+///
+/// egui stores the cursor as a **char** index; the split builder takes a byte
+/// offset, so the conversion happens here against the same buffer the text edit
+/// wrote. `None` when the widget has no cursor yet (nothing typed).
+fn caret_byte_offset(ctx: &egui::Context, id: egui::Id, buffer: &str) -> Option<usize> {
+    let state = egui::text_edit::TextEditState::load(ctx, id)?;
+    let range = state.cursor.char_range()?;
+    let chars = range.primary.index;
+    Some(
+        buffer
+            .char_indices()
+            .nth(chars)
+            .map(|(offset, _)| offset)
+            .unwrap_or(buffer.len()),
+    )
 }
 
 /// The polish panel replacing the transcript rows while a run is in flight or a

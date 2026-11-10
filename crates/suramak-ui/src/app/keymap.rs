@@ -8,6 +8,10 @@
 //! | Esc | close the sheet, else leave the editor | anywhere the sheet is open, else the editor |
 //! | ↑ / ↓ | previous / next segment (seek to its start) | editor, with a playable source |
 //! | ⌘⌫ | arm the delete confirm (the existing flow) | editor |
+//! | ⌘⇧S | split the focused segment at the caret | editor |
+//! | ⌘⇧M | merge the focused segment with the next | editor |
+//! | ⌘Z | undo the last split/merge | editor, not while typing |
+//! | ⌘⇧Z | redo the last undone split/merge | editor, not while typing |
 //!
 //! **Modifiers:** every `⌘` above is `egui::Modifiers::COMMAND`, which is ⌘ on
 //! macOS and **Ctrl on Windows and Linux** — egui-winit fills `modifiers.command`
@@ -16,11 +20,16 @@
 //! pinned that with `the_command_bindings_are_ctrl_off_macos` and
 //! `ctrl_r_toggles_recording_like_command_r` below.
 //!
-//! **The guard:** no shortcut fires while a text edit has focus — the exception
-//! is Esc, which always works (closing the sheet / leaving the editor is the way
-//! out). The guard is read from the focus as of the frame's start
-//! (`TextEditState::load` on `Memory::focused`), the same information any
-//! in-pass check would see.
+//! **Shift is exact** (`matches_binding`): the ⌘⇧ bindings and their ⌘ siblings
+//! (`⌘Z` / `⌘⇧Z`) must never fire for each other, and a shifted ⌘E must not
+//! toggle the sheet.
+//!
+//! **The guard:** no shortcut fires while a text edit has focus — the exceptions
+//! are Esc (closing the sheet / leaving the editor is the way out) and the two
+//! structural edits (⌘⇧S / ⌘⇧M), which *need* the caret that only a focused row
+//! has and cannot collide with a typing key. Undo/redo stay guarded: while
+//! typing, ⌘Z is the text edit's own undo. The guard is read from the focus as
+//! of the frame's start (`TextEditState::load` on `Memory::focused`).
 //!
 //! **The seam:** [`dispatch`] runs in `Shell::render` on the raw input *before*
 //! egui sees it. A matched shortcut's key event is removed from the event list,
@@ -56,6 +65,14 @@ pub enum Shortcut {
     SegmentDown,
     /// ⌘⌫ — arm the delete confirm (editor).
     Delete,
+    /// ⌘⇧S — split the focused segment at the caret (editor, needs the caret).
+    SplitSegment,
+    /// ⌘⇧M — merge the focused segment with the next (editor).
+    MergeSegments,
+    /// ⌘Z — undo the last split/merge (editor, not while typing).
+    UndoSegment,
+    /// ⌘⇧Z — redo the last undone split/merge (editor, not while typing).
+    RedoSegment,
 }
 
 /// The app facts a shortcut's guard reads. Built once per frame, from the state
@@ -90,6 +107,14 @@ pub enum Action {
     SegmentPrev,
     SegmentNext,
     ArmDelete,
+    /// M15.3: split the focused row at the caret.
+    SplitSegment,
+    /// M15.3: merge the focused row with the next one.
+    MergeSegments,
+    /// M15.3: undo the last structural edit.
+    UndoSegment,
+    /// M15.3: redo the last undone structural edit.
+    RedoSegment,
     /// M9e: Esc on the quit confirm — Keep Recording (cancel the quit).
     QuitKeep,
     /// M9e: Esc on the transcribe screen — cancel the running job.
@@ -138,6 +163,13 @@ pub fn resolve(shortcut: Shortcut, context: &KeyContext) -> Option<Action> {
             Some(Action::SegmentNext)
         }
         Shortcut::Delete if !context.text_focused && editor => Some(Action::ArmDelete),
+        // M15.3: the structural edits are the guard's second exception — they
+        // act on the caret a focused row holds, and ⌘⇧ is no typing key.
+        Shortcut::SplitSegment if editor => Some(Action::SplitSegment),
+        Shortcut::MergeSegments if editor => Some(Action::MergeSegments),
+        // Undo/redo stay guarded: while typing, ⌘Z belongs to the text edit.
+        Shortcut::UndoSegment if !context.text_focused && editor => Some(Action::UndoSegment),
+        Shortcut::RedoSegment if !context.text_focused && editor => Some(Action::RedoSegment),
         _ => None,
     }
 }
@@ -154,7 +186,7 @@ struct Binding {
 
 /// ⌘-shortcuts first, then the plain keys (the patterns cannot overlap, but the
 /// order documents the intent).
-const BINDINGS: [Binding; 7] = [
+const BINDINGS: [Binding; 11] = [
     Binding {
         shortcut: Shortcut::Record,
         modifiers: Modifiers::COMMAND,
@@ -171,6 +203,31 @@ const BINDINGS: [Binding; 7] = [
         shortcut: Shortcut::Delete,
         modifiers: Modifiers::COMMAND,
         key: Key::Backspace,
+        repeat: false,
+    },
+    // M15.3: the structural edits (⌘⇧S / ⌘⇧M) and their undo/redo pair.
+    Binding {
+        shortcut: Shortcut::SplitSegment,
+        modifiers: Modifiers::COMMAND.plus(Modifiers::SHIFT),
+        key: Key::S,
+        repeat: false,
+    },
+    Binding {
+        shortcut: Shortcut::MergeSegments,
+        modifiers: Modifiers::COMMAND.plus(Modifiers::SHIFT),
+        key: Key::M,
+        repeat: false,
+    },
+    Binding {
+        shortcut: Shortcut::UndoSegment,
+        modifiers: Modifiers::COMMAND,
+        key: Key::Z,
+        repeat: false,
+    },
+    Binding {
+        shortcut: Shortcut::RedoSegment,
+        modifiers: Modifiers::COMMAND.plus(Modifiers::SHIFT),
+        key: Key::Z,
         repeat: false,
     },
     Binding {
@@ -260,6 +317,9 @@ fn matches_binding(event: &Event, binding: &Binding) -> bool {
             ..
         } if *key == binding.key
             && modifiers.matches_logically(binding.modifiers)
+            // Shift is exact: ⌘Z must not fire for ⌘⇧Z (and vice versa), and a
+            // shifted ⌘E must not toggle the sheet.
+            && modifiers.shift == binding.modifiers.shift
             && (binding.repeat || !*repeat)
     )
 }
@@ -297,6 +357,17 @@ fn apply(action: Action, state: &mut AppState) -> Vec<Effect> {
         },
         // M9e: Esc on the transcribe screen — the card's Cancel path.
         Action::CancelJob => state.cancel_job(),
+        // M15.3: the structural edits act on the focused row (else the first).
+        Action::SplitSegment => match state.active_segment() {
+            Some(idx) => state.split_segment(idx),
+            None => Vec::new(),
+        },
+        Action::MergeSegments => match state.active_segment() {
+            Some(idx) => state.merge_with_next(idx),
+            None => Vec::new(),
+        },
+        Action::UndoSegment => state.undo_segment_edit(),
+        Action::RedoSegment => state.redo_segment_edit(),
     }
 }
 
@@ -435,7 +506,9 @@ mod tests {
     }
 
     #[test]
-    fn the_text_edit_focus_guard_blocks_every_shortcut_except_escape() {
+    fn the_text_edit_focus_guard_blocks_the_typing_shortcuts() {
+        // M15.3 moved Split/Merge into the guard's documented exception list
+        // (they need the caret); every other editor shortcut stays blocked.
         let state = editor_state();
         let typing = context(&state, true);
         for shortcut in [
@@ -815,5 +888,96 @@ mod tests {
         dispatch(&ctx, &mut state, &mut events);
         assert!(events.is_empty(), "held ↓ walks the transcript");
         assert_eq!(state.playback.position_ms(), 1_000);
+    }
+
+    // ---- M15.3: the structural edits ---------------------------------------
+
+    /// ⌘⇧S / ⌘⇧M are the guard's second exception: they need the caret a focused
+    /// row holds, and ⌘⇧ is no typing key. Undo/redo stay guarded.
+    #[test]
+    fn the_structural_shortcuts_need_the_caret_but_not_an_unfocused_row() {
+        let state = editor_state();
+        let typing = context(&state, true);
+        assert_eq!(
+            resolve(Shortcut::SplitSegment, &typing),
+            Some(Action::SplitSegment)
+        );
+        assert_eq!(
+            resolve(Shortcut::MergeSegments, &typing),
+            Some(Action::MergeSegments)
+        );
+        assert_eq!(
+            resolve(Shortcut::UndoSegment, &typing),
+            None,
+            "while typing, ⌘Z belongs to the text edit"
+        );
+        assert_eq!(resolve(Shortcut::RedoSegment, &typing), None);
+
+        // Outside the editor there is nothing to split.
+        let home = KeyContext {
+            route: Route::Home,
+            ..typing
+        };
+        assert_eq!(resolve(Shortcut::SplitSegment, &home), None);
+        assert_eq!(resolve(Shortcut::MergeSegments, &home), None);
+        let no_editor = KeyContext {
+            has_editor: false,
+            ..typing
+        };
+        assert_eq!(resolve(Shortcut::SplitSegment, &no_editor), None);
+    }
+
+    /// The dispatch seam carries ⌘⇧S to the same `AppState::split_segment` the
+    /// row's Split control uses, and consumes the press.
+    #[test]
+    fn command_shift_s_requests_a_split_at_the_caret() {
+        let ctx = egui::Context::default();
+        let mut state = editor_state();
+        state.editor.as_mut().unwrap().caret = Some((0, 6));
+        let mut events = vec![key_event(
+            Key::S,
+            Modifiers::COMMAND | Modifiers::SHIFT,
+            false,
+        )];
+        let effects = dispatch(&ctx, &mut state, &mut events);
+        assert!(events.is_empty(), "the press is consumed");
+        match effects.as_slice() {
+            [Effect::SplitSegment { idx, caret, .. }] => {
+                assert_eq!(*idx, 0);
+                assert_eq!(*caret, 6);
+            }
+            other => panic!("expected SplitSegment, got {other:?}"),
+        }
+    }
+
+    /// Shift is exact: ⌘⇧Z never fires the ⌘Z undo, and a shifted ⌘E never
+    /// toggles the sheet.
+    #[test]
+    fn a_shifted_command_binding_never_fires_its_unshifted_sibling() {
+        let ctx = egui::Context::default();
+        let mut state = editor_state();
+        let mut events = vec![key_event(
+            Key::Z,
+            Modifiers::COMMAND | Modifiers::SHIFT,
+            false,
+        )];
+        let effects = dispatch(&ctx, &mut state, &mut events);
+        assert!(effects.is_empty(), "{effects:?}");
+        assert!(
+            state
+                .status
+                .as_ref()
+                .is_none_or(|status| !status.text.contains("undo")),
+            "redo with an empty log, not undo"
+        );
+
+        let mut events = vec![key_event(
+            Key::E,
+            Modifiers::COMMAND | Modifiers::SHIFT,
+            false,
+        )];
+        dispatch(&ctx, &mut state, &mut events);
+        assert!(!state.export.open, "⌘⇧E is not ⌘E");
+        assert_eq!(events.len(), 1, "an unmatched key is left for egui");
     }
 }
