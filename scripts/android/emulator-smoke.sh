@@ -249,6 +249,30 @@ wait_for_log() {
   return 1
 }
 
+# The compact host's first REAL Library draw can lag the first GPU frame by
+# tens of seconds on a software-rendered emulator (the startup placeholder
+# paints the whole time). The screencap gate inspects the LIBRARY, so wait
+# for the shell's own ready marker before capturing — otherwise the gate
+# inspects a near-black placeholder and mis-fails the launch (observed in CI).
+wait_for_library_ready() {
+  local deadline=$((SECONDS + LIBRARY_TIMEOUT))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if app_log | grep -qF "compact library surface: ready"; then
+      echo "   library:  ready (compact host up, first real draw)"
+      return 0
+    fi
+    if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
+      echo "== the EMULATOR PROCESS DIED mid-wait (pid $EMULATOR_PID) ==" >&2
+      tail -40 "$OUT/emulator.log" >&2 2>/dev/null || true
+      fail "the emulator died while waiting for the compact Library to come up"
+    fi
+    sleep 3
+  done
+  return 1
+}
+
+
+
 if ! wait_for_log "android_main entered"; then
   timeout 30 "$ADB" logcat -d >"$OUT/logcat-launch-failed.txt" 2>/dev/null || true
   tail -80 "$OUT/logcat-launch-failed.txt" >&2 || true
@@ -385,6 +409,8 @@ FIRST_LAUNCH="$(latest_main_entry || true)"
 FIRST_PID="${FIRST_LAUNCH%% *}"
 echo "   launch:   first process pid $FIRST_PID"
 
+wait_for_library_ready || fail "the compact Library never drew on the first launch (no 'compact library surface: ready' marker within ${LIBRARY_TIMEOUT}s) — the compact host never came up"
+
 "$ADB" shell input keyevent 4
 # --- M13I-b layer 1: BACK finishes the Activity and the process must leave ----
 # The old code returned from the loop and lingered, which is the state that made
@@ -443,27 +469,7 @@ if app_log | grep -qF "EventLoop can't be recreated"; then
   fail "'EventLoop can't be recreated' was logged — android_main ran again in a process that already had an event loop; the finish path must exit the process"
 fi
 
-# The compact host's first REAL Library draw can lag the first GPU frame by
-# tens of seconds on a software-rendered emulator (the startup placeholder
-# paints the whole time). The screencap gate inspects the LIBRARY, so wait
-# for the shell's own ready marker before capturing — otherwise the gate
-# inspects a near-black placeholder and mis-fails the launch (observed in CI).
-READY_DEADLINE=$((SECONDS + LIBRARY_TIMEOUT))
-while [ "$SECONDS" -lt "$READY_DEADLINE" ]; do
-  if app_log | grep -qF "compact library surface: ready"; then
-    echo "   library:  ready (compact host up, first real draw)"
-    break
-  fi
-  if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
-    echo "== the EMULATOR PROCESS DIED mid-wait (pid $EMULATOR_PID) ==" >&2
-    tail -40 "$OUT/emulator.log" >&2 2>/dev/null || true
-    fail "the emulator died while waiting for the compact Library to come up"
-  fi
-  sleep 3
-done
-if ! app_log | grep -qF "compact library surface: ready"; then
-  fail "the compact Library never drew (no 'compact library surface: ready' marker within ${LIBRARY_TIMEOUT}s) — the compact host never came up"
-fi
+wait_for_library_ready || fail "the compact Library never drew (no 'compact library surface: ready' marker within ${LIBRARY_TIMEOUT}s) — the compact host never came up"
 
 sleep 3
 

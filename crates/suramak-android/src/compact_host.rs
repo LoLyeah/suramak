@@ -647,6 +647,18 @@ pub fn dispatch(request: &str) -> String {
     }
     match host() {
         Some(host) => host.dispatch(request),
+        // Back on a surface whose host is not up yet is a LEAVE: the splash
+        // has no navigation stack to pop, and swallowing the gesture traps
+        // the user on "Opening the library…" (observed on a slow emulator —
+        // and the Activity never finished, so the finish-path exit never
+        // ran). The reply must carry `finish:true` in the shape the real
+        // `back` op uses.
+        None if op == "back" => json!({
+            "ok": true,
+            "back": "finish",
+            "finish": true,
+        })
+        .to_string(),
         None => error("the compact UI host has not been initialised (send init first)"),
     }
 }
@@ -1063,5 +1075,19 @@ mod tests {
             .expect("q8 row");
         assert_eq!(q8["offered"], false);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn back_before_the_host_exists_is_a_leave() {
+        // Every other test in this binary drives a LOCAL CompactHost, so the
+        // process-wide host is unset here and this exercises the None branch.
+        // Back on the splash must leave: swallowing the gesture trapped the
+        // smoke's Activity (alive 20 s after BACK, no finish-path exit).
+        let reply: Value = serde_json::from_str(&dispatch(r#"{"op":"back"}"#)).expect("json");
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["finish"], true);
+        // Every other op still fails closed without a host.
+        let err: Value = serde_json::from_str(&dispatch(r#"{"op":"library"}"#)).expect("json");
+        assert_eq!(err["ok"], false);
     }
 }
