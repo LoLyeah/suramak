@@ -417,7 +417,7 @@ pub trait DiarizationEngine: Send {
         &mut self,
         samples: &[f32],
         params: &DiarizeParams,
-        progress: &mut dyn FnMut(u8),
+        progress: &mut (dyn FnMut(u8) + Send),
     ) -> Result<Vec<RawTurn>, DiarizationError>;
 }
 
@@ -768,7 +768,7 @@ pub fn execute(
     audio_ms: i64,
     params: &DiarizeParams,
     cancel: &CancelToken,
-    progress: &mut dyn FnMut(u8),
+    progress: &mut (dyn FnMut(u8) + Send),
 ) -> Result<(Vec<Speaker>, Vec<SpeakerTurn>, i64), DiarizationError> {
     params.validate()?;
     if audio_ms > MAX_AUDIO_MS {
@@ -888,33 +888,49 @@ impl DiarizationEngine for SherpaDiarizer {
         &mut self,
         samples: &[f32],
         _params: &DiarizeParams,
-        progress: &mut dyn FnMut(u8),
+        progress: &mut (dyn FnMut(u8) + Send),
     ) -> Result<Vec<RawTurn>, DiarizationError> {
-        // The callback is progress-only: the binding ignores its return value,
-        // which is why the cancellation contract is "discard at the next await
-        // point", never "abort".
+        // The binding stores its callback and invokes it from its own thread,
+        // so the callback must be `Send + 'static` — it cannot borrow the
+        // caller's progress sink. Bridge it with a channel: the caller's
+        // progress sink is driven by a pump on a scoped thread that drains the
+        // channel for exactly as long as `compute` runs (the sender drops with
+        // the callback when `compute` returns, ending the pump).
+        let (tx, rx) = std::sync::mpsc::channel::<u8>();
         let callback: Box<dyn Fn(i32, i32) -> i32 + Send + 'static> =
             Box::new(move |done: i32, total: i32| {
                 if total > 0 {
-                    progress(((done as f32 / total as f32) * 100.0).round() as u8);
+                    let _ = tx.send(((done as f32 / total as f32) * 100.0).round() as u8);
                 }
                 // The value is deliberately 0: a non-zero return would promise
                 // an abort the C++ pipeline does not perform.
                 0
             });
-        let segments = self
-            .inner
-            .compute(samples.to_vec(), Some(callback))
-            .map_err(|err| {
-                let message = err.to_string();
-                // M16H §6.5: silence is `Err("No segments found…")`, not a
-                // failure. It maps to zero turns ("no speech"), not "failed".
-                if message.contains("No segments found") {
-                    DiarizationError::Engine("__silence__".to_string())
-                } else {
-                    DiarizationError::Engine(message)
+        let segments = std::thread::scope(|scope| {
+            let pump = scope.spawn(|| {
+                for pct in rx {
+                    progress(pct);
                 }
             });
+            let out = self
+                .inner
+                .compute(samples.to_vec(), Some(callback))
+                .map_err(|err| {
+                    let message = err.to_string();
+                    // M16H §6.5: silence is `Err("No segments found…")`, not a
+                    // failure. It maps to zero turns ("no speech"), not
+                    // "failed".
+                    if message.contains("No segments found") {
+                        DiarizationError::Engine("__silence__".to_string())
+                    } else {
+                        DiarizationError::Engine(message)
+                    }
+                });
+            // `compute` returning drops the callback, which drops the sender,
+            // which ends the pump — join so the borrow outlives the scope.
+            let _ = pump.join();
+            out
+        });
         match segments {
             Ok(segments) => Ok(segments
                 .into_iter()
@@ -936,7 +952,7 @@ impl DiarizationEngine for SherpaDiarizer {
         &mut self,
         _samples: &[f32],
         _params: &DiarizeParams,
-        _progress: &mut dyn FnMut(u8),
+        _progress: &mut (dyn FnMut(u8) + Send),
     ) -> Result<Vec<RawTurn>, DiarizationError> {
         Err(DiarizationError::Unavailable(
             "this build was compiled without the sherpa-onnx engine".to_string(),
@@ -1157,7 +1173,7 @@ mod tests {
             &mut self,
             _samples: &[f32],
             _params: &DiarizeParams,
-            progress: &mut dyn FnMut(u8),
+            progress: &mut (dyn FnMut(u8) + Send),
         ) -> Result<Vec<RawTurn>, DiarizationError> {
             progress(self.progress);
             if let Some(err) = &self.err {
