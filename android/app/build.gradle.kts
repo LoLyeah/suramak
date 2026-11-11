@@ -22,8 +22,8 @@ android {
         // MINOR*100 + PATCH; 0.4.1 → 401) and is kept in sync with
         // packaging/Info.plist by `scripts/bump_version.py` — monotonic for
         // future releases, always above the M13x debug sequence.
-        versionCode = 401
-        versionName = "0.4.1"
+        versionCode = 402
+        versionName = "0.4.2"
 
         // Only the phone ABI: this APK exists to be installed by the owner.
         ndk {

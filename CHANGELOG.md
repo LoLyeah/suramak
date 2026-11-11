@@ -4,6 +4,19 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased]
 
+## 0.4.2 - 2026-11-11
+
+### Added
+- **Speaker diarization (M16.6)** — the editor can label who spoke, entirely offline:
+  - **Run diarization** from the transcript menu: the recording is clustered into session-local speakers (no identity claims, nothing leaves the device), rendered as color badges on segment rows and a single 8 px speaker lane above the waveform.
+  - **Manual correction first-class**: rename a speaker in place (the name propagates through the run), delete a run to restore the plain view, re-run after edits (edits mark the run stale).
+  - Verified quality on real EN+ID multi-speaker fixtures: 2-speaker DER 3.29% (2/2 speakers), rapid 3-way 2.11% (3/3) — deterministic across runs; 3+ speakers stay provisional and manually correctable by design.
+  - Runs as a job through the same one-slot queue discipline; platforms without the bundled engine show the feature as unavailable.
+- **Windows joins the release page (M14x)**: `suramak-<version>-windows-x86_64.zip` (app + CLI) with a published sha256 — the first Windows artifact on a release. Windows may show a SmartScreen note on first launch (unsigned build); More info → Run anyway.
+
+### Fixed
+- The dylib-resolution gate's rpath checks no longer mis-report matching rpaths as failures (a SIGPIPE + pipefail trap caught three times across the packaging scripts).
+
 ## 0.4.1 - 2026-11-11
 
 ### Added
