@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Suramak Spike</string>
+    <string name="app_name">Suramak</string>
 
     <!-- M13d: the model landing copy. The same sentences are produced by
          `suramak_core::device` for the bridge (LANDING_EN / LANDING_ID); these

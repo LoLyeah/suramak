@@ -624,3 +624,150 @@ jobs:
           name: suramak-android-spike-debug
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+
+  # M13I: the launch smoke on a real Android runtime. GitHub's ubuntu runners
+  # expose /dev/kvm, so an x86_64 emulator boots at usable speed. The job builds
+  # the x86_64 variant of the SAME app (debug-signed, CI-only artifact — never a
+  # release asset), installs it, launches the compact Library, inspects the
+  # screencap, and runs a bounded monkey canary.
+  #
+  # Why x86_64: the owner's phone is arm64 and no arm64 device exists on the
+  # runner; the emulator ABI proves the shared code path (Kotlin shim, JNI,
+  # wgpu/egui surface, library render) — the arm64 Metal/Adreno specifics and
+  # the Vivo OEM layer stay owner-only (docs/reports/M13i-emulator-smoke.md).
+  #
+  # Release path: this job is CI-only. Release.yml is untouched, the arm64
+  # release artifact is built by its own job, and nothing here is uploaded to a
+  # GitHub release. The job runs in parallel with the existing jobs; the system
+  # image is cached so a warm run does not re-download ~1.5 GB.
+  #
+  # A launch failure is a RED build on purpose (continue-on-error: false): that
+  # is exactly the failure the owner hit on hardware.
+  android-smoke:
+    name: android-smoke (x86_64 emulator, KVM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    continue-on-error: false
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      # AVDs are per-job state; keep them inside the workspace so a stale
+      # runner-home AVD can never leak into the run.
+      ANDROID_AVD_HOME: ${{ github.workspace }}/.android-avd
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Enable KVM (the emulator needs /dev/kvm; GitHub runners provide it)
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Free disk space (the NDK + Gradle + cargo build need the room)
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
+            /usr/local/lib/android/sdk/ndk "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # whisper-rs-sys builds whisper.cpp through cmake, exactly as in the
+      # android-build job (which installs the same two packages).
+      - name: Install system dependencies (cmake + ninja for whisper.cpp)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android-smoke
+
+      - name: Add the emulator target
+        run: rustup target add x86_64-linux-android
+
+      - name: Install cargo-ndk (pinned 4.1.2)
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+
+      - name: Restore the pinned NDK (r27d)
+        id: ndk-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/android-ndk/android-ndk-r27d
+          key: android-ndk-r27d-27.3.13750724
+
+      - name: Download the pinned NDK (r27d) — sha256 verified
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/android-ndk"
+          curl -fL --retry 3 -o "$RUNNER_TEMP/android-ndk-r27d-linux.zip" \
+            https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          echo "601246087a682d1944e1e16dd85bc6e49560fe8b6d61255be2829178c8ed15d9  $RUNNER_TEMP/android-ndk-r27d-linux.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/android-ndk-r27d-linux.zip" -d "$HOME/android-ndk"
+          rm "$RUNNER_TEMP/android-ndk-r27d-linux.zip"
+
+      # Cache BEFORE sdkmanager runs: a warm cache is a no-op install. The
+      # package.xml inside the image directory travels with it, so sdkmanager
+      # sees a complete package on the next run.
+      - name: Restore the emulator system image (android-35 google_apis x86_64)
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.ANDROID_SDK_ROOT }}/system-images/android-35/google_apis/x86_64
+          key: android-system-image-35-google-apis-x86_64-v1
+
+      - name: Install the SDK packages (emulator, system image, platform-tools, android-35, build-tools)
+        run: |
+          set -euo pipefail
+          SDKM="$(command -v sdkmanager || true)"
+          if [ -z "$SDKM" ]; then
+            SDKM="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          fi
+          test -x "$SDKM"
+          yes | "$SDKM" --licenses >/dev/null || true
+          "$SDKM" --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "emulator" \
+            "system-images;android-35;google_apis;x86_64"
+          "$ANDROID_SDK_ROOT/emulator/emulator" -accel-check
+
+      # The screencap gate is proved load-bearing before it is used: three real
+      # compact renders must pass, a black and a white frame must fail.
+      - name: Screencap gate self-test (positive + negative controls)
+        run: python3 tests/android-smoke/inspect_screencap.py --self-test
+
+      - name: Build the x86_64 debug APK (scripts/android/build-apk.sh)
+        env:
+          SURAMAK_ANDROID_ABI: x86_64
+        run: bash scripts/android/build-apk.sh
+
+      # CI-only diagnostic artifact: debug-signed, never a release asset.
+      - name: Upload the x86_64 debug APK (CI artifact, not a release)
+        uses: actions/upload-artifact@v7
+        with:
+          name: suramak-android-x86_64-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: ignore
+
+      - name: Emulator launch smoke (install → launch → Library renders → monkey)
+        timeout-minutes: 30
+        run: bash scripts/android/emulator-smoke.sh
+
+      - name: Upload the smoke evidence (screencap, uiautomator dump, logcat)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: suramak-android-smoke-evidence
+          path: build/android-smoke/
+          if-no-files-found: ignore

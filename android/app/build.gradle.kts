@@ -3,6 +3,15 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// M13I: the packaged ABI is a build input. The shipping artifact stays
+// arm64-v8a (the owner floor); `-PsuramakAbi=x86_64` exists only for the CI
+// emulator smoke, which builds a debug APK and never uploads it to a release.
+// scripts/android/build-apk.sh passes this and asserts the result with aapt.
+val suramakAbi = (project.findProperty("suramakAbi") as String?) ?: "arm64-v8a"
+require(suramakAbi == "arm64-v8a" || suramakAbi == "x86_64") {
+    "unsupported suramakAbi '$suramakAbi' (arm64-v8a, x86_64)"
+}
+
 android {
     namespace = "app.suramak.spike"
     compileSdk = 35
@@ -25,9 +34,11 @@ android {
         versionCode = 402
         versionName = "0.4.2"
 
-        // Only the phone ABI: this APK exists to be installed by the owner.
+        // arm64-v8a is what ships; x86_64 is the M13I emulator variant (a
+        // debug, CI-only artifact). Gradle excludes every other ABI's jniLibs,
+        // so a stale arm64 .so in the tree can never leak into the x86_64 APK.
         ndk {
-            abiFilters += "arm64-v8a"
+            abiFilters += suramakAbi
         }
     }
 

@@ -5,15 +5,15 @@
 #
 # What it does, in order (one source of truth; CI runs this exact file):
 #   1. discovers the pinned toolchain (NDK r27d, a full JDK 17, the Android SDK);
-#   2. cross-builds both Rust cdylibs for arm64-v8a with cargo-ndk, dropping
-#      libsuramak_android_spike.so (the M13b shell) and libsuramak_android.so
-#      (the M13d model host + M13e import/transcription host) into
-#      android/app/src/main/jniLibs/;
+#   2. cross-builds the Rust cdylibs for the selected ABI with cargo-ndk,
+#      dropping libsuramak_android_spike.so (the M13b shell) and
+#      libsuramak_android.so (the M13d model host + M13e import/transcription
+#      host + M13g compact surface) into android/app/src/main/jniLibs/;
 #   3. runs ./gradlew assembleDebug (Kotlin shim + manifest + jniLibs → APK);
-#   4. asserts the APK exists and really contains both .so files, the right
-#      version, the crash-log FileProvider, the M13d download service, the M13e
-#      share matrix / SAF / transcription service and both bridges' JNI symbols,
-#      then prints its path, size and sha256.
+#   4. asserts the APK exists and really contains the .so files for that ABI,
+#      the right version, the crash-log FileProvider, the M13d download
+#      service, the M13e share matrix / SAF / transcription service and both
+#      bridges' JNI symbols, then prints its path, size and sha256.
 #
 # It installs nothing and needs no sudo. Environment (all optional):
 #   ANDROID_HOME / ANDROID_SDK_ROOT   SDK root (default ~/android-sdk)
@@ -21,6 +21,15 @@
 #   JAVA_HOME                         JDK 17 with javac (default: ~/android-sdk/jdk/*,
 #                                     then /usr/lib/jvm/java-17-openjdk-amd64)
 #   SURAMAK_ANDROID_PLATFORM          API level for cargo-ndk (default 29 = minSdk)
+#   SURAMAK_ANDROID_ABI               arm64-v8a (default; the shipping ABI) or
+#                                     x86_64 (M13I: the CI emulator ABI — the
+#                                     debug APK is a CI artifact, never released)
+#   SURAMAK_ANDROID_PROFILE           release|debug for the Rust cdylibs
+#                                     (default: release for arm64-v8a, debug for
+#                                     x86_64 — the emulator build is debug on purpose)
+#
+# The release path is pinned to arm64-v8a: SURAMAK_ANDROID_RELEASE=1 with any
+# other ABI is refused, so the shipped artifact cannot change by accident.
 #
 # 16 KB page alignment: Android 15+ devices with 16 KB pages require the LOAD
 # segments of the .so to be 16 KB aligned. The flag below is the linker's;
@@ -30,7 +39,25 @@ set -euo pipefail
 PINNED_NDK_REVISION="27.3.13750724"   # r27d — docs/android.md
 PINNED_NDK_DIRNAME="android-ndk-r27d"
 PLATFORM="${SURAMAK_ANDROID_PLATFORM:-29}"   # minSdk 29 (PLAN-M13-ANDROID §4)
-ABI="arm64-v8a"
+ABI="${SURAMAK_ANDROID_ABI:-arm64-v8a}"
+case "$ABI" in
+  arm64-v8a) DEFAULT_TRIPLE="aarch64-linux-android" ; DEFAULT_PROFILE="release" ;;
+  x86_64)    DEFAULT_TRIPLE="x86_64-linux-android" ; DEFAULT_PROFILE="debug" ;;
+  *) echo "error: unsupported SURAMAK_ANDROID_ABI='$ABI' (arm64-v8a, x86_64)" >&2; exit 2 ;;
+esac
+TRIPLE="$DEFAULT_TRIPLE"
+PROFILE="${SURAMAK_ANDROID_PROFILE:-$DEFAULT_PROFILE}"
+case "$PROFILE" in
+  release) CARGO_PROFILE_FLAG="--release" ;;
+  debug)   CARGO_PROFILE_FLAG="" ;;
+  *) echo "error: unsupported SURAMAK_ANDROID_PROFILE='$PROFILE' (release, debug)" >&2; exit 2 ;;
+esac
+if [ "${SURAMAK_ANDROID_RELEASE:-0}" = "1" ]; then
+  [ "$ABI" = "arm64-v8a" ] \
+    || { echo "error: the release APK is arm64-v8a only (got $ABI) — the x86_64 build is CI-only" >&2; exit 2; }
+  [ "$PROFILE" = "release" ] \
+    || { echo "error: the release APK needs SURAMAK_ANDROID_PROFILE=release (got $PROFILE)" >&2; exit 2; }
+fi
 SPIKE_CRATE="suramak-android-spike"
 SPIKE_LIB="libsuramak_android_spike.so"
 APP_CRATE="suramak-android"
@@ -88,45 +115,53 @@ export ANDROID_NDK_ROOT="$NDK"
 
 command -v cargo-ndk >/dev/null || fail "cargo-ndk not on PATH (cargo install cargo-ndk --version 4.1.2)"
 command -v rustup >/dev/null || fail "rustup not on PATH"
-rustup target list --installed | grep -qx aarch64-linux-android \
-  || fail "rust target aarch64-linux-android is missing (rustup target add aarch64-linux-android)"
+rustup target list --installed | grep -qx "$TRIPLE" \
+  || fail "rust target $TRIPLE is missing (rustup target add $TRIPLE)"
 
 [ -d "$SDK/platforms/android-35" ] || fail "SDK platform android-35 missing in $SDK"
 [ -d "$SDK/build-tools/35.0.0" ] || fail "SDK build-tools 35.0.0 missing in $SDK"
 
-echo "== M13b spike build =="
+echo "== Android APK build (M13b/M13d/M13e/M13g) =="
 echo "   sdk:        $SDK"
 echo "   ndk:        $NDK ($NDK_REVISION)"
 echo "   java:       $JAVA_HOME ($("$JAVA_HOME/bin/java" -version 2>&1 | head -1))"
 echo "   cargo-ndk:  $(cargo-ndk --version)"
-echo "   abi:        $ABI (platform $PLATFORM)"
+echo "   abi:        $ABI ($TRIPLE, $PROFILE, platform $PLATFORM)"
 
 # --- 1. Rust cdylibs ----------------------------------------------------------
 # RUSTFLAGS is scoped to this invocation on purpose: the desktop crates never
 # inherit an Android linker flag from an ambient environment.
-echo "== cargo ndk build ($SPIKE_CRATE, release) =="
-RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384" \
-  cargo ndk -t "$ABI" --platform "$PLATFORM" \
-    -o android/app/src/main/jniLibs \
-    build --release -p "$SPIKE_CRATE"
+#
+# arm64-v8a keeps both libraries: the spike cdylib is part of the shipping
+# packaging (history + the host harness). The x86_64 emulator build skips it on
+# purpose — MainActivity loads only libsuramak_android.so (M13g3), and the spike
+# code is linked into that library anyway, so the second .so would only add
+# build time and APK bytes to a CI-only artifact.
+if [ "$ABI" = "arm64-v8a" ]; then
+  echo "== cargo ndk build ($SPIKE_CRATE, $PROFILE) =="
+  RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384" \
+    cargo ndk -t "$ABI" --platform "$PLATFORM" \
+      -o android/app/src/main/jniLibs \
+      build $CARGO_PROFILE_FLAG -p "$SPIKE_CRATE"
+
+  SO="android/app/src/main/jniLibs/$ABI/$SPIKE_LIB"
+  [ -f "$SO" ] || fail "cargo-ndk did not produce $SO"
+  echo "   $SO ($(stat -c %s "$SO") bytes)"
+  FILE_INFO="$(file "$SO")"
+  case "$FILE_INFO" in
+    *"ELF 64-bit"*) ;;
+    *) fail "$SO is not an ELF64 object: $FILE_INFO" ;;
+  esac
+fi
 
 # M13d: the real app crate. Its `libsuramak_android.so` carries the model-host
 # JNI symbol the JobService calls. Both libraries share `target/`, so this is a
 # link — the whisper/ggml archives are built once.
-echo "== cargo ndk build ($APP_CRATE, release) =="
+echo "== cargo ndk build ($APP_CRATE, $PROFILE) =="
 RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384" \
   cargo ndk -t "$ABI" --platform "$PLATFORM" \
     -o android/app/src/main/jniLibs \
-    build --release -p "$APP_CRATE"
-
-SO="android/app/src/main/jniLibs/$ABI/$SPIKE_LIB"
-[ -f "$SO" ] || fail "cargo-ndk did not produce $SO"
-echo "   $SO ($(stat -c %s "$SO") bytes)"
-FILE_INFO="$(file "$SO")"
-case "$FILE_INFO" in
-  *"ELF 64-bit"*) ;;
-  *) fail "$SO is not an ELF64 object: $FILE_INFO" ;;
-esac
+    build $CARGO_PROFILE_FLAG -p "$APP_CRATE"
 
 APP_SO="android/app/src/main/jniLibs/$ABI/$APP_LIB"
 [ -f "$APP_SO" ] || fail "cargo-ndk did not produce $APP_SO"
@@ -147,14 +182,19 @@ else
   GRADLE_TASK="clean assembleDebug"
   APK="android/app/build/outputs/apk/debug/app-debug.apk"
 fi
-echo "== gradle $GRADLE_TASK =="
+echo "== gradle $GRADLE_TASK -PsuramakAbi=$ABI =="
 (
   cd android
   # `clean` on purpose: an incremental packageDebug that repackages a *changed*
   # stored (uncompressed) .so leaves a ~13 MB zero-filled hole in the APK on
   # AGP 8.7 — the artifact then reports a bogus size. A clean package is 25 s
   # and the numbers in the report are the numbers you install.
-  ./gradlew --no-daemon --console=plain $GRADLE_TASK
+  #
+  # `-PsuramakAbi` is the one build input that differs for the M13I emulator
+  # variant: it sets ndk.abiFilters so Gradle packages exactly the .so files
+  # cargo-ndk just produced (arm64 libs left in jniLibs from an earlier build
+  # are excluded, not shipped).
+  ./gradlew --no-daemon --console=plain $GRADLE_TASK "-PsuramakAbi=$ABI"
 )
 
 [ -f "$APK" ] || fail "Gradle did not produce $APK"
@@ -164,15 +204,34 @@ echo "== APK assertions =="
 # Capture once: `unzip -l | grep -q` under `pipefail` reports unzip's SIGPIPE
 # (141) when grep exits at the first match, which would look like a missing .so.
 APK_LISTING="$(unzip -l "$APK")"
-case "$APK_LISTING" in
-  *"lib/$ABI/$SPIKE_LIB"*) ;;
-  *) fail "APK does not contain lib/$ABI/$SPIKE_LIB" ;;
-esac
+if [ "$ABI" = "arm64-v8a" ]; then
+  case "$APK_LISTING" in
+    *"lib/$ABI/$SPIKE_LIB"*) ;;
+    *) fail "APK does not contain lib/$ABI/$SPIKE_LIB" ;;
+  esac
+else
+  # The emulator variant ships one library; the spike cdylib is not loaded.
+  case "$APK_LISTING" in
+    *"lib/$ABI/$SPIKE_LIB"*)
+      fail "the $ABI APK carries $SPIKE_LIB — the CI variant must stay single-library" ;;
+  esac
+fi
 # M13d: the JobService's JNI symbols live in this library; an APK without it
-# would crash the moment a download starts.
+# would crash the moment a download starts. It is also the library
+# MainActivity loads for the compact surface (M13g3).
 case "$APK_LISTING" in
   *"lib/$ABI/$APP_LIB"*) ;;
   *) fail "APK does not contain lib/$ABI/$APP_LIB" ;;
+esac
+# An ABI-specific APK must not smuggle another ABI's libs: Gradle's abiFilters
+# is the mechanism, and this is the proof it took effect.
+case "$APK_LISTING" in
+  *"lib/arm64-v8a/"*)
+    [ "$ABI" = "arm64-v8a" ] || fail "the $ABI APK contains arm64-v8a libraries" ;;
+esac
+case "$APK_LISTING" in
+  *"lib/x86_64/"*)
+    [ "$ABI" = "x86_64" ] || fail "the $ABI APK contains x86_64 libraries" ;;
 esac
 case "$APK_LISTING" in
   *"AndroidManifest.xml"*) ;;
@@ -207,6 +266,12 @@ if [ -x "$AAPT" ]; then
   case "$BADGING" in
     *"launchable-activity: name='app.suramak.spike.MainActivity'"*) ;;
     *) fail "APK has no launchable app.suramak.spike.MainActivity" ;;
+  esac
+  # M13I: the packaged ABI is the one the build asked for — this is what the
+  # emulator installs and what a device would load.
+  case "$BADGING" in
+    *"native-code: '$ABI'"*) ;;
+    *) fail "APK native-code is not '$ABI' (see the badging line above)" ;;
   esac
   # v2.1: the crash banner's "Share log" route has to be in the *packaged*
   # manifest — a missing provider turns the button into an exception on the

@@ -56,6 +56,40 @@ CI runs the same script in the `android-build` job (`.github/workflows/ci.yml`),
 which downloads the pinned NDK with the sha256 check above and caches it keyed
 on the revision.
 
+## The installable APK and the x86_64 emulator variant (M13I)
+
+`scripts/android/build-apk.sh` builds the APK. Its ABI is a build input:
+
+```bash
+bash scripts/android/build-apk.sh                          # arm64-v8a, release Rust (the shipping path)
+SURAMAK_ANDROID_ABI=x86_64 bash scripts/android/build-apk.sh  # x86_64, debug Rust — CI emulator only
+```
+
+The release path is pinned: `SURAMAK_ANDROID_RELEASE=1` refuses any ABI other
+than `arm64-v8a`, and the release job in `release.yml` is unchanged. The
+x86_64 variant exists only for the `android-smoke` CI job: a debug-signed APK
+uploaded as a CI artifact (`suramak-android-x86_64-debug`), never a release
+asset. Gradle gets the ABI through `-PsuramakAbi`, so `abiFilters` packages
+exactly the `.so` cargo-ndk produced for that ABI.
+
+The emulator smoke itself is one script — CI and humans run the same file:
+
+```bash
+# needs /dev/kvm, the emulator package and the android-35 google_apis x86_64 image
+bash scripts/android/emulator-smoke.sh
+```
+
+It boots an AVD headless (`-gpu swiftshader_indirect`), installs the APK,
+launches `app.suramak.spike/.MainActivity`, waits for the app's own logcat
+markers (`android_main entered`, `first frame ... presented`), dismisses the
+one-time onboarding with BACK, and inspects the Library screencap with
+`tests/android-smoke/inspect_screencap.py` (stdlib PNG decoder; the gate's
+positive controls are the deterministic renders in `tests/ui-compact/shots/`).
+A bounded monkey pass follows as a crash canary. Artifacts land in
+`build/android-smoke/` (screencaps, uiautomator dumps, full logcat).
+
+What this proves and what it does not: `docs/reports/M13i-emulator-smoke.md`.
+
 ## Why the CMake shim exists
 
 `whisper-rs-sys` builds whisper.cpp through the `cmake` crate, which forwards
@@ -140,3 +174,10 @@ Updates ride the same release page (a newer APK with a higher versionCode
 installs over the old one; the library data stays). Uninstall removes the
 library database — back up via the export sheet first (the library itself is
 app-private).
+
+**If a debug build was ever installed** (any M13x spike APK), the release APK
+will not install over it: debug and release builds carry different signing
+keys, and Android refuses the upgrade with **"App not installed"** — before any
+of the app's code runs. Uninstall the old Suramak first (that removes the
+app-private library; export anything worth keeping), then install the release
+APK. Every later release upgrades in place.
