@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The desktop icon's charcoal. The adaptive background is a flat colour
+         so every launcher mask (circle, squircle, teardrop) keeps the mark
+         legible without a border. -->
+    <color name="ic_launcher_background">#FF111111</color>
+</resources>

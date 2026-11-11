@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The Suramak mark, scaled into the adaptive icon safe zone (66 of
+     108 dp). Artwork is the desktop mark: three coral audio bars + three
+     white text lines + one coral dot (the recording light). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#FFFFFFFF" android:pathData="M24.52,39.86 H24.44 A3.52,3.52 0 0 1 27.95,43.37 V64.55 A3.52,3.52 0 0 1 24.44,68.06 H24.52 A3.52,3.52 0 0 1 21.00,64.55 V43.37 A3.52,3.52 0 0 1 24.52,39.86 Z" />
+    <path android:fillColor="#FFFFFFFF" android:pathData="M35.46,30.43 H35.46 A3.52,3.52 0 0 1 38.98,33.94 V73.98 A3.52,3.52 0 0 1 35.46,77.49 H35.46 A3.52,3.52 0 0 1 31.95,73.98 V33.94 A3.52,3.52 0 0 1 35.46,30.43 Z" />
+    <path android:fillColor="#FFFFFFFF" android:pathData="M46.49,36.74 H46.49 A3.52,3.52 0 0 1 50.00,40.26 V67.66 A3.52,3.52 0 0 1 46.49,71.18 H46.49 A3.52,3.52 0 0 1 42.97,67.66 V40.26 A3.52,3.52 0 0 1 46.49,36.74 Z" />
+    <path android:fillColor="#FFFFFFFF" android:pathData="M63.03,35.14 H83.40 A3.52,3.52 0 0 1 86.92,38.66 V38.58 A3.52,3.52 0 0 1 83.40,42.09 H63.03 A3.52,3.52 0 0 1 59.51,38.58 V38.66 A3.52,3.52 0 0 1 63.03,35.14 Z" />
+    <path android:fillColor="#FFFFFFFF" android:pathData="M63.03,50.48 H83.40 A3.52,3.52 0 0 1 86.92,54.00 V53.92 A3.52,3.52 0 0 1 83.40,57.44 H63.03 A3.52,3.52 0 0 1 59.51,53.92 V54.00 A3.52,3.52 0 0 1 63.03,50.48 Z" />
+    <path android:fillColor="#FFFFFFFF" android:pathData="M63.03,65.83 H72.38 A3.52,3.52 0 0 1 75.89,69.34 V69.26 A3.52,3.52 0 0 1 72.38,72.78 H63.03 A3.52,3.52 0 0 1 59.51,69.26 V69.34 A3.52,3.52 0 0 1 63.03,65.83 Z" />
+    <path android:fillColor="#FFFFFFFF" android:pathData="M79.93,69.30 A3.52,3.52 0 1 0 86.96,69.30 A3.52,3.52 0 1 0 79.93,69.30 Z" />
+</vector>

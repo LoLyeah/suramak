@@ -246,6 +246,12 @@ AAPT="$SDK/build-tools/35.0.0/aapt"
 if [ -x "$AAPT" ]; then
   # Same SIGPIPE reasoning as above: match in the shell, not through a pipe.
   BADGING="$("$AAPT" dump badging "$APK")"
+  # The launcher icon is part of the product: a manifest or resource regression
+  # that drops it ships the default Android robot (which is what 0.4.2 did).
+  case "$BADGING" in
+    *"application-icon-"*) ;;
+    *) fail "APK carries no application-icon — the launcher would show the default placeholder" ;;
+  esac
   # The expected version comes from the workspace Cargo.toml (bump_version.py
   # keeps every site in sync), not a hard-coded literal — a version bump must
   # never trip the packaging assertion.
