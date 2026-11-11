@@ -305,7 +305,11 @@ jobs:
           fi
           wait $PID 2>/dev/null; echo "smoke job app exit=$?"
           test -f build/smoke_job_ok.txt && echo SMOKE-JOB-OK
-          ./target/release/suramak-cli library list | grep -q "en.wav" && echo LIBRARY-OK
+          # M16F: the CLI in target/release links the sherpa dylibs when the
+          # parakeet feature is in this job's feature set, and the dylibs only
+          # exist inside the bundle — so the library assertion runs the
+          # BUNDLED cli, which carries Contents/Frameworks beside it.
+          ./dist/Suramak.app/Contents/MacOS/suramak-cli library list | grep -q "en.wav" && echo LIBRARY-OK
 
       - name: Upload Suramak.app
         uses: actions/upload-artifact@v7
