@@ -738,3 +738,301 @@ fn a_settled_screen_with_a_live_job_requests_no_frames() {
         "a settled screen with a live job must not request a frame: {requested:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// M19A: the Settings list scrolls, the rows follow the finger, a cancelled
+// touch never toggles, and the DEVICE card clears the gesture pill.
+// ---------------------------------------------------------------------------
+
+/// A live egui context + app, so a test can drive real touch frames instead of
+/// painting one still. The touch options are the phone's (12 pt / 0.5 s), which
+/// is what makes the wobble and drag cases mean anything.
+struct Harness {
+    ctx: egui::Context,
+    app: CompactApp,
+    pointer: compact::input::TouchPointer,
+    screen: egui::Rect,
+    time: f64,
+}
+
+impl Harness {
+    fn new(app: CompactApp) -> Self {
+        let ctx = fresh_context(&app);
+        compact::input::apply_touch_options(&ctx);
+        Self {
+            ctx,
+            app,
+            pointer: compact::input::TouchPointer::new(),
+            screen: compact::phone_screen_rect(),
+            time: 10.0,
+        }
+    }
+
+    fn raw(&mut self) -> egui::RawInput {
+        self.time += 0.05;
+        egui::RawInput {
+            screen_rect: Some(self.screen),
+            time: Some(self.time),
+            ..Default::default()
+        }
+    }
+
+    fn run(&mut self, raw: egui::RawInput) -> Vec<compact::CompactAction> {
+        let app = &mut self.app;
+        let mut actions = Vec::new();
+        let _ = self.ctx.run(raw, |ctx| {
+            actions = compact::ui(ctx, app);
+        });
+        actions
+    }
+
+    fn frame(&mut self) -> Vec<compact::CompactAction> {
+        let raw = self.raw();
+        self.run(raw)
+    }
+
+    /// One frame carrying one raw finger event; the shell's synthesiser turns
+    /// it into pointer events exactly as the phone does.
+    fn touch(
+        &mut self,
+        id: u64,
+        phase: egui::TouchPhase,
+        pos: egui::Pos2,
+    ) -> Vec<compact::CompactAction> {
+        let mut raw = self.raw();
+        raw.events.push(egui::Event::Touch {
+            device_id: egui::TouchDeviceId(0),
+            id: egui::TouchId::from(id),
+            phase,
+            pos,
+            force: None,
+        });
+        let _ = self.pointer.prepare(&mut raw);
+        self.run(raw)
+    }
+
+    fn control(&self, label: &str) -> egui::Rect {
+        a11y::controls(&self.ctx)
+            .into_iter()
+            .find(|control| control.label == label)
+            .unwrap_or_else(|| {
+                let labels: Vec<String> = a11y::controls(&self.ctx)
+                    .into_iter()
+                    .map(|control| control.label)
+                    .collect();
+                panic!("no control labeled {label:?}; got {labels:?}")
+            })
+            .rect
+    }
+
+    fn shot(&mut self, name: &str) -> snapshot::Shot {
+        let (_, _, scale) = compact::phone_viewport();
+        let screen = self.screen;
+        let ctx = self.ctx.clone();
+        let app = &mut self.app;
+        let shot = snapshot::render(&ctx, screen, scale, |ctx| {
+            let _ = compact::ui(ctx, app);
+        });
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/ui-compact/shots")
+            .join(format!("{name}.png"));
+        snapshot::write_png(&out, &shot).expect("write shot");
+        shot
+    }
+}
+
+/// A phone with enough model rows that Settings really overflows: 12 GB offers
+/// four models, so the list needs ~130 pt of scroll and the DEVICE card sits at
+/// the end of it.
+fn overflowing_settings() -> CompactApp {
+    let mut app = seeded_app();
+    app.settings.model_id = "base".to_string();
+    app.seed_device(
+        DeviceProfile::new(12_000_000_000, 8_000_000_000, false, true),
+        &["base".to_string()],
+    );
+    app.open_settings(0.0);
+    app.advance(10.0);
+    app
+}
+
+#[test]
+fn settings_rows_follow_the_scroll_offset() {
+    let mut h = Harness::new(overflowing_settings());
+    h.frame(); // the first paint registers the widgets
+    h.frame();
+
+    let bands = chrome::bands(h.screen, h.app.insets.top, h.app.insets.bottom, None);
+    let language = h.control("Language");
+    assert!(
+        (language.top() - (bands.content.top() + 32.0)).abs() < 0.5,
+        "at offset 0 the rows must sit exactly where the static-top layout put \
+         them (the golden shots pin this): {:?} vs {}",
+        language,
+        bands.content.top() + 32.0
+    );
+    let note = h.control(compact::settings::DEVICE_NOTE);
+
+    // The one-shot offset is the shell-facing affordance; the same code path a
+    // drag drives.
+    h.app.settings_scroll = Some(120.0);
+    h.frame();
+    h.frame();
+
+    let language_scrolled = h.control("Language");
+    let note_scrolled = h.control(compact::settings::DEVICE_NOTE);
+    let moved = language.top() - language_scrolled.top();
+    assert!(
+        (moved - 120.0).abs() < 2.0,
+        "the rows must move with the scroll offset, moved {moved}"
+    );
+    assert!(
+        ((note.top() - note_scrolled.top()) - moved).abs() < 0.5,
+        "every row moves together"
+    );
+    assert!(
+        note_scrolled.bottom() <= bands.content.bottom(),
+        "the DEVICE card is inside the viewport once scrolled"
+    );
+}
+
+#[test]
+fn a_wobble_tap_still_toggles_the_row() {
+    let mut h = Harness::new(overflowing_settings());
+    h.frame();
+    h.frame();
+    let row = h.control("Keep the recording");
+    assert!(h.app.settings.keep_audio, "seeded on");
+
+    let start = row.center();
+    h.touch(1, egui::TouchPhase::Start, start);
+    // A thumb rolls 10 pt between press and release; egui's 6 pt mouse default
+    // would drop this tap. 12 pt keeps it.
+    h.touch(1, egui::TouchPhase::Move, start + egui::vec2(6.0, 0.0));
+    h.touch(1, egui::TouchPhase::Move, start + egui::vec2(10.0, 2.0));
+    let actions = h.touch(1, egui::TouchPhase::End, start + egui::vec2(10.0, 2.0));
+
+    assert!(
+        actions.contains(&compact::CompactAction::Setting(
+            compact::CompactSetting::KeepAudio(false)
+        )),
+        "a 10 pt wobble is still a tap: {actions:?}"
+    );
+    assert!(!h.app.settings.keep_audio, "the toggle fired");
+}
+
+#[test]
+fn a_vertical_drag_on_a_row_scrolls_without_toggling() {
+    let mut h = Harness::new(overflowing_settings());
+    h.frame();
+    h.frame();
+    let row = h.control("Keep the recording");
+    let language = h.control("Language");
+    let start = row.center();
+
+    h.touch(1, egui::TouchPhase::Start, start);
+    let mut actions = Vec::new();
+    for step in 1..=5 {
+        actions.extend(h.touch(
+            1,
+            egui::TouchPhase::Move,
+            start - egui::vec2(0.0, 20.0 * step as f32),
+        ));
+    }
+    actions.extend(h.touch(1, egui::TouchPhase::End, start - egui::vec2(0.0, 100.0)));
+
+    assert!(
+        h.app.settings.keep_audio,
+        "a drag that starts on a row must not toggle it: {actions:?}"
+    );
+    assert!(
+        !actions.iter().any(|action| matches!(
+            action,
+            compact::CompactAction::Setting(compact::CompactSetting::KeepAudio(_))
+        )),
+        "no toggle action from a drag: {actions:?}"
+    );
+    let moved = language.top() - h.control("Language").top();
+    assert!(
+        moved > 60.0,
+        "the 100 pt drag scrolls the list, moved {moved} pt"
+    );
+}
+
+#[test]
+fn a_cancelled_touch_never_toggles_the_row() {
+    let mut h = Harness::new(overflowing_settings());
+    h.frame();
+    h.frame();
+    let row = h.control("Keep the recording");
+
+    h.touch(1, egui::TouchPhase::Start, row.center());
+    // The system takes the gesture away (back-swipe / shade): cancel, never up.
+    h.touch(1, egui::TouchPhase::Cancel, row.center());
+    assert!(
+        h.app.settings.keep_audio,
+        "a cancelled touch must never click whatever sat under the finger"
+    );
+    // And the pointer must not be left *down*: a stranded primary button is the
+    // bug egui-winit's own cancel path still has (it drops the id, not the
+    // press). A later tap on the same row must work from a clean state.
+    let (down, has_pointer) = h
+        .ctx
+        .input(|input| (input.pointer.any_down(), input.pointer.has_pointer()));
+    assert!(!down, "the cancel released the pointer");
+    assert!(!has_pointer, "PointerGone cleared the hover state");
+
+    let row = h.control("Keep the recording");
+    h.touch(2, egui::TouchPhase::Start, row.center());
+    let actions = h.touch(2, egui::TouchPhase::End, row.center());
+    assert!(
+        actions.contains(&compact::CompactAction::Setting(
+            compact::CompactSetting::KeepAudio(false)
+        )),
+        "the next tap after a cancel still fires: {actions:?}"
+    );
+}
+
+#[test]
+fn the_device_note_clears_a_54_px_bottom_inset() {
+    let mut app = overflowing_settings();
+    // The Pixel-class gesture bar, in points: 54 physical px at scale 2.6.
+    let inset = 54.0 / 2.6;
+    app.insets.bottom = inset;
+    let mut h = Harness::new(app);
+    h.frame();
+    h.frame();
+
+    // Scroll to the end: a big one-shot offset is clamped to the content's
+    // height, so the next frame paints the true bottom.
+    h.app.settings_scroll = Some(100_000.0);
+    h.frame();
+    h.frame();
+
+    let bands = chrome::bands(h.screen, h.app.insets.top, h.app.insets.bottom, None);
+    let note = h.control(compact::settings::DEVICE_NOTE);
+    let quit = h.control("Quit Suramak");
+    let tail = compact::settings::bottom_clearance(inset);
+    assert!(
+        (tail - (inset + chrome::GUTTER)).abs() < 0.01,
+        "inset + gutter"
+    );
+    assert!(
+        note.bottom() <= bands.content.bottom() - tail,
+        "the DEVICE note clears the gesture area by the padding: note {} content {} tail {}",
+        note.bottom(),
+        bands.content.bottom(),
+        tail
+    );
+    assert!(
+        (bands.content.bottom() - quit.bottom() - (30.0 + tail)).abs() < 1.0,
+        "the scroll range ends with the inset + gutter under the last control: \
+         quit bottom {} content bottom {}",
+        quit.bottom(),
+        bands.content.bottom()
+    );
+    assert!(quit.bottom() < bands.content.bottom());
+
+    let shot = h.shot("settings-bottom-inset");
+    assert!(shot.painted_fraction(egui::Color32::BLACK) > 0.5);
+}

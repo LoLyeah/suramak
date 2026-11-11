@@ -23,6 +23,7 @@ synthetic negative controls, so the gate cannot silently stop biting.
 Usage:
   inspect_screencap.py --shot build/android-smoke/library.png \\
                        --baseline build/android-smoke/launcher.png
+  inspect_screencap.py --diff before.png after.png --min-mean-diff 0.4
   inspect_screencap.py --self-test
 """
 
@@ -352,6 +353,25 @@ def self_test(reference_dir):
             results, _ = inspect(path)
             expect(f"negative control {name}", results, False)
 
+        # The scroll proof's comparator (M19A): two captures of the same frame
+        # are 0; the same screen against a blank frame is far above the
+        # smoke's 0.4 threshold. A comparator that always says "different"
+        # would let a stuck list pass the swipe assertion.
+        same = os.path.join(reference_dir, "library.png")
+        identical = mean_abs_luma_diff(same, same)
+        print(f"[self-test] diff identical frames: {identical:.3f} (want 0)")
+        if identical != 0.0:
+            failures.append(f"diff of identical frames is {identical}, want 0")
+        # A blank frame at the reference's own size: the comparator must see it
+        # as a different frame by a wide margin.
+        blank = os.path.join(tmp, "blank-same-size.png")
+        ref_w, ref_h = read_png(same)[:2]
+        write_solid_png(blank, ref_w, ref_h, (0, 0, 0, 255))
+        differs = mean_abs_luma_diff(same, blank)
+        print(f"[self-test] diff library vs black: {differs:.3f} (want > 0.4)")
+        if differs <= 0.4:
+            failures.append(f"diff of library vs black is {differs}, want > 0.4")
+
     if failures:
         for failure in failures:
             print(f"[self-test] FAILED: {failure}", file=sys.stderr)
@@ -360,11 +380,57 @@ def self_test(reference_dir):
     return 0
 
 
+def mean_abs_luma_diff(shot_path, other_path):
+    """Mean |ΔL| between two same-size screenshots (0 = identical frames).
+
+    The emulator smoke's scroll proof: the compact surface is one OS window, so
+    uiautomator cannot see the list move — the pixels are the only witness.
+    """
+    width, height, channels, pixels = read_png(shot_path)
+    other_w, other_h, other_channels, other_pixels = read_png(other_path)
+    if (width, height) != (other_w, other_h):
+        raise ValueError(
+            f"resolution mismatch: {shot_path} {width}x{height} vs "
+            f"{other_path} {other_w}x{other_h}"
+        )
+    left = luminance(pixels, channels)
+    right = luminance(other_pixels, other_channels)
+    return sum(abs(a - b) for a, b in zip(left, right)) / len(left)
+
+
+def diff_main(args):
+    try:
+        diff = mean_abs_luma_diff(args.diff[0], args.diff[1])
+    except ValueError as error:
+        print(f"SCREENCAP-DIFF-FAIL: {error}", file=sys.stderr)
+        return 1
+    detail = f"mean |ΔL|={diff:.3f} between {args.diff[0]} and {args.diff[1]}"
+    if args.json:
+        with open(args.json, "w", encoding="utf-8") as handle:
+            json.dump({"mean_abs_luma_diff": round(diff, 4), "a": args.diff[0], "b": args.diff[1]}, handle, indent=2)
+    if args.min_mean_diff is not None and diff < args.min_mean_diff:
+        print(f"SCREENCAP-DIFF-FAIL: {detail} (need >= {args.min_mean_diff})")
+        return 1
+    if args.max_mean_diff is not None and diff > args.max_mean_diff:
+        print(f"SCREENCAP-DIFF-FAIL: {detail} (need <= {args.max_mean_diff})")
+        return 1
+    print(f"SCREENCAP-DIFF-OK: {detail}")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shot")
     parser.add_argument("--baseline")
     parser.add_argument("--json")
+    parser.add_argument(
+        "--diff",
+        nargs=2,
+        metavar=("BEFORE", "AFTER"),
+        help="compare two screenshots instead of inspecting one",
+    )
+    parser.add_argument("--min-mean-diff", type=float, default=None)
+    parser.add_argument("--max-mean-diff", type=float, default=None)
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument(
         "--reference-dir",
@@ -375,8 +441,10 @@ def main():
 
     if args.self_test:
         return self_test(args.reference_dir)
+    if args.diff:
+        return diff_main(args)
     if not args.shot:
-        parser.error("--shot is required (or --self-test)")
+        parser.error("--shot is required (or --diff / --self-test)")
 
     results, metrics = inspect(args.shot, args.baseline)
     for label, ok, detail in results:

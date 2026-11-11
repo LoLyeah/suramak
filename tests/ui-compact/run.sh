@@ -29,7 +29,7 @@ xvfb-run -a --server-args="-screen 0 1400x2800x24" \
 # The Rust writer emits uncompressed PNGs (no image crate in the workspace).
 # Compress the committed artifacts when ImageMagick is present; the assertions
 # below are unaffected.
-SHOTS="launch-library library library-light library-empty first-run-download download-progress download-resume onboarding diagnostics editor settings settings-tiers export-sheet export-written"
+SHOTS="launch-library library library-light library-empty first-run-download download-progress download-resume onboarding diagnostics editor settings settings-tiers settings-bottom-inset export-sheet export-written"
 if command -v convert >/dev/null 2>&1; then
   for shot in $SHOTS; do
     path="tests/ui-compact/shots/$shot.png"

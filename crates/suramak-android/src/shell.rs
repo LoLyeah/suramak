@@ -32,7 +32,9 @@ use egui::{Event, Key, Modifiers, RawInput};
 use jni::objects::{JObject, JValue};
 use jni::JavaVM;
 
-use suramak_ui::deck::compact::{self, CompactAction, CompactSetting, DiagnosticsView};
+use suramak_ui::deck::compact::{
+    self, CompactAction, CompactRoute, CompactSetting, DiagnosticsView,
+};
 
 use suramak_android_spike::diag;
 use suramak_android_spike::ui::SpikeState;
@@ -73,6 +75,18 @@ pub struct CompactShell {
     crash_rev: u64,
     /// A status line the shell owns (a refused intent, a missing host).
     shell_status: Option<String>,
+    /// M19A: primary-touch → pointer synthesis, across frames.
+    touch_pointer: compact::input::TouchPointer,
+    /// M19A: the raw-input log (`SURAMAK_INPUT_LOG`, on in debug builds).
+    input_log: bool,
+    /// The surface's pixels-per-point, for the input log's units.
+    ppp: f32,
+    /// The route the last frame painted (the navigation marker's edge).
+    last_route: Option<CompactRoute>,
+    /// When the Settings layout probe was last logged.
+    last_layout_log: Option<Instant>,
+    /// The resume counter the touch tracker was last reset for.
+    last_resumes: u64,
 }
 
 impl Default for CompactShell {
@@ -92,6 +106,12 @@ impl CompactShell {
             logged_host_missing: false,
             crash_rev: u64::MAX,
             shell_status: None,
+            touch_pointer: compact::input::TouchPointer::new(),
+            input_log: compact::input::input_log_enabled(),
+            ppp: 0.0,
+            last_route: None,
+            last_layout_log: None,
+            last_resumes: 0,
         }
     }
 
@@ -107,34 +127,58 @@ impl CompactShell {
     /// normal caret logic).
     pub fn prime_input(&mut self, raw: &mut RawInput, state: &SpikeState) {
         let target = state.text.as_str();
-        if target == self.ime_applied {
-            return;
+        if target != self.ime_applied {
+            let old: Vec<char> = self.ime_applied.chars().collect();
+            let new: Vec<char> = target.chars().collect();
+            let mut common = 0;
+            while common < old.len() && common < new.len() && old[common] == new[common] {
+                common += 1;
+            }
+            for _ in common..old.len() {
+                raw.events.push(Event::Key {
+                    key: Key::Backspace,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                });
+            }
+            if common < new.len() {
+                raw.events
+                    .push(Event::Text(new[common..].iter().collect::<String>()));
+            }
+            self.ime_applied = target.to_string();
         }
-        let old: Vec<char> = self.ime_applied.chars().collect();
-        let new: Vec<char> = target.chars().collect();
-        let mut common = 0;
-        while common < old.len() && common < new.len() && old[common] == new[common] {
-            common += 1;
+
+        // M19A Step 0 / the synthesis. The description is taken BEFORE the
+        // fold-in so it reports what the integration delivered (the question
+        // Step 0 asks), with `synth=` naming what this shell had to add.
+        let described = self
+            .input_log
+            .then(|| compact::input::describe_frame(raw, self.ppp));
+        let synthesized = self.touch_pointer.prepare(raw);
+        if let Some(line) = described {
+            log::info!("SURAMAK-INPUT {line} synth={synthesized}");
         }
-        for _ in common..old.len() {
-            raw.events.push(Event::Key {
-                key: Key::Backspace,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: Modifiers::NONE,
-            });
-        }
-        if common < new.len() {
-            raw.events
-                .push(Event::Text(new[common..].iter().collect::<String>()));
-        }
-        self.ime_applied = target.to_string();
     }
 
     /// Draws one frame. Returns the actions the host must run ([] when the
     /// compact host has not been created yet).
     pub fn draw(&mut self, ctx: &egui::Context, state: &SpikeState) -> Vec<CompactAction> {
+        // M19A: the phone's click window is thumb-sized (12 pt / 0.5 s). The
+        // check is a read, so a recreated context — a surface rebuild builds a
+        // fresh egui Context — self-heals on the next frame.
+        if !compact::input::touch_options_applied(ctx) {
+            compact::input::apply_touch_options(ctx);
+        }
+        self.ppp = ctx.pixels_per_point();
+        // A touch that was live when the Activity went away never gets its
+        // End/Cancel; holding the old id would make every later Start look like
+        // a second finger. A resume is the edge that proves it is gone.
+        if state.resumes != self.last_resumes {
+            self.last_resumes = state.resumes;
+            self.touch_pointer.reset();
+        }
         let Some(host) = crate::compact_host() else {
             // One line per generation: the host is registered by MainActivity's
             // UiBridge.init BEFORE super.onCreate, so a persistent None here
@@ -161,6 +205,7 @@ impl CompactShell {
             read_resume_offer()
         };
         let mut actions = Vec::new();
+        let mut layout_probe = None;
         let drew = host.with_app(|app| {
             app.insets.top = (state.insets.top as f32 / ppp).max(0.0);
             app.insets.bottom = (state.insets.bottom as f32 / ppp).max(0.0);
@@ -184,11 +229,29 @@ impl CompactShell {
                 app.status = Some((status, true));
             }
             actions = compact::ui(ctx, app);
+            // M19A: one logcat line per navigation change is the smoke's proof
+            // that a tap landed (`compact route: Settings`), and the Settings
+            // probe below is its bottom-clearance evidence.
+            let route = app.nav.current();
+            if self.last_route != Some(route) {
+                self.last_route = Some(route);
+                log::info!("compact route: {route:?}");
+            }
+            if self.input_log {
+                layout_probe = Some((
+                    compact::a11y::controls(ctx)
+                        .into_iter()
+                        .find(|control| control.label == compact::settings::DEVICE_NOTE)
+                        .map(|control| control.rect),
+                    app.insets.bottom,
+                ));
+            }
         });
         if drew.is_none() {
             draw_starting(ctx);
             return Vec::new();
         }
+        self.log_layout_probe(ctx, layout_probe);
         // One logcat marker for the first real Library draw (the CI smoke
         // waits for it before screencapping: the startup placeholder and the
         // Library look alike in a pixel histogram, and the host's first draw
@@ -199,6 +262,33 @@ impl CompactShell {
             log::info!("compact library surface: ready");
         }
         actions
+    }
+
+    /// One line a second while Settings is up, naming where the DEVICE note
+    /// ended up relative to the content band and the gesture inset (M19A's
+    /// bottom-clearance proof; the emulator smoke reads the last line).
+    fn log_layout_probe(&mut self, ctx: &egui::Context, probe: Option<(Option<egui::Rect>, f32)>) {
+        let Some((Some(rect), inset)) = probe else {
+            return;
+        };
+        let now = Instant::now();
+        if self
+            .last_layout_log
+            .is_some_and(|at| now.duration_since(at) < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.last_layout_log = Some(now);
+        let screen = ctx.content_rect();
+        log::info!(
+            "SURAMAK-LAYOUT route=Settings device_top={:.1} device_bottom={:.1} \
+             content_bottom={:.1} screen_bottom={:.1} inset_bottom={:.1}",
+            rect.top(),
+            rect.bottom(),
+            screen.bottom() - inset,
+            screen.bottom(),
+            inset
+        );
     }
 
     /// Runs the actions the last frame produced, after the app borrow has ended.

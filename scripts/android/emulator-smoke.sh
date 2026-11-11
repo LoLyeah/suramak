@@ -9,6 +9,14 @@
 # launch failure is a failed exit code — this script is the job's gate, not a
 # report generator.
 #
+# M19A adds the phone-interaction steps: a tap opens Settings, a swipe moves the
+# list (proved by a screencap diff with a still-frame negative control), a tap
+# after the swipe still fires (proved by the shell's route marker), and the
+# DEVICE note ends above the gesture inset at full scroll (proved by the
+# shell's SURAMAK-LAYOUT probe). The same run records Step 0's two answers in
+# `input-log.txt`: whether pointer events already reach egui, and whether the
+# touch coordinates are egui points.
+#
 # Requires (all provided by the CI job):
 #   - an x86_64 AVD package installed (`system-images;android-35;google_apis;x86_64`)
 #   - a working /dev/kvm (the emulator refuses to boot usefully without it)
@@ -143,11 +151,16 @@ echo "== booting the emulator (headless, ANGLE) =="
 # -wipe-data: a fresh first-run state every run (the onboarding sheet is part
 # of the launch surface, so the smoke expects it);
 # -no-snapshot/-no-boot-anim: no stale state, no animation delay.
+# -memory 8192 (M19A): the model table is the device tier's, and the tier is
+# read from usable RAM. At 2048 MB the phone reports "below the 4 GB floor" and
+# offers ONE model row — the Settings list then fits the screen and there is
+# nothing to scroll, which would make the swipe assertion vacuous. 8 GB is the
+# tier the owner's phone and the M19 model guidance target.
 GPU_MODE="${SURAMAK_EMU_GPU:-angle_indirect}"
 "$EMULATOR" -avd "$AVD_NAME" \
   -no-window -no-audio -no-boot-anim -no-snapshot -wipe-data \
   -gpu "$GPU_MODE" -accel on \
-  -memory 2048 -partition-size 4096 \
+  -memory 8192 -partition-size 4096 \
   -camera-back none -camera-front none \
   -no-metrics \
   >"$OUT/emulator.log" 2>&1 &
@@ -544,6 +557,187 @@ fi
 
 echo "   library:  rendered (screencap inspected)"
 
+# --- M19A: the Settings list scrolls, taps land after a swipe, and the DEVICE
+# --- card clears the gesture pill --------------------------------------------
+#
+# Every assertion below is pixel- or log-derived: the compact surface is ONE
+# Android window, so uiautomator sees a single node and cannot describe the
+# list moving. The witnesses are (a) a screencap diff before/after a swipe,
+# with a still-frame negative control, (b) the shell's own route markers for
+# "a tap landed", and (c) the shell's SURAMAK-LAYOUT probe for where the DEVICE
+# note sits relative to the content band (the gesture inset).
+echo "== M19A: Settings scroll, tap after a swipe, gesture-pill clearance =="
+
+# Geometry in physical pixels: input tap/swipe take pixels, the shell logs
+# egui points. Their ratio is Step 0's second answer.
+SCREEN_W="$("$ADB" shell wm size | tr -d '\r' | sed -n 's/.*: \([0-9]*\)x\([0-9]*\).*/\1/p' | tail -1)"
+SCREEN_H="$("$ADB" shell wm size | tr -d '\r' | sed -n 's/.*: \([0-9]*\)x\([0-9]*\).*/\2/p' | tail -1)"
+DENSITY="$("$ADB" shell wm density | tr -d '\r' | sed -n 's/.*: \([0-9]*\).*/\1/p' | tail -1)"
+[ -n "$SCREEN_W" ] && [ -n "$SCREEN_H" ] && [ -n "$DENSITY" ] \
+  || fail "could not read the screen geometry (wm size='${SCREEN_W}x${SCREEN_H}' density='${DENSITY}')"
+echo "   screen:   ${SCREEN_W}x${SCREEN_H} px, density ${DENSITY} dpi"
+
+dp() { awk -v value="$1" -v density="$DENSITY" 'BEGIN { printf "%d", value * density / 160 }'; }
+
+route_is() { app_log | grep -qF "compact route: $1"; }
+
+# Taps the app bar at `x` on a small ladder of heights and stops at the first
+# one that changes the route: the bar's centre is `status bar + 28 dp`, and the
+# status bar is 0–48 dp depending on the cutout. A fixed y would be a coin
+# flip on an unknown skin.
+tap_and_wait_route() {
+  local x="$1" route="$2" y attempt=0
+  for y in "$(dp 46)" "$(dp 70)" "$(dp 30)"; do
+    attempt=$((attempt + 1))
+    "$ADB" shell input tap "$x" "$y"
+    local deadline=$((SECONDS + 8))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+      if route_is "$route"; then
+        echo "   tap:      (${x}, ${y}) → ${route}"
+        return 0
+      fi
+      sleep 1
+    done
+    echo "   tap:      no ${route} route at (${x}, ${y}) (attempt ${attempt})"
+  done
+  return 1
+}
+
+enter_settings() {
+  # The trailing "Settings" hit area: 48 dp tall in the middle of the 56 dp app
+  # bar, its right edge GUTTER + 12 dp from the window edge. 40 dp in from the
+  # right is inside it on every density.
+  tap_and_wait_route "$((SCREEN_W - $(dp 40)))" Settings
+}
+
+# Clear logcat so a route marker seen below is one THIS tap produced (the first
+# launch already logged "compact route: Library").
+"$ADB" logcat -c 2>/dev/null || true
+
+enter_settings || {
+  timeout 30 "$ADB" logcat -d >"$OUT/logcat-settings-failed.txt" 2>/dev/null || true
+  fail "a tap on the Library's Settings action never opened Settings — taps are dead, so the M19A steps cannot run (see $OUT/logcat-settings-failed.txt)"
+}
+sleep 1
+
+# --- the swipe: the list must move -------------------------------------------
+"$ADB" exec-out screencap -p >"$OUT/settings-before.png"
+sleep 0.4
+"$ADB" exec-out screencap -p >"$OUT/settings-still.png"
+
+# A thumb flick: 30% of the screen height, 250 ms, inside the list.
+"$ADB" shell input swipe \
+  "$((SCREEN_W / 2))" "$((SCREEN_H * 65 / 100))" \
+  "$((SCREEN_W / 2))" "$((SCREEN_H * 35 / 100))" 250
+sleep 1
+"$ADB" exec-out screencap -p >"$OUT/settings-after-swipe.png"
+
+# --- Step 0: the two answers, from the shell's raw-input log ------------------
+# The debug APK this job builds has SURAMAK_INPUT_LOG on by default (see
+# `compact::input::input_log_enabled`); the swipe above is the input.
+app_log | grep -F "SURAMAK-INPUT" >"$OUT/input-log.txt" || true
+[ -s "$OUT/input-log.txt" ] \
+  || fail "the shell logged no SURAMAK-INPUT lines — the M19A instrumentation did not run (debug build / SURAMAK_INPUT_LOG)"
+python3 - "$OUT/input-log.txt" <<'PY' || fail "Step 0's answers could not be read from $OUT/input-log.txt"
+import re
+import sys
+
+lines = [line for line in open(sys.argv[1], encoding="utf-8", errors="replace") if "SURAMAK-INPUT" in line]
+if not lines:
+    sys.exit("no SURAMAK-INPUT lines")
+
+buttons = sum("ptrbutton=1" in line for line in lines)
+print(
+    "   STEP0 pointer events: "
+    + ("YES — the integration already translates touch (synth=0 on those frames)"
+       if buttons else "NO — only raw Event::Touch arrives; the shell synthesises the pointer")
+    + f" [{buttons}/{len(lines)} frames carried a PointerButton]"
+)
+
+touches = 0
+for line in lines:
+    screen = re.search(r"screen=([\d.]+)x([\d.]+)", line)
+    ppp = re.search(r"ppp=([\d.]+)", line)
+    if not screen:
+        continue
+    width, height = float(screen.group(1)), float(screen.group(2))
+    for x, y in re.findall(r"@(-?[\d.]+),(-?[\d.]+)", line):
+        touches += 1
+        x, y = float(x), float(y)
+        if not (-0.5 <= x <= width + 0.5 and -0.5 <= y <= height + 0.5):
+            sys.exit(
+                f"touch ({x},{y}) is outside the {width}x{height} pt screen the shell reports "
+                f"(ppp={ppp.group(1) if ppp else '?'}) — the coordinates are NOT egui points"
+            )
+if touches == 0:
+    sys.exit("no touch positions in the input log")
+print(
+    f"   STEP0 units:          YES — every touch position is inside the {width:.1f}x{height:.1f} "
+    "pt screen rect (already divided by pixels-per-point)"
+)
+PY
+
+# --- the two pixel assertions ------------------------------------------------
+# Negative control first: two captures of a still screen must be identical, or
+# the diff below proves nothing.
+python3 tests/android-smoke/inspect_screencap.py \
+  --diff "$OUT/settings-still.png" "$OUT/settings-before.png" \
+  --max-mean-diff 0.05 --json "$OUT/settings-still-diff.json" \
+  || fail "two captures of a still Settings screen differ — the screencap diff is not a stable witness (see $OUT/settings-still-diff.json)"
+
+python3 tests/android-smoke/inspect_screencap.py \
+  --diff "$OUT/settings-before.png" "$OUT/settings-after-swipe.png" \
+  --min-mean-diff 0.4 --json "$OUT/settings-swipe-diff.json" \
+  || fail "the Settings list did not move after a swipe (see $OUT/settings-swipe-diff.json and the two shots) — the dead-scroll regression is back"
+
+# --- a tap after the swipe must still fire -----------------------------------
+# BACK is at a fixed spot whatever the list's offset: if the gesture left the
+# pointer wedged (or the scroll swallowed the next tap), the route never
+# changes and this fails.
+tap_and_wait_route "$(dp 28)" Library \
+  || fail "a tap on Settings' back chevron after the swipe did not return to the Library — taps stop landing after a scroll"
+echo "   tap:      a tap fired after the swipe"
+
+# --- bottom clearance: the DEVICE note above the gesture area ----------------
+enter_settings || fail "could not re-enter Settings for the bottom-clearance check"
+sleep 1
+# Scroll to the end (the list clamps at its own bottom; extra swipes are no-ops).
+for _ in 1 2 3 4 5; do
+  "$ADB" shell input swipe \
+    "$((SCREEN_W / 2))" "$((SCREEN_H * 72 / 100))" \
+    "$((SCREEN_W / 2))" "$((SCREEN_H * 28 / 100))" 200
+  sleep 0.4
+done
+# The layout probe is rate-limited to one line a second.
+sleep 2
+"$ADB" exec-out screencap -p >"$OUT/settings-bottom.png"
+app_log | grep -F "SURAMAK-LAYOUT" | tail -1 >"$OUT/layout.txt" || true
+
+python3 - "$OUT/layout.txt" <<'PY' || fail "the DEVICE note does not clear the gesture area (see $OUT/layout.txt and $OUT/settings-bottom.png)"
+import re
+import sys
+
+line = open(sys.argv[1], encoding="utf-8", errors="replace").read().strip()
+values = dict(re.findall(r"([a-z_]+)=(-?[\d.]+)", line))
+if "device_bottom" not in values:
+    sys.exit(f"no SURAMAK-LAYOUT probe line: {line!r}")
+device_bottom = float(values["device_bottom"])
+content_bottom = float(values["content_bottom"])
+screen_bottom = float(values["screen_bottom"])
+inset_bottom = float(values["inset_bottom"])
+print(
+    f"   clearance: DEVICE note ends at {device_bottom:.1f} pt; content band ends at "
+    f"{content_bottom:.1f} (screen {screen_bottom:.1f} - gesture inset {inset_bottom:.1f})"
+)
+if device_bottom > content_bottom - 1.0:
+    sys.exit(
+        f"the DEVICE note ({device_bottom:.1f} pt) is not above the content band's bottom "
+        f"({content_bottom:.1f} pt) at full scroll — it is still under the gesture pill"
+    )
+PY
+
+tap_and_wait_route "$(dp 28)" Library || fail "could not return to the Library after the clearance check"
+
 # --- monkey canary ------------------------------------------------------------
 # Bounded, touch/motion only: system keys, app switching and trackball events
 # are what turn a canary into a launcher tour. ~10 s wall at the default
@@ -594,5 +788,6 @@ else
 fi
 
 echo
-echo "SMOKE-OK: install → launch → compact Library painted → monkey survived"
-echo "artifacts: $OUT (library.png, launch-onboarding.png, screencap.json, logcat-full.txt)"
+echo "SMOKE-OK: install → launch → compact Library painted → Settings swipes and taps → monkey survived"
+echo "artifacts: $OUT (library.png, launch-onboarding.png, settings-before.png, settings-after-swipe.png,"
+echo "           settings-bottom.png, settings-swipe-diff.json, input-log.txt, layout.txt, logcat-full.txt)"

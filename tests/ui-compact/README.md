@@ -22,6 +22,7 @@ tests/ui-compact/run.sh
 | `shots/diagnostics.png` | Settings → Diagnostics | the four check groups + the v2.4 crash banner (Clear / Share log) |
 | `shots/editor.png` | Editor | back, title, meta line, selected segment with **M15.6 word chips**, transport + Export |
 | `shots/settings.png` | Settings | transcription card, M13D model tiers (offered only), appearance chips, device card, Diagnostics, Quit |
+| `shots/settings-bottom-inset.png` | Settings | **M19A:** the same screen scrolled to its end on a 12 GB phone with a synthetic 54 px gesture inset — the DEVICE card and Quit are above the pill, with the inset + gutter as end padding |
 | `shots/export-sheet.png` | Editor + sheet | six format chips (md/txt/json/srt/vtt/tsv), the bilingual switch, both export routes disclosed |
 | `shots/export-written.png` | Editor + sheet | the picker result path: **Saved** with the name, size and MIME |
 | `shots/settings-tiers.png` | Settings | the M13D low-tier statement: only `tiny` offered below the 4 GB floor, 5 models hidden |
@@ -44,7 +45,12 @@ hit-target assertions.
 * the export sheet's open state and its picker-result state render at the phone
   viewport, and the sheet's six formats are the desktop serializers' set;
 * each shot is non-blank and exactly the requested size;
-* the light and dark ladders both render.
+* the light and dark ladders both render;
+* **M19A:** the Settings rows move with the scroll offset (offset 0 is
+  pixel-identical to the pre-M19A render), a 10 pt wobble is still a tap, a
+  100 pt drag on a row scrolls without toggling it, a cancelled touch never
+  clicks nor leaves the pointer down, and the DEVICE note ends above a 54 px
+  gesture inset with the inset + gutter as end padding.
 
 ## What is NOT asserted here (the honest boundary)
 

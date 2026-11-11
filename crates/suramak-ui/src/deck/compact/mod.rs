@@ -23,6 +23,7 @@ pub mod chrome;
 pub mod diagnostics;
 pub mod editor;
 pub mod first_run;
+pub mod input;
 pub mod library;
 pub mod model;
 pub mod motion;

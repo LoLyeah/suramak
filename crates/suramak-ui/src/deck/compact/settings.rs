@@ -6,6 +6,7 @@
 //! not compile, and no update channel. What remains is every setting the phone
 //! build actually honours, plus the owner-requested Quit.
 
+use egui::emath::GuiRounding;
 use egui::{
     pos2, vec2, Align, Align2, Color32, CornerRadius, FontId, Layout, Rect, ScrollArea, Stroke,
     StrokeKind, Ui, WidgetType,
@@ -19,6 +20,16 @@ use crate::deck::theme::Tokens;
 use super::a11y;
 use super::chrome::{self, GUTTER, MIN_TOUCH};
 use super::model::{bytes_label, CompactAction, CompactApp, CompactSetting, Sheet};
+
+/// The DEVICE card's last line — also the smoke's bottom-clearance probe (the
+/// shell's layout log reports this label's rect).
+pub const DEVICE_NOTE: &str = "Everything runs on this phone. No analytics, no uploads.";
+
+/// The padding the list leaves under its last control: the gesture inset the
+/// shell reports plus the standard gutter (M19A).
+pub fn bottom_clearance(inset_bottom: f32) -> f32 {
+    inset_bottom.max(0.0) + GUTTER
+}
 
 pub fn ui(
     ui: &mut Ui,
@@ -43,6 +54,7 @@ pub fn ui(
     );
     let mut clicks: Vec<CompactAction> = Vec::new();
     let mut scroll = ScrollArea::vertical()
+        .id_salt("compact-settings-scroll")
         .auto_shrink([false, false])
         .scroll_source(egui::containers::scroll_area::ScrollSource {
             drag: true,
@@ -54,7 +66,26 @@ pub fn ui(
     scroll.show(&mut child, |ui| {
         let width = bands.content.width() - GUTTER * 2.0;
         let x = bands.content.left() + GUTTER;
-        let mut y = bands.content.top() + 14.0;
+        // M19A: the rows flow from the SCROLLED cursor, not from the outer
+        // band's static top. `bands.content.top()` is where the viewport
+        // begins; inside `ScrollArea::show` the content Ui's cursor starts
+        // `offset` above it, so reading the cursor is what makes the rows move
+        // when the finger does (the pattern `library.rs` already uses).
+        //
+        // The scroll area snaps its content origin to the physical pixel grid
+        // (`round_to_pixels` then `round_ui`), which would leave the first row
+        // a fraction of a pixel above the band it has always been drawn at and
+        // soften every glyph in the shot. Add that remainder back: at offset 0
+        // the frame is byte-identical to the pre-M19A render, and while
+        // scrolling the remainder is a constant that never changes a row's
+        // spacing.
+        let snapped = bands
+            .content
+            .top()
+            .round_to_pixels(ui.pixels_per_point())
+            .round_ui();
+        let top = ui.cursor().top() + (bands.content.top() - snapped);
+        let mut y = top + 14.0;
 
         // ---- Transcription -------------------------------------------
         chrome::section_label(ui, tokens, pos2(x, y), "Transcription");
@@ -393,9 +424,21 @@ pub fn ui(
         ui.painter().text(
             pos2(device_card.left() + 14.0, device_card.top() + 68.0),
             Align2::LEFT_CENTER,
-            "Everything runs on this phone. No analytics, no uploads.",
+            DEVICE_NOTE,
             FontId::proportional(11.5),
             tokens.ink_faint,
+        );
+        // The DEVICE note is the bottom-clearance probe: the shell's layout log
+        // reports this label's rect, and the emulator smoke asserts it sits
+        // above the gesture pill after a scroll to the end. It also gives
+        // TalkBack the sentence instead of leaving it as anonymous paint.
+        a11y::describe(
+            ui,
+            Rect::from_min_size(
+                pos2(device_card.left() + 14.0, device_card.top() + 60.0),
+                vec2(width - 28.0, 16.0),
+            ),
+            DEVICE_NOTE,
         );
         y = device_card.bottom() + 22.0;
 
@@ -450,7 +493,15 @@ pub fn ui(
             state.request_quit();
         }
         y = quit.bottom() + 30.0;
-        ui.allocate_space(vec2(width, (y - bands.content.top()).max(0.0)));
+        // M19A bottom clearance. The viewport ends at the content band's
+        // bottom, which already excludes the gesture inset the shell reports —
+        // but a phone that has not pushed its insets yet (or an immersive
+        // window) reports zero, and a maxed-out scroll then pins the last
+        // line to the pill. Padding the CONTENT by the inset plus the standard
+        // gutter is what the last line scrolls above; without it the scroll
+        // range ends exactly at the DEVICE card's edge.
+        let tail = bottom_clearance(state.insets.bottom);
+        ui.allocate_space(vec2(width, (y - top).max(0.0) + tail));
     });
 
     actions.extend(clicks);
