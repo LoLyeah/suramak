@@ -203,7 +203,7 @@ pub fn run(app: android_activity::AndroidApp, generation: u32, surface: Box<dyn 
             // drove the dead runtime into a SIGSEGV (`reason=2 (SIGNALED)
             // status=11`). Exit cleanly instead: the next launch is a fresh
             // process, so any future regression becomes a clean restart.
-            relaunch::end_process(relaunch::LoopEnd::LoopUnavailable, libc::_exit)
+            relaunch::end_process(relaunch::LoopEnd::LoopUnavailable, relaunch::exit_clean)
         }
     };
     // The animation needs a frame every vsync; present mode Fifo caps it at the
@@ -255,7 +255,7 @@ pub fn run(app: android_activity::AndroidApp, generation: u32, surface: Box<dyn 
     // without running those hooks: no abort, and the platform records a
     // voluntary exit. Nothing before this point needs an atexit flush (the
     // logger writes through, the crash snapshot is pre-rendered).
-    relaunch::end_process(end, libc::_exit)
+    relaunch::end_process(end, relaunch::exit_clean)
 }
 
 /// Install the log bridge: everything still reaches logcat, and the spike's own

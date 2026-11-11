@@ -103,8 +103,7 @@ pub fn classify_loop_end(activity_destroyed: bool, loop_failed: bool) -> LoopEnd
 ///
 /// The exit call is a parameter so the decision is unit-testable on the host
 /// without killing the test process; the only production caller passes
-/// `std::process::exit`, whose `!` return makes the call site diverge. A
-/// function that returned here would be the old bug.
+/// [`exit_clean`]. A function that returned here would be the old bug.
 pub fn end_process<T>(end: LoopEnd, exit: impl FnOnce(i32) -> T) -> T {
     log::info!(
         "relaunch: {} — ending the process (code {})",
@@ -112,6 +111,35 @@ pub fn end_process<T>(end: LoopEnd, exit: impl FnOnce(i32) -> T) -> T {
         end.exit_code()
     );
     exit(end.exit_code())
+}
+
+// The kernel-level exit, declared locally like diag.rs's entry points (the
+// M13b6 workorder forbids a `libc` dependency). `_exit` is a libc symbol on
+// every Linux-family target (host CI + Android); non-unix targets never reach
+// android_main, so they fall back to the std exit.
+#[cfg(target_family = "unix")]
+extern "C" {
+    fn _exit(code: i32) -> !;
+}
+
+/// End the process at the kernel (`exit_group`), bypassing the atexit hooks.
+///
+/// Why not `std::process::exit`: CI's acceptance run proved that `exit(0)`
+/// still runs ART's atexit hooks, which abort on the way out and record a
+/// voluntary exit as `reason=2 (SIGNALED) status=6` (SIGABRT) — the owner's
+/// developer settings would then blame the app for crashing on every
+/// back-out. `_exit` ends the process without running those hooks, and the
+/// platform records a voluntary exit. Nothing before this point needs an
+/// atexit flush (the logger writes through, the crash snapshot is
+/// pre-rendered).
+#[cfg(target_family = "unix")]
+pub fn exit_clean(code: i32) -> ! {
+    unsafe { _exit(code) }
+}
+
+#[cfg(not(target_family = "unix"))]
+pub fn exit_clean(code: i32) -> ! {
+    std::process::exit(code)
 }
 
 #[cfg(test)]
