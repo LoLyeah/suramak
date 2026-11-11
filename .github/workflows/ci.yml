@@ -681,11 +681,16 @@ jobs:
           java-version: "17"
 
       # whisper-rs-sys builds whisper.cpp through cmake, exactly as in the
-      # android-build job (which installs the same two packages).
-      - name: Install system dependencies (cmake + ninja for whisper.cpp)
+      # android-build job. Both tools are PREINSTALLED on the ubuntu-24.04
+      # runner image — apt is only a fallback, because the apt mirrors have
+      # been flaking (Temporary failure resolving 'azure.archive.ubuntu.com'
+      # failed two smoke runs before the job ever started).
+      - name: Ensure system dependencies (cmake + ninja for whisper.cpp)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake ninja-build
+          command -v cmake || (sudo apt-get update && sudo apt-get install -y cmake)
+          command -v ninja || (sudo apt-get update && sudo apt-get install -y ninja-build)
+          cmake --version
+          ninja --version
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
