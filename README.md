@@ -134,3 +134,5 @@ are in `docs/reports/M12.md`; the owner smoke is `docs/USER_SMOKE.md` §32.
 ## License
 
 GPL-3.0-or-later — see [LICENSE](LICENSE).
+
+Bundled native libraries and their notices: [packaging/THIRD-PARTY-NOTICES.txt](packaging/THIRD-PARTY-NOTICES.txt).

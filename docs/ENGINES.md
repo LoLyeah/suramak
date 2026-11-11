@@ -67,7 +67,7 @@ all).
 What it is:
 
 - NVIDIA **Parakeet TDT 0.6B v3 int8** (`sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8`,
-  4 pinned files, 670 609 772 bytes) through **sherpa-rs 0.6.8** (sherpa-onnx
+  4 pinned files, 670 478 772 bytes) through **sherpa-rs 0.6.8** (sherpa-onnx
   1.12.9 — Rust-native ONNX Runtime; prebuilt native libraries fetched once at
   build time and cached under `~/.cache/sherpa-rs`).
 - Execution provider: `cpu` everywhere; `coreml` on macOS builds (the prebuilt
@@ -131,9 +131,15 @@ Boundaries (honest):
   hardware on the VPS); the darwin code path is compile-checked only.
 - On Linux the linked sherpa-onnx shared libraries are copied next to the
   binary by the sherpa-rs build script; runs need
-  `LD_LIBRARY_PATH=<target>/<profile>` (`…/deps` for test binaries). Packaging
-  the dylibs into the macOS app bundle (`Contents/Frameworks` + an
-  `@loader_path` rpath) is a follow-up for the Mac build (M10B / owner).
+  `LD_LIBRARY_PATH=<target>/<profile>` (`…/deps` for test binaries).
+- On macOS with the `parakeet` feature the release bundle carries the sherpa
+  runtime inside `Contents/Frameworks`: `libsherpa-onnx-c-api.dylib` +
+  `libonnxruntime.1.17.1.dylib`, sha256-pinned (`packaging/sherpa-dylibs.tsv`),
+  given `@executable_path/../Frameworks`, and ad-hoc signed with the rest of the
+  nested code (M16F). Builds without the feature ship none of it. The gate is
+  `scripts/mac-check-dylibs.sh` (+ its negative test); the clean-machine
+  dynamic-load smoke is `scripts/mac-smoke-parakeet.sh`. Model loading and Core
+  ML/ANE engagement on real Apple Silicon remain the owner-Mac pass.
 - sherpa-rs' `static` feature (self-contained binaries) is available but requires
   `RUSTFLAGS="-C relocation-model=dynamic-no-pic"` on Linux x86_64; not used here.
 - `live` transcription stays whisper by design; the fast engine runs on file jobs

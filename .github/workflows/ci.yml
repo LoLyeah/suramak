@@ -247,20 +247,38 @@ jobs:
       - name: Fetch the pinned Sparkle distribution (framework + tools)
         run: ./scripts/fetch-sparkle.sh
 
+      - name: Build suramak-cli with the Parakeet feature (bundle smoke)
+        # M16F: make-app.sh copies target/release/suramak-cli into the bundle,
+        # and the clean-machine smoke drives that binary — it must carry the
+        # engine, or the smoke would prove nothing about the shipped app.
+        run: cargo build --release -p suramak-cli --features parakeet
+
       - name: Package dist/Suramak.app (ad-hoc codesign; embeds Sparkle)
         env:
           # Feature parity with release.yml on purpose: the release ships with
           # `speech-transcriber`, which links a Swift bridge. Building the CI
           # bundle WITHOUT it hid a launch-blocking dyld failure in v0.3.0
           # (@rpath/libswift_Concurrency.dylib). The bundle the smoke launches
-          # must be the bundle that ships.
-          SURAMAK_FEATURES: speech-transcriber,updates
+          # must be the bundle that ships. M16F: `parakeet` adds the sherpa-onnx
+          # dylibs to Contents/Frameworks (default-OFF setting unchanged).
+          SURAMAK_FEATURES: speech-transcriber,updates,parakeet
         run: ./scripts/make-app.sh
 
       # Static, before launch: every @rpath dependency must resolve inside the
       # bundle or against its LC_RPATHs (the v0.3.0 crash class).
       - name: Bundle dylib resolution (every @rpath dep must resolve)
+        env:
+          SURAMAK_EXPECT_PARAKEET: "1"
         run: bash scripts/mac-check-dylibs.sh dist/Suramak.app
+
+      # M16F: hide each bundled sherpa dylib in turn — the gate must fail.
+      - name: Bundle dylib gate — negative test (a missing sherpa dylib must fail)
+        run: bash scripts/mac-check-dylibs-test.sh dist/Suramak.app
+
+      # M16F: dyld must load both sherpa dylibs from a copied bundle, with no
+      # cargo/target/sherpa-rs path in the loaded images.
+      - name: Parakeet dynamic-load smoke (clean env, copied bundle)
+        run: bash scripts/mac-smoke-parakeet.sh dist/Suramak.app
 
       - name: Smoke test the bundle
         run: SURAMAK_SMOKE_SECS=3 ./dist/Suramak.app/Contents/MacOS/suramak

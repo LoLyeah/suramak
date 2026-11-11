@@ -34,9 +34,40 @@ sha256 values also match the repository's LFS etags. Paste verbatim into
 
 Notes:
 - The model is a **directory** (`sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/`), not
-  one file; every file carries its own pin. Total 670 609 772 bytes (~670 MB).
+  one file; every file carries its own pin. Total 670 478 772 bytes (~670 MB).
 - Layout check: all four files must be present (`PARAKEET_REQUIRED_FILES`).
 - Coverage: 25 European languages (bg, hr, cs, da, nl, en, et, fi, fr, de, el, hu,
   it, lv, lt, mt, pl, pt, ro, sk, sl, es, sv, ru, uk) — **no Indonesian**.
 - Mirror rule: `SURAMAK_HF_MIRROR` swaps in `https://hf-mirror.com/…` (same paths).
 - `scripts/pin-model-hashes.sh` prints this section too (third block).
+
+## M16F — sherpa-onnx macOS bundle dylibs (`Contents/Frameworks`)
+
+These are the native libraries that ship **inside** the macOS app when it is
+built with the `parakeet` feature. They come from sherpa-rs-sys 0.6.8's pinned
+download (the same files on every machine); no download happens at package
+time — `scripts/bundle-sherpa-dylibs.sh` verifies the local copies against
+`packaging/sherpa-dylibs.tsv` and fails on any mismatch.
+
+Source archive (universal2: x86_64 + arm64):
+
+`https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.12.9/sherpa-onnx-v1.12.9-osx-universal2-shared.tar.bz2`
+— archive sha256 `e3f3596b84c65eef8939a8a45ced3d7c4ed857455ba5ae1148ce7a1c93ff9a3c`
+(the sherpa-rs cache directory is keyed by that hash).
+
+| file | bytes | sha256 | role |
+|---|---|---|---|
+| libsherpa-onnx-c-api.dylib | 8907832 | dbee23f44d7c66d858242127b9a7fffc99ee989726fc89386b64afb8214e78cb | sherpa-onnx 1.12.9 C API (bundled) |
+| libonnxruntime.1.17.1.dylib | 50396248 | 4979386d1e8b42f4177fa110dbc9600b10846662fe555eac2f338ffef3ab6bfa | ONNX Runtime 1.17.1 (bundled dependency) |
+
+Notes:
+- Only these two ship. `libsherpa-onnx-cxx-api.dylib` is part of the archive but
+  sherpa-rs never links it, so it is deliberately not bundled.
+- The pins cover the **pristine upstream** bytes. Inside the bundle each copy
+  gains one `LC_RPATH` (`@executable_path/../Frameworks`) via
+  `install_name_tool`, so the bundled file's hash is expected to differ; the
+  gate asserts the rpath and resolution instead of a post-patch hash (which is
+  not stable across Xcode toolchains).
+- Licenses: sherpa-onnx Apache-2.0, ONNX Runtime MIT — full texts in
+  `packaging/THIRD-PARTY-NOTICES.txt` (shipped in `Contents/Resources`).
+- `scripts/pin-model-hashes.sh` prints this table's lines as its fourth block.

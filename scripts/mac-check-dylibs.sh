@@ -15,11 +15,26 @@
 # its own LC_RPATH and its own @rpath dependencies; checking only the app's
 # executables passed a bundle whose framework would fail to load.
 #
+# M16F adds two things:
+#   - the Parakeet fast engine's sherpa-onnx dylibs are checked as a chain, not
+#     just generically: when any binary links `libsherpa-onnx-c-api.dylib`, that
+#     file and the exact `libonnxruntime.<version>.dylib` it names must both be
+#     in `Contents/Frameworks`, each must carry the bundle's
+#     `@executable_path/../Frameworks` LC_RPATH, and their @rpath deps must
+#     resolve. Set `SURAMAK_EXPECT_PARAKEET=1` to require the chain even if a
+#     broken build somehow lost the link (the release/CI jobs do).
+#   - an absolute dependency that is not OS-provided is a hard failure even if it
+#     exists on the build machine: a bundle that names `/Users/…`, a Homebrew
+#     prefix or the sherpa-rs cache is not relocatable and would abort on a clean
+#     Mac. This is the static half of the clean-machine test.
+#
 # Usage: scripts/mac-check-dylibs.sh [path/to/Suramak.app]   (default dist/Suramak.app)
 set -euo pipefail
 
 APP="${1:-dist/Suramak.app}"
 BIN_DIR="$APP/Contents/MacOS"
+FRAMEWORKS_DIR="$APP/Contents/Frameworks"
+BUNDLE_RPATH='@executable_path/../Frameworks'
 
 [ -d "$BIN_DIR" ] || { echo "error: no $BIN_DIR — run make-app.sh first" >&2; exit 1; }
 
@@ -32,6 +47,20 @@ app_rpaths="$(otool -l "$app_bin" | awk '
 
 status=0
 checked=0
+sherpa_seen=0
+sherpa_onnx_dep=""
+
+# LC_RPATH entries of one Mach-O file, one per line (macOS bash 3.2: no mapfile).
+rpaths_of() {
+  otool -l "$1" | awk '
+    /cmd LC_RPATH/ { getline; getline; sub(/^[ \t]*path /, ""); sub(/ \(offset .*/, ""); print }
+  '
+}
+
+fail() {
+  echo "FAIL: $*" >&2
+  status=1
+}
 
 # NUL-separated candidates from both roots; `find -print0` + `read -d ''` keeps a
 # path with spaces in one piece.
@@ -65,9 +94,7 @@ while IFS= read -r -d '' bin; do
   abs_dir="$(cd "$(dirname "$bin")" && pwd)"
 
   # LC_RPATH entries (one per line). macOS ships bash 3.2: no mapfile here.
-  rpaths="$(otool -l "$bin" | awk '
-    /cmd LC_RPATH/ { getline; getline; sub(/^[ \t]*path /, ""); sub(/ \(offset .*/, ""); print }
-  ')"
+  rpaths="$(rpaths_of "$bin")"
 
   # Every dependency recorded in the load commands.
   while IFS= read -r dep; do
@@ -123,9 +150,54 @@ while IFS= read -r -d '' bin; do
           status=1
         fi
         ;;
+      /*)
+        # An absolute dependency is only acceptable when the OS provides it.
+        # Anything else — a cargo target dir, a Homebrew cellar, the sherpa-rs
+        # cache under ~/.cache — makes the artifact non-relocatable even when
+        # the file happens to exist on this machine.
+        case "$dep" in
+          /usr/lib/* | /System/* | /Library/Apple/*) ;;
+          *)
+            fail "$label -> $dep is an absolute non-system dependency (a dev path leaked into the bundle)"
+            ;;
+        esac
+        ;;
+    esac
+    case "$dep" in
+      */libsherpa-onnx-c-api.dylib) sherpa_seen=1 ;;
+      @rpath/libonnxruntime.*.dylib) sherpa_onnx_dep="$dep" ;;
     esac
   done < <(dependency_paths "$bin")
 done < <(bundle_files)
+
+# ---- M16F: the Parakeet fast engine's dylib chain -------------------------
+# Only asserted when the bundle links it (or the caller demands it), so a
+# default bundle without the feature is checked exactly as before.
+if [ "$sherpa_seen" -eq 1 ]; then
+  c_api="$FRAMEWORKS_DIR/libsherpa-onnx-c-api.dylib"
+  if [ ! -f "$c_api" ]; then
+    fail "the bundle links libsherpa-onnx-c-api.dylib but $c_api is missing (the app would abort at launch)"
+  else
+    if ! rpaths_of "$c_api" | grep -Fxq "$BUNDLE_RPATH"; then
+      fail "$c_api has no LC_RPATH $BUNDLE_RPATH"
+    fi
+    if [ -z "$sherpa_onnx_dep" ]; then
+      fail "$c_api names no @rpath/libonnxruntime.*.dylib dependency — unexpected artifact"
+    else
+      onnx_name="${sherpa_onnx_dep#@rpath/}"
+      onnx_path="$FRAMEWORKS_DIR/$onnx_name"
+      if [ ! -f "$onnx_path" ]; then
+        fail "$c_api depends on $sherpa_onnx_dep but $onnx_path is missing"
+      elif ! rpaths_of "$onnx_path" | grep -Fxq "$BUNDLE_RPATH"; then
+        fail "$onnx_path has no LC_RPATH $BUNDLE_RPATH"
+      else
+        echo "ok:   sherpa: $c_api + $onnx_name in Contents/Frameworks, both with $BUNDLE_RPATH"
+      fi
+    fi
+  fi
+elif [ "${SURAMAK_EXPECT_PARAKEET:-0}" = "1" ]; then
+  fail "SURAMAK_EXPECT_PARAKEET=1 but no binary in the bundle links libsherpa-onnx-c-api.dylib"
+fi
 
 if [ "$checked" -eq 0 ]; then
   echo "error: no Mach-O binaries under $APP/Contents" >&2
@@ -133,7 +205,7 @@ if [ "$checked" -eq 0 ]; then
 fi
 
 if [ "$status" -ne 0 ]; then
-  echo "error: unresolved @rpath dependencies — this bundle would abort at launch" >&2
+  echo "error: unresolved, non-relocatable or missing expected dependencies — this bundle would abort at launch" >&2
   exit 1
 fi
 

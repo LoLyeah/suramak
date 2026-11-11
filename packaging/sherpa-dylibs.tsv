@@ -1,0 +1,16 @@
+# Suramak — sha256 pins for the sherpa-onnx shared libraries bundled into
+# Contents/Frameworks on macOS release builds with the `parakeet` feature ON.
+#
+# Source: sherpa-rs-sys 0.6.8's pinned download for aarch64-apple-darwin /
+# x86_64-apple-darwin — the same universal2 (x86_64 + arm64) archive:
+#   https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.12.9/sherpa-onnx-v1.12.9-osx-universal2-shared.tar.bz2
+#   archive sha256 e3f3596b84c65eef8939a8a45ced3d7c4ed857455ba5ae1148ce7a1c93ff9a3c
+# The archive's own checksum is what sherpa-rs-sys verifies at build time; the
+# per-file values below pin the two libraries this bundle ships (the cxx-api
+# library is not linked by sherpa-rs and is deliberately not bundled).
+#
+# Format: <file name> <TAB> <bytes> <TAB> <sha256>
+# Verified by scripts/bundle-sherpa-dylibs.sh before anything is copied into the
+# bundle; regenerate with scripts/pin-model-hashes.sh (fourth block).
+libsherpa-onnx-c-api.dylib	8907832	dbee23f44d7c66d858242127b9a7fffc99ee989726fc89386b64afb8214e78cb
+libonnxruntime.1.17.1.dylib	50396248	4979386d1e8b42f4177fa110dbc9600b10846662fe555eac2f338ffef3ab6bfa

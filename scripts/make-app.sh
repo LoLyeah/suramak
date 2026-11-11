@@ -11,6 +11,13 @@
 # the signing block below; `--deep` is no longer used). The
 # @executable_path/../Frameworks rpath is a link-time argument
 # (crates/suramak-ui/build.rs), so nothing here patches the binary.
+#
+# M16F: when the list also contains `parakeet`, the release bundle carries the
+# Parakeet fast engine's sherpa-onnx runtime: scripts/bundle-sherpa-dylibs.sh
+# verifies packaging/sherpa-dylibs.tsv and copies libsherpa-onnx-c-api.dylib +
+# libonnxruntime.1.17.1.dylib into Contents/Frameworks (each given the bundle's
+# own @executable_path/../Frameworks LC_RPATH), and the third-party notices ship
+# in Contents/Resources. Builds without the feature are unchanged.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -66,6 +73,15 @@ fi
 if [[ -n "$SPARKLE_DIR" ]]; then
   mkdir -p "$APP/Contents/Frameworks"
   ditto "$SPARKLE_DIR/Sparkle.framework" "$APP/Contents/Frameworks/Sparkle.framework"
+fi
+
+# M16F: the Parakeet fast engine's sherpa-onnx runtime. The helper verifies the
+# pinned sha256 of every dylib before copying, adds the bundle rpath to each
+# copy, and checks the dependency chain resolves — all before the signing block
+# below seals the nested code (ad-hoc, like Sparkle's).
+if [[ ",${FEATURES}," == *",parakeet,"* ]]; then
+  ./scripts/bundle-sherpa-dylibs.sh "$APP"
+  cp packaging/THIRD-PARTY-NOTICES.txt "$APP/Contents/Resources/"
 fi
 
 # Ad-hoc signature: stable per binary; the user may re-see the mic prompt after a

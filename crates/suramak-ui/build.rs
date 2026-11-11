@@ -9,9 +9,9 @@
 //! resolves inside the bundle: `@executable_path/../Frameworks` (the rpath
 //! Sparkle's setup guide and the crate's README both name).
 //!
-//! Emitted **only** for macOS builds with the feature on; every other build
-//! (all Linux/Windows builds, and macOS builds without `updates`) emits nothing
-//! and links exactly as before.
+//! Emitted **only** for macOS builds with either feature on; every other build
+//! (all Linux/Windows builds, and macOS builds without `updates`/`parakeet`)
+//! emits nothing and links exactly as before.
 //!
 //! This script does not touch the framework itself: `scripts/fetch-sparkle.sh`
 //! pins + verifies it, `scripts/make-app.sh` embeds + signs it, and
@@ -39,7 +39,7 @@
 //! — the point of the slice — and the exe's properties would lose the version.
 
 fn main() {
-    macos_sparkle_rpath();
+    macos_frameworks_rpath();
     macos_swift_runtime_rpath();
     windows_resources();
 }
@@ -68,12 +68,18 @@ fn macos_swift_runtime_rpath() {
     println!("cargo:rustc-link-arg-bins=-Wl,-rpath,/usr/lib/swift");
 }
 
-/// M12: `@executable_path/../Frameworks` on macOS builds with `updates`.
-fn macos_sparkle_rpath() {
+/// M12 + M16F: `@executable_path/../Frameworks` on macOS builds that embed code
+/// there — `updates` (Sparkle.framework) or `parakeet` (the sherpa-onnx
+/// dylibs). Both bundle their nested code in Contents/Frameworks, so both need
+/// the same runtime search path; a build with neither feature emits nothing and
+/// links exactly as before.
+fn macos_frameworks_rpath() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
-    if std::env::var_os("CARGO_FEATURE_UPDATES").is_none() {
+    let updates = std::env::var_os("CARGO_FEATURE_UPDATES").is_some();
+    let parakeet = std::env::var_os("CARGO_FEATURE_PARAKEET").is_some();
+    if !updates && !parakeet {
         return;
     }
     println!("cargo:rustc-link-arg-bins=-Wl,-rpath,@executable_path/../Frameworks");
