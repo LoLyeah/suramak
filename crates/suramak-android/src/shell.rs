@@ -67,6 +67,7 @@ pub struct CompactShell {
     last_mic_poll: Option<Instant>,
     /// The compact host was created after this shell's first frame.
     started_host: bool,
+    logged_library_ready: bool,
     /// The crash revision the diagnostics view was built from.
     crash_rev: u64,
     /// A status line the shell owns (a refused intent, a missing host).
@@ -86,6 +87,7 @@ impl CompactShell {
             last_poll: None,
             last_mic_poll: None,
             started_host: false,
+            logged_library_ready: false,
             crash_rev: u64::MAX,
             shell_status: None,
         }
@@ -174,6 +176,15 @@ impl CompactShell {
         if drew.is_none() {
             draw_starting(ctx);
             return Vec::new();
+        }
+        // One logcat marker for the first real Library draw (the CI smoke
+        // waits for it before screencapping: the startup placeholder and the
+        // Library look alike in a pixel histogram, and the host's first draw
+        // on a slow software-rendered emulator can lag the first GPU frame
+        // by tens of seconds).
+        if !self.logged_library_ready {
+            self.logged_library_ready = true;
+            log::info!("compact library surface: ready");
         }
         actions
     }

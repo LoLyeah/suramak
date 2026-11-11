@@ -44,6 +44,7 @@ OUT="${SURAMAK_OUT:-build/android-smoke}"
 BOOT_TIMEOUT="${SURAMAK_BOOT_TIMEOUT:-600}"
 LAUNCH_TIMEOUT="${SURAMAK_LAUNCH_TIMEOUT:-90}"
 FINISH_TIMEOUT="${SURAMAK_FINISH_TIMEOUT:-20}"
+LIBRARY_TIMEOUT="${SURAMAK_LIBRARY_TIMEOUT:-180}"
 MONKEY_EVENTS="${SURAMAK_MONKEY_EVENTS:-30}"
 PACKAGE="app.suramak.spike"
 ACTIVITY="$PACKAGE/.MainActivity"
@@ -432,6 +433,28 @@ echo "   relaunch: first frame presented by pid $NEW_PID"
 if app_log | grep -qF "EventLoop can't be recreated"; then
   app_log | grep -nF "EventLoop can't be recreated" >&2 || true
   fail "'EventLoop can't be recreated' was logged — android_main ran again in a process that already had an event loop; the finish path must exit the process"
+fi
+
+# The compact host's first REAL Library draw can lag the first GPU frame by
+# tens of seconds on a software-rendered emulator (the startup placeholder
+# paints the whole time). The screencap gate inspects the LIBRARY, so wait
+# for the shell's own ready marker before capturing — otherwise the gate
+# inspects a near-black placeholder and mis-fails the launch (observed in CI).
+READY_DEADLINE=$((SECONDS + LIBRARY_TIMEOUT))
+while [ "$SECONDS" -lt "$READY_DEADLINE" ]; do
+  if app_log | grep -qF "compact library surface: ready"; then
+    echo "   library:  ready (compact host up, first real draw)"
+    break
+  fi
+  if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
+    echo "== the EMULATOR PROCESS DIED mid-wait (pid $EMULATOR_PID) ==" >&2
+    tail -40 "$OUT/emulator.log" >&2 2>/dev/null || true
+    fail "the emulator died while waiting for the compact Library to come up"
+  fi
+  sleep 3
+done
+if ! app_log | grep -qF "compact library surface: ready"; then
+  fail "the compact Library never drew (no 'compact library surface: ready' marker within ${LIBRARY_TIMEOUT}s) — the compact host never came up"
 fi
 
 sleep 3
