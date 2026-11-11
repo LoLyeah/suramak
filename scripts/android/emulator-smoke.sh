@@ -549,6 +549,11 @@ echo "   library:  rendered (screencap inspected)"
 # are what turn a canary into a launcher tour. ~10 s wall at the default
 # 30 x 250 ms (plus monkey's own startup).
 echo "== monkey canary ($MONKEY_EVENTS events) =="
+# Clear logcat first: the crash scan below must look at the MONKEY WINDOW only.
+# The earlier finish-path exit legitimately logs "Process ... has died", and a
+# whole-run scan once read that as a monkey crash (the app had exited cleanly
+# through its own back/quit path — exit-info said reason=1 EXIT_SELF).
+"$ADB" logcat -c 2>/dev/null || true
 set +e
 "$ADB" shell monkey -p "$PACKAGE" -v \
   --throttle 250 \
@@ -561,6 +566,7 @@ tail -6 "$OUT/monkey.txt" || true
 sleep 2
 "$ADB" exec-out screencap -p >"$OUT/after-monkey.png" || true
 timeout 30 "$ADB" logcat -d >"$OUT/logcat-full.txt" 2>/dev/null || true
+"$ADB" shell dumpsys activity exit-info "$PACKAGE" >"$OUT/exit-info.txt" 2>&1 || true
 
 if grep -qE "FATAL EXCEPTION|ANR in $PACKAGE|Force finishing activity $PACKAGE|Process $PACKAGE .* has died" "$OUT/logcat-full.txt"; then
   grep -nE "FATAL EXCEPTION|ANR in $PACKAGE|Force finishing activity $PACKAGE|Process $PACKAGE .* has died" \
@@ -571,11 +577,17 @@ fi
 PID="$("$ADB" shell pidof "$PACKAGE" 2>/dev/null | tr -d '\r' || true)"
 if [ -z "$PID" ]; then
   # The compact Settings' Quit action ends the process on purpose; a monkey tap
-  # that reaches it is a legitimate exit, not a crash (the log names it).
+  # that reaches it is a legitimate exit, not a crash (the log names it). A
+  # BACK at the Library root is the same kind of exit: the finish path ends
+  # the process deliberately (exit-info says reason=1 EXIT_SELF).
   if grep -q "SuramakQuit" "$OUT/logcat-full.txt"; then
     echo "   monkey:   the app exited through its own Quit path (not a crash)"
+  elif grep -q "relaunch: .*ending the process (code 0)" "$OUT/logcat-full.txt" \
+    && grep -qE "process=$PACKAGE .*reason=1 \(EXIT_SELF\)" "$OUT/exit-info.txt"; then
+    echo "   monkey:   the app exited through the finish path (back at the Library root — not a crash)"
   else
-    fail "the app process is gone after the monkey pass with no Quit marker (rc=$MONKEY_RC)"
+    grep -E "process=$PACKAGE|reason=" "$OUT/exit-info.txt" >&2 || true
+    fail "the app process is gone after the monkey pass with no Quit/finish marker (rc=$MONKEY_RC)"
   fi
 else
   echo "   monkey:   process alive (pid $PID, rc=$MONKEY_RC)"
