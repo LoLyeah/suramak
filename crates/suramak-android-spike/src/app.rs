@@ -203,7 +203,7 @@ pub fn run(app: android_activity::AndroidApp, generation: u32, surface: Box<dyn 
             // drove the dead runtime into a SIGSEGV (`reason=2 (SIGNALED)
             // status=11`). Exit cleanly instead: the next launch is a fresh
             // process, so any future regression becomes a clean restart.
-            relaunch::end_process(relaunch::LoopEnd::LoopUnavailable, std::process::exit)
+            relaunch::end_process(relaunch::LoopEnd::LoopUnavailable, libc::_exit)
         }
     };
     // The animation needs a frame every vsync; present mode Fifo caps it at the
@@ -247,7 +247,15 @@ pub fn run(app: android_activity::AndroidApp, generation: u32, surface: Box<dyn 
     // loop resumes. Exiting here is therefore invisible to the M13b
     // suspend/resume containment (see `crate::relaunch`).
     let end = relaunch::classify_loop_end(platform::activity_destroyed(generation), loop_failed);
-    relaunch::end_process(end, std::process::exit)
+    // `libc::_exit`, not `std::process::exit`: CI's acceptance run proved that
+    // `exit(0)` still runs ART's atexit hooks, which abort on the way out and
+    // record a voluntary exit as `reason=2 (SIGNALED) status=6` (SIGABRT) —
+    // the owner's developer settings would then blame the app for crashing on
+    // every back-out. `_exit` ends the process at the kernel (exit_group)
+    // without running those hooks: no abort, and the platform records a
+    // voluntary exit. Nothing before this point needs an atexit flush (the
+    // logger writes through, the crash snapshot is pre-rendered).
+    relaunch::end_process(end, libc::_exit)
 }
 
 /// Install the log bridge: everything still reaches logcat, and the spike's own
