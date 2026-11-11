@@ -40,6 +40,11 @@ pub mod pipeline;
 pub mod prompt_budget;
 pub mod queue;
 pub mod speech_transcriber;
+// M16.4-S1: VAD-driven chunking (Silero v5 via sherpa-rs) behind the default-OFF
+// `vad-chunking` feature. Nothing in the capture path calls it; the feature's
+// host test measures join quality before any capture integration is considered.
+#[cfg(feature = "vad-chunking")]
+pub mod vad;
 pub mod whisper;
 pub mod words;
 pub mod worker;

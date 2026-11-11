@@ -44,6 +44,12 @@ parakeet = ["dep:sherpa-rs", "sherpa-rs/sys"]
 # same API shape, so routing can never select the engine and every refusal test
 # runs on Linux (`speech_transcriber::compiled()` is false there).
 speech-transcriber = ["dep:speech"]
+# M16.4-S1: VAD-driven chunking for long recordings (`vad.rs` + the host
+# join-quality harness in `tests/vad_join.rs`). OFF by default: no capture path,
+# no service, no settings surface calls it yet, so a default build is
+# byte-identical. It reuses the `parakeet` feature's sherpa-rs pin (same crate,
+# same prebuilt sherpa-onnx 1.12.9 libraries) but does not require that feature.
+vad-chunking = ["dep:sherpa-rs"]
 
 [dependencies.cpal]
 version = "0.15.3"
