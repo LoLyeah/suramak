@@ -79,14 +79,18 @@ The emulator smoke itself is one script — CI and humans run the same file:
 bash scripts/android/emulator-smoke.sh
 ```
 
-It boots an AVD headless (`-gpu swiftshader_indirect`), installs the APK,
+It boots an AVD headless (`-gpu angle_indirect`), installs the APK,
 launches `app.suramak.spike/.MainActivity`, waits for the app's own logcat
 markers (`android_main entered`, `first frame ... presented`), dismisses the
-one-time onboarding with BACK, and inspects the Library screencap with
+one-time onboarding with BACK, waits for the **finish-path exit** (BACK finishes
+the Activity, so the process must leave), relaunches, and asserts the second
+launch is a **fresh process** — a new pid whose `android_main entered` reads
+`entry #1` again, its own first-frame marker, and no `reason=2 (SIGNALED)` in
+`dumpsys activity exit-info`. Then it inspects the Library screencap with
 `tests/android-smoke/inspect_screencap.py` (stdlib PNG decoder; the gate's
 positive controls are the deterministic renders in `tests/ui-compact/shots/`).
 A bounded monkey pass follows as a crash canary. Artifacts land in
-`build/android-smoke/` (screencaps, uiautomator dumps, full logcat).
+`build/android-smoke/` (screencaps, uiautomator dumps, full logcat, exit-info).
 
 What this proves and what it does not: `docs/reports/M13i-emulator-smoke.md`.
 

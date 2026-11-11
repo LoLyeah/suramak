@@ -6,8 +6,9 @@
 //!
 //! Lifecycle (v2.1, audited): the counters live in a process-wide
 //! `OnceLock<Mutex<_>>` ([`state`]), *not* in this handler, because
-//! `android_main` runs again after an Activity recreation. The whole **GPU
-//! generation** — surface, device, queue, `egui_wgpu::Renderer`,
+//! `android_main` runs again after an Activity recreation — in the same process
+//! before M13I-b, in a fresh one since (see the M13I-b section below). The whole
+//! **GPU generation** — surface, device, queue, `egui_wgpu::Renderer`,
 //! `egui_winit::State` **and the `egui::Context`** — is dropped on `suspended`
 //! and rebuilt from scratch on `resumed`; the `Window` is kept, because winit's
 //! Android window is a *logical* handle (`{ AndroidApp, redraw_requester }`) that
@@ -109,6 +110,25 @@
 //! `stage(Configure)` returning and `surface.configure` entering), not the
 //! hundreds of milliseconds of a Vulkan adapter/device request. §9 of the report
 //! states that boundary rather than claiming more.
+//!
+//! **M13I-b: the one-loop-per-process contract — the process ends with the
+//! loop.** winit's Android backend allows exactly one `EventLoop` per process,
+//! but android-activity calls `android_main` again for every Activity instance.
+//! Until M13I-b this loop returned when the Activity was destroyed and left the
+//! process alive; the next launch's `android_main` then failed with `EventLoop
+//! can't be recreated`, and the JNI side drove the dead runtime into a SIGSEGV
+//! (CI: `ApplicationExitInfo reason=2 (SIGNALED) status=11`). Now the end of
+//! [`run`] is terminal: `run_app` returning means the process exits through
+//! [`relaunch::end_process`] with code 0, so the next launch is a fresh process
+//! with a fresh loop and a fresh GPU generation. The `EventLoop::build` failure
+//! path exits the same way (layer 2 — an unreachable-by-construction guard that
+//! turns a future regression into a clean restart).
+//!
+//! A **suspend is not a loop end**: `Handler::suspended` never returns from
+//! `run_app` — it closes the frame gate, drops the whole GPU generation (the
+//! M13b containment) and parks the same loop on `Wait` — so HIDE/resume never
+//! reaches the exit. That asymmetry is the invariant this pass must not
+//! regress, and it is why [`relaunch::LoopEnd`] has no `Suspended` variant.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -123,6 +143,7 @@ use winit::window::{Window, WindowId};
 use crate::diag;
 use crate::gpu_context;
 use crate::platform;
+use crate::relaunch;
 use crate::surface_api::CompactSurface;
 use crate::surface_lifecycle::{
     BuildTicket, InitStage, KillLatch, SurfaceAction, SurfaceFault, SurfaceLifecycle,
@@ -176,7 +197,13 @@ pub fn run(app: android_activity::AndroidApp, generation: u32, surface: Box<dyn 
         Ok(event_loop) => event_loop,
         Err(err) => {
             log::error!("event loop creation failed: {err}");
-            return;
+            // M13I-b layer 2 (defensive): winit allows exactly ONE `EventLoop`
+            // per process. A process that cannot build one has no runtime to
+            // drive, and the old `return` left exactly that — the JNI side then
+            // drove the dead runtime into a SIGSEGV (`reason=2 (SIGNALED)
+            // status=11`). Exit cleanly instead: the next launch is a fresh
+            // process, so any future regression becomes a clean restart.
+            relaunch::end_process(relaunch::LoopEnd::LoopUnavailable, std::process::exit)
         }
     };
     // The animation needs a frame every vsync; present mode Fifo caps it at the
@@ -195,14 +222,32 @@ pub fn run(app: android_activity::AndroidApp, generation: u32, surface: Box<dyn 
         generation,
         surface,
     };
-    if let Err(err) = event_loop.run_app(&mut handler) {
-        log::error!("event loop exited with an error: {err}");
-    }
+    let loop_failed = match event_loop.run_app(&mut handler) {
+        Ok(()) => false,
+        Err(err) => {
+            log::error!("event loop exited with an error: {err}");
+            true
+        }
+    };
     // Drop the observable resources while the Activity is still coherent, then
     // say so: this line (or its absence) is how the next launch knows the loop
     // ended cleanly.
     drop(handler);
     log::info!("M13b spike: android_main returned (entry #{entry})");
+    // M13I-b layer 1: the loop is over, and winit will never build another one
+    // in this process. When the Activity was destroyed (the finish path), the
+    // process must go with it — the next launch then starts a fresh process
+    // with a fresh `EventLoop` and a fresh GPU generation. Returning here is
+    // what left a live process with a dead runtime and produced
+    // `EventLoop can't be recreated` followed by a native SIGSEGV on the next
+    // launch.
+    //
+    // The suspend path never reaches this line: `suspended` closes the frame
+    // gate, drops the whole GPU generation and parks on `Wait`, and the same
+    // loop resumes. Exiting here is therefore invisible to the M13b
+    // suspend/resume containment (see `crate::relaunch`).
+    let end = relaunch::classify_loop_end(platform::activity_destroyed(generation), loop_failed);
+    relaunch::end_process(end, std::process::exit)
 }
 
 /// Install the log bridge: everything still reaches logcat, and the spike's own
@@ -362,6 +407,11 @@ impl ApplicationHandler for Handler {
     }
 
     fn suspended(&mut self, event_loop: &ActiveEventLoop) {
+        // M13b containment, and the M13I-b boundary with it: this handler NEVER
+        // ends the loop and never exits the process. A suspend means the
+        // Activity and the process are still alive; the same loop rebuilds on
+        // the next `resumed`. Only the destroy path (about_to_wait) returns
+        // from `run_app`, and only that path ends the process.
         diag::set_phase(diag::Phase::Suspended);
         // The ANativeWindow behind the surface is going away; drop every wgpu
         // object that references it — surface, device, queue, renderer and the

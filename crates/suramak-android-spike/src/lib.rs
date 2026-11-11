@@ -55,6 +55,7 @@
 pub mod diag;
 pub mod gpu_context;
 pub mod probe_state;
+pub mod relaunch;
 pub mod surface_lifecycle;
 pub mod ui;
 

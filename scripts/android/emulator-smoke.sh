@@ -23,6 +23,8 @@
 #   SURAMAK_OUT             artifact directory (default build/android-smoke)
 #   SURAMAK_BOOT_TIMEOUT    seconds to wait for boot (default 600)
 #   SURAMAK_LAUNCH_TIMEOUT  seconds to wait for the first frame marker (default 90)
+#   SURAMAK_FINISH_TIMEOUT  seconds to wait for the process to leave after BACK
+#                           (default 20; the M13I-b finish-path exit)
 #   SURAMAK_MONKEY_EVENTS   monkey event count (default 30; 30 × 250 ms ≈ 7.5 s
 #                           of injection, ~10 s wall including monkey's startup)
 #   SURAMAK_KEEP_RUNNING=1  leave the emulator up (local debugging only)
@@ -41,6 +43,7 @@ AVD_DEVICE="${SURAMAK_AVD_DEVICE:-pixel_6}"
 OUT="${SURAMAK_OUT:-build/android-smoke}"
 BOOT_TIMEOUT="${SURAMAK_BOOT_TIMEOUT:-600}"
 LAUNCH_TIMEOUT="${SURAMAK_LAUNCH_TIMEOUT:-90}"
+FINISH_TIMEOUT="${SURAMAK_FINISH_TIMEOUT:-20}"
 MONKEY_EVENTS="${SURAMAK_MONKEY_EVENTS:-30}"
 PACKAGE="app.suramak.spike"
 ACTIVITY="$PACKAGE/.MainActivity"
@@ -242,6 +245,107 @@ if ! wait_for_log "android_main entered"; then
   tail -80 "$OUT/logcat-launch-failed.txt" >&2 || true
   fail "no 'android_main entered' marker in logcat — the native thread never started"
 fi
+
+# --- M13I-b: the relaunch contract -------------------------------------------
+# The CI repro (run 43017092638): launch OK → BACK during the splash → the
+# Activity is destroyed → the loop returns → the process stayed alive → the
+# next launch's android_main could not create a second EventLoop → the JNI side
+# drove the dead runtime → ApplicationExitInfo reason=2 (SIGNALED) status=11
+# (SIGSEGV). The fix makes the end of the loop terminal (the process exits, so
+# the next launch is a fresh process) and makes the loop-unavailable path exit
+# cleanly too. These helpers assert exactly that, from logcat's threadtime
+# columns: $3 is the pid that wrote the line.
+
+# The app's own log, tag-filtered and time-bounded like `wait_for_log` (an
+# unbounded logcat on a wedged emulator can hang the whole step).
+app_log() {
+  timeout 20 "$ADB" logcat -d -s SuramakSpike:I 2>/dev/null || true
+}
+
+# `<pid> <entry>` for the newest `android_main entered` line; empty if none.
+latest_main_entry() {
+  local line pid entry
+  line="$(app_log | grep -F "android_main entered (entry #" | tail -1 || true)"
+  [ -n "$line" ] || return 1
+  pid="$(printf '%s\n' "$line" | awk '{print $3}')"
+  entry="$(printf '%s\n' "$line" | sed -nE 's/.*android_main entered \(entry #([0-9]+).*/\1/p')"
+  [ -n "$pid" ] && [ -n "$entry" ] || return 1
+  printf '%s %s\n' "$pid" "$entry"
+}
+
+# The pid wrote <pattern> (fixed string)? ($1 pid, $2 pattern)
+pid_log_has() {
+  app_log | awk -v pid="$1" '$3 == pid' | grep -qF "$2"
+}
+
+# Does the package have no process at all?
+package_pids() {
+  "$ADB" shell pidof "$PACKAGE" 2>/dev/null | tr -d '\r' || true
+}
+
+# M13I-b layer 1: after BACK the finish path must end the process. A process
+# that lingers is the state that produced the SIGSEGV on the next launch.
+wait_for_process_exit() {
+  local deadline=$((SECONDS + FINISH_TIMEOUT)) pids attempt=1
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    pids="$(package_pids)"
+    [ -z "$pids" ] && return 0
+    if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
+      echo "== the EMULATOR PROCESS DIED mid-wait (pid $EMULATOR_PID) ==" >&2
+      tail -40 "$OUT/emulator.log" >&2 2>/dev/null || true
+      return 2
+    fi
+    echo "   wait:     the app process to leave after BACK (pid $pids, attempt $attempt)" >&2
+    attempt=$((attempt + 1))
+    sleep 1
+  done
+  return 1
+}
+
+# The second launch must be a FRESH process. winit allows one EventLoop per
+# process, so an in-process re-entry is the crash shape: a fresh process logs
+# `entry #1` again (the counter is process-wide) under a NEW pid, while the old
+# bug logged `entry #2` under the SAME pid. Prints "<pid> <entry>".
+wait_for_fresh_launch() {
+  local deadline=$((SECONDS + LAUNCH_TIMEOUT)) info attempt=1
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
+      echo "== the EMULATOR PROCESS DIED mid-wait (pid $EMULATOR_PID) ==" >&2
+      tail -40 "$OUT/emulator.log" >&2 2>/dev/null || true
+      return 2
+    fi
+    info="$(latest_main_entry || true)"
+    if [ -n "$info" ] && [ "${info%% *}" != "$FIRST_PID" ]; then
+      printf '%s\n' "$info"
+      return 0
+    fi
+    echo "   wait:     a fresh-process android_main (attempt $attempt)" >&2
+    attempt=$((attempt + 1))
+    sleep 2
+  done
+  return 1
+}
+
+# Wait for <pattern> in the lines written by <pid> only: the first-frame marker
+# of the new generation must come from the new process, not from the old one.
+wait_for_pid_log() {
+  local pid="$1" pattern="$2" deadline=$((SECONDS + LAUNCH_TIMEOUT)) attempt=1
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if pid_log_has "$pid" "$pattern"; then
+      return 0
+    fi
+    if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
+      echo "== the EMULATOR PROCESS DIED mid-wait (pid $EMULATOR_PID) ==" >&2
+      tail -40 "$OUT/emulator.log" >&2 2>/dev/null || true
+      return 2
+    fi
+    echo "   wait:     '${pattern}' from pid $pid (attempt $attempt)" >&2
+    attempt=$((attempt + 1))
+    sleep 2
+  done
+  return 1
+}
+
 RC=0
 if ! wait_for_log "first frame of this gpu generation presented"; then RC=$?; fi
 if [ "$RC" -ne 0 ]; then
@@ -264,9 +368,72 @@ sleep 2
 "$ADB" exec-out screencap -p >"$OUT/launch-onboarding.png"
 timeout 45 "$ADB" shell uiautomator dump /sdcard/window-launch.xml >/dev/null 2>&1 || true
 "$ADB" pull /sdcard/window-launch.xml "$OUT/window-launch.xml" >/dev/null 2>&1 || true
+
+# Remember the first process before BACK: the relaunch's proof is a marker from
+# a DIFFERENT pid, whose entry counter reads #1 again (a fresh process).
+FIRST_LAUNCH="$(latest_main_entry || true)"
+[ -n "$FIRST_LAUNCH" ] || fail "no 'android_main entered' line to read the first pid from"
+FIRST_PID="${FIRST_LAUNCH%% *}"
+echo "   launch:   first process pid $FIRST_PID"
+
 "$ADB" shell input keyevent 4
-sleep 1
+# --- M13I-b layer 1: BACK finishes the Activity and the process must leave ----
+# The old code returned from the loop and lingered, which is the state that made
+# the next launch's EventLoop build fail and the JNI side crash. A finish is
+# only clean when the package has no process at all.
+if ! wait_for_process_exit; then
+  # The first BACK may have dismissed a sheet instead of finishing the root.
+  echo "   finish:   still alive after BACK — pressing BACK once more (sheet → root)"
+  "$ADB" shell input keyevent 4
+  if ! wait_for_process_exit; then
+    timeout 30 "$ADB" logcat -d >"$OUT/logcat-back-failed.txt" 2>/dev/null || true
+    "$ADB" shell dumpsys activity exit-info "$PACKAGE" >"$OUT/exit-info-back.txt" 2>&1 || true
+    fail "the app process was still alive ${FINISH_TIMEOUT}s after BACK — the finish path did not end the process (the state that leaves a dead EventLoop for the next launch)"
+  fi
+fi
+echo "   finish:   process exited after BACK (clean finish path)"
+
 "$ADB" shell am start -W -n "$ACTIVITY" >"$OUT/am-start-library.txt" 2>&1 || true
+
+# (a) the SECOND launch: a fresh pid, and the per-process entry counter at #1.
+RELAUNCH=""
+RELAUNCH="$(wait_for_fresh_launch)" || {
+  RC=$?
+  timeout 30 "$ADB" logcat -d >"$OUT/logcat-relaunch-failed.txt" 2>/dev/null || true
+  "$ADB" shell dumpsys activity exit-info "$PACKAGE" >"$OUT/exit-info-relaunch.txt" 2>&1 || true
+  if grep -qE "reason=2 \(SIGNALED\)" "$OUT/exit-info-relaunch.txt"; then
+    cat "$OUT/exit-info-relaunch.txt" >&2
+    fail "the relaunch died on a native SIGNAL (ApplicationExitInfo reason=2 (SIGNALED); status=11 in the CI repro was SIGSEGV) — the one-loop-per-process contract regressed: the finish path must exit the process, and the next launch must start a fresh one"
+  fi
+  if [ "$RC" -eq 2 ]; then
+    fail "the EMULATOR process died during the relaunch wait — the app's own relaunch markers are unassertable (see $OUT/emulator.log)"
+  fi
+  fail "no fresh-process 'android_main entered' marker within ${LAUNCH_TIMEOUT}s of the relaunch (see $OUT/logcat-relaunch-failed.txt, $OUT/exit-info-relaunch.txt)"
+}
+NEW_PID="${RELAUNCH%% *}"
+NEW_ENTRY="${RELAUNCH##* }"
+[ "$NEW_ENTRY" = "1" ] || fail "the relaunch logged entry #$NEW_ENTRY in pid $NEW_PID — a fresh process resets the counter to #1; entry #2 means android_main ran again in the old process (the EventLoop-can't-be-recreated shape)"
+echo "   relaunch: pid $NEW_PID (was $FIRST_PID), entry #$NEW_ENTRY (fresh process)"
+
+# (b) the first frame of the new generation, written by the NEW process.
+wait_for_pid_log "$NEW_PID" "first frame of this gpu generation presented" || {
+  RC=$?
+  timeout 30 "$ADB" logcat -d >"$OUT/logcat-relaunch-frame-failed.txt" 2>/dev/null || true
+  if [ "$RC" -eq 2 ]; then
+    fail "the EMULATOR process died while waiting for the new process's first frame (see $OUT/emulator.log)"
+  fi
+  fail "the fresh process (pid $NEW_PID) never logged 'first frame of this gpu generation presented' — the relaunch started but never painted (see $OUT/logcat-relaunch-frame-failed.txt)"
+}
+echo "   relaunch: first frame presented by pid $NEW_PID"
+
+# The guard's own marker must never appear in a passing run: it means a launch
+# entered android_main in a process that already had a loop — the exact state
+# the finish-path exit exists to prevent.
+if app_log | grep -qF "EventLoop can't be recreated"; then
+  app_log | grep -nF "EventLoop can't be recreated" >&2 || true
+  fail "'EventLoop can't be recreated' was logged — android_main ran again in a process that already had an event loop; the finish path must exit the process"
+fi
+
 sleep 3
 
 "$ADB" exec-out screencap -p >"$OUT/library.png"
@@ -287,6 +454,21 @@ if grep -qE "FATAL EXCEPTION|ANR in $PACKAGE|Force finishing activity $PACKAGE" 
   grep -nE "FATAL EXCEPTION|ANR in $PACKAGE|Force finishing activity $PACKAGE" \
     "$OUT/logcat-launch.txt" >&2 || true
   fail "a fatal exception/ANR was logged for $PACKAGE"
+fi
+
+# (d) the platform's exit record: no SIGNALED death for the package. reason=2
+# is ApplicationExitInfo.REASON_SIGNALED (status=11 was SIGSEGV in the CI
+# repro). This check runs BEFORE the focus assertion so a native death is named
+# as one instead of "the app did not come to the front".
+if grep -qE "reason=2 \(SIGNALED\)" "$OUT/exit-info.txt"; then
+  echo "== ApplicationExitInfo: the app died on a SIGNAL ==" >&2
+  cat "$OUT/exit-info.txt" >&2
+  fail "the app died on a native SIGNAL (ApplicationExitInfo reason=2 (SIGNALED); status=11 in the CI repro was SIGSEGV) — the one-loop-per-process contract regressed"
+fi
+if grep -qE "reason=1 \(EXIT_SELF\)" "$OUT/exit-info.txt"; then
+  echo "   exit-info: reason=1 (EXIT_SELF) recorded — the finish path's clean exit"
+else
+  echo "   exit-info: no SIGNALED death for $PACKAGE"
 fi
 
 FOCUS="$(grep -E "mCurrentFocus|mFocusedApp" "$OUT/dumpsys-window.txt" | head -4 || true)"
