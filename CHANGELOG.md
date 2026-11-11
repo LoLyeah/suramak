@@ -4,6 +4,17 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-11-12
+
+## 0.4.3 - 2026-11-11
+
+### Fixed
+- **Android: the compact Library comes up.** The library host was registered in one `OnceLock` while the shell read a second, never-set one, so the app opened and stayed on the "Opening the library…" splash forever. One host accessor now backs both sides — the Library, its model card, its empty state and the Import/Record bar draw on a cold launch (proven on a real Android 15 emulator in CI, screenshot-inspected).
+- **Android: relaunching after Back no longer crashes.** winit allows one event loop per process; the finish path now ends the process cleanly (`_exit`, recorded as a voluntary exit — no SIGABRT/SIGSEGV), so the next launch is a fresh process with a fresh loop and GPU. The relaunch screen paints and reaches the Library again.
+- **Android: Back on the splash leaves** instead of being swallowed (the gesture used to do nothing while the host was still starting).
+- **CI: an Android launch smoke** now boots an x86_64 emulator on every push and asserts the chain the owner reported broken: install → cold launch → Library renders → Back → clean exit → fresh-process relaunch → Library renders → a bounded monkey pass with the app still alive. Screenshots, logcat, uiautomator dumps and the platform's exit-info are uploaded as artifacts on every run.
+- CI: the apt-dependent jobs retry with backoff (GitHub's mirror DNS outages were failing jobs before they started); the emulator job no longer touches apt (cmake/ninja ship with the runner image).
+
 ## 0.4.2 - 2026-11-11
 
 ### Added
