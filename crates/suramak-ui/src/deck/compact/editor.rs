@@ -15,6 +15,7 @@ use egui::{
 };
 
 use crate::deck::motion::{self, Motion};
+use crate::deck::speakers;
 use crate::deck::theme::Tokens;
 
 use super::a11y;
@@ -105,8 +106,39 @@ pub fn ui(
         );
     }
 
-    // --- search / edit strip ----------------------------------------------
+    // --- speaker lane (M16I) ------------------------------------------------
+    // ONE 8 px strip above the list, drawn by the same shared renderer the
+    // desktop deck uses. It is decorative-but-labelled; the rows carry the
+    // badges that name a speaker.
     let mut strip_top = meta_rect.bottom() + 6.0;
+    if let Some(speaker_view) = &editor.speakers {
+        let lane = Rect::from_min_size(
+            pos2(bands.content.left() + GUTTER, meta_rect.bottom() + 2.0),
+            vec2(bands.content.width() - GUTTER * 2.0, speakers::LANE_H),
+        );
+        speakers::lane(
+            ui,
+            tokens,
+            lane,
+            &speaker_view.speakers,
+            &speaker_view.turns,
+            speaker_view.audio_ms,
+            speakers::LaneStyle {
+                dim: if speaker_view.stale { 0.55 } else { 1.0 },
+                fade: 1.0,
+            },
+        );
+        a11y::describe(
+            ui,
+            lane,
+            &format!(
+                "Speaker lane: {} turns, {} speakers",
+                speaker_view.turns.len(),
+                speaker_view.speakers.len()
+            ),
+        );
+        strip_top = lane.bottom() + 4.0;
+    }
     if editor.search_open {
         let search_rect = Rect::from_min_size(
             pos2(bands.content.left() + GUTTER, strip_top),
@@ -176,6 +208,8 @@ pub fn ui(
         }
         for index in matches {
             let segment = editor.transcript.segments[index].clone();
+            let speaker_view = editor.speakers.clone();
+            let speaker_pad = if speaker_view.is_some() { 29.0 } else { 0.0 };
             let selected = editor.selected == Some(segment.idx);
             let editing = editor
                 .edit_buffer
@@ -216,9 +250,38 @@ pub fn ui(
             };
             ui.painter()
                 .rect_filled(rect, CornerRadius::same(tokens.radius.row), fill);
+            // Speaker badge (M16I): the same 3 px bar + chip as the desktop,
+            // in the row's leading slot.
+            if let Some(view) = &speaker_view {
+                let slot = Rect::from_min_size(
+                    pos2(
+                        rect.left() + GUTTER,
+                        rect.top() + 18.0 - speakers::BADGE / 2.0,
+                    ),
+                    vec2(speakers::SLOT_W, speakers::BADGE),
+                );
+                if let Some(row) = view.row(segment.idx) {
+                    let label = view.label(row.primary);
+                    let response = speakers::badge(
+                        ui,
+                        tokens,
+                        segment.idx,
+                        slot,
+                        speakers::BadgeLook {
+                            label: &label,
+                            color_slot: view.color_slot(row.primary),
+                            secondary: row.secondary.map(|second| view.color_slot(second)),
+                            dim: if view.stale { 0.55 } else { 1.0 },
+                        },
+                    );
+                    if response.clicked() {
+                        editor.select(segment.idx);
+                    }
+                }
+            }
             // Time gutter.
             ui.painter().text(
-                pos2(rect.left() + GUTTER, rect.top() + 18.0),
+                pos2(rect.left() + GUTTER + speaker_pad, rect.top() + 18.0),
                 Align2::LEFT_CENTER,
                 clock(segment.start_ms),
                 FontId::new(12.0, FontFamily::Monospace),
@@ -226,8 +289,8 @@ pub fn ui(
             );
             if editing {
                 let edit_rect = Rect::from_min_size(
-                    pos2(rect.left() + 62.0, rect.top() + 34.0),
-                    vec2(rect.width() - 62.0 - GUTTER, 74.0),
+                    pos2(rect.left() + 62.0 + speaker_pad, rect.top() + 34.0),
+                    vec2(rect.width() - 62.0 - GUTTER - speaker_pad, 74.0),
                 );
                 let idx = editor
                     .edit_buffer
@@ -314,10 +377,10 @@ pub fn ui(
                     text,
                     FontId::proportional(15.5),
                     tokens.ink,
-                    (rect.width() - 62.0 - GUTTER - 24.0).max(60.0),
+                    (rect.width() - 62.0 - GUTTER - 24.0 - speaker_pad).max(60.0),
                 );
                 ui.painter().galley(
-                    pos2(rect.left() + 62.0, rect.top() + 12.0),
+                    pos2(rect.left() + 62.0 + speaker_pad, rect.top() + 12.0),
                     galley,
                     tokens.ink,
                 );

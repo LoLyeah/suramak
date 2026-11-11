@@ -153,6 +153,44 @@ fn render(app: &mut CompactApp, name: &str) -> snapshot::Shot {
 }
 
 #[test]
+fn the_phone_editor_inherits_the_speaker_badges_and_lane() {
+    // M16I: the phone draws the same shared Deck components as the desktop —
+    // one 8 px lane above the list, a badge on every row. No Android-specific
+    // rendering exists; this shot is the inheritance proof.
+    use suramak_core::diarization::{Speaker, SpeakerTurn};
+    let mut app = seeded_app();
+    let target = app.transcripts[0].clone();
+    app.open_editor(target.clone(), 0.0);
+    app.advance(10.0);
+    let speakers = vec![Speaker::new(0, "Speaker 1", 0), Speaker::new(1, "Budi", 1)];
+    let turns = vec![
+        SpeakerTurn::new(0, 0, 4_200, 0),
+        SpeakerTurn::new(1, 4_200, 8_400, 1),
+        SpeakerTurn::new(2, 8_400, 12_000, 0),
+    ];
+    let projection = suramak_core::diarization::speaker_for_segments(&target.segments, &turns);
+    app.editor.as_mut().expect("editor").speakers = Some(compact::CompactSpeakers {
+        speakers,
+        turns,
+        per_segment: projection,
+        stale: false,
+        audio_ms: 12_000,
+    });
+    let shot = render(&mut app, "editor-speakers");
+    assert!(shot.painted_fraction(egui::Color32::BLACK) > 0.5);
+    // The lane is inside the content column, under the meta line, and the
+    // badges sit inside the row's leading slot (nothing overflows the viewport).
+    let screen = compact::phone_screen_rect();
+    let bands = chrome::bands(
+        screen,
+        app.insets.top,
+        app.insets.bottom,
+        Some(chrome::BOTTOM_BAR),
+    );
+    assert!(screen.contains_rect(bands.content));
+}
+
+#[test]
 fn the_phone_viewport_shoots_library_editor_and_settings() {
     // --- Library -----------------------------------------------------------
     let mut app = seeded_app();

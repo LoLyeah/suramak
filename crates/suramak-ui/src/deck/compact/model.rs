@@ -601,6 +601,40 @@ pub enum Sheet {
     Onboarding,
 }
 
+/// M16I: what the compact editor needs from one diarization run — the shared
+/// [`crate::deck::speakers`] renderer takes exactly this shape.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactSpeakers {
+    pub speakers: Vec<suramak_core::diarization::Speaker>,
+    pub turns: Vec<suramak_core::diarization::SpeakerTurn>,
+    /// One badge per segment row (the read-time projection).
+    pub per_segment: Vec<Option<suramak_core::diarization::SegmentSpeaker>>,
+    pub stale: bool,
+    pub audio_ms: i64,
+}
+
+impl CompactSpeakers {
+    pub fn label(&self, speaker_id: u32) -> String {
+        self.speakers
+            .iter()
+            .find(|speaker| speaker.speaker_id == speaker_id)
+            .map(|speaker| speaker.label.clone())
+            .unwrap_or_else(|| suramak_core::diarization::default_label(speaker_id))
+    }
+
+    pub fn color_slot(&self, speaker_id: u32) -> u8 {
+        self.speakers
+            .iter()
+            .find(|speaker| speaker.speaker_id == speaker_id)
+            .map(|speaker| speaker.color_slot)
+            .unwrap_or(0)
+    }
+
+    pub fn row(&self, idx: u32) -> Option<suramak_core::diarization::SegmentSpeaker> {
+        self.per_segment.get(idx as usize).copied().flatten()
+    }
+}
+
 /// Editor state for the open transcript.
 #[derive(Debug, Clone)]
 pub struct CompactEditor {
@@ -627,6 +661,10 @@ pub struct CompactEditor {
     /// whose rows are current drive the compact chips; the rest fall back to
     /// segment seeking (there is no row-level badge for it on the phone).
     pub words: WordAlignment,
+    /// M16I: the speaker annotation, when the host seeded one. `None` keeps the
+    /// plain phone row (no badge, no lane) — the same shared Deck components
+    /// the desktop draws, not a second implementation.
+    pub speakers: Option<CompactSpeakers>,
 }
 
 impl CompactEditor {
@@ -645,6 +683,7 @@ impl CompactEditor {
             focus_segment: None,
             has_translation: false,
             words: WordAlignment::default(),
+            speakers: None,
         }
     }
 

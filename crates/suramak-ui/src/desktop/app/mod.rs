@@ -51,7 +51,11 @@ pub mod bilingual;
 #[allow(unused_imports)] // named only from `cfg(test)` audit tests
 pub use suramak_ui::deck::bounds;
 pub use suramak_ui::deck::controls;
+// M16I: the shared badge + lane renderer (the same functions the phone calls).
+pub use suramak_ui::deck::speakers;
 pub mod copy;
+// M16I: the diarization surface state (badges, lane, rename, delete).
+pub mod diarization;
 pub mod dropdown;
 pub mod editor;
 pub mod export;
@@ -1134,6 +1138,9 @@ pub struct AppState {
     pub translation_gate_reason: Option<String>,
     /// M15.8: a translation run waiting for the dirty text to save first.
     pub pending_translation: Option<(TargetLanguage, Option<Vec<u32>>)>,
+    /// M16I: the open transcript's speaker annotation (run, badges, rename
+    /// draft, job state). `view = None` means the plain editor view.
+    pub diarization: diarization::DiarizationState,
     /// M16B: the Compact HUD's six-state machine. `Idle` until the global
     /// hotkey (or the smoke harness) drives it; the window is hidden in Idle.
     pub hud: HudState,
@@ -1220,6 +1227,27 @@ pub enum Effect {
     RefreshAudioProcesses,
     /// Persist the settings form (toml; keychain on macOS/Windows).
     SaveSettings { form: Box<SettingsForm> },
+    /// M16I: start (or re-run) the diarization job for `id` with the chosen
+    /// speaker count (`0` = Auto). The runtime resolves the transcript's audio
+    /// and refuses honestly when there is none.
+    RunDiarization { id: Uuid, count: u8 },
+    /// M16I: set the running job's cooperative token. The binding has no
+    /// mid-run abort, so this means "discard the result at the next await
+    /// point" — the surface says so.
+    CancelDiarization,
+    /// M16I: persist a speaker's new name (one row; every badge follows).
+    RenameSpeaker {
+        id: Uuid,
+        speaker_id: u32,
+        label: String,
+    },
+    /// M16I: persist a speaker's colour slot (0..6).
+    SetSpeakerColor { id: Uuid, speaker_id: u32, slot: u8 },
+    /// M16I: delete the run + its speakers (the plain view, byte-for-byte for
+    /// the transcript).
+    DeleteDiarization { id: Uuid },
+    /// M16I: re-read a transcript's run (after a run, an edit, a rename).
+    RefreshDiarization { id: Uuid },
     /// M16B: a Compact HUD side effect the **frame loop** executes (AppKit main
     /// thread + the live HUD window). `Runtime::apply` never handles it.
     Hud(HudEffect),
@@ -1366,6 +1394,7 @@ impl AppState {
             // `Some` until then so the disabled surface always has a reason.
             translation_gate_reason: Some(bilingual::BILINGUAL_SETUP_NOTE.to_string()),
             pending_translation: None,
+            diarization: diarization::DiarizationState::default(),
             // M16B: opt-in; the window/stage is created only once enabled or a
             // smoke seeds a state.
             hud: HudState::idle(),
@@ -3314,6 +3343,15 @@ impl AppState {
         self.bilingual = bilingual::BilingualState::Idle;
         self.pending_translation = None;
         self.bilingual_target = target;
+        // M16I: the speaker view belongs to the transcript that was open. A
+        // run belongs to its transcript and is loaded fresh; the rename draft,
+        // note and projections must never leak across (the availability is the
+        // binary's, not the transcript's, so it stays).
+        self.diarization.view = None;
+        self.diarization.per_segment.clear();
+        self.diarization.rename = None;
+        self.diarization.note = None;
+        self.diarization.confirm_delete = false;
         self.route = Route::Editor;
         // M8: the transport is rebuilt for this transcript's source (a previous
         // transcript's playback never leaks across).

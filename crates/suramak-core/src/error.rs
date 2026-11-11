@@ -84,6 +84,11 @@ pub enum SuramakError {
     #[error("segment edit refused: {0}")]
     SegmentEdit(#[from] crate::segment_edit::EditError),
 
+    /// A diarization run, rename, colour or turn operation was refused; the
+    /// database was not touched (M16I).
+    #[error("diarization: {0}")]
+    Diarization(String),
+
     #[error("Polish backend error: {0}")]
     Polish(String),
 

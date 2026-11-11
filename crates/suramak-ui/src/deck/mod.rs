@@ -18,4 +18,6 @@ pub mod controls;
 pub mod motion;
 pub mod nav;
 pub mod snapshot;
+// M16I: the shared speaker badge + 8 px lane (desktop and phone draw the same).
+pub mod speakers;
 pub mod theme;

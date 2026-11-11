@@ -4,6 +4,11 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 use uuid::Uuid;
 
+use crate::diarization::{
+    default_label, merge_speakers, rename, speaker_for_segments, speaker_turn_ranges,
+    split_speaker, validate as validate_diarization, Diarization, DiarizationRun, SegmentSpeaker,
+    Speaker, SpeakerSource, SpeakerTurn, TurnSource, COLOR_SLOTS,
+};
 use crate::export::ZeroDuration;
 use crate::search::{self, HitKind, SearchHit, SearchOptions, SearchResults};
 use crate::segment_edit::{merge_rows, split_rows, EditError, SegmentRow, SegmentSnapshot};
@@ -78,7 +83,12 @@ const SEARCH_DOCS_DDL: &str = "CREATE TABLE IF NOT EXISTS search_docs (
 ///   they were computed from (`aligned_text`) with a sticky stale marker for
 ///   any later source edit. Existing tables and rows are untouched; a library
 ///   that never re-aligns simply has no rows here (and gets segment seeking).
-pub const SCHEMA_VERSION: i64 = 6;
+/// - **v7** — M16I, additive only: `diarization_runs`, `speakers`,
+///   `speaker_turns` — the derived speaker annotation (M16H's interface
+///   decision). Turns are time-anchored; segment ranges are a read-time
+///   projection. No segment or transcript row is rewritten, and a library that
+///   never diarizes simply has no rows here (the plain editor view).
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// SQLite-backed transcript library with WAL mode.
 pub struct Store {
@@ -196,6 +206,10 @@ impl Store {
     }
 
     fn init(&self) -> Result<(), SuramakError> {
+        // The version marker is readable before anything else is created: a
+        // database from a newer build is refused **without writing** the
+        // current DDL into it (the M16I upgrade contract; the older binary must
+        // not touch a schema it does not understand).
         self.conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
@@ -203,8 +217,11 @@ impl Store {
              CREATE TABLE IF NOT EXISTS meta (
                  key   TEXT PRIMARY KEY,
                  value TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS transcripts (
+             );",
+        )?;
+        self.refuse_newer_schema()?;
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS transcripts (
                  id          TEXT PRIMARY KEY,
                  title       TEXT NOT NULL,
                  created_at  TEXT NOT NULL,
@@ -283,10 +300,93 @@ impl Store {
                  aligned_text  TEXT    NOT NULL,
                  stale         INTEGER NOT NULL DEFAULT 0,
                  PRIMARY KEY (transcript_id, segment_idx, word_idx)
-             );",
+             );
+             -- M16I (schema v7): the derived speaker annotation. One active run
+             -- per transcript; `stale` is the M15 sticky marker an edit sets and
+             -- a fresh run clears. Turns are time-anchored, never segment ids.
+             CREATE TABLE IF NOT EXISTS diarization_runs (
+                 transcript_id       TEXT    NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
+                 run_id              INTEGER NOT NULL,
+                 created_at          TEXT    NOT NULL,
+                 segmentation_model  TEXT    NOT NULL,
+                 segmentation_sha256 TEXT    NOT NULL,
+                 embedding_model     TEXT    NOT NULL,
+                 embedding_sha256    TEXT    NOT NULL,
+                 engine_version      TEXT    NOT NULL DEFAULT '',
+                 num_clusters        INTEGER NOT NULL,
+                 threshold           REAL    NOT NULL,
+                 min_duration_on     REAL    NOT NULL,
+                 min_duration_off    REAL    NOT NULL,
+                 audio_ms            INTEGER NOT NULL,
+                 stale               INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (transcript_id, run_id)
+             );
+             CREATE TABLE IF NOT EXISTS speakers (
+                 transcript_id TEXT    NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
+                 speaker_id    INTEGER NOT NULL,
+                 label         TEXT    NOT NULL,
+                 color_slot    INTEGER NOT NULL,
+                 source        TEXT    NOT NULL,
+                 created_at    TEXT    NOT NULL,
+                 updated_at    TEXT    NOT NULL,
+                 PRIMARY KEY (transcript_id, speaker_id)
+             );
+             CREATE TABLE IF NOT EXISTS speaker_turns (
+                 transcript_id TEXT    NOT NULL,
+                 run_id        INTEGER NOT NULL,
+                 turn_idx      INTEGER NOT NULL,
+                 start_ms      INTEGER NOT NULL,
+                 end_ms        INTEGER NOT NULL,
+                 speaker_id    INTEGER NOT NULL,
+                 source        TEXT    NOT NULL DEFAULT 'auto',
+                 PRIMARY KEY (transcript_id, run_id, turn_idx),
+                 FOREIGN KEY (transcript_id, run_id)
+                     REFERENCES diarization_runs(transcript_id, run_id) ON DELETE CASCADE,
+                 FOREIGN KEY (transcript_id, speaker_id)
+                     REFERENCES speakers(transcript_id, speaker_id) ON DELETE CASCADE,
+                 CHECK (end_ms > start_ms)
+             );
+             CREATE INDEX IF NOT EXISTS speaker_turns_span
+                 ON speaker_turns(transcript_id, run_id, start_ms, end_ms);",
         )?;
         self.migrate()?;
         self.ensure_search_index()
+    }
+
+    /// Reads `meta.schema_version`, if the database has one. A non-numeric
+    /// marker is a refusal, never a guess.
+    fn schema_version_marker(&self) -> Result<Option<i64>, SuramakError> {
+        let version: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match version {
+            None => Ok(None),
+            Some(raw) => raw.parse::<i64>().map(Some).map_err(|_| {
+                SuramakError::Schema(format!(
+                    "meta.schema_version is not a number ({raw:?}); refusing to guess"
+                ))
+            }),
+        }
+    }
+
+    /// Refuses a database written by a newer build before any v7 DDL is
+    /// written into it — the older binary must not touch a schema it does not
+    /// understand (and an open must not silently add tables to it).
+    fn refuse_newer_schema(&self) -> Result<(), SuramakError> {
+        if let Some(version) = self.schema_version_marker()? {
+            if version > SCHEMA_VERSION {
+                return Err(SuramakError::Schema(format!(
+                    "database is schema v{version}, this build supports up to v{SCHEMA_VERSION} — \
+                     open it with the newer Suramak build"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Brings an existing library up to [`SCHEMA_VERSION`], in place.
@@ -299,26 +399,10 @@ impl Store {
     /// A database from a *newer* build is refused instead of guessed at: the
     /// older binary must not write to a schema it does not understand.
     fn migrate(&self) -> Result<(), SuramakError> {
-        let version: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'schema_version'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-
-        let version = match version {
-            // A fresh database (the DDL above already created the current
-            // schema) or a very old one without the marker: both are brought
-            // forward step by step.
-            None => 0,
-            Some(raw) => raw.parse::<i64>().map_err(|_| {
-                SuramakError::Schema(format!(
-                    "meta.schema_version is not a number ({raw:?}); refusing to guess"
-                ))
-            })?,
-        };
+        // A fresh database (the DDL above already created the current schema)
+        // or a very old one without the marker: both are brought forward step
+        // by step. v0 is the `None` case.
+        let version = self.schema_version_marker()?.unwrap_or(0);
 
         if version > SCHEMA_VERSION {
             return Err(SuramakError::Schema(format!(
@@ -340,6 +424,9 @@ impl Store {
         }
         if version < 6 {
             self.upgrade_to_v6()?;
+        }
+        if version < 7 {
+            self.upgrade_to_v7()?;
         }
         Ok(())
     }
@@ -500,6 +587,66 @@ impl Store {
                  stale         INTEGER NOT NULL DEFAULT 0,
                  PRIMARY KEY (transcript_id, segment_idx, word_idx)
              );",
+        )?;
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// v6 → v7, one transaction, additive only: the diarization tables (M16I).
+    /// A fresh database already has them from the DDL above, and a re-run is a
+    /// no-op; an older library starts with no rows — exactly today's view.
+    fn upgrade_to_v7(&self) -> Result<(), SuramakError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS diarization_runs (
+                 transcript_id       TEXT    NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
+                 run_id              INTEGER NOT NULL,
+                 created_at          TEXT    NOT NULL,
+                 segmentation_model  TEXT    NOT NULL,
+                 segmentation_sha256 TEXT    NOT NULL,
+                 embedding_model     TEXT    NOT NULL,
+                 embedding_sha256    TEXT    NOT NULL,
+                 engine_version      TEXT    NOT NULL DEFAULT '',
+                 num_clusters        INTEGER NOT NULL,
+                 threshold           REAL    NOT NULL,
+                 min_duration_on     REAL    NOT NULL,
+                 min_duration_off    REAL    NOT NULL,
+                 audio_ms            INTEGER NOT NULL,
+                 stale               INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (transcript_id, run_id)
+             );
+             CREATE TABLE IF NOT EXISTS speakers (
+                 transcript_id TEXT    NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
+                 speaker_id    INTEGER NOT NULL,
+                 label         TEXT    NOT NULL,
+                 color_slot    INTEGER NOT NULL,
+                 source        TEXT    NOT NULL,
+                 created_at    TEXT    NOT NULL,
+                 updated_at    TEXT    NOT NULL,
+                 PRIMARY KEY (transcript_id, speaker_id)
+             );
+             CREATE TABLE IF NOT EXISTS speaker_turns (
+                 transcript_id TEXT    NOT NULL,
+                 run_id        INTEGER NOT NULL,
+                 turn_idx      INTEGER NOT NULL,
+                 start_ms      INTEGER NOT NULL,
+                 end_ms        INTEGER NOT NULL,
+                 speaker_id    INTEGER NOT NULL,
+                 source        TEXT    NOT NULL DEFAULT 'auto',
+                 PRIMARY KEY (transcript_id, run_id, turn_idx),
+                 FOREIGN KEY (transcript_id, run_id)
+                     REFERENCES diarization_runs(transcript_id, run_id) ON DELETE CASCADE,
+                 FOREIGN KEY (transcript_id, speaker_id)
+                     REFERENCES speakers(transcript_id, speaker_id) ON DELETE CASCADE,
+                 CHECK (end_ms > start_ms)
+             );
+             CREATE INDEX IF NOT EXISTS speaker_turns_span
+                 ON speaker_turns(transcript_id, run_id, start_ms, end_ms);",
         )?;
         tx.execute(
             "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
@@ -1431,6 +1578,10 @@ impl Store {
             // M15.7: the index follows the same transaction — an edit that
             // fails to reindex must fail as a whole, not leave search stale.
             Self::sync_segment_doc(&self.conn, transcript_id, idx)?;
+            // M16I: a text edit changes the row set the badge projection was
+            // computed against; the turns stay time-valid but the view is
+            // provisional until a re-run (the sticky M15 rule).
+            Self::mark_diarization_stale(&self.conn, transcript_id)?;
             self.conn.execute(
                 "UPDATE transcripts SET updated_at = ?1 WHERE id = ?2",
                 params![now, transcript_id.to_string()],
@@ -1617,6 +1768,10 @@ impl Store {
         // down, a merge up), so any word rows that no longer sit on a segment
         // with exactly their text are stale. Same rule as `write_segments`.
         Self::mark_alignment_stale(conn, id)?;
+        // M16I: a split/merge/restore changes the row set the diarization badge
+        // projection was computed against. The time-anchored turns are never
+        // rewritten; the run is simply marked stale (re-run to refresh).
+        Self::mark_diarization_stale(conn, id)?;
         Ok(())
     }
 
@@ -1893,6 +2048,503 @@ impl Store {
                 Err(err)
             }
         }
+    }
+
+    // ---- M16I: the derived speaker annotation (schema v7) ------------------
+
+    /// Writes one complete diarization result in **one transaction** and
+    /// returns its monotonic `run_id`.
+    ///
+    /// The old run (and its turns, by cascade) and the speakers with it are
+    /// replaced; no segment, transcript or word row is touched. Validation runs
+    /// before anything is deleted, so a malformed result leaves the previous
+    /// run intact. `run_id` is `MAX(run_id) + 1` read *before* the delete, so
+    /// the sequence stays monotonic even though only one run is kept.
+    pub fn replace_diarization_run(
+        &self,
+        transcript_id: Uuid,
+        run: &DiarizationRun,
+        speakers: &[Speaker],
+        turns: &[SpeakerTurn],
+    ) -> Result<u32, SuramakError> {
+        validate_diarization(run, speakers, turns).map_err(SuramakError::Diarization)?;
+        let mut run = run.clone();
+        let tx = self.conn.unchecked_transaction()?;
+        let next: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(run_id), 0) FROM diarization_runs WHERE transcript_id = ?1",
+                params![transcript_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        run.run_id = (next as u32) + 1;
+        run.transcript_id = transcript_id;
+        // Derived data: the old run and everything hanging off it goes first.
+        // `speakers` rows are user data — unmatched manual names survive a
+        // re-run (M16H §8.4.3), so they are upserted, not deleted.
+        tx.execute(
+            "DELETE FROM diarization_runs WHERE transcript_id = ?1",
+            params![transcript_id.to_string()],
+        )?;
+        tx.execute(
+            "INSERT INTO diarization_runs(
+                 transcript_id, run_id, created_at, segmentation_model, segmentation_sha256,
+                 embedding_model, embedding_sha256, engine_version, num_clusters, threshold,
+                 min_duration_on, min_duration_off, audio_ms, stale)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0)",
+            params![
+                transcript_id.to_string(),
+                run.run_id,
+                run.created_at,
+                run.segmentation_model,
+                run.segmentation_sha256,
+                run.embedding_model,
+                run.embedding_sha256,
+                run.engine_version,
+                run.num_clusters,
+                run.threshold,
+                run.min_duration_on,
+                run.min_duration_off,
+                run.audio_ms,
+            ],
+        )?;
+        for speaker in speakers {
+            // A manual row (a user's name or colour) is never overwritten by an
+            // engine label: the M16H re-run rule — a renamed voice keeps its
+            // name. The caller's `Manual` rows still win (they are the user's
+            // own edit arriving through the same path).
+            let existing: Option<(String, u8, String)> = tx
+                .query_row(
+                    "SELECT label, color_slot, source FROM speakers
+                     WHERE transcript_id = ?1 AND speaker_id = ?2",
+                    params![transcript_id.to_string(), speaker.speaker_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let (label, color_slot, source) = match existing {
+                Some((label, slot, source))
+                    if source == "manual" && speaker.source == SpeakerSource::Auto =>
+                {
+                    (label, slot, SpeakerSource::Manual.as_str().to_string())
+                }
+                _ => (
+                    speaker.label.clone(),
+                    speaker.color_slot,
+                    speaker.source.as_str().to_string(),
+                ),
+            };
+            tx.execute(
+                "INSERT INTO speakers(transcript_id, speaker_id, label, color_slot, source,
+                                      created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(transcript_id, speaker_id) DO UPDATE SET
+                     label = excluded.label,
+                     color_slot = excluded.color_slot,
+                     source = excluded.source,
+                     updated_at = excluded.updated_at",
+                params![
+                    transcript_id.to_string(),
+                    speaker.speaker_id,
+                    label,
+                    color_slot,
+                    source,
+                    speaker.created_at,
+                    speaker.updated_at,
+                ],
+            )?;
+        }
+        for turn in turns {
+            tx.execute(
+                "INSERT INTO speaker_turns(transcript_id, run_id, turn_idx, start_ms, end_ms,
+                                           speaker_id, source)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    transcript_id.to_string(),
+                    run.run_id,
+                    turn.turn_idx,
+                    turn.start_ms,
+                    turn.end_ms,
+                    turn.speaker_id,
+                    turn.source.as_str(),
+                ],
+            )?;
+        }
+        // Speakers the new run does not use: an *auto* row is replaced data and
+        // goes; a *manual* name survives with no turns (M16H §8.4.3 — a name is
+        // never silently deleted).
+        tx.execute(
+            "DELETE FROM speakers
+             WHERE transcript_id = ?1 AND source = 'auto'
+               AND speaker_id NOT IN (
+                   SELECT speaker_id FROM speaker_turns
+                   WHERE transcript_id = ?1 AND run_id = ?2
+               )",
+            params![transcript_id.to_string(), run.run_id],
+        )?;
+        tx.commit()?;
+        Ok(run.run_id)
+    }
+
+    /// The active run, if the transcript has one.
+    pub fn diarization_run(
+        &self,
+        transcript_id: Uuid,
+    ) -> Result<Option<DiarizationRun>, SuramakError> {
+        let run = self
+            .conn
+            .query_row(
+                "SELECT run_id, created_at, segmentation_model, segmentation_sha256,
+                        embedding_model, embedding_sha256, engine_version,
+                        num_clusters, threshold,
+                        min_duration_on, min_duration_off, audio_ms, stale
+                 FROM diarization_runs WHERE transcript_id = ?1
+                 ORDER BY run_id DESC LIMIT 1",
+                params![transcript_id.to_string()],
+                |row| {
+                    Ok(DiarizationRun {
+                        transcript_id,
+                        run_id: row.get(0)?,
+                        created_at: row.get(1)?,
+                        segmentation_model: row.get(2)?,
+                        segmentation_sha256: row.get(3)?,
+                        embedding_model: row.get(4)?,
+                        embedding_sha256: row.get(5)?,
+                        engine_version: row.get(6)?,
+                        num_clusters: row.get(7)?,
+                        threshold: row.get(8)?,
+                        min_duration_on: row.get(9)?,
+                        min_duration_off: row.get(10)?,
+                        audio_ms: row.get(11)?,
+                        stale: row.get::<_, i64>(12)? != 0,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(run)
+    }
+
+    /// Every speaker row of a transcript, in id order (manual names included,
+    /// even when the active run has no turn for them).
+    pub fn speakers(&self, transcript_id: Uuid) -> Result<Vec<Speaker>, SuramakError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT speaker_id, label, color_slot, source, created_at, updated_at
+             FROM speakers WHERE transcript_id = ?1 ORDER BY speaker_id",
+        )?;
+        let rows = stmt.query_map(params![transcript_id.to_string()], |row| {
+            Ok(Speaker {
+                speaker_id: row.get(0)?,
+                label: row.get(1)?,
+                color_slot: row.get(2)?,
+                source: SpeakerSource::parse(&row.get::<_, String>(3)?),
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(SuramakError::Sqlite)
+    }
+
+    /// The active run's turns, in `turn_idx` order (which validation ties to
+    /// time order).
+    pub fn speaker_turns(&self, transcript_id: Uuid) -> Result<Vec<SpeakerTurn>, SuramakError> {
+        let Some(run) = self.diarization_run(transcript_id)? else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT turn_idx, start_ms, end_ms, speaker_id, source
+             FROM speaker_turns WHERE transcript_id = ?1 AND run_id = ?2
+             ORDER BY turn_idx",
+        )?;
+        let rows = stmt.query_map(params![transcript_id.to_string(), run.run_id], |row| {
+            Ok(SpeakerTurn {
+                turn_idx: row.get(0)?,
+                start_ms: row.get(1)?,
+                end_ms: row.get(2)?,
+                speaker_id: row.get(3)?,
+                source: TurnSource::parse(&row.get::<_, String>(4)?),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(SuramakError::Sqlite)
+    }
+
+    /// A run, its speakers and its turns as one consistent read (one
+    /// connection, so the three queries see one committed state).
+    pub fn diarization(&self, transcript_id: Uuid) -> Result<Option<Diarization>, SuramakError> {
+        let Some(run) = self.diarization_run(transcript_id)? else {
+            return Ok(None);
+        };
+        let speakers = self.speakers(transcript_id)?;
+        let turns = self.speaker_turns(transcript_id)?;
+        Ok(Some(Diarization {
+            run,
+            speakers,
+            turns,
+        }))
+    }
+
+    /// The editor badge projection: one speaker per segment row, derived from
+    /// the time-anchored turns (never stored).
+    pub fn speaker_for_segments(
+        &self,
+        transcript_id: Uuid,
+    ) -> Result<Vec<Option<SegmentSpeaker>>, SuramakError> {
+        let Some(diarization) = self.diarization(transcript_id)? else {
+            return Ok(Vec::new());
+        };
+        let segments = self.get_transcript(transcript_id)?.segments;
+        Ok(speaker_for_segments(&segments, &diarization.turns))
+    }
+
+    /// The "segment range" projection for list operations.
+    pub fn speaker_turn_ranges(
+        &self,
+        transcript_id: Uuid,
+    ) -> Result<Vec<(u32, u32, u32)>, SuramakError> {
+        let Some(diarization) = self.diarization(transcript_id)? else {
+            return Ok(Vec::new());
+        };
+        let segments = self.get_transcript(transcript_id)?.segments;
+        Ok(speaker_turn_ranges(&segments, &diarization.turns))
+    }
+
+    /// Renames one speaker (one row; every turn and export follows because they
+    /// join through `speaker_id`).
+    pub fn rename_speaker(
+        &self,
+        transcript_id: Uuid,
+        speaker_id: u32,
+        label: &str,
+    ) -> Result<(), SuramakError> {
+        let mut speakers = self.speakers(transcript_id)?;
+        if speakers.is_empty() {
+            return Err(SuramakError::Diarization(
+                "this transcript has no speaker labels".to_string(),
+            ));
+        }
+        rename(&mut speakers, speaker_id, label).map_err(SuramakError::Diarization)?;
+        let speaker = speakers
+            .iter()
+            .find(|speaker| speaker.speaker_id == speaker_id)
+            .ok_or_else(|| SuramakError::Diarization(format!("no speaker {speaker_id}")))?;
+        self.conn.execute(
+            "UPDATE speakers SET label = ?1, source = 'manual', updated_at = ?2
+             WHERE transcript_id = ?3 AND speaker_id = ?4",
+            params![
+                speaker.label,
+                speaker.updated_at,
+                transcript_id.to_string(),
+                speaker_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Sets one speaker's colour slot (0..6; the Deck palette's first N hues).
+    pub fn set_speaker_color(
+        &self,
+        transcript_id: Uuid,
+        speaker_id: u32,
+        slot: u8,
+    ) -> Result<(), SuramakError> {
+        if slot >= COLOR_SLOTS {
+            return Err(SuramakError::Diarization(format!(
+                "colour slot {slot} is outside 0..{COLOR_SLOTS}"
+            )));
+        }
+        let changed = self.conn.execute(
+            "UPDATE speakers SET color_slot = ?1, source = 'manual', updated_at = ?2
+             WHERE transcript_id = ?3 AND speaker_id = ?4",
+            params![
+                slot,
+                Utc::now().to_rfc3339(),
+                transcript_id.to_string(),
+                speaker_id
+            ],
+        )?;
+        if changed == 0 {
+            return Err(SuramakError::Diarization(format!(
+                "no speaker {speaker_id} on this transcript"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Reassigns one turn to another speaker, in one statement, marking it
+    /// manual. A no-op when the turn already belongs to that speaker.
+    pub fn reassign_turn(
+        &self,
+        transcript_id: Uuid,
+        turn_idx: u32,
+        speaker_id: u32,
+    ) -> Result<(), SuramakError> {
+        let run = self
+            .diarization_run(transcript_id)?
+            .ok_or_else(|| SuramakError::Diarization("no diarization run".to_string()))?;
+        let known: bool = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM speakers WHERE transcript_id = ?1 AND speaker_id = ?2",
+                params![transcript_id.to_string(), speaker_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !known {
+            return Err(SuramakError::Diarization(format!(
+                "no speaker {speaker_id} on this transcript"
+            )));
+        }
+        let changed = self.conn.execute(
+            "UPDATE speaker_turns SET speaker_id = ?1, source = 'manual'
+             WHERE transcript_id = ?2 AND run_id = ?3 AND turn_idx = ?4",
+            params![speaker_id, transcript_id.to_string(), run.run_id, turn_idx],
+        )?;
+        if changed == 0 {
+            return Err(SuramakError::Diarization(format!("no turn {turn_idx}")));
+        }
+        Ok(())
+    }
+
+    /// Merges two speakers: moves the turns, deletes the source speaker row and
+    /// renumbers the remaining speakers densely (turns follow).
+    pub fn merge_speakers(
+        &self,
+        transcript_id: Uuid,
+        from: u32,
+        into: u32,
+    ) -> Result<(), SuramakError> {
+        let run = self
+            .diarization_run(transcript_id)?
+            .ok_or_else(|| SuramakError::Diarization("no diarization run".to_string()))?;
+        let before = self.speakers(transcript_id)?;
+        let mut speakers = before.clone();
+        let mut turns = self.speaker_turns(transcript_id)?;
+        merge_speakers(&mut speakers, &mut turns, from, into).map_err(SuramakError::Diarization)?;
+        // The surviving speakers keep their order, so a speaker's new id is its
+        // position among the survivors. Walk from the highest id down: an id
+        // only ever decreases, so a lower row is never in the way.
+        let survivors: Vec<(u32, u32, String)> = before
+            .iter()
+            .filter(|speaker| speaker.speaker_id != from)
+            .enumerate()
+            .map(|(new_id, speaker)| {
+                let label = if speaker.has_default_label() {
+                    default_label(new_id as u32)
+                } else {
+                    speaker.label.clone()
+                };
+                (speaker.speaker_id, new_id as u32, label)
+            })
+            .collect();
+        let tx = self.conn.unchecked_transaction()?;
+        // The renumbering is a permutation: turns must be re-pointed before the
+        // speaker rows change, and a row's id can move onto another row's old
+        // id. Both are only consistent at commit, so the FK checks are deferred
+        // to it (SQLite's documented per-transaction mechanism).
+        tx.execute_batch("PRAGMA defer_foreign_keys = ON")?;
+        for turn in &turns {
+            tx.execute(
+                "UPDATE speaker_turns SET speaker_id = ?1, source = ?2
+                 WHERE transcript_id = ?3 AND run_id = ?4 AND turn_idx = ?5",
+                params![
+                    turn.speaker_id,
+                    turn.source.as_str(),
+                    transcript_id.to_string(),
+                    run.run_id,
+                    turn.turn_idx
+                ],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM speakers WHERE transcript_id = ?1 AND speaker_id = ?2",
+            params![transcript_id.to_string(), from],
+        )?;
+        for (old_id, new_id, label) in survivors.iter().rev() {
+            tx.execute(
+                "UPDATE speakers SET speaker_id = ?1, label = ?2
+                 WHERE transcript_id = ?3 AND speaker_id = ?4",
+                params![new_id, label, transcript_id.to_string(), old_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Splits selected turns into a new speaker appended at the end.
+    pub fn split_speaker(
+        &self,
+        transcript_id: Uuid,
+        new_label: &str,
+        color_slot: u8,
+        turn_idxs: &[u32],
+    ) -> Result<u32, SuramakError> {
+        let run = self
+            .diarization_run(transcript_id)?
+            .ok_or_else(|| SuramakError::Diarization("no diarization run".to_string()))?;
+        let mut speakers = self.speakers(transcript_id)?;
+        let mut turns = self.speaker_turns(transcript_id)?;
+        let id = split_speaker(&mut speakers, &mut turns, new_label, color_slot, turn_idxs)
+            .map_err(SuramakError::Diarization)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let speaker = &speakers[id as usize];
+        tx.execute(
+            "INSERT INTO speakers(transcript_id, speaker_id, label, color_slot, source,
+                                  created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'manual', ?5, ?6)",
+            params![
+                transcript_id.to_string(),
+                speaker.speaker_id,
+                speaker.label,
+                speaker.color_slot,
+                speaker.created_at,
+                speaker.updated_at
+            ],
+        )?;
+        for turn in &turns {
+            if turn_idxs.contains(&turn.turn_idx) {
+                tx.execute(
+                    "UPDATE speaker_turns SET speaker_id = ?1, source = 'manual'
+                     WHERE transcript_id = ?2 AND run_id = ?3 AND turn_idx = ?4",
+                    params![
+                        turn.speaker_id,
+                        transcript_id.to_string(),
+                        run.run_id,
+                        turn.turn_idx
+                    ],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Deletes the run **and** the transcript's speakers in one transaction —
+    /// "Delete diarization" restores exactly the plain view. Turns cascade from
+    /// the run; no segment or transcript row is touched.
+    pub fn delete_diarization(&self, transcript_id: Uuid) -> Result<(), SuramakError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM diarization_runs WHERE transcript_id = ?1",
+            params![transcript_id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM speakers WHERE transcript_id = ?1",
+            params![transcript_id.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Marks the active run stale (the M15 sticky rule): any edit of the
+    /// segment set makes the badge projection provisional. Only a fresh run
+    /// clears it; nothing ever rewrites the turns.
+    fn mark_diarization_stale(conn: &Connection, id: Uuid) -> Result<(), SuramakError> {
+        conn.execute(
+            "UPDATE diarization_runs SET stale = 1 WHERE transcript_id = ?1",
+            params![id.to_string()],
+        )?;
+        Ok(())
     }
 
     // ---- M15.5: the stored text rules --------------------------------------
@@ -3668,6 +4320,849 @@ mod tests {
         let again = Store::open(&path).expect("reopen");
         assert_eq!(again.schema_version().unwrap(), SCHEMA_VERSION);
         drop(again);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- M16I: schema v7 — the derived speaker annotation -------------------
+
+    fn diarization_fixture(
+        store: &Store,
+    ) -> (Transcript, DiarizationRun, Vec<Speaker>, Vec<SpeakerTurn>) {
+        let mut t = sample("speakers.wav");
+        t.segments = vec![
+            Segment {
+                idx: 0,
+                start_ms: 0,
+                end_ms: 1_000,
+                text: "halo".to_string(),
+            },
+            Segment {
+                idx: 1,
+                start_ms: 1_000,
+                end_ms: 2_000,
+                text: "dunia".to_string(),
+            },
+            Segment {
+                idx: 2,
+                start_ms: 2_000,
+                end_ms: 3_000,
+                text: "selamat pagi".to_string(),
+            },
+        ];
+        store.insert_transcript(&t).unwrap();
+        let run = DiarizationRun::new(
+            t.id,
+            0,
+            "pyannote-segmentation-3.0.onnx",
+            "seg-sha",
+            "campplus.onnx",
+            "emb-sha",
+            2,
+            0.5,
+            3_000,
+        );
+        let speakers = vec![
+            Speaker::new(0, "Speaker 1", 0),
+            Speaker::new(1, "Speaker 2", 1),
+        ];
+        let turns = vec![
+            SpeakerTurn::new(0, 0, 1_000, 0),
+            SpeakerTurn::new(1, 1_000, 2_000, 1),
+            SpeakerTurn::new(2, 2_000, 3_000, 0),
+        ];
+        (t, run, speakers, turns)
+    }
+
+    /// Every row of every table, sorted — the "loses nothing" comparison.
+    fn dump_table(store: &Store, table: &str) -> Vec<String> {
+        let sql = format!("SELECT * FROM {table} ORDER BY 1, 2");
+        let mut stmt = store.conn.prepare(&sql).expect("prepare dump");
+        let columns = stmt.column_count();
+        let rows = stmt
+            .query_map([], |row| {
+                let mut values = Vec::with_capacity(columns);
+                for index in 0..columns {
+                    let value: rusqlite::types::Value = row.get(index)?;
+                    values.push(format!("{value:?}"));
+                }
+                Ok(values.join("|"))
+            })
+            .expect("dump rows");
+        rows.collect::<Result<Vec<_>, _>>().expect("collect dump")
+    }
+
+    #[test]
+    fn a_diarization_run_round_trips_with_turns_and_the_read_projections() {
+        let store = Store::open_in_memory().unwrap();
+        let (t, run, speakers, turns) = diarization_fixture(&store);
+
+        assert_eq!(store.diarization(t.id).unwrap(), None);
+        assert!(store.speaker_for_segments(t.id).unwrap().is_empty());
+        let run_id = store
+            .replace_diarization_run(t.id, &run, &speakers, &turns)
+            .unwrap();
+        assert_eq!(run_id, 1, "the first run is 1");
+
+        let loaded = store.diarization(t.id).unwrap().expect("a run");
+        assert_eq!(loaded.run.run_id, 1);
+        assert_eq!(
+            loaded.run.segmentation_model,
+            "pyannote-segmentation-3.0.onnx"
+        );
+        assert_eq!(loaded.run.segmentation_sha256, "seg-sha");
+        assert_eq!(loaded.run.embedding_sha256, "emb-sha");
+        assert_eq!(loaded.run.num_clusters, 2);
+        assert!(!loaded.run.stale);
+        assert_eq!(loaded.speakers, speakers);
+        assert_eq!(loaded.turns, turns);
+
+        // The badge projection is derived, not stored.
+        let projected = store.speaker_for_segments(t.id).unwrap();
+        assert_eq!(projected.len(), 3);
+        assert_eq!(projected[0].unwrap().primary, 0);
+        assert_eq!(projected[1].unwrap().primary, 1);
+        assert_eq!(projected[2].unwrap().primary, 0);
+        assert!(projected.iter().all(|row| row.unwrap().secondary.is_none()));
+        // …and the range projection is the midpoint rule.
+        let ranges = store.speaker_turn_ranges(t.id).unwrap();
+        assert_eq!(ranges, vec![(0, 0, 0), (1, 1, 1), (2, 2, 2)]);
+
+        // A re-run replaces the run and its turns, and the id stays monotonic.
+        let mut second = run.clone();
+        second.num_clusters = 3;
+        let speakers2 = vec![
+            Speaker::new(0, "Speaker 1", 0),
+            Speaker::new(1, "Speaker 2", 1),
+            Speaker::new(2, "Speaker 3", 2),
+        ];
+        let turns2 = vec![
+            SpeakerTurn::new(0, 0, 1_000, 0),
+            SpeakerTurn::new(1, 1_000, 2_000, 1),
+            SpeakerTurn::new(2, 2_000, 3_000, 2),
+        ];
+        let run_id = store
+            .replace_diarization_run(t.id, &second, &speakers2, &turns2)
+            .unwrap();
+        assert_eq!(
+            run_id, 2,
+            "run ids never repeat even though one run is kept"
+        );
+        let loaded = store.diarization(t.id).unwrap().expect("the new run");
+        assert_eq!(loaded.run.run_id, 2);
+        assert_eq!(loaded.run.num_clusters, 3);
+        assert_eq!(loaded.turns.len(), 3);
+        assert_eq!(loaded.speakers.len(), 3);
+        // Only one run row survives.
+        let runs: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM diarization_runs WHERE transcript_id = ?1",
+                params![t.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(runs, 1);
+    }
+
+    #[test]
+    fn renaming_a_speaker_propagates_to_every_read_and_marks_it_manual() {
+        let store = Store::open_in_memory().unwrap();
+        let (t, run, speakers, turns) = diarization_fixture(&store);
+        store
+            .replace_diarization_run(t.id, &run, &speakers, &turns)
+            .unwrap();
+
+        store.rename_speaker(t.id, 1, "Budi").unwrap();
+        let loaded = store.diarization(t.id).unwrap().unwrap();
+        assert_eq!(loaded.label(1), Some("Budi"));
+        assert_eq!(loaded.speakers[1].source, SpeakerSource::Manual);
+        assert_eq!(loaded.speakers[0].label, "Speaker 1");
+        assert_eq!(
+            loaded.turns, turns,
+            "turns carry speaker ids, so a rename never rewrites one"
+        );
+        // Every consumer joins through speaker_id: the projection and the run
+        // label both see the new name immediately.
+        assert_eq!(loaded.color_slot(1), 1);
+        assert_eq!(
+            loaded.segment_speakers(&store.get_transcript(t.id).unwrap().segments)[1]
+                .unwrap()
+                .primary,
+            1
+        );
+
+        // Duplicate and empty names are refused; nothing changes.
+        assert!(store.rename_speaker(t.id, 0, "budi").is_err());
+        assert!(store.rename_speaker(t.id, 0, "  ").is_err());
+        assert!(store.rename_speaker(t.id, 9, "x").is_err());
+        assert_eq!(
+            store.diarization(t.id).unwrap().unwrap().speakers[0].label,
+            "Speaker 1"
+        );
+
+        // A re-run never renames a manual speaker automatically: the existing
+        // manual row (name + colour) wins over the engine's fresh auto label.
+        let mut rerun = run.clone();
+        rerun.num_clusters = 2;
+        store
+            .replace_diarization_run(t.id, &rerun, &speakers, &turns)
+            .unwrap();
+        assert_eq!(
+            store.diarization(t.id).unwrap().unwrap().label(1),
+            Some("Budi"),
+            "the manual name survives the re-run on the same speaker id"
+        );
+        assert_eq!(
+            store.diarization(t.id).unwrap().unwrap().speakers[1].source,
+            SpeakerSource::Manual
+        );
+        store.rename_speaker(t.id, 0, "Ani").unwrap();
+        let stored = store.speakers(t.id).unwrap();
+        assert_eq!(stored[0].label, "Ani");
+        assert_eq!(stored[0].source, SpeakerSource::Manual);
+    }
+
+    #[test]
+    fn an_edit_split_or_merge_marks_the_run_stale_but_never_rewrites_it() {
+        let store = Store::open_in_memory().unwrap();
+        let (t, run, speakers, turns) = diarization_fixture(&store);
+        store
+            .replace_diarization_run(t.id, &run, &speakers, &turns)
+            .unwrap();
+        let before_rows = store.segment_rows(t.id).unwrap();
+        let before_turns = store.speaker_turns(t.id).unwrap();
+        let before_sources = dump_table(&store, "segments");
+
+        // A text edit: the turns are untouched, the source text is untouched.
+        store.update_segment_text(t.id, 0, "halo semua").unwrap();
+        let loaded = store.diarization(t.id).unwrap().unwrap();
+        assert!(loaded.run.stale, "a text edit stales the badge view");
+        assert_eq!(loaded.turns, before_turns, "turns are time-anchored");
+        let rows = store.segment_rows(t.id).unwrap();
+        assert_eq!(rows[0].text, "halo semua");
+        assert_eq!(rows[0].source_text.as_deref(), Some("halo"));
+        assert_eq!(rows[1].source_text.as_deref(), Some("dunia"));
+
+        // A split stales it too (and never moves a turn).
+        store
+            .split_segment(t.id, 2, 7, None, ZeroDuration::OneFrame)
+            .unwrap();
+        assert!(store.diarization_run(t.id).unwrap().unwrap().stale);
+        assert_eq!(store.speaker_turns(t.id).unwrap(), before_turns);
+
+        // …and a merge.
+        store.merge_segments(t.id, 0, 2, " ").unwrap();
+        assert!(store.diarization_run(t.id).unwrap().unwrap().stale);
+        // The turns stayed byte-identical through all three paths.
+        assert_eq!(store.speaker_turns(t.id).unwrap(), before_turns);
+
+        // A fresh run clears the marker and re-derives the projection.
+        store
+            .replace_diarization_run(t.id, &run, &speakers, &turns)
+            .unwrap();
+        assert!(!store.diarization_run(t.id).unwrap().unwrap().stale);
+
+        // The transcript text is never written by any diarization path: only
+        // the edit/split/merge above changed the segment rows, and deleting the
+        // run changes none of them back.
+        let after_turns_and_delete = {
+            store.delete_diarization(t.id).unwrap();
+            dump_table(&store, "segments")
+        };
+        assert_ne!(
+            after_turns_and_delete, before_sources,
+            "the edits above did change text"
+        );
+        assert!(before_rows[0].source_text.is_some());
+    }
+
+    #[test]
+    fn deleting_the_diarization_restores_the_plain_view_byte_for_byte() {
+        let store = Store::open_in_memory().unwrap();
+        let (t, run, speakers, turns) = diarization_fixture(&store);
+        let segments_before = dump_table(&store, "segments");
+        let words_before = dump_table(&store, "word_timings");
+        let transcripts_before = dump_table(&store, "transcripts");
+
+        store
+            .replace_diarization_run(t.id, &run, &speakers, &turns)
+            .unwrap();
+        assert_eq!(dump_table(&store, "segments"), segments_before);
+        assert_eq!(dump_table(&store, "word_timings"), words_before);
+        assert_eq!(dump_table(&store, "transcripts"), transcripts_before);
+
+        store.delete_diarization(t.id).unwrap();
+        assert_eq!(store.diarization(t.id).unwrap(), None);
+        assert!(store.speakers(t.id).unwrap().is_empty());
+        assert!(store.speaker_turns(t.id).unwrap().is_empty());
+        assert_eq!(store.speaker_for_segments(t.id).unwrap(), Vec::new());
+        assert_eq!(dump_table(&store, "segments"), segments_before);
+        assert_eq!(dump_table(&store, "transcripts"), transcripts_before);
+
+        // Deleting the transcript cascades every diarization row.
+        store
+            .replace_diarization_run(t.id, &run, &speakers, &turns)
+            .unwrap();
+        store.delete_transcript(t.id).unwrap();
+        for table in ["diarization_runs", "speakers", "speaker_turns"] {
+            let count: i64 = store
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} must cascade");
+        }
+    }
+
+    #[test]
+    fn a_silent_run_round_trips_with_no_speakers() {
+        let store = Store::open_in_memory().unwrap();
+        let (t, run, _, _) = diarization_fixture(&store);
+        store.replace_diarization_run(t.id, &run, &[], &[]).unwrap();
+        let loaded = store.diarization(t.id).unwrap().unwrap();
+        assert!(loaded.speakers.is_empty());
+        assert!(loaded.turns.is_empty());
+        assert_eq!(loaded.run.audio_ms, 3_000);
+        assert_eq!(
+            store.speaker_for_segments(t.id).unwrap(),
+            vec![None, None, None]
+        );
+    }
+
+    #[test]
+    fn a_malformed_run_is_refused_and_the_previous_run_survives() {
+        let store = Store::open_in_memory().unwrap();
+        let (t, run, speakers, turns) = diarization_fixture(&store);
+        store
+            .replace_diarization_run(t.id, &run, &speakers, &turns)
+            .unwrap();
+        let before = store.diarization(t.id).unwrap().unwrap();
+
+        // A turn pointing at a speaker that is not in the set.
+        let mut bad_turns = turns.clone();
+        bad_turns[0].speaker_id = 7;
+        let err = store
+            .replace_diarization_run(t.id, &run, &speakers, &bad_turns)
+            .expect_err("unknown speaker");
+        assert!(matches!(err, SuramakError::Diarization(_)), "{err}");
+        assert_eq!(store.diarization(t.id).unwrap().unwrap(), before);
+
+        // An empty turn span is refused by the pure rules before the FK/CHECK.
+        let mut bad = turns.clone();
+        bad[1].end_ms = bad[1].start_ms;
+        assert!(store
+            .replace_diarization_run(t.id, &run, &speakers, &bad)
+            .is_err());
+        assert_eq!(store.diarization(t.id).unwrap().unwrap(), before);
+
+        // No speakers at all is a SILENT run (M16I: a recording with no speech
+        // is a legitimate completed result), not an error — it replaces the
+        // previous run, matching `a_silent_run_round_trips_with_no_speakers`.
+        store
+            .replace_diarization_run(t.id, &run, &[], &[])
+            .expect("a silent run is accepted");
+        let silent = store.diarization(t.id).unwrap().unwrap();
+        assert!(
+            silent.speakers.is_empty() && silent.turns.is_empty(),
+            "{silent:?}"
+        );
+    }
+
+    #[test]
+    fn speaker_corrections_reassign_merge_and_split_in_one_transaction() {
+        let store = Store::open_in_memory().unwrap();
+        let (t, run, speakers, turns) = diarization_fixture(&store);
+        store
+            .replace_diarization_run(t.id, &run, &speakers, &turns)
+            .unwrap();
+
+        // Reassign one turn: it becomes manual, the others stay auto.
+        store.reassign_turn(t.id, 1, 0).unwrap();
+        let loaded = store.diarization(t.id).unwrap().unwrap();
+        assert_eq!(loaded.turns[1].speaker_id, 0);
+        assert_eq!(loaded.turns[1].source, TurnSource::Manual);
+        assert_eq!(loaded.turns[0].source, TurnSource::Auto);
+        assert!(loaded.has_manual_turns());
+        assert!(store.reassign_turn(t.id, 9, 0).is_err());
+        assert!(store.reassign_turn(t.id, 0, 9).is_err());
+
+        // Merge Speaker 2 into Speaker 1: one speaker left, renumbered.
+        let (t2, run2, speakers2, turns2) = diarization_fixture(&store);
+        store
+            .replace_diarization_run(t2.id, &run2, &speakers2, &turns2)
+            .unwrap();
+        store.merge_speakers(t2.id, 1, 0).unwrap();
+        let merged = store.diarization(t2.id).unwrap().unwrap();
+        assert_eq!(merged.speakers.len(), 1);
+        assert_eq!(merged.speakers[0].speaker_id, 0);
+        assert_eq!(merged.turns.len(), 3, "a merge never loses a turn");
+        assert!(merged.turns.iter().all(|turn| turn.speaker_id == 0));
+
+        // Split turns 1..=2 into a new speaker.
+        store.split_speaker(t2.id, "Speaker 2", 2, &[1, 2]).unwrap();
+        let split = store.diarization(t2.id).unwrap().unwrap();
+        assert_eq!(split.speakers.len(), 2);
+        assert_eq!(split.speakers[1].label, "Speaker 2");
+        assert_eq!(split.speakers[1].color_slot, 2);
+        assert_eq!(split.speakers[1].source, SpeakerSource::Manual);
+        assert_eq!(split.turns[0].speaker_id, 0);
+        assert_eq!(split.turns[1].speaker_id, 1);
+        assert_eq!(split.turns[1].source, TurnSource::Manual);
+
+        // Colour is a one-row manual edit.
+        store.set_speaker_color(t2.id, 0, 4).unwrap();
+        assert_eq!(store.speakers(t2.id).unwrap()[0].color_slot, 4);
+        assert!(store.set_speaker_color(t2.id, 0, 9).is_err());
+    }
+
+    #[test]
+    fn a_rerun_drops_unused_auto_speakers_but_keeps_a_manual_name() {
+        let store = Store::open_in_memory().unwrap();
+        let (t, run, speakers, turns) = diarization_fixture(&store);
+        let three = vec![
+            Speaker::new(0, "Speaker 1", 0),
+            Speaker::new(1, "Speaker 2", 1),
+            Speaker::new(2, "Speaker 3", 2),
+        ];
+        let three_turns = vec![
+            SpeakerTurn::new(0, 0, 1_000, 0),
+            SpeakerTurn::new(1, 1_000, 2_000, 1),
+            SpeakerTurn::new(2, 2_000, 3_000, 2),
+        ];
+        store
+            .replace_diarization_run(t.id, &run, &three, &three_turns)
+            .unwrap();
+        store.rename_speaker(t.id, 2, "Ibu Sari").unwrap();
+
+        // The re-run finds only two speakers (the third voice merged): the
+        // unused *auto* rows go, the manual name stays as a name without turns.
+        store
+            .replace_diarization_run(t.id, &run, &speakers, &turns)
+            .unwrap();
+        let loaded = store.diarization(t.id).unwrap().unwrap();
+        assert_eq!(loaded.speakers.len(), 3);
+        assert_eq!(loaded.label(2), Some("Ibu Sari"));
+        assert!(!loaded.turns.iter().any(|turn| turn.speaker_id == 2));
+        assert_eq!(loaded.speakers[2].source, SpeakerSource::Manual);
+    }
+
+    /// A populated database at `version` (1..=6), with the tables that version
+    /// actually had. Enough rows that a lossy upgrade cannot hide.
+    fn write_fixture(path: &Path, version: i64) {
+        let conn = Connection::open(path).unwrap();
+        let mut ddl = String::from(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE transcripts (
+                 id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL, source_json TEXT NOT NULL,
+                 model TEXT NOT NULL, language TEXT, audio_path TEXT);
+             CREATE TABLE segments (
+                 transcript_id TEXT NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
+                 idx INTEGER NOT NULL, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL,
+                 text TEXT NOT NULL, PRIMARY KEY (transcript_id, idx));",
+        );
+        if version >= 2 {
+            ddl.push_str("ALTER TABLE segments ADD COLUMN source_text TEXT;");
+        }
+        if version >= 3 {
+            ddl.push_str(
+                "ALTER TABLE segments ADD COLUMN derived TEXT NOT NULL DEFAULT '';
+                 CREATE TABLE glossary_terms (position INTEGER PRIMARY KEY, term TEXT NOT NULL, created_at TEXT NOT NULL);
+                 CREATE TABLE dictionary_entries (position INTEGER PRIMARY KEY, from_text TEXT NOT NULL, to_text TEXT NOT NULL, created_at TEXT NOT NULL);
+                 CREATE TABLE text_prefs (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE prompt_budgets (model_id TEXT PRIMARY KEY, n_text_ctx INTEGER NOT NULL, cap_tokens INTEGER NOT NULL, measured_at TEXT NOT NULL);",
+            );
+        }
+        if version >= 4 {
+            ddl.push_str(
+                "CREATE VIRTUAL TABLE search_fts USING fts5(body, original, tokenize = 'unicode61 remove_diacritics 1');
+                 CREATE TABLE search_docs (rowid INTEGER PRIMARY KEY, doc_key TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, transcript_id TEXT, segment_idx INTEGER);
+                 CREATE INDEX search_docs_transcript ON search_docs(transcript_id);",
+            );
+        }
+        if version >= 5 {
+            ddl.push_str(
+                "ALTER TABLE segments ADD COLUMN translation TEXT;
+                 ALTER TABLE segments ADD COLUMN translation_model TEXT;
+                 ALTER TABLE segments ADD COLUMN translation_at TEXT;
+                 ALTER TABLE segments ADD COLUMN translation_sources TEXT;
+                 ALTER TABLE segments ADD COLUMN translation_stale INTEGER NOT NULL DEFAULT 0;",
+            );
+        }
+        if version >= 6 {
+            ddl.push_str(
+                "CREATE TABLE word_timings (
+                     transcript_id TEXT NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
+                     segment_idx INTEGER NOT NULL, word_idx INTEGER NOT NULL,
+                     start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, text TEXT NOT NULL,
+                     aligned_text TEXT NOT NULL, stale INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY (transcript_id, segment_idx, word_idx));",
+            );
+        }
+        conn.execute_batch(&ddl).unwrap();
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)",
+            params![version.to_string()],
+        )
+        .unwrap();
+        let id = "00000000-0000-0000-0000-000000000001";
+        conn.execute(
+            "INSERT INTO transcripts VALUES (?1, 'old.wav', '2024-01-01T00:00:00+00:00',
+                 '2024-01-02T00:00:00+00:00', '{\"type\":\"file\",\"name\":\"old.wav\"}',
+                 'tiny', 'id', NULL)",
+            params![id],
+        )
+        .unwrap();
+        for idx in 0..3u32 {
+            let text = format!("baris {idx}");
+            if version >= 5 {
+                conn.execute(
+                    "INSERT INTO segments(transcript_id, idx, start_ms, end_ms, text,
+                         source_text, derived, translation, translation_model, translation_at,
+                         translation_sources, translation_stale)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5, '', 'terjemahan', 'mock',
+                         '2024-01-02T00:00:00+00:00', '[0]', 1)",
+                    params![id, idx, idx as i64 * 1000, (idx as i64 + 1) * 1000, text],
+                )
+                .unwrap();
+            } else if version >= 3 {
+                conn.execute(
+                    "INSERT INTO segments(transcript_id, idx, start_ms, end_ms, text, source_text, derived)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5, 'split')",
+                    params![id, idx, idx as i64 * 1000, (idx as i64 + 1) * 1000, text],
+                )
+                .unwrap();
+            } else if version >= 2 {
+                conn.execute(
+                    "INSERT INTO segments(transcript_id, idx, start_ms, end_ms, text, source_text)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                    params![id, idx, idx as i64 * 1000, (idx as i64 + 1) * 1000, text],
+                )
+                .unwrap();
+            } else {
+                conn.execute(
+                    "INSERT INTO segments VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![id, idx, idx as i64 * 1000, (idx as i64 + 1) * 1000, text],
+                )
+                .unwrap();
+            }
+        }
+        if version >= 3 {
+            conn.execute(
+                "INSERT INTO glossary_terms VALUES (0, 'Cilandak', '2024-01-01T00:00:00+00:00')",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO text_prefs VALUES ('normalize', 'true')", [])
+                .unwrap();
+        }
+        if version >= 6 {
+            conn.execute(
+                "INSERT INTO word_timings VALUES (?1, 0, 0, 0, 400, 'baris', 'baris 0', 0)",
+                params![id],
+            )
+            .unwrap();
+        }
+    }
+
+    /// The M15-A discipline, for v6→v7: every populated fixture upgrades in
+    /// place and every existing row reads back exactly as it did.
+    #[test]
+    fn every_populated_fixture_upgrades_to_v7_losing_nothing() {
+        fn dump(conn: &Connection, table: &str) -> Vec<String> {
+            let sql = format!("SELECT * FROM {table} ORDER BY 1, 2");
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let columns = stmt.column_count();
+            let rows = stmt
+                .query_map([], |row| {
+                    let mut values = Vec::new();
+                    for index in 0..columns {
+                        let value: rusqlite::types::Value = row.get(index)?;
+                        values.push(format!("{value:?}"));
+                    }
+                    Ok(values.join("|"))
+                })
+                .unwrap();
+            rows.collect::<Result<Vec<_>, _>>().unwrap()
+        }
+        fn dump_segments(conn: &Connection, columns: &str) -> Vec<String> {
+            let sql = format!("SELECT {columns} FROM segments ORDER BY idx");
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let width = stmt.column_count();
+            let rows = stmt
+                .query_map([], |row| {
+                    let mut values = Vec::new();
+                    for index in 0..width {
+                        let value: rusqlite::types::Value = row.get(index)?;
+                        values.push(format!("{value:?}"));
+                    }
+                    Ok(values.join("|"))
+                })
+                .unwrap();
+            rows.collect::<Result<Vec<_>, _>>().unwrap()
+        }
+        // The columns each version actually had (the widened row after the
+        // upgrade must not be compared against the old, narrower one).
+        let projection = |version: i64| match version {
+            0 | 1 => "idx, start_ms, end_ms, text",
+            2 => "idx, start_ms, end_ms, text, source_text",
+            3 | 4 => "idx, start_ms, end_ms, text, source_text, derived",
+            _ => {
+                "idx, start_ms, end_ms, text, source_text, derived, translation,
+                 translation_model, translation_at, translation_sources, translation_stale"
+            }
+        };
+        let dir = std::env::temp_dir().join(format!("suramak-v7-fixtures-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for version in 1..=6i64 {
+            let path = dir.join(format!("v{version}.db"));
+            write_fixture(&path, version);
+            let (transcripts, segments, extras) = {
+                let conn = Connection::open(&path).unwrap();
+                let extras = if version >= 3 {
+                    (dump(&conn, "glossary_terms"), dump(&conn, "text_prefs"))
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+                (
+                    dump(&conn, "transcripts"),
+                    dump_segments(&conn, projection(version)),
+                    extras,
+                )
+            };
+
+            let store = Store::open(&path).expect("upgrade");
+            assert_eq!(store.schema_version().unwrap(), 7, "v{version} reaches v7");
+            assert_eq!(dump_table(&store, "transcripts").len(), 1);
+            assert_eq!(dump_table(&store, "segments").len(), 3);
+            assert_eq!(
+                store
+                    .get_transcript(
+                        Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
+                    )
+                    .unwrap()
+                    .segments
+                    .len(),
+                3
+            );
+            // No diarization rows are invented by the upgrade.
+            assert_eq!(store.diarization_run(Uuid::nil()).unwrap(), None);
+            let count: i64 = store
+                .conn
+                .query_row("SELECT COUNT(*) FROM speakers", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 0);
+
+            // The rows the old schema carried are still there, value for value.
+            assert_eq!(
+                dump_table(&store, "transcripts"),
+                transcripts,
+                "v{version}: transcripts"
+            );
+            assert_eq!(
+                dump_segments(&store.conn, projection(version)),
+                segments,
+                "v{version}: segments"
+            );
+            if version >= 3 {
+                assert_eq!(dump_table(&store, "glossary_terms"), extras.0);
+                assert_eq!(dump_table(&store, "text_prefs"), extras.1);
+            }
+            drop(store);
+            // A second open is a no-op at the same version.
+            let again = Store::open(&path).expect("reopen");
+            assert_eq!(again.schema_version().unwrap(), 7);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same check against the real populated databases this workspace's
+    /// acceptance runs left under `build/` (gitignored). Skipped when there are
+    /// none — the synthetic fixtures above are the CI guarantee.
+    #[test]
+    fn the_build_directories_populated_databases_upgrade_in_place() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../build");
+        if !root.is_dir() {
+            return;
+        }
+        let mut checked = 0usize;
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|ext| ext.to_str()) != Some("db") {
+                    continue;
+                }
+                let conn = match Connection::open(&path) {
+                    Ok(conn) => conn,
+                    Err(_) => continue,
+                };
+                let version: Option<String> = conn
+                    .query_row(
+                        "SELECT value FROM meta WHERE key = 'schema_version'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .unwrap_or(None);
+                let transcripts: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM transcripts", [], |row| row.get(0))
+                    .unwrap_or(0);
+                drop(conn);
+                let Some(version) = version.and_then(|raw| raw.parse::<i64>().ok()) else {
+                    continue;
+                };
+                if transcripts == 0 || version >= 7 {
+                    continue;
+                }
+                let copy = std::env::temp_dir().join(format!(
+                    "suramak-fixture-{}-{}.db",
+                    std::process::id(),
+                    checked
+                ));
+                let _ = std::fs::remove_file(&copy);
+                std::fs::copy(&path, &copy).expect("copy fixture");
+                // The projection is the columns every v1..v6 fixture has, so a
+                // wider row after the upgrade cannot masquerade as a loss.
+                let before = {
+                    let conn = Connection::open(&copy).unwrap();
+                    let mut stmt = conn
+                        .prepare("SELECT idx, start_ms, end_ms, text FROM segments ORDER BY idx")
+                        .unwrap();
+                    let rows = stmt
+                        .query_map([], |row| {
+                            Ok(format!(
+                                "{}|{}|{}|{}",
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, String>(3)?
+                            ))
+                        })
+                        .unwrap();
+                    rows.collect::<Result<Vec<_>, _>>().unwrap()
+                };
+                let store = Store::open(&copy).expect("upgrade fixture");
+                assert_eq!(store.schema_version().unwrap(), 7, "{}", path.display());
+                let after = {
+                    let mut stmt = store
+                        .conn
+                        .prepare("SELECT idx, start_ms, end_ms, text FROM segments ORDER BY idx")
+                        .unwrap();
+                    let rows = stmt
+                        .query_map([], |row| {
+                            Ok(format!(
+                                "{}|{}|{}|{}",
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, String>(3)?
+                            ))
+                        })
+                        .unwrap();
+                    rows.collect::<Result<Vec<_>, _>>().unwrap()
+                };
+                assert_eq!(
+                    after,
+                    before,
+                    "{} lost or changed a segment row",
+                    path.display()
+                );
+                let id: String = store
+                    .conn
+                    .query_row("SELECT id FROM transcripts LIMIT 1", [], |row| row.get(0))
+                    .unwrap();
+                let id = Uuid::parse_str(&id).unwrap();
+                let stored: i64 = store
+                    .conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM segments WHERE transcript_id = ?1",
+                        params![id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    store.get_transcript(id).unwrap().segments.len() as i64,
+                    stored,
+                    "{} changed a transcript's segment count",
+                    path.display()
+                );
+                drop(store);
+                let _ = std::fs::remove_file(&copy);
+                checked += 1;
+            }
+        }
+        println!("upgraded {checked} populated build/ fixtures in place");
+    }
+
+    #[test]
+    fn a_corrupt_or_newer_schema_is_refused_without_touching_the_file() {
+        let dir = std::env::temp_dir().join(format!("suramak-v7-refuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A newer schema: the older binary must not write to it.
+        let newer = dir.join("newer.db");
+        write_fixture(&newer, 6);
+        {
+            let conn = Connection::open(&newer).unwrap();
+            conn.execute(
+                "UPDATE meta SET value = '99' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        }
+        let err = match Store::open(&newer) {
+            Ok(_) => panic!("a newer schema must be refused"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, SuramakError::Schema(_)), "{err}");
+        {
+            let conn = Connection::open(&newer).unwrap();
+            let version: String = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(version, "99", "the marker was not rewritten");
+            let v7_tables: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name IN ('diarization_runs', 'speakers', 'speaker_turns')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(v7_tables, 0, "a refused open must not add v7 tables");
+        }
+
+        // A non-numeric version marker is a refusal, not a guess.
+        let corrupt = dir.join("corrupt.db");
+        write_fixture(&corrupt, 6);
+        {
+            let conn = Connection::open(&corrupt).unwrap();
+            conn.execute(
+                "UPDATE meta SET value = 'banana' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        }
+        let err = match Store::open(&corrupt) {
+            Ok(_) => panic!("a corrupt marker must be refused"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, SuramakError::Schema(_)), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

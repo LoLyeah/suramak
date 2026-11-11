@@ -194,6 +194,11 @@ pub struct Tokens {
     // ---- waveform ----------------------------------------------------------
     pub wave: Color32,
     pub wave_dim: Color32,
+    // ---- speaker badges/lane (M16I) ---------------------------------------
+    /// The six fixed speaker hues, indexed by `speakers.color_slot`. Authored
+    /// per ladder; the contrast test asserts 3:1 against the card (the bar) and
+    /// 4.5:1 for ink on the 12 % chip wash (the numeral) on both ladders.
+    pub speaker: [Color32; 6],
     // ---- floating record control ------------------------------------------
     /// The fallback pill's fill (M8.5; the real material stands behind it on
     /// macOS 26+).
@@ -265,6 +270,14 @@ pub fn macos_ladder(theme: AppTheme) -> Tokens {
             disabled_alpha: 0.45,
             wave: Color32::from_rgb(0x54, 0x5c, 0x6b),
             wave_dim: Color32::from_rgb(0x8b, 0x93, 0xa3),
+            speaker: [
+                Color32::from_rgb(0x2f, 0x6f, 0xed), // accent blue
+                Color32::from_rgb(0xa8, 0x5f, 0x00), // amber
+                Color32::from_rgb(0x0f, 0x76, 0x6e), // teal
+                Color32::from_rgb(0x7a, 0x3e, 0x9d), // plum
+                Color32::from_rgb(0x5c, 0x66, 0x00), // olive
+                Color32::from_rgb(0xb3, 0x30, 0x5f), // rose
+            ],
             float_fill: Color32::from_white_alpha(200),
             space,
             radius,
@@ -306,6 +319,14 @@ pub fn macos_ladder(theme: AppTheme) -> Tokens {
             disabled_alpha: 0.45,
             wave: Color32::from_rgb(0xae, 0xb7, 0xc5),
             wave_dim: Color32::from_rgb(0x83, 0x86, 0x8e),
+            speaker: [
+                Color32::from_rgb(0x6e, 0xa8, 0xff),
+                Color32::from_rgb(0xe0, 0xa4, 0x3c),
+                Color32::from_rgb(0x4f, 0xd1, 0xc5),
+                Color32::from_rgb(0xc4, 0x9b, 0xff),
+                Color32::from_rgb(0xb7, 0xc9, 0x5a),
+                Color32::from_rgb(0xff, 0x7a, 0x9c),
+            ],
             float_fill: Color32::from_white_alpha(22),
             space,
             radius,
@@ -361,6 +382,14 @@ pub fn desktop_ladder(theme: AppTheme) -> Tokens {
             disabled_alpha: 0.45,
             wave: Color32::from_rgb(0x54, 0x5c, 0x6b),
             wave_dim: Color32::from_rgb(0x8b, 0x93, 0xa3),
+            speaker: [
+                Color32::from_rgb(0x2f, 0x6f, 0xed), // accent blue
+                Color32::from_rgb(0xa8, 0x5f, 0x00), // amber
+                Color32::from_rgb(0x0f, 0x76, 0x6e), // teal
+                Color32::from_rgb(0x7a, 0x3e, 0x9d), // plum
+                Color32::from_rgb(0x5c, 0x66, 0x00), // olive
+                Color32::from_rgb(0xb3, 0x30, 0x5f), // rose
+            ],
             float_fill: Color32::from_rgba_unmultiplied(0xff, 0xff, 0xff, 0xe8),
             space,
             radius,
@@ -402,6 +431,14 @@ pub fn desktop_ladder(theme: AppTheme) -> Tokens {
             disabled_alpha: 0.45,
             wave: Color32::from_rgb(0xae, 0xb7, 0xc5),
             wave_dim: Color32::from_rgb(0x83, 0x86, 0x8e),
+            speaker: [
+                Color32::from_rgb(0x6e, 0xa8, 0xff),
+                Color32::from_rgb(0xe0, 0xa4, 0x3c),
+                Color32::from_rgb(0x4f, 0xd1, 0xc5),
+                Color32::from_rgb(0xc4, 0x9b, 0xff),
+                Color32::from_rgb(0xb7, 0xc9, 0x5a),
+                Color32::from_rgb(0xff, 0x7a, 0x9c),
+            ],
             float_fill: Color32::from_rgba_unmultiplied(0x1e, 0x2a, 0x54, 0xd9),
             space,
             radius,
@@ -812,6 +849,57 @@ mod tests {
                             "{ladder} {theme:?}: the {name} dot on {surface} = {ratio:.2}:1 \
                              — under the 3:1 UI floor"
                         );
+                    }
+                }
+            }
+        }
+        for line in &measured {
+            println!("{line}");
+        }
+    }
+
+    /// M16I: the six speaker slots clear the Deck's contrast rules on both
+    /// ladders: the bar is a non-text indicator (≥ 3:1 against the card) and
+    /// the badge numeral is small text on the 12 % chip wash (≥ 4.5:1). A slot
+    /// that fails must not ship.
+    #[test]
+    fn every_speaker_slot_clears_the_badge_contrast_rules_on_both_ladders() {
+        type Ladder = (&'static str, fn(AppTheme) -> Tokens);
+        let ladders: [Ladder; 2] = [("macos", macos_ladder), ("desktop", desktop_ladder)];
+        let mut measured: Vec<String> = Vec::new();
+        for (ladder, build) in ladders {
+            for theme in [AppTheme::Light, AppTheme::Dark] {
+                let t = build(theme);
+                let backdrop = match theme {
+                    AppTheme::Light => Color32::WHITE,
+                    AppTheme::Dark => Color32::BLACK,
+                };
+                let card = composite_over(t.card, backdrop);
+                for (slot, color) in t.speaker.iter().enumerate() {
+                    let bar = contrast_ratio(*color, card);
+                    measured.push(format!(
+                        "{ladder} {theme:?}: speaker {slot} bar on card: {bar:.2}:1"
+                    ));
+                    assert!(
+                        bar >= 3.0,
+                        "{ladder} {theme:?}: speaker slot {slot} = {bar:.2}:1 — under 3:1"
+                    );
+                    // The numeral sits on the 12 % chip wash over the card.
+                    let chip = crate::deck::speakers::chip_fill(&t, slot as u8);
+                    let wash = composite_over(chip, card);
+                    let numeral = contrast_ratio(t.ink, wash);
+                    measured.push(format!(
+                        "{ladder} {theme:?}: speaker {slot} numeral on the 12 % wash: {numeral:.2}:1"
+                    ));
+                    assert!(
+                        numeral >= 4.5,
+                        "{ladder} {theme:?}: speaker slot {slot} numeral = {numeral:.2}:1 — under 4.5:1"
+                    );
+                }
+                // The six slots are distinct colours (a badge must identify).
+                for left in 0..6 {
+                    for right in (left + 1)..6 {
+                        assert_ne!(t.speaker[left], t.speaker[right]);
                     }
                 }
             }

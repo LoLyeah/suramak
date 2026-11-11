@@ -1077,6 +1077,43 @@ impl App {
             self.apply(effects);
         }
 
+        // M16I: the diarization job (one slot; its own thread). A terminal
+        // event is followed by a store re-read so the badges/lane reflect the
+        // committed run, and a Progress only moves the status line.
+        // The lane is mirrored every frame: the stop button's state changes
+        // the instant the click is handled, not when the worker returns.
+        let lane = self
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.diarization_lane_status());
+        if let (Some(lane), Some(shell)) = (lane, self.shell.as_mut()) {
+            shell.app.diarization.mirror_lane(&lane);
+        }
+        let diarization = self
+            .runtime
+            .as_mut()
+            .and_then(|runtime| runtime.diarization_status());
+        if let Some(event) = diarization {
+            changed = true;
+            let effects = match self.shell.as_mut() {
+                Some(shell) => {
+                    shell.app.on_diarization_event(&event);
+                    // Progress only moves the status line; a terminal event is
+                    // the one that needs the store re-read.
+                    if matches!(
+                        event,
+                        suramak_asr::diarization::DiarizationEvent::Progress { .. }
+                    ) {
+                        Vec::new()
+                    } else {
+                        shell.app.refresh_diarization()
+                    }
+                }
+                None => Vec::new(),
+            };
+            self.apply(effects);
+        }
+
         // M15.5: the prompt-budget measurement (a model load on its own thread).
         let measured = self
             .runtime
@@ -1524,6 +1561,10 @@ impl ApplicationHandler<UserEvent> for App {
                 shell.sync_appearance(runtime.appearance());
                 // Polish availability is derived from the settings + key policy (M4).
                 shell.app.polish_configured = runtime.polish_configured();
+                // M16I: the diarization feature's availability is a build +
+                // platform + model-install fact, probed once here (never per
+                // frame); a platform without the M16F dylibs shows the reason.
+                shell.app.diarization.availability = runtime.diarization_availability();
                 // M15.8: the bilingual action's gate is the same endpoint; the
                 // disabled reason is seeded here (never a live check per frame).
                 shell.app.translation_gate_reason = runtime.translation_gate_reason();

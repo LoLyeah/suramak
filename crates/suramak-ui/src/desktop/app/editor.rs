@@ -27,6 +27,7 @@ use suramak_core::diagnostics::{diagnose, Level, SubtitleLimits};
 use suramak_playback::segment_index_at;
 use suramak_playback::Peaks;
 
+use super::speakers;
 use crate::app::controls::{self, Tier};
 use crate::motion::{self, Motion};
 use crate::theme::{self, Tokens};
@@ -138,6 +139,8 @@ pub fn header_caption_rect(header: &HeaderLayout, row: usize) -> Rect {
 pub struct DeckLayout {
     pub band: Rect,
     pub transport: Rect,
+    /// The single 8 px speaker lane, directly above the waveform (M16I).
+    pub lane: Rect,
     pub waveform: Rect,
     pub readout: Rect,
     pub export: Rect,
@@ -167,13 +170,18 @@ pub fn deck_layout(pane: Rect) -> DeckLayout {
     );
     let wave_left = transport.right() + 18.0;
     let wave_right = (readout.left() - 18.0).max(wave_left + 40.0);
-    let waveform = Rect::from_min_max(
+    let lane = Rect::from_min_size(
         pos2(wave_left, band.top() + 16.0),
+        vec2(wave_right - wave_left, speakers::LANE_H),
+    );
+    let waveform = Rect::from_min_max(
+        pos2(wave_left, lane.bottom() + speakers::LANE_GAP),
         pos2(wave_right, band.bottom() - 16.0),
     );
     DeckLayout {
         band,
         transport,
+        lane,
         waveform,
         readout,
         export,
@@ -252,6 +260,43 @@ fn deck_band(
 
     // ---- waveform strip (middle) -------------------------------------------
     let total_ms = state.playback.duration_ms();
+    // M16I: the lane sits directly above the strip and is drawn from the
+    // time-anchored turns, never from a segment join. The lane's length is the
+    // audio it describes (the run's own length when playback has none).
+    if let Some(view) = &state.diarization.view {
+        let lane_total = i64::from(total_ms).max(view.run.audio_ms);
+        let dim = if view.run.stale { 0.55 } else { 1.0 };
+        // The lane is a settled annotation: a run that already exists when the
+        // editor opens is not "arriving", so it draws immediately (no first-
+        // frame fade, no idle repaint). A fresh run also appears at once — the
+        // badges are the feedback, not an animation.
+        let lane_response = ui.interact(
+            deck.lane,
+            egui::Id::new("suramak-speaker-lane-hit"),
+            egui::Sense::hover(),
+        );
+        lane_response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Other,
+                true,
+                "Speaker lane — labels describe voices in this recording",
+            )
+        });
+        if lane_response.hovered() && !view.turns.is_empty() {
+            lane_response.on_hover_text(
+                "Speaker lane — labels describe voices in this recording, not people",
+            );
+        }
+        speakers::lane(
+            ui,
+            tokens,
+            deck.lane,
+            &view.speakers,
+            &view.turns,
+            lane_total,
+            speakers::LaneStyle { dim, fade: 1.0 },
+        );
+    }
     let position_ms = state.playback.position_ms();
     // M9d item 3: what the strip **draws** eases to a seek (base token) — the
     // data/seek math above is untouched (the readout and the transport keep
@@ -967,6 +1012,64 @@ fn transcript_rows(
         .map(|editor| editor.words.stale.len())
         .unwrap_or_default();
 
+    // M16I: the speaker surface's per-row data is snapshotted before the scroll
+    // closure takes the editor borrow. The badge is drawn from this snapshot;
+    // clicks are applied after the closure (rename/run/delete).
+    let has_run = state.diarization.has_run();
+    let row_speakers: Vec<Option<suramak_core::diarization::SegmentSpeaker>> =
+        state.diarization.per_segment.clone();
+    let speaker_labels: Vec<Option<(String, u8)>> = row_speakers
+        .iter()
+        .map(|row| {
+            row.map(|speaker| {
+                (
+                    state.diarization.label(speaker.primary),
+                    state.diarization.color_slot(speaker.primary),
+                )
+            })
+        })
+        .collect();
+    let speaker_secondary: Vec<Option<u8>> = row_speakers
+        .iter()
+        .map(|row| {
+            row.and_then(|speaker| speaker.secondary)
+                .map(|secondary| state.diarization.color_slot(secondary))
+        })
+        .collect();
+    let speaker_dim = if state.diarization.is_stale() {
+        0.55
+    } else {
+        1.0
+    };
+    let has_audio = state
+        .editor
+        .as_ref()
+        .and_then(|editor| editor.transcript.audio_path.as_ref())
+        .is_some();
+    let rename = state.diarization.rename.clone();
+    let mut rename_buffer = rename
+        .as_ref()
+        .map(|draft| draft.buffer.clone())
+        .unwrap_or_default();
+    let mut rename_pending_focus = rename.is_some();
+    // The in-place field renders once: on the first row owned by the speaker
+    // being renamed (a speaker owns many rows; two widgets with one id would
+    // be an egui id clash).
+    let rename_row: Option<usize> = rename.as_ref().and_then(|draft| {
+        row_speakers.iter().position(|row| {
+            row.map(|speaker| speaker.primary == draft.speaker_id)
+                .unwrap_or(false)
+        })
+    });
+    let mut badge_click: Option<u32> = None;
+    let mut badge_color_click: Option<u32> = None;
+    let mut rename_commit = false;
+    let mut rename_cancel = false;
+    let mut speaker_action = SpeakerAction::None;
+    // The status row reads a clone: inside the scroll closure the editor borrow
+    // is live, so `state.diarization` itself is not reachable there.
+    let state_speaker_view = state.diarization.clone();
+
     let mut seek_to: Option<u32> = None;
     // M15.3: the caret of whichever row has focus this frame, and the row
     // action the user pressed (applied after the scroll closure, when the
@@ -1009,6 +1112,17 @@ fn transcript_rows(
                 });
             }
             let mut edited: Option<(u32, String)> = None;
+            // M16I: the one speaker line at the top of the transcript — the run
+            // status/provenance, the count selector, the re-run and the delete
+            // affordance. It scrolls with the transcript (never a floating
+            // panel) and is drawn while the editor borrow is still free.
+            speaker_action = speaker_status_row(
+                ui,
+                tokens,
+                motion,
+                &state_speaker_view,
+                has_audio,
+            );
             let Some(editor) = &mut state.editor else {
                 return;
             };
@@ -1028,13 +1142,108 @@ fn transcript_rows(
                 let focus_idx = ui.painter().add(egui::Shape::Noop);
 
                 let gutter_w = GUTTER_WIDTH;
+                let speaker_reserve = if has_run {
+                    speakers::SLOT_W + speakers::SLOT_GAP
+                } else {
+                    0.0
+                };
                 let row_max = ui.max_rect();
-                let text_w =
-                    ((row_max.width() - PANE_PAD_X - gutter_w - 24.0) * BODY_MEASURE).max(220.0);
+                let text_w = ((row_max.width()
+                    - PANE_PAD_X
+                    - gutter_w
+                    - 24.0
+                    - speaker_reserve)
+                    * BODY_MEASURE)
+                    .max(220.0);
                 let mut content_rect = Rect::NOTHING;
                 let mut row_focused = false;
                 ui.horizontal_top(|ui| {
                     ui.add_space(PANE_PAD_X - 8.0);
+                    // M16I: the speaker badge (3 px bar + 18 px chip) occupies
+                    // a reserved slot only when the transcript has a run — the
+                    // plain view keeps its exact geometry.
+                    if has_run {
+                        let row_speaker = row_speakers.get(index).copied().flatten();
+                        match row_speaker {
+                            Some(speaker)
+                                if rename_row == Some(index)
+                                    && rename
+                                        .as_ref()
+                                        .is_some_and(|draft| draft.speaker_id == speaker.primary) =>
+                            {
+                                let field = egui::TextEdit::singleline(&mut rename_buffer)
+                                    .id_salt(("speaker-rename", *idx))
+                                    .desired_width(150.0)
+                                    .font(FontId::new(13.0, FontFamily::Proportional))
+                                    .text_color(tokens.ink)
+                                    .hint_text("Speaker name");
+                                let response = ui.add_sized([150.0, 20.0], field);
+                                response.widget_info(|| {
+                                    egui::WidgetInfo::labeled(
+                                        egui::WidgetType::TextEdit,
+                                        true,
+                                        "Speaker name — Enter to save, Escape to cancel",
+                                    )
+                                });
+                                if rename_pending_focus {
+                                    response.request_focus();
+                                    rename_pending_focus = false;
+                                }
+                                if response.lost_focus() {
+                                    rename_commit = true;
+                                }
+                                if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                                    rename_cancel = true;
+                                }
+                                ui.add_space(speakers::SLOT_GAP);
+                            }
+                            Some(speaker) => {
+                                let (slot_rect, _) = ui.allocate_exact_size(
+                                    vec2(speakers::SLOT_W, 20.0),
+                                    egui::Sense::hover(),
+                                );
+                                let slot = Rect::from_min_size(
+                                    pos2(
+                                        slot_rect.left(),
+                                        slot_rect.center().y - speakers::BADGE / 2.0,
+                                    ),
+                                    vec2(speakers::SLOT_W, speakers::BADGE),
+                                );
+                                let (label, color_slot) = speaker_labels
+                                    .get(index)
+                                    .and_then(|entry| entry.clone())
+                                    .unwrap_or_else(|| ("Speaker".to_string(), 0));
+                                let response = speakers::badge(
+                                    ui,
+                                    tokens,
+                                    *idx,
+                                    slot,
+                                    speakers::BadgeLook {
+                                        label: &label,
+                                        color_slot,
+                                        secondary: speaker_secondary
+                                            .get(index)
+                                            .copied()
+                                            .flatten(),
+                                        dim: speaker_dim,
+                                    },
+                                );
+                                response.clone().on_hover_text(format!(
+                                    "{label} — click to rename · right-click to change colour"
+                                ));
+                                if response.clicked() {
+                                    badge_click = Some(speaker.primary);
+                                }
+                                if response.secondary_clicked() {
+                                    badge_color_click = Some(speaker.primary);
+                                }
+                                ui.add_space(speakers::SLOT_GAP);
+                            }
+                            None => {
+                                ui.add_space(speakers::SLOT_W + speakers::SLOT_GAP);
+                            }
+                        }
+                    }
                     // M8: the timestamp seeks to the segment's start.
                     let stamp_rect =
                         Rect::from_min_size(ui.cursor().min, vec2(gutter_w - 10.0, 20.0));
@@ -1416,6 +1625,38 @@ fn transcript_rows(
     // M15.5: every edit invalidates the clean preview; the caret is what the
     // split command reads. Both are applied here, after the scroll closure's
     // editor borrow ended.
+    // M16I: the speaker row/badge actions, applied now that the borrow ended.
+    if let Some(speaker_id) = badge_click {
+        state.diarization.begin_rename(speaker_id);
+    }
+    if let Some(speaker_id) = badge_color_click {
+        // Right-click cycles the slot colour: a manual edit, persisted in one
+        // row (every badge and the lane follow through speaker_id).
+        if let Some(editor) = &state.editor {
+            let slot = (state.diarization.color_slot(speaker_id) + 1) % 6;
+            effects.push(Effect::SetSpeakerColor {
+                id: editor.transcript.id,
+                speaker_id,
+                slot,
+            });
+        }
+    }
+    if rename_cancel {
+        state.cancel_rename();
+    }
+    if rename_commit {
+        if let Some(draft) = state.diarization.rename.as_mut() {
+            draft.buffer = rename_buffer;
+        }
+        effects.extend(state.commit_rename());
+    }
+    match speaker_action {
+        SpeakerAction::None => {}
+        SpeakerAction::Run => effects.extend(state.run_diarization()),
+        SpeakerAction::Stop => effects.extend(state.cancel_diarization()),
+        SpeakerAction::Delete => effects.extend(state.delete_diarization()),
+        SpeakerAction::CycleCount => state.cycle_speaker_count(),
+    }
     if let Some((idx, text)) = edited_out {
         state.edit_segment(idx, text, Instant::now());
     }
@@ -1447,6 +1688,143 @@ fn transcript_rows(
 enum RowAction {
     Split(u32),
     Merge(u32),
+}
+
+/// The speaker status row's one action for this frame (M16I).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpeakerAction {
+    None,
+    Run,
+    Stop,
+    Delete,
+    CycleCount,
+}
+
+/// The one speaker line at the top of the transcript: the run's status and
+/// provenance, the count selector, re-run/stop and the delete affordance.
+///
+/// Restrained by design: a caption plus at most three small tertiary controls.
+/// When the feature is unavailable the line names the reason and draws no dead
+/// control (the "never silently absent" rule). When a run is stale the line
+/// says so in the warn colour and the re-run action is the repair.
+fn speaker_status_row(
+    ui: &mut egui::Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    diarization: &crate::app::diarization::DiarizationState,
+    has_audio: bool,
+) -> SpeakerAction {
+    let mut action = SpeakerAction::None;
+    let ready = diarization.availability.is_ready();
+    let running = diarization.is_running();
+    let has_run = diarization.has_run();
+    // Nothing to say and nothing to offer: no line at all (a transcript on a
+    // build without the feature never gets a dead control, but it does get the
+    // honest reason once — see the unavailable branch below).
+    if !has_run && !running && !ready && diarization.note.is_none() {
+        ui.horizontal(|ui| {
+            ui.add_space(PANE_PAD_X - 8.0);
+            if let Some((line, _)) = diarization.status_line() {
+                pane_caption(ui, &line, tokens, false);
+            }
+        });
+        return action;
+    }
+    ui.horizontal(|ui| {
+        ui.add_space(PANE_PAD_X - 8.0);
+        if let Some((line, error)) = diarization.status_line() {
+            pane_caption(ui, &line, tokens, error);
+        } else if !has_run {
+            pane_caption(ui, "Speakers · no labels yet", tokens, false);
+        }
+        if !ready {
+            return;
+        }
+        if diarization.is_stale() {
+            ui.label(
+                egui::RichText::new("labels stale — text changed")
+                    .font(FontId::new(10.5, FontFamily::Proportional))
+                    .color(tokens.warn),
+            )
+            .on_hover_text(
+                "The transcript was edited after the labels were written. \
+                 The turns are still time-correct; re-run to refresh the badges.",
+            );
+        }
+        ui.add_space(tokens.space.xs);
+        if running {
+            if controls::button(
+                ui,
+                tokens,
+                motion,
+                "speakers-stop",
+                "Stop",
+                Tier::Tertiary,
+                true,
+            )
+            .on_hover_text(suramak_asr::diarization::CANCEL_CONTRACT)
+            .clicked()
+            {
+                action = SpeakerAction::Stop;
+            }
+            return;
+        }
+        // The count selector cycles Auto/2–6; the label is the value, so the
+        // control never needs a separate caption.
+        let count = controls::button(
+            ui,
+            tokens,
+            motion,
+            "speakers-count",
+            &diarization.count_label(),
+            Tier::Tertiary,
+            has_audio,
+        )
+        .on_hover_text("Speaker count: Auto or an explicit 2–6 (Auto is a suggestion, not a fact)");
+        if count.clicked() {
+            action = SpeakerAction::CycleCount;
+        }
+        if controls::button(
+            ui,
+            tokens,
+            motion,
+            "speakers-run",
+            if has_run { "Re-run" } else { "Add labels" },
+            Tier::Tertiary,
+            diarization.can_run(has_audio),
+        )
+        .on_hover_text(if has_audio {
+            "Listen to the recording and mark who speaks when. Labels describe voices in this recording, not people."
+        } else {
+            "This transcript has no audio file to listen to."
+        })
+        .clicked()
+        {
+            action = SpeakerAction::Run;
+        }
+        if has_run {
+            let label = if diarization.confirm_delete {
+                "Confirm delete"
+            } else {
+                "Delete diarization"
+            };
+            if controls::button(
+                ui,
+                tokens,
+                motion,
+                "speakers-delete",
+                label,
+                Tier::Tertiary,
+                true,
+            )
+            .on_hover_text("Remove the speaker labels — the transcript text is never touched")
+            .clicked()
+            {
+                action = SpeakerAction::Delete;
+            }
+        }
+    });
+    action
 }
 
 /// The byte offset of the caret inside a focused row's text edit.
@@ -1819,7 +2197,7 @@ mod tests {
         };
         let output = ctx.run(input, |ctx| {
             egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
+                .frame(egui::Frame::NONE.fill(tokens.window))
                 .show(ctx, |ui| {
                     super::ui(ui, &tokens, &motion, &mut state, &mut effects);
                 });
@@ -2064,6 +2442,229 @@ mod tests {
                 "the editor's a11y tree must carry {expected:?}; got {labels:?}"
             );
         }
+    }
+
+    // ---- M16I: the diarization surface (badges + lane) ----------------------
+
+    /// A transcript with three rows and a two-speaker run, shaped like the S0
+    /// fixtures (a woman/man alternation with one overlapping third turn).
+    fn diarized_state(tag: &str, stale: bool) -> crate::app::AppState {
+        use suramak_core::diarization::{DiarizationRun, Speaker, SpeakerTurn};
+        let dir = std::env::temp_dir().join(format!("suramak-a11y-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let wav = dir.join(format!("{tag}.wav"));
+        std::fs::write(&wav, b"RIFF....").expect("temp wav");
+        let transcript = suramak_core::transcript::Transcript::new(
+            "Rapat tim produk.wav".to_string(),
+            suramak_core::transcript::Source::File {
+                name: "rapat.wav".to_string(),
+            },
+            "tiny".to_string(),
+            Some("id".to_string()),
+            Some(wav),
+            vec![
+                suramak_core::transcript::Segment {
+                    idx: 0,
+                    start_ms: 0,
+                    end_ms: 4_000,
+                    text: "Kita membahas anggaran kuartal depan dan jadwal peluncuran.".to_string(),
+                },
+                suramak_core::transcript::Segment {
+                    idx: 1,
+                    start_ms: 4_000,
+                    end_ms: 8_000,
+                    text: "Tim desain akan menyiapkan dua alternatif untuk review.".to_string(),
+                },
+                suramak_core::transcript::Segment {
+                    idx: 2,
+                    start_ms: 8_000,
+                    end_ms: 12_000,
+                    text: "Setuju. The pump needs a new seal before the dry season.".to_string(),
+                },
+            ],
+        );
+        let mut state = crate::app::AppState::new();
+        state.on_transcript_loaded(transcript.clone());
+        let speakers = vec![Speaker::new(0, "Speaker 1", 0), Speaker::new(1, "Budi", 1)];
+        let turns = vec![
+            SpeakerTurn::new(0, 0, 3_800, 0),
+            SpeakerTurn::new(1, 3_900, 7_900, 1),
+            SpeakerTurn::new(2, 8_000, 11_900, 0),
+        ];
+        let mut run = DiarizationRun::new(
+            transcript.id,
+            1,
+            "pyannote-segmentation-3.0.onnx",
+            "seg",
+            "campplus.onnx",
+            "emb",
+            2,
+            0.6,
+            12_000,
+        );
+        run.stale = stale;
+        let diarization = suramak_core::diarization::Diarization {
+            run,
+            speakers,
+            turns,
+        };
+        state.diarization.availability = suramak_asr::diarization::Availability::Ready;
+        state.diarization.job = crate::app::diarization::JobState::Done;
+        state
+            .diarization
+            .adopt(Ok(Some(diarization)), &transcript.segments);
+        state
+    }
+
+    /// The workorder's desktop golden shots: the badges + the one lane, in both
+    /// ladders, plus the stale/dimmed view. Written under
+    /// `tests/ui-desktop/shots/` (the phone suite's sibling).
+    #[test]
+    fn the_desktop_shots_show_the_badges_and_the_lane() {
+        let out_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/ui-desktop/shots");
+        for (theme, name) in [
+            (crate::theme::AppTheme::Light, "editor-speakers-light"),
+            (crate::theme::AppTheme::Dark, "editor-speakers-dark"),
+        ] {
+            let ctx = egui::Context::default();
+            crate::theme::install_fonts(&ctx);
+            crate::theme::install(&ctx, theme, false);
+            let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
+            let mut state = diarized_state(&format!("shots-{name}"), false);
+            let shot = suramak_ui::deck::snapshot::render(&ctx, screen, 1.0, |ctx| {
+                let tokens = crate::theme::tokens(theme);
+                let motion = crate::motion::Motion::new(false);
+                let mut effects = Vec::new();
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE.fill(tokens.window))
+                    .show(ctx, |ui| {
+                        super::ui(ui, &tokens, &motion, &mut state, &mut effects);
+                    });
+            });
+            let path = out_dir.join(format!("{name}.png"));
+            suramak_ui::deck::snapshot::write_png(&path, &shot).expect("write shot");
+            let painted = shot.painted_fraction(egui::Color32::BLACK);
+            assert!(
+                painted > 0.5,
+                "{name} must not be blank (painted {painted})"
+            );
+        }
+        // The stale view: same rows, dimmed badges/lane and the re-run line.
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::install(&ctx, crate::theme::AppTheme::Light, false);
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
+        let mut state = diarized_state("shots-stale", true);
+        let shot = suramak_ui::deck::snapshot::render(&ctx, screen, 1.0, |ctx| {
+            let tokens = crate::theme::tokens(crate::theme::AppTheme::Light);
+            let motion = crate::motion::Motion::new(false);
+            let mut effects = Vec::new();
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    super::ui(ui, &tokens, &motion, &mut state, &mut effects);
+                });
+        });
+        let path = out_dir.join("editor-speakers-stale.png");
+        suramak_ui::deck::snapshot::write_png(&path, &shot).expect("write shot");
+    }
+
+    /// The badge is a real, labelled focusable control — and there is none at
+    /// all without a run (no placeholder "Speaker ?" surfaces).
+    #[test]
+    fn a_badge_is_labelled_and_absent_without_a_run() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::theme::install_fonts(&ctx);
+        let mut framed = diarized_state("badges-a11y", false);
+        let output = {
+            let tokens = crate::theme::tokens(crate::theme::AppTheme::Light);
+            let motion = crate::motion::Motion::new(false);
+            let mut effects = Vec::new();
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0))),
+                ..Default::default()
+            };
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    super::ui(ui, &tokens, &motion, &mut framed, &mut effects);
+                });
+            })
+        };
+        let labels: Vec<String> = output
+            .platform_output
+            .accesskit_update
+            .expect("a11y update")
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.label().map(str::to_string))
+            .collect();
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("Budi — click to rename")),
+            "the badge's semantic label must name the speaker: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|label| label.contains("Speaker lane")),
+            "the lane must be labelled: {labels:?}"
+        );
+
+        // The plain transcript: no badge label anywhere.
+        let plain_ctx = egui::Context::default();
+        plain_ctx.enable_accesskit();
+        crate::theme::install_fonts(&plain_ctx);
+        let mut plain = demo_state("badges-plain");
+        plain.diarization.availability = suramak_asr::diarization::Availability::Unavailable {
+            reason: "not installed".to_string(),
+        };
+        let tokens = crate::theme::tokens(crate::theme::AppTheme::Light);
+        let motion = crate::motion::Motion::new(false);
+        let mut effects = Vec::new();
+        let output = plain_ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    super::ui(ui, &tokens, &motion, &mut plain, &mut effects);
+                });
+            },
+        );
+        let labels: Vec<String> = output
+            .platform_output
+            .accesskit_update
+            .expect("a11y update")
+            .nodes
+            .iter()
+            .filter_map(|(_node, node_data)| node_data.label().map(str::to_string))
+            .collect();
+        assert!(
+            !labels.iter().any(|label| label.contains("click to rename")),
+            "no run means no badge: {labels:?}"
+        );
+    }
+
+    /// The lane's geometry: 8 px, directly above the waveform, and the waveform
+    /// shrinks by exactly that much (never an overlap).
+    #[test]
+    fn the_speaker_lane_is_one_eight_pixel_strip_above_the_waveform() {
+        let pane = demo_pane();
+        let deck = deck_layout(pane);
+        assert_eq!(deck.lane.height(), speakers::LANE_H);
+        assert_eq!(deck.lane.top(), deck.band.top() + 16.0);
+        assert_eq!(deck.lane.width(), deck.waveform.width());
+        assert_eq!(deck.waveform.top(), deck.lane.bottom() + speakers::LANE_GAP);
+        assert!(deck.waveform.height() >= 40.0);
+        // The lane never intersects the waveform or the transport.
+        assert_eq!(deck.waveform.intersect(deck.lane).area(), 0.0);
+        // No run → no slot reserved on the row.
+        assert!(speakers::row_slot(false, 0.0, 0.0).is_none());
+        let slot = speakers::row_slot(true, 10.0, 30.0).unwrap();
+        assert_eq!(slot.width(), speakers::SLOT_W);
+        assert!(speakers::badge_rect(slot).right() <= slot.right());
     }
 
     /// M15.4: the badge is advisory and only names the crossed dimension.

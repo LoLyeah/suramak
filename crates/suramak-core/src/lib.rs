@@ -5,6 +5,7 @@ pub mod android;
 pub mod decode;
 pub mod device;
 pub mod diagnostics;
+pub mod diarization;
 pub mod download;
 pub mod error;
 pub mod export;
@@ -23,3 +24,7 @@ pub mod transcript;
 pub mod translate;
 
 pub use error::SuramakError;
+// M16I: the id type the store, effects and the diarization lane all name — one
+// re-export of the crate the workspace already pins, so a caller never needs a
+// second `uuid` declaration to speak about a transcript id.
+pub use uuid::Uuid;

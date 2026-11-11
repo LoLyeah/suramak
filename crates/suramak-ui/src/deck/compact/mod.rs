@@ -37,8 +37,9 @@ use crate::deck::theme::{self, AppTheme, Tokens};
 pub use model::{
     bytes_label, clock, count_noun, row_key, sanitise_stem, snippet, word_at, CompactAction,
     CompactApp, CompactEditor, CompactExportFormat, CompactRoute, CompactSetting, CompactSettings,
-    CrashBanner, DiagnosticsView, DownloadState, DownloadView, ExportPhase, ExportSession,
-    FlingProbe, Insets, JobView, LibraryHit, LibraryRow, ModelRow, SegmentEdit, Sheet,
+    CompactSpeakers, CrashBanner, DiagnosticsView, DownloadState, DownloadView, ExportPhase,
+    ExportSession, FlingProbe, Insets, JobView, LibraryHit, LibraryRow, ModelRow, SegmentEdit,
+    Sheet,
 };
 
 /// Paints one frame of the compact app and returns everything the host must do.

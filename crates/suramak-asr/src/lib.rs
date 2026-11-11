@@ -18,6 +18,10 @@
 
 pub mod cancel;
 pub mod capture;
+// M16I: the diarization runner (model pins, availability, one-slot lane,
+// cancellation contract). The engine rides the `parakeet` link, so builds
+// without it report an honest unavailable state.
+pub mod diarization;
 // M13F: the streaming 16 kHz WAV tail the Android capture path uses. Always
 // compiled (no cpal): the resample/WAV math is host-tested against the desktop
 // writer, and the desktop capture path itself is untouched.

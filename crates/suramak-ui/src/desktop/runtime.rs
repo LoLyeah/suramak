@@ -31,6 +31,10 @@ use std::time::{Duration, Instant};
 
 use suramak_asr::cancel::CancelToken;
 use suramak_asr::capture;
+use suramak_asr::diarization::{
+    self as asr_diarization, Availability, DiarizationEvent, DiarizationJob, DiarizationLane,
+    DiarizationModels, DiarizationWorker, DiarizeParams, SubmitDecision,
+};
 use suramak_asr::live;
 use suramak_asr::mix;
 use suramak_asr::worker::{Job, Worker, WorkerEvent};
@@ -53,10 +57,11 @@ use suramak_playback::{
 use uuid::Uuid;
 
 use crate::app::{
-    self, bilingual, model_manager, polish, record_source_label, settings_form, AppState, Effect,
-    ExportFormat, RecordState,
+    self, bilingual, diarization, model_manager, polish, record_source_label, settings_form,
+    AppState, Effect, ExportFormat, RecordState,
 };
 use crate::pending_transcription::{self, PendingTranscription};
+use suramak_core::diarization::Diarization;
 
 /// Subdirectory of the system temp dir used for transient recordings
 /// (`keep_audio` off — deleted once the transcript is saved).
@@ -110,6 +115,13 @@ pub struct Runtime {
     /// M15.8: the opt-in translation run (one at a time), its latest progress/
     /// terminal event, and the cooperative token the Cancel effect sets.
     translation: Option<TranslationJob>,
+    /// M16I: the one diarization slot (pure lane) and its worker thread. The
+    /// lane owns the run id + token; the worker owns the model run.
+    diarization_lane: DiarizationLane,
+    diarization_worker: DiarizationWorker,
+    /// The latest runner event, kept until the frame loop drains it (the same
+    /// shape as the translation event slot).
+    diarization_event: Option<DiarizationEvent>,
 }
 
 /// A translation run on a detached thread (`suramak-translate`); the UI polls
@@ -250,7 +262,219 @@ impl Runtime {
             prompt_budget,
             prompt_job: None,
             translation: None,
+            diarization_lane: DiarizationLane::new(),
+            diarization_worker: DiarizationWorker::new(),
+            diarization_event: None,
         }
+    }
+
+    /// M16I: whether the runner is usable here (build linkage + platform
+    /// packaging + model install), with the reason when it is not.
+    pub fn diarization_availability(&self) -> Availability {
+        asr_diarization::current_availability(&self.diarization_models())
+    }
+
+    fn diarization_models(&self) -> DiarizationModels {
+        DiarizationModels::in_dir(&self.models_dir.join("diarization"))
+    }
+
+    /// The stored run for `id` (the editor's whole speaker surface).
+    pub fn diarization_of(&self, id: Uuid) -> Result<Option<Diarization>, String> {
+        self.store
+            .as_ref()
+            .ok_or_else(|| "library database unavailable".to_string())?
+            .diarization(id)
+            .map_err(|err| err.to_string())
+    }
+
+    /// Starts (or re-runs) the job, refusing honestly when the build/platform/
+    /// model install cannot run it, when the transcript has no audio, or when
+    /// the one slot is held.
+    pub fn start_diarization(&mut self, state: &mut AppState, id: Uuid, count: u8) {
+        state.diarization.availability = self.diarization_availability();
+        if let Some(reason) = state.diarization.availability.reason() {
+            state.diarization.note = Some((reason.to_string(), false));
+            return;
+        }
+        let Some(store) = &self.store else {
+            state.diarization.note = Some(("library database unavailable".to_string(), true));
+            return;
+        };
+        let transcript = match store.get_transcript(id) {
+            Ok(transcript) => transcript,
+            Err(err) => {
+                state.diarization.note = Some((err.to_string(), true));
+                return;
+            }
+        };
+        let Some(audio) = transcript.audio_path.clone() else {
+            state.diarization.note = Some((
+                "this transcript has no audio file — diarization needs the recording".to_string(),
+                false,
+            ));
+            return;
+        };
+        if !audio.is_file() {
+            state.diarization.note = Some((
+                format!("the recording is missing at {}", audio.display()),
+                true,
+            ));
+            return;
+        }
+        let params = if count == 0 {
+            DiarizeParams::auto()
+        } else {
+            match DiarizeParams::with_count(u32::from(count)) {
+                Ok(params) => params,
+                Err(err) => {
+                    state.diarization.note = Some((err.to_string(), true));
+                    return;
+                }
+            }
+        };
+        let job = DiarizationJob {
+            transcript_id: id,
+            audio,
+            params,
+            models: self.diarization_models(),
+        };
+        match self.diarization_lane.submit(job) {
+            SubmitDecision::Accepted => {}
+            SubmitDecision::Busy => {
+                state.diarization.note = Some((
+                    "one diarization job runs at a time — wait for the current one".to_string(),
+                    false,
+                ));
+                state
+                    .diarization
+                    .mirror_lane(self.diarization_lane.status());
+                return;
+            }
+            SubmitDecision::Duplicate => {
+                state.diarization.note = Some((
+                    "this transcript is already being diarized".to_string(),
+                    false,
+                ));
+                return;
+            }
+        }
+        let Some((job, token)) = self.diarization_lane.take() else {
+            return;
+        };
+        if let Err(err) = self.diarization_worker.submit(job, token) {
+            // The slot must not stay held by a job that never reached a worker.
+            self.diarization_lane
+                .admit(Err(asr_diarization::DiarizationError::Engine(err.clone())));
+            state.diarization.note = Some((err, true));
+            return;
+        }
+        state.diarization.job = diarization::JobState::Running {
+            pct: 0,
+            cancelling: false,
+        };
+    }
+
+    /// Sets the running job's token. The lane keeps the slot until the worker
+    /// returns and the result is discarded (the binding has no mid-run abort).
+    pub fn cancel_diarization(&mut self, state: &mut AppState) {
+        let decision = self.diarization_lane.cancel();
+        state
+            .diarization
+            .mirror_lane(self.diarization_lane.status());
+        if matches!(decision, suramak_asr::diarization::CancelDecision::Removed) {
+            // A queued job never started: nothing else to do.
+            state.diarization.job = diarization::JobState::Cancelled { discarded: false };
+        }
+    }
+
+    /// Drains one runner event, writes a finished run in one transaction and
+    /// returns the event for the UI. The lane decides discard-vs-store, so a
+    /// cancelled job's turns are never written.
+    /// The lane as it stands (the frame mirrors it so an accepted stop reads
+    /// `cancelling…` before the slot frees).
+    pub fn diarization_lane_status(&self) -> suramak_asr::diarization::LaneStatus {
+        self.diarization_lane.status().clone()
+    }
+
+    pub fn diarization_status(&mut self) -> Option<DiarizationEvent> {
+        let event = self.diarization_worker.try_recv()?;
+        let transcript_id = match &event {
+            DiarizationEvent::Progress { pct, .. } => {
+                self.diarization_lane.on_progress(*pct);
+                self.diarization_event = Some(event.clone());
+                return Some(event);
+            }
+            DiarizationEvent::Done { transcript_id, .. }
+            | DiarizationEvent::Failed { transcript_id, .. }
+            | DiarizationEvent::Cancelled { transcript_id, .. } => *transcript_id,
+        };
+        let params = self
+            .diarization_lane
+            .running_job()
+            .map(|job| job.params)
+            .unwrap_or_default();
+        let admitted = match &event {
+            DiarizationEvent::Done {
+                speakers, turns, ..
+            } => self
+                .diarization_lane
+                .admit(Ok((speakers.clone(), turns.clone()))),
+            DiarizationEvent::Failed { reason, .. } => {
+                self.diarization_lane
+                    .admit(Err(asr_diarization::DiarizationError::Engine(
+                        reason.clone(),
+                    )))
+            }
+            DiarizationEvent::Cancelled { .. } => self
+                .diarization_lane
+                .admit(Err(asr_diarization::DiarizationError::Cancelled)),
+            DiarizationEvent::Progress { .. } => unreachable!("handled above"),
+        };
+        let mut event = event;
+        // A cancel that landed while `compute` was finishing is answered here:
+        // the turns were just discarded, so the visible event is `Cancelled`,
+        // never `Done` with nothing written.
+        if matches!(admitted, suramak_asr::diarization::Admit::Discarded { .. }) {
+            event = DiarizationEvent::Cancelled {
+                transcript_id,
+                discarded: true,
+            };
+        }
+        if let (
+            DiarizationEvent::Done { audio_ms, .. },
+            suramak_asr::diarization::Admit::Stored {
+                speakers, turns, ..
+            },
+        ) = (&event, &admitted)
+        {
+            let mut run = suramak_core::diarization::DiarizationRun::new(
+                transcript_id,
+                0,
+                asr_diarization::SEGMENTATION_FILE,
+                asr_diarization::SEGMENTATION_SHA256,
+                asr_diarization::EMBEDDING_FILE,
+                asr_diarization::EMBEDDING_SHA256,
+                params.num_clusters,
+                params.threshold,
+                *audio_ms,
+            );
+            run.engine_version = asr_diarization::ENGINE_VERSION.to_string();
+            let written = match &self.store {
+                Some(store) => store
+                    .replace_diarization_run(transcript_id, &run, speakers, turns)
+                    .map(|_| ())
+                    .map_err(|err| err.to_string()),
+                None => Err("library database unavailable".to_string()),
+            };
+            if let Err(reason) = written {
+                event = DiarizationEvent::Failed {
+                    transcript_id,
+                    reason,
+                };
+            }
+        }
+        self.diarization_event = Some(event.clone());
+        Some(event)
     }
 
     /// M15.5: the stored text rules (the settings form seeds from this).
@@ -609,6 +833,10 @@ impl Runtime {
                         // stops offering it in the same frame the save lands.
                         if let Some(id) = state.editor.as_ref().map(|editor| editor.transcript.id) {
                             state.on_word_alignment_loaded(id, self.alignment_of(id));
+                            // M16I: a real text edit marked the run stale in
+                            // the same transaction; re-read so the dim + the
+                            // re-run affordance appear with the save.
+                            queue.push_back(Effect::RefreshDiarization { id });
                         }
                     }
                     queue.extend(state.on_edits_saved(Instant::now(), result));
@@ -620,6 +848,7 @@ impl Runtime {
                         queue.extend(state.on_transcript_loaded(transcript));
                         state.on_translations_loaded(id, &translations);
                         state.on_word_alignment_loaded(id, self.alignment_of(id));
+                        queue.push_back(Effect::RefreshDiarization { id });
                     }
                     Err(err) => state.set_status(err, true),
                 },
@@ -692,6 +921,65 @@ impl Runtime {
                     let result = self.delete_transcript(id);
                     queue.extend(state.on_transcript_deleted(id, result));
                 }
+                // M16I: the diarization effect family. Every mutation writes
+                // through the store first and then re-reads, so a refused write
+                // can never leave a half-drawn badge.
+                Effect::RunDiarization { id, count } => {
+                    self.start_diarization(state, id, count);
+                }
+                Effect::CancelDiarization => self.cancel_diarization(state),
+                Effect::RefreshDiarization { id } => {
+                    let read = self.diarization_of(id);
+                    state.on_diarization_loaded(id, read);
+                }
+                Effect::RenameSpeaker {
+                    id,
+                    speaker_id,
+                    label,
+                } => {
+                    let result = match &self.store {
+                        Some(store) => store
+                            .rename_speaker(id, speaker_id, &label)
+                            .map_err(|err| err.to_string()),
+                        None => Err("library database unavailable".to_string()),
+                    };
+                    if let Err(err) = result {
+                        state.diarization.note = Some((err, true));
+                    }
+                    let read = self.diarization_of(id);
+                    state.on_diarization_loaded(id, read);
+                }
+                Effect::SetSpeakerColor {
+                    id,
+                    speaker_id,
+                    slot,
+                } => {
+                    let result = match &self.store {
+                        Some(store) => store
+                            .set_speaker_color(id, speaker_id, slot)
+                            .map_err(|err| err.to_string()),
+                        None => Err("library database unavailable".to_string()),
+                    };
+                    if let Err(err) = result {
+                        state.diarization.note = Some((err, true));
+                    }
+                    let read = self.diarization_of(id);
+                    state.on_diarization_loaded(id, read);
+                }
+                Effect::DeleteDiarization { id } => {
+                    let result = match &self.store {
+                        Some(store) => store.delete_diarization(id).map_err(|err| err.to_string()),
+                        None => Err("library database unavailable".to_string()),
+                    };
+                    match result {
+                        Ok(()) => {
+                            state.set_status("speaker labels removed".to_string(), false);
+                        }
+                        Err(err) => state.diarization.note = Some((err, true)),
+                    }
+                    let read = self.diarization_of(id);
+                    state.on_diarization_loaded(id, read);
+                }
                 // M15.3: one store transaction per structural edit. On success
                 // the UI adopts the stored rows and records the snapshot; on a
                 // refusal nothing changed and the status line says why.
@@ -731,6 +1019,7 @@ impl Runtime {
                                     transcript,
                                     self.alignment_of(transcript),
                                 );
+                                queue.push_back(Effect::RefreshDiarization { id: transcript });
                             }
                             Err(err) => state.on_segment_edit_failed(err),
                         },
@@ -768,6 +1057,7 @@ impl Runtime {
                                     transcript,
                                     self.alignment_of(transcript),
                                 );
+                                queue.push_back(Effect::RefreshDiarization { id: transcript });
                             }
                             Err(err) => state.on_segment_edit_failed(err),
                         },
@@ -800,6 +1090,7 @@ impl Runtime {
                                     transcript,
                                     self.alignment_of(transcript),
                                 );
+                                queue.push_back(Effect::RefreshDiarization { id: transcript });
                             }
                             Err(err) => state.set_status(err, true),
                         },
