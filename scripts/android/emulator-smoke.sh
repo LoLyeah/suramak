@@ -207,23 +207,30 @@ echo "== launching $ACTIVITY =="
 cat "$OUT/am-start.txt"
 
 wait_for_log() {
-  local pattern="$1" deadline=$((SECONDS + LAUNCH_TIMEOUT))
+  local pattern="$1" deadline=$((SECONDS + LAUNCH_TIMEOUT)) attempt=1
   while [ "$SECONDS" -lt "$deadline" ]; do
-    if "$ADB" logcat -d -s SuramakSpike:I GameActivity:I AndroidRuntime:E 2>/dev/null | grep -q "$pattern"; then
+    # Each logcat -d is hard-bounded: on the swiftshader emulator the app's
+    # GPU loop pegs the cores and an unbounded logcat can hang the whole
+    # loop (observed: the step blew its 30-minute CI timeout inside one
+    # logcat call). 20 s per attempt, marker grepped over the full log —
+    # the marker text is unique, so no -s tag filter needed.
+    if timeout 20 "$ADB" logcat -d 2>/dev/null | grep -qF "$pattern"; then
       return 0
     fi
+    echo "   wait:     ${pattern} (attempt ${attempt})"
+    attempt=$((attempt + 1))
     sleep 2
   done
   return 1
 }
 
 wait_for_log "android_main entered" || {
-  "$ADB" logcat -d >"$OUT/logcat-launch-failed.txt" || true
+  timeout 30 "$ADB" logcat -d >"$OUT/logcat-launch-failed.txt" 2>/dev/null || true
   tail -80 "$OUT/logcat-launch-failed.txt" >&2 || true
   fail "no 'android_main entered' marker in logcat — the native thread never started"
 }
 wait_for_log "first frame of this gpu generation presented" || {
-  "$ADB" logcat -d >"$OUT/logcat-first-frame-failed.txt" || true
+  timeout 30 "$ADB" logcat -d >"$OUT/logcat-first-frame-failed.txt" 2>/dev/null || true
   tail -80 "$OUT/logcat-first-frame-failed.txt" >&2 || true
   fail "no 'first frame ... presented' marker — the surface never painted"
 }
@@ -250,8 +257,8 @@ timeout 45 "$ADB" shell uiautomator dump /sdcard/window-library.xml >/dev/null 2
 # directly relevant to the owner's "opens then closes" report.
 "$ADB" shell dumpsys activity exit-info "$PACKAGE" >"$OUT/exit-info.txt" 2>&1 || true
 "$ADB" shell dumpsys package "$PACKAGE" | grep -E "primaryCpuAbi|versionName|versionCode" >"$OUT/package.txt" || true
-"$ADB" logcat -d >"$OUT/logcat-launch.txt" || true
-"$ADB" logcat -d -s SuramakSpike:I >"$OUT/logcat-app.txt" || true
+timeout 30 "$ADB" logcat -d >"$OUT/logcat-launch.txt" 2>/dev/null || true
+timeout 30 "$ADB" logcat -d -s SuramakSpike:I >"$OUT/logcat-app.txt" 2>/dev/null || true
 
 # --- assertions ---------------------------------------------------------------
 echo "== assertions =="
@@ -313,7 +320,7 @@ set -e
 tail -6 "$OUT/monkey.txt" || true
 sleep 2
 "$ADB" exec-out screencap -p >"$OUT/after-monkey.png" || true
-"$ADB" logcat -d >"$OUT/logcat-full.txt" || true
+timeout 30 "$ADB" logcat -d >"$OUT/logcat-full.txt" 2>/dev/null || true
 
 if grep -qE "FATAL EXCEPTION|ANR in $PACKAGE|Force finishing activity $PACKAGE|Process $PACKAGE .* has died" "$OUT/logcat-full.txt"; then
   grep -nE "FATAL EXCEPTION|ANR in $PACKAGE|Force finishing activity $PACKAGE|Process $PACKAGE .* has died" \
