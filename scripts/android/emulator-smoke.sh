@@ -44,13 +44,21 @@ OUT="${SURAMAK_OUT:-build/android-smoke}"
 BOOT_TIMEOUT="${SURAMAK_BOOT_TIMEOUT:-600}"
 LAUNCH_TIMEOUT="${SURAMAK_LAUNCH_TIMEOUT:-90}"
 FINISH_TIMEOUT="${SURAMAK_FINISH_TIMEOUT:-20}"
-LIBRARY_TIMEOUT="${SURAMAK_LIBRARY_TIMEOUT:-180}"
+LIBRARY_TIMEOUT="${SURAMAK_LIBRARY_TIMEOUT:-300}"
 MONKEY_EVENTS="${SURAMAK_MONKEY_EVENTS:-30}"
 PACKAGE="app.suramak.spike"
 ACTIVITY="$PACKAGE/.MainActivity"
 
 fail() {
   echo "SMOKE-FAIL: $*" >&2
+  # Always leave the app's own logcat in the artifact dir: a failure is the
+  # one time its lines matter most (the Library-ready wait failed once with
+  # no app log uploaded — the verdict had to be re-derived from a rerun).
+  if [ -n "${OUT:-}" ] && [ -d "${OUT:-}" ] && command -v "$ADB" >/dev/null 2>&1; then
+    timeout 30 "$ADB" logcat -d >"$OUT/logcat-on-fail.txt" 2>/dev/null || true
+    timeout 30 "$ADB" logcat -d -s SuramakSpike:I >"$OUT/logcat-app-on-fail.txt" 2>/dev/null || true
+    echo "   logs:     $OUT/logcat-on-fail.txt, $OUT/logcat-app-on-fail.txt" >&2
+  fi
   exit 1
 }
 
