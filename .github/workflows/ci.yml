@@ -44,8 +44,15 @@ jobs:
 
       - name: Install system dependencies (cmake for whisper.cpp; libasound2 for the capture feature; xvfb + software GL/Vulkan + libxkbcommon-x11 for the UI smoke)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake libasound2-dev xvfb libgl1-mesa-dri mesa-vulkan-drivers libxkbcommon-x11-0
+          # GitHub's apt mirrors have had DNS outages (Temporary failure
+          # resolving 'azure.archive.ubuntu.com') that killed whole jobs before
+          # they started; retry with backoff, then fail on the last attempt.
+          for attempt in 1 2 3; do
+            sudo apt-get update && sudo apt-get install -y cmake libasound2-dev xvfb libgl1-mesa-dri mesa-vulkan-drivers libxkbcommon-x11-0 && break
+            echo "apt attempt $attempt failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          sudo apt-get install -y cmake libasound2-dev xvfb libgl1-mesa-dri mesa-vulkan-drivers libxkbcommon-x11-0 >/dev/null
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -334,8 +341,13 @@ jobs:
 
       - name: Install system dependencies (cmake for whisper.cpp)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake
+          # Same retry guard as the linux job (the apt mirrors' DNS flakes).
+          for attempt in 1 2 3; do
+            sudo apt-get update && sudo apt-get install -y cmake && break
+            echo "apt attempt $attempt failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          sudo apt-get install -y cmake >/dev/null
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2

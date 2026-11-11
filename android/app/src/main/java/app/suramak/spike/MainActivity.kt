@@ -322,7 +322,8 @@ class MainActivity : GameActivity() {
         // from it. `UiBridge.init` is idempotent (one process-wide host), so
         // this is the same call the later job-host block used to make.
         try {
-            UiBridge.init(this)
+            val initReply = UiBridge.init(this)
+            Log.i(TAG, "compact UI host: $initReply")
             UiBridge.device(
                 DeviceMemory.read(this),
                 freeBytes = DeviceMemory.freeBytes(this),
