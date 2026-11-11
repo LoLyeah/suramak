@@ -643,7 +643,12 @@ pub fn dispatch(request: &str) -> String {
         #[cfg(target_os = "android")]
         suramak_core::android::set_data_dir(PathBuf::from(root));
         let host = HOST.get_or_init(|| CompactHost::new(Path::new(root)));
-        return host.dispatch(request);
+        // `init` creates the host and answers with its first library snapshot.
+        // It must NOT be forwarded to `CompactHost::dispatch`, which has no
+        // `init` arm — forwarding it returned `{"ok":false,"error":"unknown op
+        // 'init'"}` to Kotlin (visible in logcat on the CI emulator), which
+        // read as a failed initialisation even though the host existed.
+        return host.dispatch(r#"{"op":"library"}"#);
     }
     match host() {
         Some(host) => host.dispatch(request),

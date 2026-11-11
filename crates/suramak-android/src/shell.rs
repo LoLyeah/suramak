@@ -68,6 +68,7 @@ pub struct CompactShell {
     /// The compact host was created after this shell's first frame.
     started_host: bool,
     logged_library_ready: bool,
+    logged_host_missing: bool,
     /// The crash revision the diagnostics view was built from.
     crash_rev: u64,
     /// A status line the shell owns (a refused intent, a missing host).
@@ -88,6 +89,7 @@ impl CompactShell {
             last_mic_poll: None,
             started_host: false,
             logged_library_ready: false,
+            logged_host_missing: false,
             crash_rev: u64::MAX,
             shell_status: None,
         }
@@ -134,6 +136,16 @@ impl CompactShell {
     /// compact host has not been created yet).
     pub fn draw(&mut self, ctx: &egui::Context, state: &SpikeState) -> Vec<CompactAction> {
         let Some(host) = crate::compact_host() else {
+            // One line per generation: the host is registered by MainActivity's
+            // UiBridge.init BEFORE super.onCreate, so a persistent None here
+            // means the bridge reply was not ok (its text is in logcat) — a
+            // silent placeholder once hid exactly that on the CI emulator.
+            if !self.logged_host_missing {
+                self.logged_host_missing = true;
+                log::warn!(
+                    "compact shell: the host is not initialised yet — drawing the startup placeholder (see MainActivity's 'compact UI host:' line for the init reply)"
+                );
+            }
             draw_starting(ctx);
             self.shell_status = Some("The compact host is still starting.".to_string());
             return Vec::new();

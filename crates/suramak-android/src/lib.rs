@@ -89,11 +89,15 @@ static MIC_HOST: OnceLock<MicHost> = OnceLock::new();
 
 /// The compact UI host (M13g1): the library/settings state the shared Deck
 /// screens read and the notification's deep link writes.
+///
+/// Reads the ONE process-wide host that `init` registers
+/// ([`compact_host::host`]). A second `OnceLock` here once shadowed it — this
+/// accessor always returned `None`, so the shell drew the startup placeholder
+/// forever while `init` had in fact created the host (the owner's "opens and
+/// stays on the splash" report, reproduced on the CI emulator).
 pub fn compact_host() -> Option<&'static CompactHost> {
-    COMPACT_HOST.get()
+    compact_host::host()
 }
-
-static COMPACT_HOST: OnceLock<CompactHost> = OnceLock::new();
 
 /// Handles the compact UI protocol, including the one command that creates the
 /// host (`init`). Kept beside [`dispatch_jobs`] so the JNI surface stays one
