@@ -14,7 +14,7 @@
 
 use egui::{
     pos2, vec2, Align, Align2, Color32, CornerRadius, FontFamily, FontId, Layout, Rect, ScrollArea,
-    Sense, Stroke, Ui, WidgetType,
+    Sense, Stroke, StrokeKind, Ui, WidgetType,
 };
 
 use crate::deck::motion::{self, Motion};
@@ -183,9 +183,14 @@ pub fn ui(
     }
 
     // --- list --------------------------------------------------------------
+    // M19B: with no verified model there is nothing to transcribe. The record
+    // button is disabled and the reason rides directly above the bar, so the
+    // list must end above that line.
+    let record_reason = state.record_block_reason();
+    let note_h = if record_reason.is_some() { 26.0 } else { 0.0 };
     let list_rect = Rect::from_min_max(
         pos2(bands.content.left(), list_top),
-        bands.content.right_bottom(),
+        pos2(bands.content.right(), bands.content.bottom() - note_h),
     );
     if state.library_query.trim().is_empty() {
         if state.rows.is_empty() {
@@ -395,6 +400,20 @@ pub fn ui(
 
     // --- bottom bar --------------------------------------------------------
     let bar = bands.bottom_bar;
+    if let Some(reason) = record_reason {
+        let note = Rect::from_min_size(
+            pos2(bar.left() + GUTTER, bar.top() - 24.0),
+            vec2(bar.width() - GUTTER * 2.0, 20.0),
+        );
+        ui.painter().text(
+            pos2(note.left(), note.center().y),
+            Align2::LEFT_CENTER,
+            reason,
+            FontId::proportional(12.0),
+            tokens.warn,
+        );
+        a11y::describe(ui, note, reason);
+    }
     ui.painter()
         .rect_filled(bar, CornerRadius::ZERO, tokens.panel);
     ui.painter().line_segment(
@@ -421,33 +440,59 @@ pub fn ui(
     }
     a11y::record_button(ui, import, "Import audio", true);
     let record_label = if state.recording { "Stop" } else { "Record" };
-    if chrome::action_button(
-        ui,
-        tokens,
-        motion,
-        record,
-        "library-record",
-        record_label,
-        true,
-    )
-    .clicked()
-    {
-        actions.push(if state.recording {
-            CompactAction::StopRecording
-        } else {
-            CompactAction::Record
-        });
+    if record_reason.is_none() {
+        if chrome::action_button(
+            ui,
+            tokens,
+            motion,
+            record,
+            "library-record",
+            record_label,
+            true,
+        )
+        .clicked()
+        {
+            actions.push(if state.recording {
+                CompactAction::StopRecording
+            } else {
+                CompactAction::Record
+            });
+        }
+        a11y::record_button(
+            ui,
+            record,
+            if state.recording {
+                "Stop recording"
+            } else {
+                "Record from the microphone"
+            },
+            true,
+        );
+    } else {
+        // Disabled paint: the same rect and label, in the quiet ink — and a
+        // semantic node that says it cannot be pressed.
+        let reason = record_reason.unwrap_or_default();
+        ui.painter().rect(
+            record,
+            CornerRadius::same(tokens.radius.control),
+            tokens.control_fill.gamma_multiply(0.5),
+            Stroke::new(1.0_f32, tokens.hairline),
+            StrokeKind::Inside,
+        );
+        ui.painter().text(
+            record.center(),
+            Align2::CENTER_CENTER,
+            record_label,
+            FontId::proportional(15.0),
+            tokens.ink_faint,
+        );
+        a11y::record_button(
+            ui,
+            record,
+            &format!("Record from the microphone — {reason}"),
+            false,
+        );
     }
-    a11y::record_button(
-        ui,
-        record,
-        if state.recording {
-            "Stop recording"
-        } else {
-            "Record from the microphone"
-        },
-        true,
-    );
 
     let _ = state.nav.current() == CompactRoute::Library;
     actions

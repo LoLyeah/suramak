@@ -87,6 +87,12 @@ pub struct CompactShell {
     last_layout_log: Option<Instant>,
     /// The resume counter the touch tracker was last reset for.
     last_resumes: u64,
+    /// M19B: the last model truth marker (one line per state change). The
+    /// emulator smoke asserts "no In use on a fresh install" from these lines,
+    /// because uiautomator cannot read egui's painted text.
+    last_model_header: Option<String>,
+    last_model_can_record: Option<bool>,
+    last_model_rows: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for CompactShell {
@@ -112,6 +118,9 @@ impl CompactShell {
             last_route: None,
             last_layout_log: None,
             last_resumes: 0,
+            last_model_header: None,
+            last_model_can_record: None,
+            last_model_rows: std::collections::BTreeMap::new(),
         }
     }
 
@@ -206,6 +215,7 @@ impl CompactShell {
         };
         let mut actions = Vec::new();
         let mut layout_probe = None;
+        let mut model_probe = None;
         let drew = host.with_app(|app| {
             app.insets.top = (state.insets.top as f32 / ppp).max(0.0);
             app.insets.bottom = (state.insets.bottom as f32 / ppp).max(0.0);
@@ -246,12 +256,31 @@ impl CompactShell {
                     app.insets.bottom,
                 ));
             }
+            // M19B: the model table's truth, one line per state change. This is
+            // the only readable witness on the emulator — egui paints pixels,
+            // so uiautomator's tree cannot see a row's action word.
+            let (header, missing) = app.model_label();
+            model_probe = Some((
+                header,
+                missing,
+                app.can_record(),
+                app.settings.model_id.clone(),
+                app.models
+                    .iter()
+                    .map(|row| {
+                        let selected = app.settings.model_id == row.id;
+                        let state = row.state(selected, app.download.as_ref());
+                        (row.id.clone(), state.slug().to_string(), state.is_in_use())
+                    })
+                    .collect::<Vec<_>>(),
+            ));
         });
         if drew.is_none() {
             draw_starting(ctx);
             return Vec::new();
         }
         self.log_layout_probe(ctx, layout_probe);
+        self.log_model_probe(model_probe);
         // One logcat marker for the first real Library draw (the CI smoke
         // waits for it before screencapping: the startup placeholder and the
         // Library look alike in a pixel histogram, and the host's first draw
@@ -289,6 +318,43 @@ impl CompactShell {
             screen.bottom(),
             inset
         );
+    }
+
+    /// One line per model-row state change (M19B).
+    ///
+    /// The phone's text is painted by egui, so neither uiautomator nor a pixel
+    /// diff can read "In use" — these lines are the machine-readable witness.
+    /// The header line carries the TRANSCRIPTION → Model value, the row lines
+    /// carry each row's five-state slug and whether it is allowed to say
+    /// "In use" (only a verified + selected file ever is).
+    #[allow(clippy::type_complexity)]
+    fn log_model_probe(
+        &mut self,
+        probe: Option<(String, bool, bool, String, Vec<(String, String, bool)>)>,
+    ) {
+        let Some((header, missing, can_record, model_id, rows)) = probe else {
+            return;
+        };
+        let header_changed = self.last_model_header.as_deref() != Some(header.as_str())
+            || self.last_model_can_record != Some(can_record);
+        if header_changed {
+            self.last_model_header = Some(header.clone());
+            self.last_model_can_record = Some(can_record);
+            log::info!(
+                "SURAMAK-MODEL header=\"{header}\" model_id={model_id} missing={} can_record={}",
+                missing as u8,
+                can_record as u8
+            );
+        }
+        for (id, state, in_use) in rows {
+            if self.last_model_rows.get(&id).map(String::as_str) != Some(state.as_str()) {
+                self.last_model_rows.insert(id.clone(), state.clone());
+                log::info!(
+                    "SURAMAK-MODEL row={id} state={state} in_use={}",
+                    in_use as u8
+                );
+            }
+        }
     }
 
     /// Runs the actions the last frame produced, after the app borrow has ended.
@@ -359,7 +425,17 @@ impl CompactShell {
                 log_reply("cancel download", &reply);
             }
             CompactAction::Import => send_intent(ACTION_IMPORT, &[]),
-            CompactAction::Record => send_intent(ACTION_RECORD, &[]),
+            CompactAction::Record => {
+                // M19B: no verified model means nothing to transcribe; the
+                // Library's button is already disabled, and this guard stops a
+                // stale a11y/monkey tap from starting a doomed job.
+                let blocked = host.with_app(|app| app.record_block_reason());
+                if let Some(Some(reason)) = blocked {
+                    host.with_app(|app| app.status = Some((reason.to_string(), true)));
+                } else {
+                    send_intent(ACTION_RECORD, &[]);
+                }
+            }
             CompactAction::StopRecording => send_intent(ACTION_STOP_RECORDING, &[]),
             CompactAction::Export {
                 format, bilingual, ..

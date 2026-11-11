@@ -231,6 +231,14 @@ impl ModelHost {
         if let Some(reason) = device::refusal_for(profile, language, model_id) {
             return json!({ "ok": false, "refused": reason });
         }
+        // M19B: a wrong-sized file can never verify and cannot be resumed into
+        // a good one — "Re-download" unlinks it (and any part) before the first
+        // byte. A `.part` alone is kept: that is the resume bookmark.
+        if models::model_file_state(Path::new(models_dir), info)
+            == models::ModelFileState::WrongSize
+        {
+            models::remove_model_files(Path::new(models_dir), info);
+        }
         // The free-space preflight runs here, before the worker exists, so a
         // refusal leaves no `.part` and no thread behind.
         if let Err(err) = download::check_space(Path::new(models_dir), info.size_bytes) {

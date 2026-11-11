@@ -52,6 +52,13 @@ pub struct ModelInfo {
     pub phone: PhoneGuidance,
 }
 
+/// The model a desktop install runs until the user chooses another (M19B).
+///
+/// `Settings::default()` and the Android migration both name this constant, so
+/// the phone can recognise "the untouched desktop default" without copying the
+/// string (and without drifting if it ever changes).
+pub const DESKTOP_DEFAULT_MODEL_ID: &str = "turbo-q5-0";
+
 /// HuggingFace base URL for the whisper.cpp model repository.
 pub const HF_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
 
@@ -126,7 +133,7 @@ pub static MODELS: &[ModelInfo] = &[
         hf_file: "ggml-large-v3-turbo-q5_0.bin",
         size_bytes: 574_041_195,
         sha256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
-        role: "default (macOS)",
+        role: "desktop default",
         encoder: Some(LARGE_V3_TURBO_ENCODER),
         phone: PhoneGuidance {
             min_ram_bytes: crate::device::HIGH_RAM_BYTES,
@@ -360,6 +367,120 @@ pub fn speech_transcriber_covers(code: &str) -> bool {
 /// Looks up a model by id.
 pub fn find_model(id: &str) -> Option<&'static ModelInfo> {
     MODELS.iter().find(|m| m.id == id)
+}
+
+// ---------------------------------------------------------------------------
+// M19B: the on-disk truth behind a model row
+// ---------------------------------------------------------------------------
+
+/// What is actually on disk for one pinned model (M19B).
+///
+/// This is deliberately **not** `path.exists()`: a model counts only when the
+/// file is present at exactly the pinned byte count and no `.part` is left
+/// beside it. The sha256 was already verified by M13D when the file landed
+/// ([`crate::download::install_file`]); re-hashing hundreds of megabytes on
+/// every Settings frame is not something a phone should do, and the size plus
+/// `.part` pair is what catches the states that really occur — an interrupted
+/// transfer (a `.part` and no file) and a truncated/corrupt file (the wrong
+/// size).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelFileState {
+    /// Neither the model file nor a partial download exists.
+    Absent,
+    /// A `.part` is on disk: an interrupted (or in-flight) transfer. Not usable.
+    Partial,
+    /// A file exists, but not at the pinned size — truncated or corrupt.
+    WrongSize,
+    /// Present at exactly the pinned size, with no `.part` beside it.
+    Verified,
+}
+
+impl ModelFileState {
+    /// Whether the file can be handed to the engine.
+    pub fn is_verified(self) -> bool {
+        matches!(self, Self::Verified)
+    }
+
+    /// The Settings row's state word.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Absent => "Not downloaded",
+            Self::Partial => "Downloading",
+            Self::WrongSize => "Stale — re-download",
+            Self::Verified => "Installed",
+        }
+    }
+}
+
+/// Reads the disk truth for `model` under `models_dir`.
+///
+/// A complete file with a leftover `.part` is **not** trusted until the part is
+/// swept ([`sweep_completed_parts`]): the work order's rule is "no stale
+/// `.part`", and a stale part means the last attempt never reached its atomic
+/// rename, so the complete file is not provably the one that was verified.
+pub fn model_file_state(models_dir: &Path, model: &ModelInfo) -> ModelFileState {
+    let dest = models_dir.join(model.hf_file);
+    let part = crate::download::part_path(&dest);
+    let part_present = std::fs::metadata(&part).is_ok_and(|meta| meta.is_file());
+    match std::fs::metadata(&dest) {
+        Ok(meta) if meta.is_file() => {
+            if meta.len() == model.size_bytes && !part_present {
+                ModelFileState::Verified
+            } else if meta.len() == model.size_bytes {
+                // A finished file with a leftover part: the part is debris, but
+                // the row stays unverified until the sweep removes it.
+                ModelFileState::Partial
+            } else {
+                ModelFileState::WrongSize
+            }
+        }
+        _ if part_present => ModelFileState::Partial,
+        _ => ModelFileState::Absent,
+    }
+}
+
+/// Every manifest model's disk state under `models_dir`, in manifest order.
+pub fn model_file_states(models_dir: &Path) -> Vec<(&'static str, ModelFileState)> {
+    MODELS
+        .iter()
+        .map(|model| (model.id, model_file_state(models_dir, model)))
+        .collect()
+}
+
+/// Removes `.part` files that sit beside a complete, pinned-size model file.
+///
+/// M13D renames a `.part` to the model file after its checksum verifies, so a
+/// part next to a complete file is debris from an older attempt that cannot be
+/// resumed (the server would 416 it). Sweeping it is what lets the strict
+/// "no stale `.part`" rule report `Verified` for a good file instead of
+/// `Downloading`. Returns how many parts were removed.
+pub fn sweep_completed_parts(models_dir: &Path) -> usize {
+    let mut removed = 0;
+    for model in MODELS {
+        let dest = models_dir.join(model.hf_file);
+        let complete = std::fs::metadata(&dest)
+            .is_ok_and(|meta| meta.is_file() && meta.len() == model.size_bytes);
+        if !complete {
+            continue;
+        }
+        let part = crate::download::part_path(&dest);
+        if std::fs::remove_file(&part).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Deletes a model file and any `.part` (the Re-download action's first step).
+///
+/// Returns whether anything was removed. The next download then starts from
+/// byte 0 instead of resuming bytes that belong to the bad copy.
+pub fn remove_model_files(models_dir: &Path, model: &ModelInfo) -> bool {
+    let dest = models_dir.join(model.hf_file);
+    let part = crate::download::part_path(&dest);
+    let removed_file = std::fs::remove_file(&dest).is_ok();
+    let removed_part = std::fs::remove_file(&part).is_ok();
+    removed_file || removed_part
 }
 
 /// Base URL for model/encoder downloads, respecting `SURAMAK_HF_MIRROR`.
@@ -646,8 +767,104 @@ mod tests {
         }
     }
 
-    // ---- M10B: Apple SpeechTranscriber coverage ------------------------------
+    // ---- M19B: the disk truth behind a model row ----------------------------
 
+    fn temp_models(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("suramak-model-state-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A sparse file of exactly `len` bytes: the size is real, the blocks are
+    /// not (a 574 MB model must not be written to prove a size check).
+    fn sparse(path: &Path, len: u64) {
+        let file = std::fs::File::create(path).unwrap();
+        file.set_len(len).unwrap();
+    }
+
+    #[test]
+    fn a_model_counts_only_at_the_pinned_size_and_without_a_part() {
+        let dir = temp_models("size");
+        let model = find_model("tiny").unwrap();
+
+        assert_eq!(
+            model_file_state(&dir, model),
+            ModelFileState::Absent,
+            "an empty models dir has nothing"
+        );
+
+        // Truncated (or otherwise wrong-sized) file: not installed.
+        std::fs::write(dir.join(model.hf_file), b"not a model").unwrap();
+        assert_eq!(model_file_state(&dir, model), ModelFileState::WrongSize);
+
+        // A `.part` alone is an interrupted transfer, never an install.
+        std::fs::remove_file(dir.join(model.hf_file)).unwrap();
+        std::fs::write(crate::download::part_path(&dir.join(model.hf_file)), b"x").unwrap();
+        assert_eq!(model_file_state(&dir, model), ModelFileState::Partial);
+
+        // Exact size, part still there: strict verification says no …
+        sparse(&dir.join(model.hf_file), model.size_bytes);
+        assert_eq!(
+            model_file_state(&dir, model),
+            ModelFileState::Partial,
+            "a stale .part keeps the row unverified"
+        );
+
+        // … and the sweep removes the debris, after which the row is honest.
+        assert_eq!(sweep_completed_parts(&dir), 1);
+        assert_eq!(model_file_state(&dir, model), ModelFileState::Verified);
+        assert!(model_file_state(&dir, model).is_verified());
+        assert_eq!(ModelFileState::Verified.label(), "Installed");
+        assert_eq!(ModelFileState::Absent.label(), "Not downloaded");
+
+        // Re-download's first step unlinks the file and any part.
+        std::fs::write(crate::download::part_path(&dir.join(model.hf_file)), b"x").unwrap();
+        assert!(remove_model_files(&dir, model));
+        assert_eq!(model_file_state(&dir, model), ModelFileState::Absent);
+        assert!(
+            !remove_model_files(&dir, model),
+            "second removal is a no-op"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_scan_covers_every_manifest_model_in_order() {
+        let dir = temp_models("scan");
+        let states = model_file_states(&dir);
+        let ids: Vec<&str> = states.iter().map(|(id, _)| *id).collect();
+        let manifest: Vec<&str> = MODELS.iter().map(|model| model.id).collect();
+        assert_eq!(ids, manifest);
+        assert!(states
+            .iter()
+            .all(|(_, state)| *state == ModelFileState::Absent));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_desktop_default_constant_names_the_default_settings_model() {
+        assert_eq!(DESKTOP_DEFAULT_MODEL_ID, "turbo-q5-0");
+        assert_eq!(
+            crate::settings::Settings::default().asr.model_id,
+            DESKTOP_DEFAULT_MODEL_ID
+        );
+        assert_eq!(
+            find_model(DESKTOP_DEFAULT_MODEL_ID).unwrap().role,
+            "desktop default"
+        );
+        for model in MODELS {
+            assert!(
+                !model.role.contains("macOS"),
+                "{}: no platform-confusing catalog copy on the phone",
+                model.id
+            );
+        }
+    }
+
+    // ---- M10B: Apple SpeechTranscriber coverage ------------------------------
     #[test]
     fn speech_transcriber_coverage_has_10_languages_and_never_indonesian() {
         // macOS 26.6: 10 languages (no Indonesian — the M10B invariant).

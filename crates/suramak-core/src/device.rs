@@ -303,6 +303,55 @@ fn size_mb(model: &ModelInfo) -> u64 {
     model.size_bytes / 1_000_000
 }
 
+/// The best model that is **verified on disk** and may run here (M19B).
+///
+/// "Highest tier" is the manifest's own `min_ram_bytes` ladder (tiny → base →
+/// small → turbo-q5-0), with the pinned size as a tie-break, restricted to the
+/// models this device is allowed to run. `None` when nothing usable is
+/// installed.
+pub fn highest_tier_verified(profile: DeviceProfile, verified: &[&str]) -> Option<&'static str> {
+    if tier_for(profile) == PhoneTier::Unsupported {
+        return None;
+    }
+    MODELS
+        .iter()
+        .filter(|model| verified.contains(&model.id))
+        .filter(|model| model.phone.min_ram_bytes <= profile.total_ram_bytes)
+        .max_by_key(|model| (model.phone.min_ram_bytes, model.size_bytes))
+        .map(|model| model.id)
+}
+
+/// M19B: the model the Android host should store for this phone at load.
+///
+/// `None` means "keep what is stored". A change is proposed only when **all**
+/// of these hold:
+///
+/// * the user never chose the model (`model_explicitly_chosen == false`);
+/// * the stored model is the untouched desktop default (`turbo-q5-0`);
+/// * that model is not verified on disk.
+///
+/// The replacement is the highest-tier *verified* model this phone may run, or
+/// — when nothing usable is installed — the device tier's default (`small` at
+/// 8 GB+, `base` at 4–6 GB, `tiny` below the floor). A user's explicit choice
+/// is never overridden, and a verified desktop default is kept: it is a real
+/// file the user can use.
+pub fn model_choice_for_phone(
+    model_id: &str,
+    explicitly_chosen: bool,
+    profile: DeviceProfile,
+    verified: &[&str],
+) -> Option<&'static str> {
+    if explicitly_chosen || model_id != crate::models::DESKTOP_DEFAULT_MODEL_ID {
+        return None;
+    }
+    if verified.contains(&crate::models::DESKTOP_DEFAULT_MODEL_ID) {
+        return None;
+    }
+    let best = highest_tier_verified(profile, verified)
+        .or_else(|| recommend(profile, "en").default_model_id)?;
+    (best != model_id).then_some(best)
+}
+
 /// The Android landing copy, in the app's UI language.
 ///
 /// Prepared here (not in the UI crate) so the text ships with the same rules
@@ -520,5 +569,117 @@ mod tests {
         let too_big = refusal_for(profile(7.4, false, true), "en", "turbo").unwrap();
         assert!(too_big.contains("not offered on phones"), "{too_big}");
         assert_eq!(refusal_for(profile(7.4, false, true), "en", "nope"), None);
+    }
+
+    // ---- M19B: the phone's model choice at first run and after migration ----
+
+    /// The tier default the phone selects when nothing else is installed:
+    /// `base` on 4 and 6 GB, `small` on 8, 12 and 16 GB.
+    #[test]
+    fn the_phone_default_follows_the_tier_at_4_6_8_12_16_gb() {
+        let cases = [
+            (4.0, PhoneTier::Low, "base"),
+            (6.0, PhoneTier::Mid, "base"),
+            (8.0, PhoneTier::High, "small"),
+            (12.0, PhoneTier::High, "small"),
+            (16.0, PhoneTier::High, "small"),
+        ];
+        for (ram_gb, expected_tier, expected) in cases {
+            let device = profile(ram_gb, false, true);
+            assert_eq!(tier_for(device), expected_tier, "{ram_gb} GB");
+            assert_eq!(
+                recommend(device, "en").default_model_id,
+                Some(expected),
+                "{ram_gb} GB"
+            );
+            // The migration path names the same model for an untouched install.
+            assert_eq!(
+                model_choice_for_phone("turbo-q5-0", false, device, &[]),
+                Some(expected),
+                "{ram_gb} GB: a fresh phone takes its tier default"
+            );
+        }
+    }
+
+    /// Below the floor the existing steer is unchanged: `tiny`, and only tiny.
+    #[test]
+    fn below_the_floor_the_default_is_still_tiny() {
+        let device = profile(2.7, false, true);
+        assert_eq!(tier_for(device), PhoneTier::BelowFloor);
+        assert_eq!(recommend(device, "en").default_model_id, Some("tiny"));
+        assert_eq!(
+            model_choice_for_phone("turbo-q5-0", false, device, &[]),
+            Some("tiny")
+        );
+    }
+
+    /// The migration matrix: only an unchosen, unverified desktop default moves.
+    #[test]
+    fn the_migration_matrix() {
+        let high = profile(7.4, false, true); // 8 GB class: tier default small
+        let low = profile(3.7, false, true); // 4 GB class: tier default base
+
+        // (a) Old file + turbo + nothing installed → the tier default.
+        assert_eq!(
+            model_choice_for_phone("turbo-q5-0", false, high, &[]),
+            Some("small")
+        );
+        assert_eq!(
+            model_choice_for_phone("turbo-q5-0", false, low, &[]),
+            Some("base")
+        );
+
+        // (b) Old file + turbo + an installed model → the highest-tier
+        // installed model, even when the tier default is something else.
+        assert_eq!(
+            model_choice_for_phone("turbo-q5-0", false, high, &["base"]),
+            Some("base")
+        );
+        assert_eq!(
+            model_choice_for_phone("turbo-q5-0", false, high, &["tiny", "base"]),
+            Some("base")
+        );
+        assert_eq!(
+            model_choice_for_phone("turbo-q5-0", false, high, &["base", "small"]),
+            Some("small")
+        );
+        // A model the phone may not run cannot win: small is refused on 4 GB.
+        assert_eq!(
+            model_choice_for_phone("turbo-q5-0", false, low, &["base", "small"]),
+            Some("base")
+        );
+
+        // (c) Turbo itself verified → keep it: it is a real file.
+        assert_eq!(
+            model_choice_for_phone("turbo-q5-0", false, high, &["turbo-q5-0"]),
+            None
+        );
+
+        // (d) An explicit user choice is never overridden.
+        assert_eq!(model_choice_for_phone("turbo-q5-0", true, high, &[]), None);
+        // (e) A different stored model (a real choice made before the flag
+        // existed) is kept as-is.
+        assert_eq!(model_choice_for_phone("small", false, high, &[]), None);
+        assert_eq!(model_choice_for_phone("tiny", false, low, &["base"]), None);
+    }
+
+    /// What "highest tier" means on disk, and what happens when nothing usable
+    /// is installed.
+    #[test]
+    fn the_highest_verified_model_is_the_biggest_that_may_run() {
+        let high = profile(7.4, false, true);
+        assert_eq!(highest_tier_verified(high, &[]), None);
+        assert_eq!(highest_tier_verified(high, &["tiny"]), Some("tiny"));
+        assert_eq!(
+            highest_tier_verified(high, &["tiny", "small", "base"]),
+            Some("small")
+        );
+        assert_eq!(
+            highest_tier_verified(high, &["turbo"]),
+            None,
+            "a verified file the phone may not run is not a choice"
+        );
+        let unsupported = profile(8.0, false, false);
+        assert_eq!(highest_tier_verified(unsupported, &["tiny"]), None);
     }
 }

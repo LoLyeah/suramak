@@ -321,6 +321,107 @@ fn the_settings_shot_shows_the_low_tier_refusals() {
 }
 
 #[test]
+fn a_fresh_phone_reads_not_downloaded_and_never_in_use() {
+    // The owner's defect: the configured model read "In use" with no file.
+    let mut app = CompactApp::new(fixture_settings()); // base, 6 GB phone
+    app.theme = AppTheme::Dark;
+    app.insets = Insets {
+        top: 28.0,
+        bottom: 20.0,
+    };
+    app.seed_device(
+        DeviceProfile::new(6_000_000_000, 2_000_000_000, false, true),
+        &[],
+    );
+    assert_eq!(
+        app.model_label(),
+        ("base · not downloaded".to_string(), true)
+    );
+    app.open_settings(0.0);
+    app.advance(10.0);
+    let shot = render(&mut app, "settings-model-truth");
+    assert!(shot.painted_fraction(egui::Color32::BLACK) > 0.5);
+
+    let ctx = fresh_context(&app);
+    let (_, _, scale) = compact::phone_viewport();
+    let screen = compact::phone_screen_rect();
+    let _ = snapshot::render(&ctx, screen, scale, |ctx| {
+        let _ = compact::ui(ctx, &mut app);
+    });
+    let labels: Vec<String> = a11y::controls(&ctx)
+        .into_iter()
+        .map(|control| control.label)
+        .collect();
+    assert!(
+        labels.iter().any(|label| label == "Download base"),
+        "the configured model with no file offers a primary Download: {labels:?}"
+    );
+    assert!(
+        !labels.iter().any(|label| label.contains("In use")),
+        "nothing may read 'In use' without a verified file: {labels:?}"
+    );
+
+    // The file verifies: now — and only now — the row says In use.
+    app.refresh_models(&["base".to_string()]);
+    assert_eq!(app.model_label(), ("base".to_string(), false));
+    let ctx = fresh_context(&app);
+    let _ = snapshot::render(&ctx, screen, scale, |ctx| {
+        let _ = compact::ui(ctx, &mut app);
+    });
+    let labels: Vec<String> = a11y::controls(&ctx)
+        .into_iter()
+        .map(|control| control.label)
+        .collect();
+    assert!(
+        labels.iter().any(|label| label == "In use base"),
+        "a verified + selected file is the only 'In use': {labels:?}"
+    );
+}
+
+#[test]
+fn a_phone_without_a_verified_model_cannot_tap_record() {
+    let mut app = CompactApp::new(fixture_settings());
+    app.theme = AppTheme::Dark;
+    app.insets = Insets {
+        top: 28.0,
+        bottom: 20.0,
+    };
+    app.seed_device(
+        DeviceProfile::new(6_000_000_000, 2_000_000_000, false, true),
+        &[],
+    );
+    let ctx = fresh_context(&app);
+    let (_, _, scale) = compact::phone_viewport();
+    let screen = compact::phone_screen_rect();
+    let _ = snapshot::render(&ctx, screen, scale, |ctx| {
+        let _ = compact::ui(ctx, &mut app);
+    });
+    let labels: Vec<String> = a11y::controls(&ctx)
+        .into_iter()
+        .map(|control| control.label)
+        .collect();
+    assert!(
+        labels
+            .iter()
+            .any(|label| label == "Download a model before recording."),
+        "the reason is on screen: {labels:?}"
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.contains("Record from the microphone")
+                && label.contains("Download a model before recording")),
+        "the Record control says why it is disabled: {labels:?}"
+    );
+    assert!(
+        !labels
+            .iter()
+            .any(|label| label == "Record from the microphone"),
+        "the enabled Record label must be gone: {labels:?}"
+    );
+}
+
+#[test]
 fn a_small_phone_keeps_every_target_at_least_48_dp() {
     let screen = compact::small_phone_screen_rect();
     assert!(library::bar_is_safe(screen));

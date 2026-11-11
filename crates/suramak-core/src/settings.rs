@@ -55,6 +55,12 @@ pub struct AsrSettings {
     /// settings files → `false`, which keeps today's routing exactly.
     #[serde(default)]
     pub fast_engine: bool,
+    /// M19B: the model was chosen by the user (an explicit "Use" tap), so the
+    /// Android host must never migrate it. Missing in older files → `false`,
+    /// which is what lets an untouched legacy `turbo-q5-0` be re-pointed at a
+    /// model the phone can actually run.
+    #[serde(default)]
+    pub model_explicitly_chosen: bool,
 }
 
 /// LLM polish settings.
@@ -283,12 +289,13 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             asr: AsrSettings {
-                model_id: "turbo-q5-0".to_string(),
+                model_id: crate::models::DESKTOP_DEFAULT_MODEL_ID.to_string(),
                 language: LangMode::Auto,
                 initial_prompt: None,
                 translate_to_english: false,
                 engine: EngineSetting::Auto,
                 fast_engine: false,
+                model_explicitly_chosen: false,
             },
             polish: None,
             storage: StorageSettings { keep_audio: false },
@@ -401,6 +408,41 @@ font_scale = 1.0
     }
 
     // ---- M10A: the fast-engine toggle ---------------------------------------
+
+    #[test]
+    fn the_model_choice_flag_defaults_to_false_and_round_trips() {
+        // A settings file from before M19B has no key: it must read as "the
+        // user never chose this" so the Android host can migrate it.
+        let text = r#"
+[asr]
+model_id = "turbo-q5-0"
+language = "auto"
+translate_to_english = false
+
+[storage]
+keep_audio = false
+
+[ui]
+glass = "auto"
+font_scale = 1.0
+"#;
+        let settings: Settings = toml::from_str(text).expect("legacy settings must load");
+        assert!(!settings.asr.model_explicitly_chosen);
+        assert_eq!(settings.asr.model_id, "turbo-q5-0");
+
+        for chosen in [false, true] {
+            let mut settings = Settings::default();
+            settings.asr.model_explicitly_chosen = chosen;
+            let text = toml::to_string_pretty(&settings).expect("serialize");
+            let back: Settings = toml::from_str(&text).expect("deserialize");
+            assert_eq!(back.asr.model_explicitly_chosen, chosen);
+        }
+
+        // Desktop defaults are unchanged by M19B.
+        let desktop = Settings::default();
+        assert_eq!(desktop.asr.model_id, "turbo-q5-0");
+        assert!(!desktop.asr.model_explicitly_chosen);
+    }
 
     #[test]
     fn fast_engine_roundtrips_and_defaults_to_off() {

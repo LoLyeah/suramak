@@ -43,6 +43,9 @@ struct Inner {
     app: CompactApp,
     dirs: HostDirs,
     settings_path: PathBuf,
+    /// M19B: whether `settings.toml` existed when the host was created. A
+    /// missing file is a first run, which takes the phone tier's default.
+    settings_existed: bool,
     /// The last device probe; the download card and `download_state` reuse it.
     profile: Option<DeviceProfile>,
     /// The export job slot (single-flight; staging under `files/exports`).
@@ -54,6 +57,7 @@ impl CompactHost {
     pub fn new(root: &Path) -> Self {
         let dirs = HostDirs::under(root);
         let settings_path = root.join("settings.toml");
+        let settings_existed = settings_path.is_file();
         let settings = Settings::load(&settings_path).unwrap_or_default();
         let compact = compact_settings(&settings);
         let mut app = CompactApp::new(compact);
@@ -67,6 +71,7 @@ impl CompactHost {
             app,
             dirs,
             settings_path,
+            settings_existed,
             profile: None,
             exports: ExportJobs::new(root),
         };
@@ -144,6 +149,25 @@ impl Inner {
             CompactRoute::Settings => "settings",
             CompactRoute::Diagnostics => "diagnostics",
         };
+        // M19B: the model truth the shell logs and the tests assert. Computed
+        // once so every field names the same frame.
+        let (model_label, model_missing) = self.app.model_label();
+        let models: Vec<Value> = self
+            .app
+            .models
+            .iter()
+            .map(|row| {
+                let selected = self.app.settings.model_id == row.id;
+                let state = row.state(selected, self.app.download.as_ref());
+                json!({
+                    "id": row.id,
+                    "offered": row.offered,
+                    "installed": row.installed,
+                    "recommended": row.recommended,
+                    "state": state.slug(),
+                })
+            })
+            .collect();
         json!({
             "ok": true,
             "screen": route,
@@ -155,12 +179,11 @@ impl Inner {
             "library_rows": self.app.rows.len(),
             "first_run_seen": self.app.first_run_seen,
             "recording": self.app.recording,
-            "models": self.app.models.iter().map(|row| json!({
-                "id": row.id,
-                "offered": row.offered,
-                "installed": row.installed,
-                "recommended": row.recommended,
-            })).collect::<Vec<_>>(),
+            "model_id": self.app.settings.model_id,
+            "model_label": model_label,
+            "model_missing": model_missing,
+            "can_record": self.app.can_record(),
+            "models": models,
             "library_error": self.app.library_error.clone(),
             "export": self.app.export_session.as_ref().map(|session| json!({
                 "transcript": session.transcript.to_string(),
@@ -287,6 +310,9 @@ impl Inner {
                     return error("model needs a value");
                 }
                 settings.asr.model_id = id.clone();
+                // M19B: this arm is the explicit "Use" tap. The flag is what
+                // stops the next launch's migration from overriding it.
+                settings.asr.model_explicitly_chosen = true;
                 self.app.apply_setting(CompactSetting::Model(id));
             }
             "language" => {
@@ -338,9 +364,10 @@ impl Inner {
                 .unwrap_or(false),
             value.get("arm64").and_then(Value::as_bool).unwrap_or(true),
         );
-        let installed = installed_models(&self.dirs.models_dir);
+        let disk = self.model_disk_scan();
+        self.migrate_model(profile, &disk);
         self.profile = Some(profile);
-        self.app.seed_device(profile, &installed);
+        self.app.seed_device_states(profile, &disk);
         self.app
             .set_free_space(value.get("free_bytes").and_then(Value::as_u64));
         if let Some(reduce) = value.get("reduce_motion").and_then(Value::as_bool) {
@@ -349,31 +376,110 @@ impl Inner {
         self.snapshot()
     }
 
-    /// Rescans `files/models` after a job finishes, adopts the new model as the
-    /// setting when nothing else is installed, and re-derives the card.
-    fn refresh_models(&mut self) -> String {
-        let installed = installed_models(&self.dirs.models_dir);
-        self.app.refresh_models(&installed);
-        if let Some(profile) = self.profile {
-            if self.app.model_card_needed() {
-                self.app.seed_device(profile, &installed);
+    /// Scans `files/models` for the truth behind every row (M19B).
+    ///
+    /// A `.part` beside a complete file is debris from an older attempt, so the
+    /// sweep runs first; then every manifest model gets its verified / partial
+    /// / wrong-size / absent state. No sha256 here — `install_file` verified it
+    /// when the file landed, and re-hashing on every device op would stall the
+    /// first frame.
+    fn model_disk_scan(&self) -> Vec<(&'static str, suramak_core::models::ModelFileState)> {
+        let swept = suramak_core::models::sweep_completed_parts(&self.dirs.models_dir);
+        if swept > 0 {
+            log::info!("SURAMAK-MODEL swept {swept} stale .part file(s)");
+        }
+        suramak_core::models::model_file_states(&self.dirs.models_dir)
+    }
+
+    /// M19B: first-run tier default and the legacy-desktop-default migration.
+    ///
+    /// Runs on the first device report (the shell probes RAM once per
+    /// Activity). The rule lives in `device::model_choice_for_phone`; this
+    /// function only persists what it returns. A user-chosen model is never
+    /// touched, and an explicitly downloaded file is never deleted.
+    fn migrate_model(
+        &mut self,
+        profile: DeviceProfile,
+        disk: &[(&'static str, suramak_core::models::ModelFileState)],
+    ) {
+        let mut settings = Settings::load(&self.settings_path).unwrap_or_default();
+        let verified: Vec<&str> = disk
+            .iter()
+            .filter(|(_, state)| state.is_verified())
+            .map(|(id, _)| *id)
+            .collect();
+        let Some(next) = suramak_core::device::model_choice_for_phone(
+            &settings.asr.model_id,
+            settings.asr.model_explicitly_chosen,
+            profile,
+            &verified,
+        ) else {
+            return;
+        };
+        let previous = settings.asr.model_id.clone();
+        settings.asr.model_id = next.to_string();
+        // The migration is not a choice: the flag stays false, so a later
+        // uninstall of the selected default may steer again.
+        match settings.save(&self.settings_path) {
+            Ok(()) => log::info!(
+                "SURAMAK-MODEL migrate from={previous} to={next} tier={:?} first_run={} verified={:?}",
+                suramak_core::device::tier_for(profile),
+                !self.settings_existed,
+                verified
+            ),
+            Err(err) => {
+                self.app
+                    .on_save_failed(format!("could not save the phone's model choice: {err}"));
             }
         }
-        if self
-            .app
-            .download
-            .as_ref()
-            .is_some_and(|download| installed.iter().any(|id| id == &download.model))
-        {
-            if let Some(model) = self.app.recommended_model().map(|row| row.id.clone()) {
-                if installed.iter().any(|id| id == &model) {
-                    self.app.apply_setting(CompactSetting::Model(model.clone()));
-                    let mut settings = Settings::load(&self.settings_path).unwrap_or_default();
-                    settings.asr.model_id = model;
-                    let _ = settings.save(&self.settings_path);
-                }
+        self.app.settings.model_id = next.to_string();
+    }
+
+    /// Rescans `files/models` after a job finishes, adopts the new model as the
+    /// setting when nothing else is installed, and re-derives the card.
+    ///
+    /// M19B: the scan is the verified one; a `.part` or a wrong-sized file is
+    /// not an install. The auto-adopt is deliberately **not** an explicit
+    /// choice (it never sets `model_explicitly_chosen`): the user chose to
+    /// download a file, not to pin the app to it forever.
+    fn refresh_models(&mut self) -> String {
+        let disk = self.model_disk_scan();
+        self.app.refresh_model_states(&disk);
+        if let Some(profile) = self.profile {
+            if self.app.model_card_needed() {
+                self.app.seed_device_states(profile, &disk);
             }
-            self.app.clear_download();
+        }
+        let verified: Vec<String> = disk
+            .iter()
+            .filter(|(_, state)| state.is_verified())
+            .map(|(id, _)| (*id).to_string())
+            .collect();
+        // The model the user just downloaded is the one they asked for: adopt
+        // it when the configured model has no verified file (a fresh install's
+        // tier default may still be downloading, or the user picked an
+        // alternative). A currently verified configured model is never
+        // switched away from. This is not the explicit "Use" tap, so the
+        // `model_explicitly_chosen` flag is left untouched.
+        if let Some(downloaded) = self.app.download.clone() {
+            if verified.iter().any(|id| id == &downloaded.model) {
+                let configured_ready = self.app.configured_model().is_some_and(|row| row.installed);
+                if !configured_ready {
+                    if let Some(row) = self
+                        .app
+                        .models
+                        .iter()
+                        .find(|row| row.id == downloaded.model && row.offered)
+                    {
+                        let model = row.id.clone();
+                        self.app.apply_setting(CompactSetting::Model(model.clone()));
+                        let mut settings = Settings::load(&self.settings_path).unwrap_or_default();
+                        settings.asr.model_id = model;
+                        let _ = settings.save(&self.settings_path);
+                    }
+                }
+                self.app.clear_download();
+            }
         }
         self.snapshot()
     }
@@ -388,8 +494,12 @@ impl Inner {
         let Some(model_id) = recommendation.default_model_id else {
             return json!({ "ok": true, "known": false }).to_string();
         };
-        let installed = installed_models(&self.dirs.models_dir);
-        if installed.iter().any(|id| id == model_id) {
+        let installed = suramak_core::models::find_model(model_id)
+            .map(|model| {
+                suramak_core::models::model_file_state(&self.dirs.models_dir, model).is_verified()
+            })
+            .unwrap_or(false);
+        if installed {
             return json!({ "ok": true, "known": true, "model": model_id, "installed": true })
                 .to_string();
         }
@@ -596,22 +706,6 @@ fn compact_settings(settings: &Settings) -> CompactSettings {
         appearance: settings.ui.appearance,
         keep_audio: settings.storage.keep_audio,
     }
-}
-
-/// Which manifest models have a file in `<root>/models`.
-fn installed_models(dir: &Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let files: Vec<String> = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.file_name().to_string_lossy().to_string())
-        .collect();
-    suramak_core::models::MODELS
-        .iter()
-        .filter(|model| files.iter().any(|file| file == model.hf_file))
-        .map(|model| model.id.to_string())
-        .collect()
 }
 
 fn error(message: &str) -> String {
@@ -1048,11 +1142,14 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("suramak-compact-host-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("models")).expect("models");
-        std::fs::write(
-            dir.join("models").join("ggml-base.bin"),
-            b"not a model, just a filename",
-        )
-        .expect("model file");
+        // M19B: a model counts only at the pinned byte count. A sparse file of
+        // exactly base's size is the cheap fixture (no 148 MB of writes).
+        let base_info = suramak_core::models::find_model("base").expect("base");
+        let file = std::fs::File::create(dir.join("models").join(base_info.hf_file)).expect("file");
+        file.set_len(base_info.size_bytes).expect("size");
+        // A three-byte "model" beside it is exactly the path-existence lie the
+        // new scan must not tell.
+        std::fs::write(dir.join("models").join("ggml-small.bin"), b"no").expect("small file");
         let host = CompactHost::new(&dir);
         let reply: Value = serde_json::from_str(
             &host.dispatch(
@@ -1074,11 +1171,317 @@ mod tests {
             .expect("base row");
         assert_eq!(base["installed"], true);
         assert_eq!(base["recommended"], true);
+        assert_eq!(base["state"], "in_use", "base is this tier's default");
+        let small = models
+            .iter()
+            .find(|row| row["id"] == "small")
+            .expect("small row");
+        assert_eq!(small["installed"], false, "a 2-byte file is not an install");
+        assert_eq!(small["state"], "stale_corrupt");
         let q8 = models
             .iter()
             .find(|row| row["id"] == "turbo-q8-0")
             .expect("q8 row");
         assert_eq!(q8["offered"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- M19B: tier default, migration, the five states on the real host ----
+
+    fn host_dir() -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("suramak-compact-host-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        fixture(&dir);
+        dir
+    }
+
+    fn device(host: &CompactHost, total_ram_bytes: u64) -> Value {
+        serde_json::from_str(
+            &host.dispatch(
+                &json!({
+                    "op": "device",
+                    "total_ram_bytes": total_ram_bytes,
+                    "available_ram_bytes": total_ram_bytes / 2,
+                    "low_memory": false,
+                    "arm64": true,
+                })
+                .to_string(),
+            ),
+        )
+        .expect("json")
+    }
+
+    /// A settings file from before M19B: no `model_explicitly_chosen` key.
+    fn write_legacy_settings(dir: &Path, model_id: &str, chosen: Option<bool>) {
+        let chosen_line = chosen
+            .map(|value| format!("model_explicitly_chosen = {value}\n"))
+            .unwrap_or_default();
+        let text = format!(
+            "[asr]\nmodel_id = \"{model_id}\"\nlanguage = \"auto\"\ntranslate_to_english = false\n{chosen_line}\n[storage]\nkeep_audio = false\n\n[ui]\nglass = \"auto\"\nfont_scale = 1.0\n"
+        );
+        std::fs::write(dir.join("settings.toml"), text).expect("legacy settings");
+    }
+
+    /// A sparse file of the pinned size — a real byte count with no bytes.
+    fn sparse_model(dir: &Path, id: &str) -> String {
+        let info = suramak_core::models::find_model(id).expect("model");
+        std::fs::create_dir_all(dir.join("models")).expect("models");
+        let file = std::fs::File::create(dir.join("models").join(info.hf_file)).expect("file");
+        file.set_len(info.size_bytes).expect("size");
+        info.hf_file.to_string()
+    }
+
+    fn model_row<'a>(reply: &'a Value, id: &str) -> &'a Value {
+        reply["models"]
+            .as_array()
+            .expect("models")
+            .iter()
+            .find(|row| row["id"] == id)
+            .expect("row")
+    }
+
+    #[test]
+    fn a_fresh_install_takes_the_phone_tier_default_and_persists_it() {
+        for (ram, expected) in [
+            (3_700_000_000_u64, "base"),
+            (5_500_000_000, "base"),
+            (8_000_000_000, "small"),
+            (12_000_000_000, "small"),
+            (16_000_000_000, "small"),
+        ] {
+            let dir = host_dir();
+            assert!(
+                !dir.join("settings.toml").exists(),
+                "the precondition is a first run"
+            );
+            let host = CompactHost::new(&dir);
+            let reply = device(&host, ram);
+            assert_eq!(reply["model_id"], expected, "{ram} bytes of RAM");
+            // The tier default is *selected*, but a fresh install has no model
+            // file — so it must NOT read "In use".
+            assert_eq!(
+                model_row(&reply, expected)["installed"],
+                false,
+                "{ram}: a fresh install has no model file"
+            );
+            assert_eq!(model_row(&reply, expected)["state"], "not_downloaded");
+            assert_eq!(reply["model_label"], format!("{expected} · not downloaded"));
+            assert_eq!(reply["can_record"], false);
+
+            let saved = Settings::load(&dir.join("settings.toml")).expect("persisted settings");
+            assert_eq!(saved.asr.model_id, expected, "{ram}");
+            assert!(
+                !saved.asr.model_explicitly_chosen,
+                "the tier default is not a user choice"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_legacy_turbo_file_migrates_to_the_highest_installed_model() {
+        let dir = host_dir();
+        write_legacy_settings(&dir, "turbo-q5-0", None);
+        sparse_model(&dir, "base");
+        let host = CompactHost::new(&dir);
+        let reply = device(&host, 8_000_000_000);
+        assert_eq!(
+            reply["model_id"], "base",
+            "an installed model wins over the tier default"
+        );
+        assert_eq!(model_row(&reply, "base")["state"], "in_use");
+        let saved = Settings::load(&dir.join("settings.toml")).expect("settings");
+        assert_eq!(saved.asr.model_id, "base");
+        assert!(!saved.asr.model_explicitly_chosen);
+        // A relaunch keeps the migrated choice (it is no longer turbo).
+        let relaunched = CompactHost::new(&dir);
+        let reply = device(&relaunched, 8_000_000_000);
+        assert_eq!(reply["model_id"], "base");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_legacy_turbo_file_with_nothing_installed_takes_the_tier_default() {
+        let dir = host_dir();
+        write_legacy_settings(&dir, "turbo-q5-0", None);
+        let host = CompactHost::new(&dir);
+        let reply = device(&host, 8_000_000_000);
+        assert_eq!(reply["model_id"], "small");
+        assert_eq!(reply["model_label"], "small · not downloaded");
+        let saved = Settings::load(&dir.join("settings.toml")).expect("settings");
+        assert_eq!(saved.asr.model_id, "small");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_explicit_model_choice_is_never_overridden() {
+        // (a) The flag on a legacy file protects a model that is not installed.
+        let dir = host_dir();
+        write_legacy_settings(&dir, "turbo-q5-0", Some(true));
+        let host = CompactHost::new(&dir);
+        let reply = device(&host, 8_000_000_000);
+        assert_eq!(reply["model_id"], "turbo-q5-0");
+        assert_eq!(model_row(&reply, "turbo-q5-0")["state"], "not_downloaded");
+        assert_eq!(
+            reply["model_label"], "turbo-q5-0 · not downloaded",
+            "an explicit turbo with no file is shown honestly, not migrated"
+        );
+
+        // (b) A different stored model (a real choice from before the flag) is
+        // kept as-is.
+        let dir2 = host_dir();
+        write_legacy_settings(&dir2, "small", None);
+        let host2 = CompactHost::new(&dir2);
+        let reply = device(&host2, 8_000_000_000);
+        assert_eq!(reply["model_id"], "small");
+
+        // (c) An explicit Use tap sets the flag, so the next launch keeps it.
+        let dir3 = host_dir();
+        sparse_model(&dir3, "base");
+        let host3 = CompactHost::new(&dir3);
+        device(&host3, 8_000_000_000); // first run: small
+        let used: Value = serde_json::from_str(
+            &host3.dispatch(r#"{"op":"setting","setting":"model","value":"base"}"#),
+        )
+        .expect("json");
+        assert_eq!(used["model_id"], "base");
+        let saved = Settings::load(&dir3.join("settings.toml")).expect("settings");
+        assert!(saved.asr.model_explicitly_chosen, "Use must set the flag");
+        assert_eq!(saved.asr.model_id, "base");
+        let relaunched = CompactHost::new(&dir3);
+        let reply = device(&relaunched, 8_000_000_000);
+        assert_eq!(reply["model_id"], "base", "the choice survives a relaunch");
+        assert_eq!(model_row(&reply, "base")["state"], "in_use");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+        let _ = std::fs::remove_dir_all(&dir3);
+    }
+
+    #[test]
+    fn a_missing_file_never_reads_as_in_use_on_the_host() {
+        let dir = host_dir();
+        let host = CompactHost::new(&dir);
+        // The tier default on 8 GB, with no file: honest header, no "In use".
+        let reply = device(&host, 8_000_000_000);
+        assert_eq!(reply["model_id"], "small");
+        assert_eq!(model_row(&reply, "small")["state"], "not_downloaded");
+        assert_eq!(model_row(&reply, "small")["installed"], false);
+        for row in reply["models"].as_array().expect("models") {
+            assert_ne!(row["state"], "in_use", "{row}");
+            assert_eq!(row["installed"], false, "{row}");
+        }
+        assert_eq!(reply["can_record"], false);
+        assert!(reply["model_label"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not downloaded"));
+
+        // A PARTIAL download (a `.part` left by an interrupted run) is still
+        // not installed; it reads as the resumable Downloading state.
+        let info = suramak_core::models::find_model("small").expect("small");
+        let models = dir.join("models");
+        std::fs::create_dir_all(&models).expect("models");
+        std::fs::write(
+            suramak_core::download::part_path(&models.join(info.hf_file)),
+            vec![0u8; 1_000],
+        )
+        .expect("part");
+        let reply = device(&host, 8_000_000_000);
+        assert_eq!(model_row(&reply, "small")["state"], "downloading");
+        assert_eq!(model_row(&reply, "small")["installed"], false);
+        assert_eq!(reply["can_record"], false);
+        let resume: Value =
+            serde_json::from_str(&host.dispatch(r#"{"op":"download_state"}"#)).expect("json");
+        assert_eq!(resume["installed"], false);
+        assert_eq!(resume["bytes_done"], 1_000);
+
+        // The download lands at exactly the pinned size; only now is it "in
+        // use" (the tier default was already selected on the first run).
+        let file = std::fs::File::create(models.join(info.hf_file)).expect("file");
+        file.set_len(info.size_bytes).expect("size");
+        let refreshed: Value =
+            serde_json::from_str(&host.dispatch(r#"{"op":"refresh_models"}"#)).expect("json");
+        assert_eq!(model_row(&refreshed, "small")["state"], "in_use");
+        assert_eq!(refreshed["can_record"], true);
+        assert_eq!(refreshed["model_label"], "small");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_wrong_sized_file_reads_as_stale_and_blocks_recording() {
+        let dir = host_dir();
+        let host = CompactHost::new(&dir);
+        device(&host, 8_000_000_000);
+        let info = suramak_core::models::find_model("small").expect("small");
+        let models = dir.join("models");
+        std::fs::create_dir_all(&models).expect("models");
+        std::fs::write(models.join(info.hf_file), b"truncated").expect("bad file");
+        let reply = device(&host, 8_000_000_000);
+        assert_eq!(model_row(&reply, "small")["state"], "stale_corrupt");
+        assert_eq!(reply["can_record"], false);
+
+        // Re-download unlinks the bad file before the job starts (proved at
+        // the model host, not by a network call).
+        assert!(suramak_core::models::remove_model_files(
+            &models,
+            suramak_core::models::find_model("small").unwrap()
+        ));
+        assert!(!models.join(info.hf_file).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_finished_download_becomes_the_model_the_user_asked_for() {
+        let dir = host_dir();
+        let host = CompactHost::new(&dir);
+        device(&host, 6_000_000_000); // 6 GB: base is the tier default
+        sparse_model(&dir, "small");
+        host.with_app(|app| {
+            app.on_download(
+                "small",
+                10,
+                20,
+                50,
+                suramak_ui::deck::compact::DownloadState::Running,
+                "finishing",
+                0.0,
+            );
+        });
+        let reply: Value =
+            serde_json::from_str(&host.dispatch(r#"{"op":"refresh_models"}"#)).expect("json");
+        assert_eq!(
+            reply["model_id"], "small",
+            "the configured base has no file; the verified download wins"
+        );
+        assert_eq!(model_row(&reply, "small")["state"], "in_use");
+        assert_eq!(
+            Settings::load(&dir.join("settings.toml"))
+                .expect("settings")
+                .asr
+                .model_id,
+            "small"
+        );
+
+        // A second refresh must not switch away from a verified model.
+        sparse_model(&dir, "base");
+        host.with_app(|app| {
+            app.on_download(
+                "base",
+                10,
+                20,
+                50,
+                suramak_ui::deck::compact::DownloadState::Running,
+                "finishing",
+                0.0,
+            );
+        });
+        let reply: Value =
+            serde_json::from_str(&host.dispatch(r#"{"op":"refresh_models"}"#)).expect("json");
+        assert_eq!(
+            reply["model_id"], "small",
+            "a working choice is not replaced by a later download"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Local};
 use suramak_core::device::{self, DeviceProfile, PhoneTier};
-use suramak_core::models::MODELS;
+use suramak_core::models::{ModelFileState, MODELS};
 use suramak_core::settings::Appearance;
 use suramak_core::store::WordAlignment;
 use suramak_core::transcript::{Segment, Transcript, WordTiming};
@@ -385,20 +385,140 @@ pub struct ModelRow {
     pub note: String,
     /// Whether this model runs on the device at all (M13D's refusal rule).
     pub offered: bool,
-    /// Whether the host found its file in `files/models`.
+    /// Whether the file is **verified** on disk (pinned size, no `.part`) —
+    /// M19B: not merely present. `false` for an absent file, a `.part` or a
+    /// wrong-sized file.
     pub installed: bool,
+    /// The disk truth behind `installed` (M19B).
+    pub disk: ModelFileState,
     /// The model the action should select/download.
     pub recommended: bool,
 }
 
+/// The five states a model row can be in (M19B).
+///
+/// Only [`ModelState::InUse`] may paint the accent border and the "In use"
+/// pill, and it is reachable only through a **verified** file — the row state
+/// is derived from disk truth, never from the configured id alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelState {
+    /// Nothing on disk: `Get` (or the card's `Download`).
+    NotDownloaded,
+    /// A transfer is running or a `.part` is waiting: progress + `Cancel`
+    /// (`Resume` when there is no live job).
+    Downloading,
+    /// A file exists at the wrong size: `Re-download` (the bad file is
+    /// unlinked before the transfer starts).
+    StaleCorrupt,
+    /// Verified, not the configured model: `Use`.
+    Installed,
+    /// Verified **and** configured: the only "In use" state.
+    InUse,
+}
+
+impl ModelState {
+    pub const ALL: [Self; 5] = [
+        Self::NotDownloaded,
+        Self::Downloading,
+        Self::StaleCorrupt,
+        Self::Installed,
+        Self::InUse,
+    ];
+
+    /// The row's state word (the second line's suffix and the log marker).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotDownloaded => "not downloaded",
+            Self::Downloading => "downloading",
+            Self::StaleCorrupt => "stale file",
+            Self::Installed => "installed",
+            Self::InUse => "in use",
+        }
+    }
+
+    /// The row's action word.
+    pub fn action(self) -> &'static str {
+        match self {
+            Self::NotDownloaded => "Get",
+            Self::Downloading => "Cancel",
+            Self::StaleCorrupt => "Re-download",
+            Self::Installed => "Use",
+            Self::InUse => "In use",
+        }
+    }
+
+    /// The machine-readable token (the shell's log marker, the host snapshot).
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::NotDownloaded => "not_downloaded",
+            Self::Downloading => "downloading",
+            Self::StaleCorrupt => "stale_corrupt",
+            Self::Installed => "installed",
+            Self::InUse => "in_use",
+        }
+    }
+
+    pub fn is_in_use(self) -> bool {
+        matches!(self, Self::InUse)
+    }
+
+    /// Whether the row's action button does anything.
+    pub fn is_actionable(self) -> bool {
+        !self.is_in_use()
+    }
+}
+
 impl ModelRow {
-    /// `"78 MB · CI + tests"` — the one-line subtitle the cards reuse.
+    /// `"78 MB · CI + tests"` — the one-line subtitle the cards reuse. A role
+    /// that only describes the desktop (`desktop default`) is omitted: no
+    /// platform-confusing copy on the phone.
     pub fn size_role(&self) -> String {
+        if self.role.is_empty() {
+            super::model::bytes_label(self.size_bytes)
+        } else {
+            format!(
+                "{} · {}",
+                super::model::bytes_label(self.size_bytes),
+                self.role
+            )
+        }
+    }
+
+    /// The Settings row's second line: size, role and the disk truth.
+    pub fn subtitle(&self) -> String {
         format!(
             "{} · {}",
-            super::model::bytes_label(self.size_bytes),
-            self.role
+            self.size_role(),
+            self.disk.label().to_lowercase()
         )
+    }
+
+    /// The five-state machine for this row (M19B).
+    ///
+    /// `selected` is the configured model id; `download` is the live M13D job
+    /// view for this row, when one exists. A verified file is a precondition
+    /// for `InUse` — nothing else can produce it.
+    pub fn state(&self, selected: bool, download: Option<&DownloadView>) -> ModelState {
+        if self.installed {
+            return if selected {
+                ModelState::InUse
+            } else {
+                ModelState::Installed
+            };
+        }
+        if download.is_some_and(|download| {
+            matches!(
+                download.state,
+                DownloadState::Running | DownloadState::Paused
+            )
+        }) {
+            return ModelState::Downloading;
+        }
+        match self.disk {
+            ModelFileState::Partial => ModelState::Downloading,
+            ModelFileState::WrongSize => ModelState::StaleCorrupt,
+            ModelFileState::Absent | ModelFileState::Verified => ModelState::NotDownloaded,
+        }
     }
 }
 
@@ -1070,18 +1190,86 @@ impl CompactApp {
     }
 
     /// Seeds the device facts and derives the model rows through M13D's rules.
+    ///
+    /// `installed` is the **verified** set (M19B): callers that only have ids
+    /// (tests, fixtures) get the same treatment as a host that scanned disk.
     pub fn seed_device(&mut self, profile: DeviceProfile, installed: &[String]) {
+        let disk = disk_from_ids(installed);
+        self.seed_device_states(profile, &disk);
+    }
+
+    /// Seeds the device facts with the full disk truth per model (M19B). The
+    /// Android host scans `files/models` and passes every row's state, so a
+    /// `.part` or a truncated file can never read as installed.
+    pub fn seed_device_states(
+        &mut self,
+        profile: DeviceProfile,
+        disk: &[(&'static str, ModelFileState)],
+    ) {
         self.tier = Some(device::tier_for(profile));
         self.ram_bytes = Some(profile.total_ram_bytes);
         self.profile = Some(profile);
-        self.models = model_rows(profile, &self.settings.language, installed);
+        self.models = model_rows_from_states(profile, &self.settings.language, disk);
     }
 
     /// Re-derives the model rows after a language change (Indonesian's `tiny`
     /// steering is a property of the recommendation, not of the tier).
     pub fn refresh_models(&mut self, installed: &[String]) {
+        let disk = disk_from_ids(installed);
+        self.refresh_model_states(&disk);
+    }
+
+    /// Re-derives the rows from a fresh disk scan (M19B).
+    pub fn refresh_model_states(&mut self, disk: &[(&'static str, ModelFileState)]) {
         if let Some(profile) = self.profile {
-            self.models = model_rows(profile, &self.settings.language, installed);
+            self.models = model_rows_from_states(profile, &self.settings.language, disk);
+        }
+    }
+
+    /// The row for the configured model, when the manifest carries it.
+    pub fn configured_model(&self) -> Option<&ModelRow> {
+        self.models
+            .iter()
+            .find(|row| row.id == self.settings.model_id)
+    }
+
+    /// The TRANSCRIPTION → Model row's value and whether it needs the warning
+    /// tint (M19B): `small` when the file is verified, `small · not downloaded`
+    /// when it is not. The configured model is shown even when another model is
+    /// installed — the header must name what the app will actually try to load.
+    pub fn model_label(&self) -> (String, bool) {
+        let id = self.settings.model_id.clone();
+        match self.models.iter().find(|row| row.id == id) {
+            Some(row) if row.installed => (id, false),
+            Some(_) => (format!("{id} · not downloaded"), true),
+            // No device report yet (or an unknown id): nothing to qualify.
+            None => (id, false),
+        }
+    }
+
+    /// Whether a recording has the configured model to run (M19B).
+    ///
+    /// The job loads `settings.model_id`, so "some model is installed" is not
+    /// enough: the configured one must be verified. Before the shell reports
+    /// memory the model table is empty and the answer is "unknown, do not
+    /// block". A phone with a verified file that is not the configured model
+    /// gets [`Self::record_block_reason`]'s "choose" line instead.
+    pub fn can_record(&self) -> bool {
+        self.models.is_empty() || self.configured_model().is_some_and(|row| row.installed)
+    }
+
+    /// The inline reason the Record button is disabled, if it is (M19B).
+    pub fn record_block_reason(&self) -> Option<&'static str> {
+        if self.can_record() {
+            return None;
+        }
+        if self.tier == Some(PhoneTier::Unsupported) {
+            return Some("No model can run on this phone.");
+        }
+        if self.models.iter().any(|row| row.installed && row.offered) {
+            Some("Choose a model that is on this phone.")
+        } else {
+            Some("Download a model before recording.")
         }
     }
 
@@ -1707,18 +1895,61 @@ pub fn row_key(id: Uuid) -> u64 {
 }
 
 /// The model rows for a device, from the M13D manifest rules.
+///
+/// `installed` names the models whose files are **verified** (M19B); every
+/// other row is `Absent`. The host uses [`model_rows_from_states`] with its
+/// real disk scan so `.part` and wrong-sized files stay honest.
 pub fn model_rows(profile: DeviceProfile, language: &str, installed: &[String]) -> Vec<ModelRow> {
+    let disk = disk_from_ids(installed);
+    model_rows_from_states(profile, language, &disk)
+}
+
+/// The model rows for a device and a full disk scan (M19B).
+pub fn model_rows_from_states(
+    profile: DeviceProfile,
+    language: &str,
+    disk: &[(&'static str, ModelFileState)],
+) -> Vec<ModelRow> {
     let recommended = device::recommend(profile, language).default_model_id;
     MODELS
         .iter()
-        .map(|model| ModelRow {
-            id: model.id.to_string(),
-            size_bytes: model.size_bytes,
-            role: model.role.to_string(),
-            note: model.phone.note.to_string(),
-            offered: device::refusal_for(profile, language, model.id).is_none(),
-            installed: installed.iter().any(|id| id == model.id),
-            recommended: Some(model.id) == recommended,
+        .map(|model| {
+            let state = disk
+                .iter()
+                .find(|(id, _)| *id == model.id)
+                .map(|(_, state)| *state)
+                .unwrap_or(ModelFileState::Absent);
+            ModelRow {
+                id: model.id.to_string(),
+                size_bytes: model.size_bytes,
+                // A role that only names the desktop is not phone copy.
+                role: if model.role == "desktop default" {
+                    String::new()
+                } else {
+                    model.role.to_string()
+                },
+                note: model.phone.note.to_string(),
+                offered: device::refusal_for(profile, language, model.id).is_none(),
+                installed: state.is_verified(),
+                disk: state,
+                recommended: Some(model.id) == recommended,
+            }
+        })
+        .collect()
+}
+
+/// `["base"]` → every manifest id with `Verified` for the named ones and
+/// `Absent` for the rest (the fixture form of a disk scan).
+fn disk_from_ids(installed: &[String]) -> Vec<(&'static str, ModelFileState)> {
+    MODELS
+        .iter()
+        .map(|model| {
+            let state = if installed.iter().any(|id| id == model.id) {
+                ModelFileState::Verified
+            } else {
+                ModelFileState::Absent
+            };
+            (model.id, state)
         })
         .collect()
 }
@@ -1992,6 +2223,252 @@ mod tests {
         assert!(!turbo.offered, "874 MB model is refused on phones");
         let tier = device::tier_for(profile);
         assert_eq!(tier, PhoneTier::Mid);
+    }
+
+    // ---- M19B: the model registry tells the truth --------------------------
+
+    fn profile_at(ram_gb: f64) -> DeviceProfile {
+        DeviceProfile::new(
+            (ram_gb * 1_000_000_000.0) as u64,
+            1_000_000_000,
+            false,
+            true,
+        )
+    }
+
+    fn rows_at(ram_gb: f64, disk: &[(&'static str, ModelFileState)]) -> Vec<ModelRow> {
+        model_rows_from_states(profile_at(ram_gb), "en", disk)
+    }
+
+    fn find_row<'a>(rows: &'a [ModelRow], id: &str) -> &'a ModelRow {
+        rows.iter().find(|row| row.id == id).expect(id)
+    }
+
+    fn live(model: &str, state: DownloadState) -> DownloadView {
+        DownloadView {
+            model: model.to_string(),
+            bytes_done: 42,
+            bytes_total: 100,
+            percent: 42,
+            state,
+            message: String::new(),
+            resumed: false,
+        }
+    }
+
+    #[test]
+    fn the_tier_default_is_the_recommended_row_at_4_6_8_12_16_gb() {
+        let cases = [
+            (4.0, "base"),
+            (6.0, "base"),
+            (8.0, "small"),
+            (12.0, "small"),
+            (16.0, "small"),
+        ];
+        for (ram_gb, expected) in cases {
+            let rows = rows_at(ram_gb, &[]);
+            let recommended: Vec<&str> = rows
+                .iter()
+                .filter(|row| row.recommended)
+                .map(|row| row.id.as_str())
+                .collect();
+            assert_eq!(recommended, vec![expected], "{ram_gb} GB");
+            assert!(
+                find_row(&rows, expected).offered,
+                "{ram_gb} GB must offer it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_five_row_states_are_reachable_from_disk_truth() {
+        // Nothing on disk: the configured model is honestly "not downloaded".
+        let rows = rows_at(8.0, &[("small", ModelFileState::Absent)]);
+        let row = find_row(&rows, "small");
+        assert_eq!(row.state(true, None), ModelState::NotDownloaded);
+        assert_eq!(row.state(true, None).action(), "Get");
+        assert_eq!(row.state(true, None).label(), "not downloaded");
+        assert!(!row.state(true, None).is_in_use(), "no file, no 'In use'");
+
+        // A `.part` — or a live job — is the Downloading state.
+        let rows = rows_at(8.0, &[("small", ModelFileState::Partial)]);
+        let row = find_row(&rows, "small");
+        assert_eq!(row.state(false, None), ModelState::Downloading);
+        let running = live("small", DownloadState::Running);
+        assert_eq!(row.state(false, Some(&running)), ModelState::Downloading);
+        assert_eq!(
+            row.state(false, Some(&running)).action(),
+            "Cancel",
+            "a live transfer offers Cancel"
+        );
+        let paused = live("small", DownloadState::Paused);
+        assert_eq!(row.state(false, Some(&paused)), ModelState::Downloading);
+
+        // A wrong-sized file is stale: re-download, never install/use.
+        let rows = rows_at(8.0, &[("small", ModelFileState::WrongSize)]);
+        let row = find_row(&rows, "small");
+        assert_eq!(row.state(true, None), ModelState::StaleCorrupt);
+        assert_eq!(row.state(true, None).action(), "Re-download");
+
+        // Verified but not selected → Use; verified + selected → In use.
+        let rows = rows_at(8.0, &[("small", ModelFileState::Verified)]);
+        let row = find_row(&rows, "small");
+        assert!(row.installed);
+        assert_eq!(row.state(false, None), ModelState::Installed);
+        assert_eq!(row.state(false, None).action(), "Use");
+        assert_eq!(row.state(true, None), ModelState::InUse);
+        assert_eq!(row.state(true, None).action(), "In use");
+        assert!(row.state(true, None).is_in_use());
+
+        // The five labels/actions are distinct and exhaustive.
+        let mut slugs: Vec<&str> = ModelState::ALL.iter().map(|state| state.slug()).collect();
+        slugs.sort_unstable();
+        slugs.dedup();
+        assert_eq!(slugs.len(), 5);
+        assert_eq!(
+            ModelState::ALL.map(|state| state.label()),
+            [
+                "not downloaded",
+                "downloading",
+                "stale file",
+                "installed",
+                "in use"
+            ]
+        );
+    }
+
+    #[test]
+    fn in_use_is_impossible_without_a_verified_file() {
+        let states = [
+            ModelFileState::Absent,
+            ModelFileState::Partial,
+            ModelFileState::WrongSize,
+            ModelFileState::Verified,
+        ];
+        let views = [
+            None,
+            Some(live("base", DownloadState::Running)),
+            Some(live("base", DownloadState::Paused)),
+            Some(live("base", DownloadState::Failed)),
+        ];
+        for disk in states {
+            for selected in [false, true] {
+                for view in &views {
+                    let rows = rows_at(8.0, &[("base", disk)]);
+                    let row = find_row(&rows, "base");
+                    let state = row.state(selected, view.as_ref());
+                    let expected = disk == ModelFileState::Verified && selected;
+                    assert_eq!(
+                        state == ModelState::InUse,
+                        expected,
+                        "disk={disk:?} selected={selected} view={:?}",
+                        view.as_ref().map(|view| view.state)
+                    );
+                    // The row's `installed` is exactly the verified flag, so a
+                    // UI that keys "In use" off it cannot lie either.
+                    assert_eq!(row.installed, disk == ModelFileState::Verified);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_header_row_names_the_configured_model_and_its_disk_truth() {
+        // Before the shell reports memory there is nothing to qualify.
+        let mut app = CompactApp::new(CompactSettings::default());
+        assert_eq!(app.model_label(), ("turbo-q5-0".to_string(), false));
+        assert!(app.can_record(), "no device report yet: do not block");
+
+        // An 8 GB phone whose configured model is the tier default, with no
+        // file: the header says so, in warning ink.
+        app.settings.model_id = "small".to_string();
+        app.seed_device(profile_at(8.0), &[]);
+        assert_eq!(
+            app.model_label(),
+            ("small · not downloaded".to_string(), true)
+        );
+        assert!(!app.can_record());
+        assert_eq!(
+            app.record_block_reason(),
+            Some("Download a model before recording.")
+        );
+
+        // The file lands and verifies: the suffix goes away.
+        app.refresh_models(&["small".to_string()]);
+        assert_eq!(app.model_label(), ("small".to_string(), false));
+        assert!(app.can_record());
+        assert_eq!(app.record_block_reason(), None);
+        assert_eq!(
+            app.configured_model().map(|row| row.state(true, None)),
+            Some(ModelState::InUse)
+        );
+
+        // A configured model cannot borrow another installed model's file.
+        app.settings.model_id = "turbo-q5-0".to_string();
+        assert_eq!(
+            app.model_label(),
+            ("turbo-q5-0 · not downloaded".to_string(), true),
+            "base/small being installed does not make turbo usable"
+        );
+        assert!(!app.can_record(), "the job loads the configured model");
+        assert_eq!(
+            app.record_block_reason(),
+            Some("Choose a model that is on this phone.")
+        );
+    }
+
+    #[test]
+    fn a_partial_or_stale_file_does_not_unlock_recording() {
+        let mut app = CompactApp::new(CompactSettings {
+            model_id: "small".to_string(),
+            ..CompactSettings::default()
+        });
+        for disk in [
+            ModelFileState::Partial,
+            ModelFileState::WrongSize,
+            ModelFileState::Absent,
+        ] {
+            app.seed_device_states(profile_at(8.0), &[("small", disk)]);
+            assert!(!app.can_record(), "{disk:?} must not unlock Record");
+            assert!(app.model_card_needed(), "{disk:?} still needs a model");
+            assert!(!app.models.iter().any(|row| row.installed));
+        }
+        app.seed_device_states(profile_at(8.0), &[("small", ModelFileState::Verified)]);
+        assert!(app.can_record());
+        assert!(!app.model_card_needed());
+    }
+
+    #[test]
+    fn an_unsupported_cpu_says_why_recording_is_blocked() {
+        let mut app = CompactApp::new(CompactSettings::default());
+        app.seed_device(
+            DeviceProfile::new(8_000_000_000, 4_000_000_000, false, false),
+            &[],
+        );
+        assert!(!app.can_record());
+        assert_eq!(
+            app.record_block_reason(),
+            Some("No model can run on this phone.")
+        );
+    }
+
+    #[test]
+    fn the_desktop_role_is_not_phone_copy() {
+        let rows = rows_at(8.0, &[("turbo-q5-0", ModelFileState::Verified)]);
+        let turbo = find_row(&rows, "turbo-q5-0");
+        assert_eq!(turbo.role, "", "the catalog role is desktop-only copy");
+        assert_eq!(turbo.size_role(), "574 MB");
+        assert!(!turbo.subtitle().contains("desktop"));
+        assert!(!turbo.subtitle().contains("macOS"));
+        for row in &rows {
+            assert!(!row.role.contains("macOS"), "{}: {}", row.id, row.role);
+            assert!(!row.note.contains("macOS"), "{}: {}", row.id, row.note);
+        }
+        // A model with a real phone role keeps it.
+        let small = find_row(&rows, "small");
+        assert_eq!(small.role, "fast");
+        assert_eq!(small.size_role(), "488 MB · fast");
+        assert_eq!(small.subtitle(), "488 MB · fast · not downloaded");
     }
 
     #[test]

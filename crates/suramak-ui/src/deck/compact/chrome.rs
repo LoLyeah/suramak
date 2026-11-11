@@ -274,6 +274,24 @@ pub fn setting_row(
     value: &str,
     enabled: bool,
 ) -> Response {
+    setting_row_with_ink(ui, tokens, motion, rect, id, label, value, enabled, None)
+}
+
+/// [`setting_row`] whose value line takes an explicit ink (M19B: the model row
+/// tints `small · not downloaded` with the warning colour instead of painting
+/// a reassuring grey).
+#[allow(clippy::too_many_arguments)]
+pub fn setting_row_with_ink(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    rect: Rect,
+    id: impl std::hash::Hash,
+    label: &str,
+    value: &str,
+    enabled: bool,
+    value_ink: Option<Color32>,
+) -> Response {
     let response = a11y::touch(ui, tokens, rect, id, WidgetType::Button, label, enabled);
     let wash = if response.is_pointer_button_down_on() {
         tokens.surface_active
@@ -300,7 +318,7 @@ pub fn setting_row(
         Align2::LEFT_CENTER,
         value,
         FontId::proportional(12.5),
-        tokens.ink_soft,
+        value_ink.unwrap_or(tokens.ink_soft),
     );
     if enabled {
         // A small right chevron: the row opens something.

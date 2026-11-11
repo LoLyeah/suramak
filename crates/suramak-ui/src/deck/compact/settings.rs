@@ -92,8 +92,8 @@ pub fn ui(
         y += 18.0;
         let card = Rect::from_min_size(pos2(x, y), vec2(width, 168.0));
         chrome::card(ui, tokens, card);
-        let model_label = state.settings.model_id.clone();
-        if chrome::setting_row(
+        let (model_label, model_missing) = state.model_label();
+        if chrome::setting_row_with_ink(
             ui,
             tokens,
             motion,
@@ -102,6 +102,7 @@ pub fn ui(
             "Language",
             language_label(&state.settings.language),
             true,
+            None,
         )
         .clicked()
         {
@@ -109,8 +110,10 @@ pub fn ui(
             state.apply_setting(CompactSetting::Language(next.clone()));
             clicks.push(CompactAction::Setting(CompactSetting::Language(next)));
         }
-        // The model row opens the list below rather than a second screen.
-        let _ = chrome::setting_row(
+        // The model row opens the list below rather than a second screen. Its
+        // value carries the disk truth (M19B): a configured model with no
+        // verified file says so in the warning ink instead of reading "in use".
+        let _ = chrome::setting_row_with_ink(
             ui,
             tokens,
             motion,
@@ -119,6 +122,7 @@ pub fn ui(
             "Model",
             &model_label,
             false,
+            model_missing.then_some(tokens.warn),
         );
         let keep = state.settings.keep_audio;
         let toggle_row = Rect::from_min_size(pos2(x, y + 112.0), vec2(width, 56.0));
@@ -174,6 +178,18 @@ pub fn ui(
         for row in offered {
             let height = 74.0;
             let rect = Rect::from_min_size(pos2(x, y), vec2(width, height));
+            let selected = state.settings.model_id == row.id;
+            // M19B: the live job for THIS row (the card and the table read the
+            // same `DownloadView` the job reports).
+            let live = state.download.clone().filter(|download| {
+                download.model == row.id
+                    && matches!(
+                        download.state,
+                        super::model::DownloadState::Running | super::model::DownloadState::Paused
+                    )
+            });
+            let row_state = row.state(selected, live.as_ref());
+            let in_use = row_state.is_in_use();
             let response = a11y::touch(
                 ui,
                 tokens,
@@ -183,8 +199,7 @@ pub fn ui(
                 &format!("Model {}", row.id),
                 row.offered,
             );
-            let selected = state.settings.model_id == row.id;
-            let fill = if selected {
+            let fill = if in_use {
                 tokens.accent_tint
             } else if response.hovered() {
                 tokens.surface_hover
@@ -197,7 +212,7 @@ pub fn ui(
                 fill,
                 Stroke::new(
                     1.0_f32,
-                    if selected {
+                    if in_use {
                         tokens.accent
                     } else {
                         tokens.hairline
@@ -210,14 +225,16 @@ pub fn ui(
             } else {
                 tokens.ink_faint
             };
-            let action = if selected {
-                "In use"
-            } else if row.installed {
-                "Use"
-            } else {
-                "Get"
+            // Only a verified + selected file may say "In use" (M19B); every
+            // other state names what is really there.
+            let action = match (row_state, live.is_some()) {
+                (super::model::ModelState::Downloading, false) => "Resume",
+                // The configured model with no file is the one the row must
+                // not lie about: a primary Download, not "In use"/"Get".
+                (super::model::ModelState::NotDownloaded, _) if selected => "Download",
+                _ => row_state.action(),
             };
-            let action_width = 86.0;
+            let action_width = 92.0;
             // The action sits on the title line; the note below gets the
             // full card width so a manifest sentence never runs under it.
             let action_rect = Rect::from_min_size(
@@ -242,19 +259,29 @@ pub fn ui(
             ui.painter().text(
                 pos2(rect.left() + 14.0, rect.top() + 37.0),
                 Align2::LEFT_CENTER,
-                format!(
-                    "{} · {}{}",
-                    bytes_label(row.size_bytes),
-                    row.role,
-                    if row.installed { " · installed" } else { "" }
-                ),
+                row.subtitle(),
                 FontId::proportional(12.0),
                 tokens.ink_soft,
             );
+            let note = match (row_state, live.as_ref()) {
+                (super::model::ModelState::Downloading, Some(download)) => format!(
+                    "Downloading · {}% · {} of {}",
+                    download.percent,
+                    bytes_label(download.bytes_done),
+                    bytes_label(download.bytes_total)
+                ),
+                (super::model::ModelState::StaleCorrupt, _) => {
+                    "The file on this phone is incomplete — download it again.".to_string()
+                }
+                (super::model::ModelState::NotDownloaded, _) if selected => {
+                    "This is the model Suramak is set to, but its file is not here yet.".to_string()
+                }
+                _ => row.note.clone(),
+            };
             ui.painter().text(
                 pos2(rect.left() + 14.0, rect.top() + 57.0),
                 Align2::LEFT_CENTER,
-                truncate(&row.note, rect.width() - 28.0, 11.5),
+                truncate(&note, rect.width() - 28.0, 11.5),
                 FontId::proportional(11.5),
                 if row.offered {
                     tokens.ink_soft
@@ -269,10 +296,11 @@ pub fn ui(
                 ("model-action", &row.id),
                 WidgetType::Button,
                 &format!("{} {}", action, row.id),
-                row.offered && !selected,
+                row.offered && row_state.is_actionable(),
             );
-            let primary = !selected && row.installed;
-            let fills = if selected {
+            let primary = row_state == super::model::ModelState::Installed
+                || (row_state == super::model::ModelState::NotDownloaded && selected);
+            let fills = if in_use {
                 tokens.accent_tint
             } else if primary {
                 tokens.accent
@@ -285,7 +313,7 @@ pub fn ui(
                 fills,
                 Stroke::new(
                     1.0_f32,
-                    if selected {
+                    if in_use {
                         tokens.accent
                     } else {
                         tokens.hairline
@@ -298,7 +326,7 @@ pub fn ui(
                 Align2::CENTER_CENTER,
                 action,
                 FontId::proportional(12.5),
-                if selected {
+                if in_use {
                     tokens.accent
                 } else if primary {
                     tokens.on_accent
@@ -306,16 +334,30 @@ pub fn ui(
                     tokens.ink
                 },
             );
-            if action_response.clicked() && row.offered && !selected {
-                if row.installed {
-                    state.apply_setting(CompactSetting::Model(row.id.clone()));
-                    clicks.push(CompactAction::Setting(CompactSetting::Model(
-                        row.id.clone(),
-                    )));
-                } else {
-                    clicks.push(CompactAction::DownloadModel(row.id.clone()));
+            if action_response.clicked() && row.offered && row_state.is_actionable() {
+                match row_state {
+                    super::model::ModelState::Installed => {
+                        state.apply_setting(CompactSetting::Model(row.id.clone()));
+                        clicks.push(CompactAction::Setting(CompactSetting::Model(
+                            row.id.clone(),
+                        )));
+                    }
+                    super::model::ModelState::Downloading if live.is_some() => {
+                        clicks.push(CompactAction::CancelDownload);
+                    }
+                    // A stale/corrupt file is unlinked by the host before the
+                    // transfer starts; a bare `.part` resumes where it stopped.
+                    super::model::ModelState::NotDownloaded
+                    | super::model::ModelState::StaleCorrupt
+                    | super::model::ModelState::Downloading => {
+                        clicks.push(CompactAction::DownloadModel(row.id.clone()));
+                    }
+                    super::model::ModelState::InUse => {}
                 }
-            } else if response.clicked() && row.installed && row.offered && !selected {
+            } else if response.clicked()
+                && row.offered
+                && row_state == super::model::ModelState::Installed
+            {
                 state.apply_setting(CompactSetting::Model(row.id.clone()));
                 clicks.push(CompactAction::Setting(CompactSetting::Model(
                     row.id.clone(),

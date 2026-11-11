@@ -557,6 +557,41 @@ fi
 
 echo "   library:  rendered (screencap inspected)"
 
+# --- M19B: the model table tells the truth on a fresh install ----------------
+# The owner-reported defect: a phone that never downloaded turbo-q5-0 showed it
+# as "In use". egui paints pixels, so uiautomator cannot read the row text; the
+# shell's own SURAMAK-MODEL marker (one line per state change) is the witness.
+# The install is fresh (`-wipe-data`), so models/ must be empty for the
+# assertion to mean anything.
+echo "== M19B: no 'In use' without a verified model =="
+MODELS_LISTING="$("$ADB" shell ls "/sdcard/Android/data/$PACKAGE/files/models" 2>/dev/null | tr -d '\r' || true)"
+if [ -n "$MODELS_LISTING" ]; then
+  printf '%s\n' "$MODELS_LISTING" >&2
+  fail "the fresh install already has files in files/models — the 'no In use' assertion would be vacuous"
+fi
+grep -F "SURAMAK-MODEL" "$OUT/logcat-app.txt" >"$OUT/model-log.txt" || true
+[ -s "$OUT/model-log.txt" ] \
+  || fail "the shell logged no SURAMAK-MODEL lines — the M19B row-state marker did not run (see $OUT/logcat-app.txt)"
+python3 - "$OUT/model-log.txt" <<'PY' || fail "the model table is not honest on a fresh install (see $OUT/model-log.txt and $OUT/logcat-app.txt)"
+import sys
+
+lines = [line for line in open(sys.argv[1], encoding="utf-8", errors="replace")]
+rows = [line for line in lines if "row=" in line]
+headers = [line for line in lines if "header=\"" in line]
+if not rows:
+    sys.exit("no SURAMAK-MODEL row lines")
+if not headers:
+    sys.exit("no SURAMAK-MODEL header line")
+in_use = [line.strip() for line in rows if "in_use=1" in line or "state=in_use" in line]
+if in_use:
+    sys.exit("a row claims 'In use' on a fresh install with no model files: " + "; ".join(in_use))
+if "not downloaded" not in headers[-1]:
+    sys.exit(f"the header row does not carry 'not downloaded': {headers[-1].strip()!r}")
+states = sorted({part.split()[0] for line in rows for part in line.split() if part.startswith("state=")})
+print(f"   model:    header={headers[-1].strip()}")
+print(f"   model:    no row says 'In use'; row states seen: {', '.join(states)}")
+PY
+
 # --- M19A: the Settings list scrolls, taps land after a swipe, and the DEVICE
 # --- card clears the gesture pill --------------------------------------------
 #
@@ -790,4 +825,4 @@ fi
 echo
 echo "SMOKE-OK: install → launch → compact Library painted → Settings swipes and taps → monkey survived"
 echo "artifacts: $OUT (library.png, launch-onboarding.png, settings-before.png, settings-after-swipe.png,"
-echo "           settings-bottom.png, settings-swipe-diff.json, input-log.txt, layout.txt, logcat-full.txt)"
+echo "           settings-bottom.png, settings-swipe-diff.json, input-log.txt, layout.txt, model-log.txt, logcat-full.txt)"

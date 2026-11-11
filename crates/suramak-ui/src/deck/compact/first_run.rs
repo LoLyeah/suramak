@@ -275,7 +275,7 @@ pub fn card(
     let (space_line, space_error) = match state.free_bytes {
         Some(free) if free >= recommended_size => (
             format!(
-                "Needs {} · {} free on this phone",
+                "Needs {} · {} free",
                 bytes_label(recommended_size),
                 bytes_label(free)
             ),
