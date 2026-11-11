@@ -178,9 +178,17 @@ if [ "$sherpa_seen" -eq 1 ]; then
   if [ ! -f "$c_api" ]; then
     fail "the bundle links libsherpa-onnx-c-api.dylib but $c_api is missing (the app would abort at launch)"
   else
-    if ! rpaths_of "$c_api" | grep -Fxq "$BUNDLE_RPATH"; then
-      fail "$c_api has no LC_RPATH $BUNDLE_RPATH"
-    fi
+    # Capture first, match second: a live `awk | grep -q` pipeline lets grep
+    # exit early, awk dies on SIGPIPE, and `set -o pipefail` turns a MATCHING
+    # rpath into a failure (the v0.4.1 CI red: `awk: write error on
+    # /dev/stdout` right before a spurious "no LC_RPATH" fail).
+    c_api_rpaths="$(rpaths_of "$c_api")"
+    case "$c_api_rpaths" in
+      *"$BUNDLE_RPATH"*) ;;
+      *)
+        fail "$c_api has no LC_RPATH $BUNDLE_RPATH"
+        ;;
+    esac
     if [ -z "$sherpa_onnx_dep" ]; then
       fail "$c_api names no @rpath/libonnxruntime.*.dylib dependency — unexpected artifact"
     else
@@ -188,10 +196,16 @@ if [ "$sherpa_seen" -eq 1 ]; then
       onnx_path="$FRAMEWORKS_DIR/$onnx_name"
       if [ ! -f "$onnx_path" ]; then
         fail "$c_api depends on $sherpa_onnx_dep but $onnx_path is missing"
-      elif ! rpaths_of "$onnx_path" | grep -Fxq "$BUNDLE_RPATH"; then
-        fail "$onnx_path has no LC_RPATH $BUNDLE_RPATH"
       else
-        echo "ok:   sherpa: $c_api + $onnx_name in Contents/Frameworks, both with $BUNDLE_RPATH"
+        onnx_rpaths="$(rpaths_of "$onnx_path")"
+        case "$onnx_rpaths" in
+          *"$BUNDLE_RPATH"*)
+            echo "ok:   sherpa: $c_api + $onnx_name in Contents/Frameworks, both with $BUNDLE_RPATH"
+            ;;
+          *)
+            fail "$onnx_path has no LC_RPATH $BUNDLE_RPATH"
+            ;;
+        esac
       fi
     fi
   fi
