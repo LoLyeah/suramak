@@ -89,9 +89,15 @@ while IFS=$'\t' read -r name bytes sha; do
   case "$name" in ''|'#'*) continue ;; esac
   cp -f "$SRC_DIR/$name" "$FW/$name"
   chmod u+w "$FW/$name"
-  if ! rpaths_of "$FW/$name" | grep -Fxq "$RPATH"; then
-    install_name_tool -add_rpath "$RPATH" "$FW/$name"
-  fi
+  # Capture then match: a live `awk | grep -q` lets grep exit early, awk dies
+  # on SIGPIPE, and `set -o pipefail` turns a MATCHING rpath into a failure.
+  existing_rpaths="$(rpaths_of "$FW/$name")"
+  case "$existing_rpaths" in
+    *"$RPATH"*) ;;
+    *)
+      install_name_tool -add_rpath "$RPATH" "$FW/$name"
+      ;;
+  esac
   echo "sherpa: bundled $name ($bytes bytes, sha256 verified, rpath $RPATH)"
 done < "$MANIFEST"
 
@@ -100,10 +106,17 @@ done < "$MANIFEST"
 # entry is a link-time argument (crates/suramak-ui/build.rs, `updates` or
 # `parakeet`); patching the executable here would be too late to be trustworthy.
 app_bin="$APP/Contents/MacOS/suramak"
-if [ -x "$app_bin" ] && ! rpaths_of "$app_bin" | grep -Fxq "$RPATH"; then
-  echo "error: $app_bin has no LC_RPATH $RPATH" >&2
-  echo "       (crates/suramak-ui/build.rs must emit it for this feature set)" >&2
-  exit 1
+if [ -x "$app_bin" ]; then
+  # Capture then match (the SIGPIPE/pipefail trap again — see pass 2).
+  app_rpaths="$(rpaths_of "$app_bin")"
+  case "$app_rpaths" in
+    *"$RPATH"*) ;;
+    *)
+      echo "error: $app_bin has no LC_RPATH $RPATH" >&2
+      echo "       (crates/suramak-ui/build.rs must emit it for this feature set)" >&2
+      exit 1
+      ;;
+  esac
 fi
 
 # Pass 4 — the copied C API must resolve its own @rpath dependencies inside the
