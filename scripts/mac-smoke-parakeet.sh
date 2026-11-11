@@ -38,6 +38,10 @@ otool -L "$app_bin" | grep -q '@rpath/libsherpa-onnx-c-api.dylib' ||
 
 SMOKE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/suramak-parakeet-smoke.XXXXXX")"
 trap 'rm -rf "$SMOKE_ROOT"' EXIT INT TERM
+# macOS: mktemp returns the /var/... alias of TMPDIR, but dyld prints the
+# RESOLVED /private/var/... path. Match the trace against the canonical path
+# or the check compares two spellings of the same directory and "fails".
+SMOKE_REAL="$(cd "$SMOKE_ROOT" && pwd -P)"
 SMOKE_APP="$SMOKE_ROOT/Suramak.app"
 mkdir -p "$SMOKE_ROOT/home" "$SMOKE_ROOT/tmp"
 ditto "$APP" "$SMOKE_APP"
@@ -72,7 +76,7 @@ loaded_from_bundle() { # <basename> <human label>
     cat "$libs" >&2
     fail "dyld did not load the $2 ($1)"
   }
-  grep -F "$1" "$libs" | grep -F "$SMOKE_APP/" >/dev/null || {
+  grep -F "$1" "$libs" | grep -F "$SMOKE_REAL/Suramak.app/" >/dev/null || {
     cat "$libs" >&2
     fail "the $2 ($1) was loaded from outside the copied bundle"
   }
