@@ -122,15 +122,19 @@ cleanup() {
 trap cleanup EXIT
 
 # --- boot ---------------------------------------------------------------------
-echo "== booting the emulator (headless, swiftshader) =="
-# -no-window: no display on a runner; -gpu swiftshader_indirect: deterministic
-# software Vulkan/GL (the app's wgpu backend list is VULKAN|GL);
+echo "== booting the emulator (headless, ANGLE) =="
+# -no-window: no display on a runner; -gpu angle_indirect: the app's wgpu
+# backend list is VULKAN|GL and swiftshader_indirect's GPU emulation
+# SEGFAULTED mid-GPU-init while the app painted its first frame (observed in
+# CI: the emulator process core-dumped during the first-frame wait) — ANGLE's
+# translation layer is the supported GPU path on modern emulators.
 # -wipe-data: a fresh first-run state every run (the onboarding sheet is part
 # of the launch surface, so the smoke expects it);
 # -no-snapshot/-no-boot-anim: no stale state, no animation delay.
+GPU_MODE="${SURAMAK_EMU_GPU:-angle_indirect}"
 "$EMULATOR" -avd "$AVD_NAME" \
   -no-window -no-audio -no-boot-anim -no-snapshot -wipe-data \
-  -gpu swiftshader_indirect -accel on \
+  -gpu "$GPU_MODE" -accel on \
   -memory 2048 -partition-size 4096 \
   -camera-back none -camera-front none \
   -no-metrics \
@@ -209,6 +213,15 @@ cat "$OUT/am-start.txt"
 wait_for_log() {
   local pattern="$1" deadline=$((SECONDS + LAUNCH_TIMEOUT)) attempt=1
   while [ "$SECONDS" -lt "$deadline" ]; do
+    # The emulator dying mid-wait must end the wait with a PRECISE verdict:
+    # observed in CI (swiftshader): the emulator core-dumped during the
+    # first-frame wait, and the smoke then blamed the app for a missing
+    # marker. If the emulator process is gone, name it and dump its log.
+    if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
+      echo "== the EMULATOR PROCESS DIED mid-wait (pid $EMULATOR_PID) ==" >&2
+      tail -40 "$OUT/emulator.log" >&2 2>/dev/null || true
+      return 2
+    fi
     # Each logcat -d is hard-bounded: on the swiftshader emulator the app's
     # GPU loop pegs the cores and an unbounded logcat can hang the whole
     # loop (observed: the step blew its 30-minute CI timeout inside one
@@ -224,16 +237,24 @@ wait_for_log() {
   return 1
 }
 
-wait_for_log "android_main entered" || {
+if ! wait_for_log "android_main entered"; then
   timeout 30 "$ADB" logcat -d >"$OUT/logcat-launch-failed.txt" 2>/dev/null || true
   tail -80 "$OUT/logcat-launch-failed.txt" >&2 || true
   fail "no 'android_main entered' marker in logcat — the native thread never started"
-}
-wait_for_log "first frame of this gpu generation presented" || {
+fi
+RC=0
+if ! wait_for_log "first frame of this gpu generation presented"; then RC=$?; fi
+if [ "$RC" -ne 0 ]; then
   timeout 30 "$ADB" logcat -d >"$OUT/logcat-first-frame-failed.txt" 2>/dev/null || true
   tail -80 "$OUT/logcat-first-frame-failed.txt" >&2 || true
+  if [ "$RC" -eq 2 ]; then
+    # The EMULATOR died (GPU emulation), not the app: the launch markers up
+    # to here (am-start ok, android_main entered) PASSED, and painting is
+    # unassertable on a dead emulator. Red, with the precise verdict.
+    fail "the EMULATOR process died mid-launch (its GPU emulation segfaulted during the app's first-frame init) — the app's own launch markers passed; painting on real devices stays the owner-device gate"
+  fi
   fail "no 'first frame ... presented' marker — the surface never painted"
-}
+fi
 echo "   launch:   android_main entered + first frame presented"
 
 # First-run: the onboarding sheet rides the Library. Capture it, then dismiss it
