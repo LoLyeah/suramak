@@ -216,9 +216,132 @@ jobs:
             suramak-*-android-arm64-v8a.apk
             suramak-*-android-arm64-v8a.apk.sha256
 
+  # M14X: Windows joins the release page. Shape mirrors `linux-app`; the env
+  # block is the ci.yml `windows` job's, copied verbatim so the static-CRT /
+  # portable-ggml settings have one source of truth (that job's comment owns
+  # the why for each variable). Build only — no installer and no signing: the
+  # zip is the shipped form, and the SmartScreen note is explained in the
+  # release notes. The decision is recorded in
+  # docs/reports/M14x-windows-release.md.
+  windows-app:
+    name: Windows app (zip, x86_64)
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      # whisper sessions are not concurrency-safe in-process (see the linux job)
+      RUST_TEST_THREADS: "1"
+      CMAKE_POLICY_DEFAULT_CMP0091: NEW
+      CMAKE_MSVC_RUNTIME_LIBRARY: MultiThreaded
+      CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/scripts/windows/msvc-static-crt.cmake
+      GGML_NATIVE: "OFF"
+      GGML_AVX2: "ON"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-release
+
+      # The same binaries the CI windows job builds: `suramak.exe` is the GUI
+      # (the [[bin]] name of suramak-ui), `suramak-cli.exe` the console CLI.
+      # No macOS-only features; Parakeet is not packaged on Windows (D4).
+      - name: Build release binaries (static CRT)
+        run: cargo build --release -p suramak-ui -p suramak-cli
+
+      - name: Package suramak-<tag>-windows-x86_64.zip + .sha256
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag  = $env:GITHUB_REF_NAME
+          $name = "suramak-$tag-windows-x86_64"
+          $stage = Join-Path "build/windows-pkg" $name
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          foreach ($exe in @("suramak.exe", "suramak-cli.exe")) {
+            $src = "target/release/$exe"
+            if (-not (Test-Path $src)) { throw "$src was not produced by the release build" }
+            Copy-Item $src (Join-Path $stage $exe)
+          }
+          foreach ($doc in @("LICENSE", "README.md")) {
+            if (-not (Test-Path $doc)) { throw "$doc is missing from the checkout" }
+            Copy-Item $doc (Join-Path $stage $doc)
+          }
+
+          $zip = "$name.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          # Files at the archive root: extract → the two EXEs beside LICENSE
+          # and README. Deflate is lossless, so the PE checks below run on the
+          # exact bytes a user downloads.
+          Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -CompressionLevel Optimal
+
+          $hash = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          # sha256sum(1) format with LF endings — `sha256sum -c` verifies it on
+          # Linux/macOS, the same shape the Android APK ships.
+          $sha = "$zip.sha256"
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) $sha), "$hash  $zip`n")
+          $recorded = ((Get-Content $sha -Raw) -split '\s+')[0]
+          if ($recorded -ne $hash) { throw "sha256 file does not match $zip" }
+          Write-Host "packaged $zip ($((Get-Item $zip).Length) bytes)"
+          Write-Host "sha256 $hash"
+          Get-ChildItem $stage | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+
+      # The gate the CI windows job already enforces, moved onto the bytes that
+      # will actually be downloaded: extract the zip, prove each EXE is
+      # byte-identical to its build output, that suramak.exe is a GUI-subsystem
+      # PE, and that neither EXE imports the dynamic VC++ runtime (D4).
+      - name: Verify the packaged EXEs — PE headers (GUI subsystem, no dynamic CRT)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = "suramak-$env:GITHUB_REF_NAME-windows-x86_64.zip"
+          $out = "build/windows-verify"
+          if (Test-Path $out) { Remove-Item $out -Recurse -Force }
+          Expand-Archive -Path $zip -DestinationPath $out
+
+          $dumpbin = Get-ChildItem -Path "${env:ProgramFiles}\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin.exe not found under Program Files — unexpected for the pinned windows-2022 image" }
+
+          foreach ($exe in @("suramak.exe", "suramak-cli.exe")) {
+            $packaged = Join-Path $out $exe
+            if (-not (Test-Path $packaged)) { throw "$exe is missing from the zip" }
+            $inside = (Get-FileHash $packaged -Algorithm SHA256).Hash
+            $built  = (Get-FileHash "target/release/$exe" -Algorithm SHA256).Hash
+            if ($inside -ne $built) { throw "$exe inside the zip is not byte-identical to target/release/$exe" }
+
+            $deps = & $dumpbin.FullName /dependents $packaged | Out-String
+            if ($LASTEXITCODE -ne 0) { throw "dumpbin /dependents failed on $exe" }
+            Write-Host "--- $exe imports ---"
+            Write-Host $deps
+            if ($deps -match '(?im)^\s*(vcruntime|msvcp)') {
+              throw "dynamic VC++ runtime import in packaged $exe — the static CRT (D4) is broken"
+            }
+          }
+
+          $headers = & $dumpbin.FullName /headers (Join-Path $out "suramak.exe") | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin /headers failed on suramak.exe" }
+          $gui = ($headers -split "`n" | Select-String -Pattern '\(Windows GUI\)').Line
+          $cui = ($headers -split "`n" | Select-String -Pattern '\(Windows CUI\)').Line
+          Write-Host "subsystem evidence: GUI=[$gui] CUI=[$cui]"
+          if (-not $gui -or $cui) { throw "packaged suramak.exe is not a Windows GUI subsystem binary (GUI=[$gui] CUI=[$cui])" }
+
+          # A console binary here proves the two EXEs were not swapped.
+          $cliHeaders = & $dumpbin.FullName /headers (Join-Path $out "suramak-cli.exe") | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin /headers failed on suramak-cli.exe" }
+          if ($cliHeaders -notmatch '\(Windows CUI\)') { throw "packaged suramak-cli.exe is not a console binary — wrong binary in the zip?" }
+          Write-Host "PE-OK: suramak.exe (Windows GUI), suramak-cli.exe (Windows CUI), no VCRUNTIME/MSVCP imports"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-app
+          path: |
+            suramak-*-windows-x86_64.zip
+            suramak-*-windows-x86_64.zip.sha256
+          if-no-files-found: error
+
   release:
     name: Publish GitHub Release
-    needs: [macos-app, linux-app, android-app]
+    needs: [macos-app, linux-app, android-app, windows-app]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -236,6 +359,8 @@ jobs:
             echo "Ad-hoc signed build: on first launch macOS may ask you to right-click → Open (Gatekeeper)."
             echo "Models are not bundled — they download on first use (sha256-pinned)."
             echo "Linux: extract the tarball and run ./suramak — needs a Vulkan or OpenGL capable desktop; suramak.desktop + icon are included for your app menu."
+            echo "Windows: extract the zip and run suramak.exe (suramak-cli.exe is the console CLI) — no installer; verify the download against the .sha256 file."
+            echo "Windows may show a SmartScreen note on first launch — More info → Run anyway; the binary is bit-for-bit the CI build with a published sha256."
             echo "Android: install the arm64-v8a APK (Android 10+; the model downloads on first use)."
             echo "Owner checklist for this machine: docs/USER_SMOKE.md"
           } >> RELEASE-NOTES.md
@@ -254,6 +379,8 @@ jobs:
             Suramak-*.zip
             Suramak-*.dmg
             suramak-*-linux-x86_64.tar.gz
+            suramak-*-windows-x86_64.zip
+            suramak-*-windows-x86_64.zip.sha256
             suramak-*-android-arm64-v8a.apk
             suramak-*-android-arm64-v8a.apk.sha256
             appcast.xml
