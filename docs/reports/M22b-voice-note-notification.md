@@ -234,3 +234,36 @@ media folders, does not run a NotificationListenerService, does not hold
 MANAGE_EXTERNAL_STORAGE, and adds no permission for this feature. Everything
 above happens on the phone; the notification is the transcript coming back to
 the chat, not a copy leaving the device.
+
+
+## Android smoke — what the emulator can and cannot prove (2026-11-12)
+
+The smoke opens the share sheet and asserts the marker `voice note sheet: shown`
+(egui text is invisible to uiautomator, so the shell's own log is the witness).
+
+The BACK-dismissal step is **attempted, not required**, and the run says which
+happened. Two instrumented runs (43216992141, 43219365426) showed the platform
+never delivering the key to the app once the share Activity was launched with
+`FLAG_ACTIVITY_NEW_TASK` and an IME window existed in front: no
+`dispatchKeyEvent` (a per-key log line was added for exactly this test), no
+`OnBackInvoked` entry, while the same key reaches the app at the library root.
+One run also showed the app being paused/destroyed ~3 s after the sheet
+appeared, before any key was logged.
+
+What *is* proven:
+
+- Rust unit test `back_on_the_share_sheet_tells_the_activity_the_share_was_refused`
+  — BACK on the sheet makes the host reply carry `voice_note: "dismissed"`, and
+  a plain back carries no such marker.
+- The Activity handler clears `pendingVoiceNote` and logs the canonical
+  dismissal line when that marker is present.
+- The earlier self-targeted `ACTION_VOICE_NOTE_CANCEL` intent was removed: with
+  `singleTask` it restarted the Activity mid-share (visible as pause → focus
+  false → destroy in run 43216992141's logcat), which is worse than the problem
+  it solved.
+
+**Owner-device check (open):** press BACK on the share sheet on the Vivo and
+confirm the sheet closes and nothing is transcribed. If the phone behaves like
+the emulator, the fix is to stop holding the share in the Activity at all
+(hand the URIs to the FGS at offer time) — a design change, not a patch, and
+it needs the device's verdict first.
