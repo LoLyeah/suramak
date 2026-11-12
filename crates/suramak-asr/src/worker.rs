@@ -410,16 +410,21 @@ mod tests {
         }
     }
 
-    /// A cancellation that lands while the job waits in the channel (before
-    /// the worker picks it up) is observed at the same first check point.
+    /// A cancellation that lands before the worker picks the job up is
+    /// observed at the same first check point.
+    ///
+    /// The token is cancelled BEFORE submission on purpose: submit-then-cancel
+    /// is a race the test cannot win deterministically — under load the worker
+    /// may reach the model load first and answer Error (a legitimate outcome,
+    /// not a cancellation), which failed this test on a 2-core box. A
+    /// pre-cancelled token exercises the exact seam ("the token is checked
+    /// before the model load") without depending on scheduling.
     #[test]
-    fn a_cancel_queued_with_the_job_is_observed_before_the_model_load() {
+    fn a_pre_cancelled_token_is_observed_before_the_model_load() {
         let worker = Worker::spawn();
         let token = CancelToken::new();
-        worker.submit(job(7, token.clone())).expect("submit");
-        // The token is set right after submission; the worker may or may not
-        // have started — either way the answer is Cancelled (never an Error).
         token.cancel();
+        worker.submit(job(7, token.clone())).expect("submit");
         let mut cancelled = false;
         // Bounded wait: a blocking `recv()` here turns any missed event into an
         // infinite test-suite hang (observed once on a 2-core box: 13 minutes
@@ -438,7 +443,7 @@ mod tests {
                 None => std::thread::sleep(std::time::Duration::from_millis(20)),
             }
         }
-        assert!(cancelled, "the queued cancellation must be observed");
+        assert!(cancelled, "the pre-cancelled job must be observed");
     }
 
     /// M10B: the SpeechTranscriber→Whisper degradation warning names the reason

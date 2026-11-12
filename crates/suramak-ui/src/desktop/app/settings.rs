@@ -1420,7 +1420,13 @@ fn row_caption(ui: &mut egui::Ui, tokens: &Tokens, text: &str, error: bool) {
         // visible clip — not the layout max-rect, which inside the scroll area
         // can be looser than the pane — so a caption can never run past the
         // pane edge at the 900×600 minimum.
-        let width = (ui.clip_rect().right() - ui.cursor().left()).max(120.0);
+        // The clip rect can be looser than the pane: a control in another row
+        // can widen the scroll content past the viewport, and the clip is then
+        // the window edge, not the pane. Clamp to the pane's padded edge so the
+        // caption wraps inside it (M20A found this when Inter's narrower
+        // metrics let a row fill the whole clip for the first time).
+        let pane_right = ui.clip_rect().right() - PANE_PAD_X;
+        let width = (pane_right - ui.cursor().left()).max(120.0);
         ui.scope(|ui| {
             ui.set_max_width(width);
             pane_caption(ui, text, tokens, error);

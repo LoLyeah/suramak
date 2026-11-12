@@ -1,9 +1,11 @@
 //! Theme tokens + typography (M9a): ONE material ladder, TWO appearances.
 //!
-//! Typography follows the direction contract (`.impeccable/surface-brief-body.md`):
-//! system faces only — SF Pro / New York / SF Mono on macOS, loaded from
-//! `/System/Library/Fonts` at runtime and silently skipped when absent (no font
-//! files are shipped). Everywhere else egui's defaults stand in.
+//! Typography follows the direction contract (`.impeccable/surface-brief-body.md`)
+//! with one M20A amendment: macOS keeps the system faces (SF Pro / New York /
+//! SF Mono, loaded from `/System/Library/Fonts` at runtime); every other
+//! platform loads the five bundled OFL statics under `assets/fonts/` (Inter
+//! 400/500/600, Newsreader 400, Geist Mono 400) so the phone no longer renders
+//! egui's 2019 fallbacks. See [`crate::deck::fonts`] for the table.
 //!
 //! The M9a token ladder replaces the ad-hoc palette:
 //!
@@ -26,17 +28,17 @@ use egui::{Color32, CornerRadius, Stroke, ThemePreference, Visuals};
 
 use suramak_core::settings::Appearance;
 
-#[cfg(target_os = "macos")]
 use egui::FontData;
 use egui::{FontDefinitions, FontFamily};
-#[cfg(target_os = "macos")]
 use std::sync::Arc;
 
 /// New York (serif) family name; always registered (falls back to proportional).
 pub const SERIF_FAMILY: &str = "suramak-serif";
-const SANS_FACE: &str = "suramak-sf-pro";
-const SERIF_FACE: &str = "suramak-new-york";
-const MONO_FACE: &str = "suramak-sf-mono";
+/// Carbon's `SansMedium`: Inter Medium 500 on Android/Windows/Linux; SF Pro on
+/// macOS, whose variable system face has no static Medium instance to load.
+pub const SANS_MEDIUM_FAMILY: &str = "SansMedium";
+/// Carbon's `SansSemiBold`: Inter SemiBold 600 (SF Pro on macOS — see above).
+pub const SANS_SEMIBOLD_FAMILY: &str = "SansSemiBold";
 
 /// The resolved appearance the app draws with (System has been decided).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -585,38 +587,163 @@ pub fn visuals(tokens: &Tokens, theme: AppTheme) -> Visuals {
 /// Registers the font families on the egui context (once, at startup).
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
-
-    #[cfg(target_os = "macos")]
-    let (sans_loaded, serif_loaded, mono_loaded) = load_system_fonts(&mut fonts);
-    #[cfg(not(target_os = "macos"))]
-    let (sans_loaded, serif_loaded, mono_loaded) = (false, false, false);
-
-    if sans_loaded {
-        prepend_face(&mut fonts, FontFamily::Proportional, SANS_FACE);
-    }
-    if mono_loaded {
-        prepend_face(&mut fonts, FontFamily::Monospace, MONO_FACE);
-    }
-
-    // The serif family always exists: New York first when present, then the
-    // proportional stack so text still renders without the system face.
-    let mut serif_stack: Vec<String> = Vec::new();
-    if serif_loaded {
-        serif_stack.push(SERIF_FACE.to_owned());
-    }
-    if let Some(proportional) = fonts.families.get(&FontFamily::Proportional) {
-        serif_stack.extend(proportional.iter().cloned());
-    }
-    fonts
-        .families
-        .insert(FontFamily::Name(SERIF_FAMILY.into()), serif_stack);
-
+    register_fonts(&mut fonts);
     ctx.set_fonts(fonts);
+}
+
+/// Which faces a registration filled (the tests read this; every field is the
+/// *effective* table, not the intent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Registered {
+    pub sans: bool,
+    pub medium: bool,
+    pub semibold: bool,
+    pub serif: bool,
+    pub mono: bool,
+}
+
+impl Registered {
+    /// Every role resolves to a loaded face — the five bundled statics off
+    /// macOS, the three system faces (plus SF Pro standing in for the weight
+    /// roles) on it.
+    pub fn all(&self) -> bool {
+        self.sans && self.medium && self.semibold && self.serif && self.mono
+    }
+}
+
+/// Applies the platform font table to `fonts`.
+///
+/// * **macOS** — SF Pro / New York / SF Mono from `/System/Library/Fonts`,
+///   exactly as M9a did; a missing file keeps egui's stack (PLAN §1).
+/// * **Android / Windows / Linux** — the five bundled statics: Inter 400 fills
+///   `Proportional`, 500 and 600 fill the named weight families, Newsreader
+///   fills the serif family, Geist Mono fills `Monospace`.
+///
+/// The weight families exist on BOTH platforms so a screen can ask for
+/// `theme::sans_medium()` without a `cfg`: on macOS they resolve to SF Pro
+/// (the system ships no static Medium/SemiBold face to load).
+pub fn register_fonts(fonts: &mut FontDefinitions) -> Registered {
+    let faces = platform_faces(fonts);
+    debug_assert!(
+        fonts
+            .families
+            .get(&FontFamily::Proportional)
+            .is_some_and(|stack| !stack.is_empty()),
+        "egui's default Proportional stack must be non-empty"
+    );
+
+    if let Some(id) = faces.sans {
+        prepend_face(fonts, FontFamily::Proportional, id);
+    }
+    if let Some(id) = faces.mono {
+        prepend_face(fonts, FontFamily::Monospace, id);
+    }
+
+    // The proportional stack AFTER the bundled/system sans was prepended: the
+    // serif and weight families fall back through it, so a glyph the display
+    // face does not carry lands on the sans of the same vintage (Inter off
+    // macOS, SF Pro on it), not on egui's Ubuntu-Light.
+    let proportional = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+
+    // The serif family always exists: its own face first when present, then
+    // the proportional stack so text still renders without the serif.
+    let mut serif = Vec::new();
+    if let Some(id) = faces.serif {
+        serif.push(id.to_owned());
+    }
+    serif.extend(proportional.iter().cloned());
+    fonts.families.insert(serif_family(), serif);
+
+    // The named weight families, same shape: the weight face then the
+    // proportional stack for glyphs the face does not carry.
+    for (family, face) in [
+        (SANS_MEDIUM_FAMILY, faces.medium.or(faces.sans)),
+        (SANS_SEMIBOLD_FAMILY, faces.semibold.or(faces.sans)),
+    ] {
+        let mut stack = Vec::new();
+        if let Some(id) = face {
+            stack.push(id.to_owned());
+        }
+        stack.extend(proportional.iter().cloned());
+        fonts
+            .families
+            .insert(FontFamily::Name(family.into()), stack);
+    }
+
+    Registered {
+        sans: faces.sans.is_some(),
+        medium: faces.medium.is_some(),
+        semibold: faces.semibold.is_some(),
+        serif: faces.serif.is_some(),
+        mono: faces.mono.is_some(),
+    }
+}
+
+/// The effective face ids for this platform, after the system files are read.
+struct FaceIds {
+    sans: Option<&'static str>,
+    medium: Option<&'static str>,
+    semibold: Option<&'static str>,
+    serif: Option<&'static str>,
+    mono: Option<&'static str>,
+}
+
+#[cfg(target_os = "macos")]
+fn platform_faces(fonts: &mut FontDefinitions) -> FaceIds {
+    use crate::deck::fonts::MACOS_SYSTEM;
+    let [sans, serif, mono] = MACOS_SYSTEM;
+    let sans_loaded = load_face(fonts, sans.id, sans.path);
+    let serif_loaded = load_face(fonts, serif.id, serif.path);
+    let mono_loaded = load_face(fonts, mono.id, mono.path);
+    FaceIds {
+        // SF Pro is the only proportional face the system ships, so the weight
+        // roles resolve to it — no static Medium/SemiBold instance exists to
+        // load, and the rendering is the unchanged M9a one.
+        sans: sans_loaded.then_some(sans.id),
+        medium: sans_loaded.then_some(sans.id),
+        semibold: sans_loaded.then_some(sans.id),
+        serif: serif_loaded.then_some(serif.id),
+        mono: mono_loaded.then_some(mono.id),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_faces(fonts: &mut FontDefinitions) -> FaceIds {
+    use crate::deck::fonts::{
+        GEIST_MONO_REGULAR, INTER_MEDIUM, INTER_REGULAR, INTER_SEMIBOLD, NEWSREADER_REGULAR,
+    };
+    for face in crate::deck::fonts::bundled_faces() {
+        fonts.font_data.insert(
+            face.id.to_owned(),
+            Arc::new(FontData::from_static(face.bytes)),
+        );
+    }
+    FaceIds {
+        sans: Some(INTER_REGULAR),
+        medium: Some(INTER_MEDIUM),
+        semibold: Some(INTER_SEMIBOLD),
+        serif: Some(NEWSREADER_REGULAR),
+        mono: Some(GEIST_MONO_REGULAR),
+    }
 }
 
 /// The New York family (falls back to proportional when the system face is absent).
 pub fn serif_family() -> FontFamily {
     FontFamily::Name(SERIF_FAMILY.into())
+}
+
+/// `SansMedium` — Inter Medium 500 off macOS, SF Pro on it.
+pub fn sans_medium() -> FontFamily {
+    FontFamily::Name(SANS_MEDIUM_FAMILY.into())
+}
+
+/// `SansSemiBold` — Inter SemiBold 600 off macOS, SF Pro on it.
+pub fn sans_semibold() -> FontFamily {
+    FontFamily::Name(SANS_SEMIBOLD_FAMILY.into())
 }
 
 fn prepend_face(fonts: &mut FontDefinitions, family: FontFamily, face: &str) {
@@ -627,17 +754,8 @@ fn prepend_face(fonts: &mut FontDefinitions, family: FontFamily, face: &str) {
         .insert(0, face.to_owned());
 }
 
-/// Loads SF Pro / New York / SF Mono from the system font directory.
-/// Returns which faces loaded; absent files are skipped silently (PLAN §1).
-#[cfg(target_os = "macos")]
-fn load_system_fonts(fonts: &mut FontDefinitions) -> (bool, bool, bool) {
-    (
-        load_face(fonts, SANS_FACE, "/System/Library/Fonts/SFNS.ttf"),
-        load_face(fonts, SERIF_FACE, "/System/Library/Fonts/NewYork.ttf"),
-        load_face(fonts, MONO_FACE, "/System/Library/Fonts/SFNSMono.ttf"),
-    )
-}
-
+/// Loads one face from an absolute system path. Returns whether it loaded;
+/// absent files are skipped silently (PLAN §1).
 #[cfg(target_os = "macos")]
 fn load_face(fonts: &mut FontDefinitions, name: &str, path: &str) -> bool {
     let Ok(bytes) = std::fs::read(path) else {
@@ -783,7 +901,170 @@ mod tests {
         assert_eq!(ctx.style().animation_time, 0.0);
     }
 
-    // ---- M9d item 7: the WCAG contrast artifact ----------------------------
+    // ---- M20A: the platform font table -------------------------------------
+
+    /// Every family the Deck asks for exists, is non-empty, and references
+    /// only faces that were actually inserted — so `set_fonts` cannot panic on
+    /// a dangling key.
+    #[test]
+    fn the_platform_table_fills_every_family() {
+        let mut fonts = FontDefinitions::default();
+        let registered = register_fonts(&mut fonts);
+
+        assert!(!fonts.families.is_empty());
+        for (family, stack) in &fonts.families {
+            assert!(!stack.is_empty(), "{family:?} must not be an empty stack");
+            for id in stack {
+                assert!(
+                    fonts.font_data.contains_key(id),
+                    "{family:?} references {id}, which was never inserted"
+                );
+            }
+        }
+        // The plan's family names are exact.
+        assert!(fonts.families.contains_key(&serif_family()));
+        assert!(fonts.families.contains_key(&sans_medium()));
+        assert!(fonts.families.contains_key(&sans_semibold()));
+        assert_eq!(SANS_MEDIUM_FAMILY, "SansMedium");
+        assert_eq!(SANS_SEMIBOLD_FAMILY, "SansSemiBold");
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            use crate::deck::fonts::{
+                GEIST_MONO_REGULAR, INTER_MEDIUM, INTER_REGULAR, INTER_SEMIBOLD, NEWSREADER_REGULAR,
+            };
+            assert!(registered.all(), "the five bundled faces all load");
+            assert_eq!(
+                fonts.families[&FontFamily::Proportional].first(),
+                Some(&INTER_REGULAR.to_owned())
+            );
+            assert_eq!(
+                fonts.families[&FontFamily::Monospace].first(),
+                Some(&GEIST_MONO_REGULAR.to_owned())
+            );
+            assert_eq!(
+                fonts.families[&serif_family()].first(),
+                Some(&NEWSREADER_REGULAR.to_owned())
+            );
+            assert_eq!(
+                fonts.families[&sans_medium()].first(),
+                Some(&INTER_MEDIUM.to_owned())
+            );
+            assert_eq!(
+                fonts.families[&sans_semibold()].first(),
+                Some(&INTER_SEMIBOLD.to_owned())
+            );
+            // egui's own fallbacks remain behind the bundled face (emoji and
+            // any glyph the subset does not carry).
+            assert!(
+                fonts.families[&FontFamily::Proportional].len() > 1,
+                "the proportional stack keeps its fallbacks"
+            );
+            // The display/weight families fall back to the bundled sans
+            // before egui's stack — a missing serif glyph must not turn into
+            // Ubuntu-Light in the middle of a title.
+            assert_eq!(
+                fonts.families[&serif_family()].get(1),
+                Some(&INTER_REGULAR.to_owned())
+            );
+            assert_eq!(
+                fonts.families[&sans_medium()].get(1),
+                Some(&INTER_REGULAR.to_owned())
+            );
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            use crate::deck::fonts::{NEW_YORK, SF_MONO, SF_PRO};
+            assert_eq!(
+                fonts.families[&FontFamily::Proportional]
+                    .first()
+                    .map(String::as_str),
+                registered.sans.then_some(SF_PRO),
+            );
+            assert_eq!(
+                fonts.families[&FontFamily::Monospace]
+                    .first()
+                    .map(String::as_str),
+                registered.mono.then_some(SF_MONO),
+            );
+            assert_eq!(
+                fonts.families[&serif_family()].first().map(String::as_str),
+                registered.serif.then_some(NEW_YORK),
+            );
+            // No static SF weight instances exist: the weight families fall
+            // back to the one proportional face, exactly the M9a rendering.
+            assert_eq!(
+                fonts.families[&sans_medium()].first().map(String::as_str),
+                registered.sans.then_some(SF_PRO),
+            );
+        }
+    }
+
+    /// Width of `text` in `family` at `size`, through egui's real layout.
+    fn width(ctx: &egui::Context, family: FontFamily, size: f32, text: &str) -> f32 {
+        ctx.fonts_mut(|fonts| {
+            fonts
+                .layout_no_wrap(
+                    text.to_owned(),
+                    egui::FontId::new(size, family),
+                    Color32::WHITE,
+                )
+                .size()
+                .x
+        })
+    }
+
+    /// The faces that render are the ones the table installed: the bundled
+    /// Inter covers the punctuation and Indonesian accents, and its metrics
+    /// differ from egui's baked-in Ubuntu-Light (which is the bug M20A closes).
+    #[test]
+    fn the_installed_faces_are_the_ones_that_render() {
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+
+        let body = egui::FontId::new(15.5, FontFamily::Proportional);
+        let covered = "éñüß’“”—…€™→";
+        assert!(
+            ctx.fonts_mut(|fonts| fonts.has_glyphs(&body, covered)),
+            "the proportional face must carry the Deck's punctuation and accents"
+        );
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Stock egui (no install_fonts) renders Ubuntu-Light. The bundled
+            // Inter must beat a different width, or nothing was installed.
+            let stock = egui::Context::default();
+            let _ = stock.run(egui::RawInput::default(), |_| {});
+            let stock_width = width(&stock, FontFamily::Proportional, 20.0, "Hamburgefonstiv");
+            let inter_width = width(&ctx, FontFamily::Proportional, 20.0, "Hamburgefonstiv");
+            assert!(stock_width > 0.0 && inter_width > 0.0);
+            assert!(
+                (stock_width - inter_width).abs() > 0.5,
+                "the bundled face must replace Ubuntu-Light (stock {stock_width}, installed {inter_width})"
+            );
+            // The weight families resolve to the real 500/600 statics: the
+            // same string is wider as the weight rises.
+            let regular = width(&ctx, FontFamily::Proportional, 15.0, "Hamburgefonstiv");
+            let medium = width(&ctx, sans_medium(), 15.0, "Hamburgefonstiv");
+            let semibold = width(&ctx, sans_semibold(), 15.0, "Hamburgefonstiv");
+            assert!(
+                medium > regular && semibold > medium,
+                "weights must step: {regular} < {medium} < {semibold}"
+            );
+            // The serif is Newsreader, not a fallback to the sans: its
+            // metrics differ from the proportional face at the same size.
+            let serif = width(&ctx, serif_family(), 21.0, "No transcripts yet");
+            let sans = width(&ctx, FontFamily::Proportional, 21.0, "No transcripts yet");
+            assert!(
+                (serif - sans).abs() > 0.5,
+                "the serif family must resolve to its own face ({serif} vs {sans})"
+            );
+        }
+    }
+
+    // ---- M20A: the WCAG contrast artifact ----------------------------
 
     /// The key text pairs must clear WCAG AA for small text (≥ 4.5:1) on
     /// **both** ladders (macOS translucent + desktop opaque) and both

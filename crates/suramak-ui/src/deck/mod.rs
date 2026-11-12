@@ -15,9 +15,13 @@
 pub mod bounds;
 pub mod compact;
 pub mod controls;
+// M20A: the bundled OFL faces (embedded statics) + their platform table.
+pub mod fonts;
 pub mod motion;
 pub mod nav;
 pub mod snapshot;
 // M16I: the shared speaker badge + 8 px lane (desktop and phone draw the same).
 pub mod speakers;
 pub mod theme;
+// M20A: the plan's type scale as tokens (FontId + tracking + line height).
+pub mod type_scale;

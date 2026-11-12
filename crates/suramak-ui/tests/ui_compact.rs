@@ -1192,3 +1192,102 @@ fn the_quit_row_clears_the_pill_when_android_reports_no_inset() {
         "the phone floor moves the last row up; desktop keeps the plain gutter"
     );
 }
+
+// ---------------------------------------------------------------------------
+// M20A: the bundled faces on the phone's 360 dp column
+// ---------------------------------------------------------------------------
+
+/// Indonesian is pure Latin but agglutinative, so its words are long
+/// (`mentranskripsikan`, `ketidakberdayaan`) and a proportional UI face has to
+/// wrap them without crowding or overflowing. This drives the real egui
+/// layout with the bundled Inter at the narrowest supported device width and
+/// the phone's content column, and asserts the wrap is finite and inside the
+/// measure.
+#[test]
+fn indonesian_long_words_wrap_at_360_dp() {
+    use egui::{Color32, FontId};
+    use suramak_ui::deck::type_scale;
+
+    let app = seeded_app();
+    let ctx = fresh_context(&app);
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 800.0));
+    let _ = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            time: Some(0.0),
+            ..Default::default()
+        },
+        |_| {},
+    );
+
+    let body = type_scale::body();
+    let paragraph = "Kami mentranskripsikan rekaman rapat mengenai ketidakberdayaan \
+sistem lama, lalu memverifikasi keberlanjutan keputusan tersebut bersama seluruh \
+anggota tim produk dan tim desain pada hari Kamis.";
+
+    for width in [360.0_f32, 328.0] {
+        let galley = ctx.fonts_mut(|fonts| {
+            fonts.layout(
+                paragraph.to_owned(),
+                body.font.clone(),
+                Color32::WHITE,
+                width,
+            )
+        });
+        let rows = galley.rows.len();
+        assert!(
+            (2..=14).contains(&rows),
+            "a {width} pt column must wrap the paragraph into a sane number of rows: {rows}"
+        );
+        for (index, row) in galley.rows.iter().enumerate() {
+            assert!(
+                row.rect().width() <= width + 0.5,
+                "row {index} is {} pt wide in a {width} pt column",
+                row.rect().width()
+            );
+        }
+    }
+
+    // The longest word fits unwrapped inside the device width (epaint does not
+    // hyphenate: a word wider than the column would be split mid-word).
+    let longest = "ketidakberdayaan";
+    let width = ctx.fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap(longest.to_owned(), body.font.clone(), Color32::WHITE)
+            .size()
+            .x
+    });
+    assert!(
+        width < 360.0,
+        "{longest} is {width} pt — wider than the 360 dp column"
+    );
+
+    // And the body face really is the bundled one: the same run in egui's
+    // stock Ubuntu-Light has different metrics.
+    let stock = egui::Context::default();
+    let _ = stock.run(egui::RawInput::default(), |_| {});
+    let stock_width = stock.fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap(
+                paragraph.to_owned(),
+                FontId::new(body.size(), egui::FontFamily::Proportional),
+                Color32::WHITE,
+            )
+            .size()
+            .x
+    });
+    let bundled_width = ctx.fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap(
+                paragraph.to_owned(),
+                FontId::new(body.size(), egui::FontFamily::Proportional),
+                Color32::WHITE,
+            )
+            .size()
+            .x
+    });
+    assert!(
+        (stock_width - bundled_width).abs() > 1.0,
+        "the phone must render the bundled face (stock {stock_width}, bundled {bundled_width})"
+    );
+}

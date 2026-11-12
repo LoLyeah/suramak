@@ -64,9 +64,13 @@ pub fn theme_caption(platform: Platform) -> &'static str {
              appearance. Applied when you press Save."
         }
         Platform::Linux => {
-            "System follows the desktop theme when the desktop reports one (Linux falls back to \
-             Light otherwise); Light or Dark forces this app's appearance. Applied when you \
-             press Save."
+            // M20A: the caption wraps in the field column (491 pt at the
+            // 900×600 minimum) under the bundled Inter; the older, longer
+            // sentence left "Save." alone on a third line. Same facts — the
+            // pinned phrases the copy tests require stay — in fewer words:
+            // the M14e Windows rule, applied to the Linux variant.
+            "Linux follows the desktop theme when the desktop reports one and falls back to \
+             Light; Light or Dark forces this app's appearance. Applied when you press Save."
         }
     }
 }

@@ -10,6 +10,26 @@
 //! Reduce Motion (macOS `NSWorkspace.accessibilityDisplayShouldReduceMotion`,
 //! read through `suramak-glass`) sets every duration to 0 — a snap. Opacity is
 //! kept where legibility demands it (a snapped-to-1 fade is simply opaque).
+//!
+//! ## M20A: the screen-facing vocabulary
+//!
+//! The M9a helpers animate an egui `Id` through the context ([`Motion::factor`],
+//! [`Motion::press_spring`]); they are what the desktop's widgets use. The
+//! phone's transitions are state machines owned by the caller, so M20A adds a
+//! second, pure family that takes `now` and returns plain values:
+//!
+//! | helper | token | what moves | Reduce Motion |
+//! |---|---|---|---|
+//! | [`ScreenMotion`] | [`SLOW`] | incoming ±24 pt X + alpha; outgoing ∓8 pt + alpha | [`FAST`] crossfade, no travel |
+//! | [`SheetMotion`] | [`SLOW`] | slide 100 %→0 + scrim + alpha | [`FAST`] crossfade, no slide |
+//! | [`PressMotion`] | [`FAST`] in / [`SPRING_DURATION`] out | scale 1→0.97 + fill 0→1 | fill swap, no scale |
+//! | [`SuccessBadge`] | [`BASE`] scale, [`SLOW`] flash | scale 0.88→1 + `ok` flash 0.22→0 | instant |
+//! | [`RubberBand`] | [`BASE`] release | ≤4 pt offset past a scroll bound | hard clamp |
+//!
+//! Each ends exactly at its endpoint and reports `running` — and
+//! [`AnimationClock`] turns "any helper running" into at most one
+//! `request_repaint` per frame. That is the whole repaint discipline: no idle
+//! loop exists to forget.
 
 use egui::{Color32, Id};
 
@@ -334,9 +354,512 @@ struct SeekEase {
     easing: bool,
 }
 
+// ---------------------------------------------------------------------------
+// M20A: the screen-facing motion vocabulary (pure, caller-owned state)
+// ---------------------------------------------------------------------------
+
+/// How far the arriving screen travels on a push/pop, in points (the plan's
+/// ±24). The outgoing screen drifts the other way by [`SCREEN_EXIT_TRAVEL`].
+pub const SCREEN_TRAVEL: f32 = 24.0;
+/// The departing screen's drift, in points (the plan's ∓8).
+pub const SCREEN_EXIT_TRAVEL: f32 = 8.0;
+/// The press scale (the plan's 0.97 — the same value as the M9d pill spring).
+pub const PRESS_SCALE: f32 = SPRING_PRESS_SCALE;
+/// The success badge's starting scale (the plan's 0.88).
+pub const SUCCESS_SCALE_FROM: f32 = 0.88;
+/// The success flash's starting alpha (the `ok` tint at 0.22).
+pub const SUCCESS_FLASH_ALPHA: f32 = 0.22;
+/// The scroll rubber-band's ceiling, in points (the plan's 2–4).
+pub const RUBBER_MAX: f32 = 4.0;
+/// The distance (points) at which the rubber-band reaches 1 − 1/e of its
+/// ceiling — the resistance constant.
+pub const RUBBER_RESISTANCE: f32 = 24.0;
+
+/// The easing a [`Tween`] rides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Curve {
+    /// The one ease-out ([`ease_out`]).
+    Ease,
+    /// The Deck's damped spring ([`spring_ease`]) — press release only.
+    Spring,
+}
+
+/// A one-shot scalar animation: from `from` at `start`, exactly `to` once
+/// `duration` has elapsed, eased in between.
+///
+/// `sample` returns the value **and whether the tween is still running**, which
+/// is the only thing allowed to request a repaint (see [`AnimationClock`]). A
+/// zero duration is the Reduce Motion snap: the first sample is already the
+/// endpoint and nothing runs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Tween {
+    from: f32,
+    to: f32,
+    value: f32,
+    started_at: f64,
+    duration: f32,
+    curve: Curve,
+    running: bool,
+}
+
+impl Tween {
+    /// A tween that has already settled at `value` — the first frame of a
+    /// helper must not animate (no startup teleport).
+    fn settled(value: f32) -> Self {
+        Self {
+            from: value,
+            to: value,
+            value,
+            started_at: 0.0,
+            duration: 0.0,
+            curve: Curve::Ease,
+            running: false,
+        }
+    }
+
+    /// Starts a tween at `now`. `duration == 0` settles immediately.
+    fn begin(from: f32, to: f32, now: f64, duration: f32, curve: Curve) -> Self {
+        let mut tween = Self {
+            from,
+            to,
+            value: from,
+            started_at: now,
+            duration,
+            curve,
+            running: true,
+        };
+        // A zero token is Reduce Motion's snap: no frame is ever needed.
+        if duration <= 0.0 {
+            tween.value = to;
+            tween.running = false;
+        }
+        tween
+    }
+
+    /// Retargets toward a new endpoint, continuing from the current value (a
+    /// mid-flight flip never snaps back and never queues).
+    fn retarget(&mut self, to: f32, now: f64, duration: f32, curve: Curve) {
+        if self.running && to == self.to {
+            return; // already heading there — do not restart the clock
+        }
+        if to == self.value && to == self.to {
+            return; // settled at the requested value
+        }
+        self.from = self.value;
+        self.to = to;
+        self.started_at = now;
+        self.duration = duration;
+        self.curve = curve;
+        self.running = true;
+        if duration <= 0.0 {
+            self.value = to;
+            self.running = false;
+        }
+    }
+
+    /// Jumps to `value` with no animation (a drag's frame-by-frame offset, or
+    /// Reduce Motion's instant swap).
+    fn snap(&mut self, value: f32) {
+        self.from = value;
+        self.to = value;
+        self.value = value;
+        self.running = false;
+    }
+
+    fn running(&self) -> bool {
+        self.running
+    }
+
+    /// Advances to `now`. Returns `(value, running)`; once `running` is false
+    /// the value is exactly `to` and stays there.
+    fn sample(&mut self, now: f64) -> (f32, bool) {
+        if !self.running {
+            return (self.value, false);
+        }
+        // A host-started tween can carry a clock base older than this frame's
+        // (a context rebuild). Re-anchor rather than run backwards forever.
+        reanchor(&mut self.started_at, now);
+        let elapsed = (now - self.started_at).max(0.0) as f32;
+        if self.duration <= 0.0 || elapsed >= self.duration {
+            self.value = self.to;
+            self.running = false;
+            return (self.value, false);
+        }
+        let t = elapsed / self.duration;
+        let eased = match self.curve {
+            Curve::Ease => ease_out(t),
+            Curve::Spring => spring_ease(t),
+        };
+        self.value = self.from + (self.to - self.from) * eased;
+        (self.value, true)
+    }
+}
+
+/// Which way a screen transition goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenDirection {
+    /// A new screen enters from the right (`+X`).
+    Push,
+    /// The current screen leaves to the right (`−X` arriving from the left).
+    Pop,
+}
+
+/// One frame of a screen transition, in points / alpha.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScreenFrame {
+    /// Incoming screen's horizontal offset; 0 at the end.
+    pub incoming_dx: f32,
+    /// Incoming screen's opacity; 1 at the end.
+    pub incoming_alpha: f32,
+    /// Outgoing screen's horizontal offset; ±[`SCREEN_EXIT_TRAVEL`] at the
+    /// end, 0 at the start.
+    pub outgoing_dx: f32,
+    /// Outgoing screen's opacity; 0 at the end.
+    pub outgoing_alpha: f32,
+    /// True while another frame is needed.
+    pub running: bool,
+}
+
+/// A push/pop transition: [`SLOW`], incoming ±24 pt → 0 with an opacity
+/// crossfade, outgoing ∓8 pt drift. Under Reduce Motion the travel is removed
+/// and only a [`FAST`] crossfade remains (opacity is not vestibular motion —
+/// cutting straight to the next screen is what loses a reduced-motion user
+/// their place).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScreenMotion {
+    direction: ScreenDirection,
+    tween: Tween,
+    reduce: bool,
+}
+
+impl ScreenMotion {
+    /// A push starting at `now`.
+    pub fn push(now: f64, reduce: bool) -> Self {
+        Self::new(ScreenDirection::Push, now, reduce)
+    }
+
+    /// A pop starting at `now`.
+    pub fn pop(now: f64, reduce: bool) -> Self {
+        Self::new(ScreenDirection::Pop, now, reduce)
+    }
+
+    fn new(direction: ScreenDirection, now: f64, reduce: bool) -> Self {
+        let token = if reduce { FAST } else { SLOW };
+        Self {
+            direction,
+            tween: Tween::begin(0.0, 1.0, now, token, Curve::Ease),
+            reduce,
+        }
+    }
+
+    /// The transition's value this frame.
+    pub fn sample(&mut self, now: f64) -> ScreenFrame {
+        let (progress, running) = self.tween.sample(now);
+        if self.reduce {
+            return ScreenFrame {
+                incoming_dx: 0.0,
+                incoming_alpha: progress,
+                outgoing_dx: 0.0,
+                outgoing_alpha: 1.0 - progress,
+                running,
+            };
+        }
+        let sign = match self.direction {
+            ScreenDirection::Push => 1.0,
+            ScreenDirection::Pop => -1.0,
+        };
+        ScreenFrame {
+            incoming_dx: sign * SCREEN_TRAVEL * (1.0 - progress),
+            incoming_alpha: progress,
+            outgoing_dx: -sign * SCREEN_EXIT_TRAVEL * progress,
+            outgoing_alpha: 1.0 - progress,
+            running,
+        }
+    }
+
+    /// Whether the transition is still between endpoints.
+    pub fn is_running(&self) -> bool {
+        self.tween.running()
+    }
+}
+
+/// One frame of a sheet transition. `slide` is the fraction of the sheet's own
+/// height still below its resting place (1 = fully off, 0 = presented); the
+/// caller multiplies by the sheet rect's height.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SheetFrame {
+    pub slide: f32,
+    pub scrim: f32,
+    pub alpha: f32,
+    pub running: bool,
+}
+
+/// A sheet present/dismiss: [`SLOW`], slide 100 %→0 with the scrim and the
+/// sheet's own alpha rising together. Reduce Motion keeps the [`FAST`]
+/// crossfade and removes the slide.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SheetMotion {
+    presenting: bool,
+    tween: Tween,
+    reduce: bool,
+}
+
+impl SheetMotion {
+    /// A sheet presenting at `now`.
+    pub fn present(now: f64, reduce: bool) -> Self {
+        Self::new(true, now, reduce)
+    }
+
+    /// A sheet dismissing at `now`.
+    pub fn dismiss(now: f64, reduce: bool) -> Self {
+        Self::new(false, now, reduce)
+    }
+
+    fn new(presenting: bool, now: f64, reduce: bool) -> Self {
+        let token = if reduce { FAST } else { SLOW };
+        Self {
+            presenting,
+            tween: Tween::begin(0.0, 1.0, now, token, Curve::Ease),
+            reduce,
+        }
+    }
+
+    /// The sheet's value this frame.
+    pub fn sample(&mut self, now: f64) -> SheetFrame {
+        let (progress, running) = self.tween.sample(now);
+        // `shown` is the presentation level: 0 hidden, 1 presented. A dismiss
+        // runs the same 0→1 tween against the presentation it is leaving.
+        let shown = if self.presenting {
+            progress
+        } else {
+            1.0 - progress
+        };
+        SheetFrame {
+            slide: if self.reduce { 0.0 } else { 1.0 - shown },
+            scrim: shown,
+            alpha: shown,
+            running,
+        }
+    }
+
+    /// Whether the transition is still between endpoints.
+    pub fn is_running(&self) -> bool {
+        self.tween.running()
+    }
+}
+
+/// One frame of a press: the scale and the `control_active` fill strength.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PressFrame {
+    pub scale: f32,
+    pub fill: f32,
+    pub running: bool,
+}
+
+/// Row/button press: scale 1.0 → [`PRESS_SCALE`] and the `control_active` fill
+/// 0 → 1 over [`FAST`]; on release both spring back over
+/// [`SPRING_DURATION`]. Reduce Motion keeps the fill swap and removes the
+/// scale (the plan: "fill opacity swap only; no scale").
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PressMotion {
+    tween: Tween,
+    reduce: bool,
+}
+
+impl PressMotion {
+    /// A press at rest.
+    pub fn new(reduce: bool) -> Self {
+        Self {
+            tween: Tween::settled(0.0),
+            reduce,
+        }
+    }
+
+    /// Finger down (`pressed = true`) or up (`false`) at `now`.
+    pub fn set_pressed(&mut self, pressed: bool, now: f64) {
+        if self.reduce {
+            self.tween.snap(if pressed { 1.0 } else { 0.0 });
+            return;
+        }
+        if pressed {
+            self.tween.retarget(1.0, now, FAST, Curve::Ease);
+        } else {
+            self.tween
+                .retarget(0.0, now, SPRING_DURATION, Curve::Spring);
+        }
+    }
+
+    /// The press's value this frame.
+    pub fn sample(&mut self, now: f64) -> PressFrame {
+        let (amount, running) = self.tween.sample(now);
+        if self.reduce {
+            return PressFrame {
+                scale: 1.0,
+                fill: amount,
+                running,
+            };
+        }
+        PressFrame {
+            scale: 1.0 - (1.0 - PRESS_SCALE) * amount,
+            // The fill is a wash: a spring's bounded overshoot must not push
+            // the alpha outside 0..=1.
+            fill: amount.clamp(0.0, 1.0),
+            running,
+        }
+    }
+}
+
+/// One frame of a success badge: its scale and the fading `ok` tint.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SuccessFrame {
+    pub scale: f32,
+    /// The `ok` tint's alpha (0.22 → 0), for the caller to composite.
+    pub flash: f32,
+    pub running: bool,
+}
+
+/// The success/completion moment: the badge scales [`SUCCESS_SCALE_FROM`] → 1
+/// over [`BASE`] while the `ok` tint flashes [`SUCCESS_FLASH_ALPHA`] → 0 over
+/// [`SLOW`]. One authored moment, not a loop. Reduce Motion swaps the
+/// checkmark instantly (scale 1, no flash).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SuccessBadge {
+    scale: Tween,
+    flash: Tween,
+}
+
+impl SuccessBadge {
+    /// Starts the badge at `now`.
+    pub fn begin(now: f64, reduce: bool) -> Self {
+        if reduce {
+            return Self {
+                scale: Tween::settled(1.0),
+                flash: Tween::settled(0.0),
+            };
+        }
+        Self {
+            scale: Tween::begin(SUCCESS_SCALE_FROM, 1.0, now, BASE, Curve::Ease),
+            flash: Tween::begin(SUCCESS_FLASH_ALPHA, 0.0, now, SLOW, Curve::Ease),
+        }
+    }
+
+    /// The badge's value this frame (running while either half runs).
+    pub fn sample(&mut self, now: f64) -> SuccessFrame {
+        let (scale, scale_running) = self.scale.sample(now);
+        let (flash, flash_running) = self.flash.sample(now);
+        SuccessFrame {
+            scale,
+            flash,
+            running: scale_running || flash_running,
+        }
+    }
+}
+
+/// The rubber-band offset for a finger `overscroll` points past a scroll
+/// bound: signed, diminishing, and never wider than [`RUBBER_MAX`].
+pub fn rubber_offset(overscroll: f32) -> f32 {
+    if overscroll == 0.0 || !overscroll.is_finite() {
+        return 0.0;
+    }
+    let sign = overscroll.signum();
+    let distance = overscroll.abs();
+    sign * RUBBER_MAX * (1.0 - (-distance / RUBBER_RESISTANCE).exp())
+}
+
+/// The scroll rubber-band: while the finger is past a bound the content
+/// follows a resisted ≤4 pt offset; on release the offset eases back to 0 over
+/// [`BASE`]. Reduce Motion hard-clamps (offset 0, no release animation).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RubberBand {
+    offset: Tween,
+    reduce: bool,
+}
+
+impl RubberBand {
+    /// A band at rest.
+    pub fn new(reduce: bool) -> Self {
+        Self {
+            offset: Tween::settled(0.0),
+            reduce,
+        }
+    }
+
+    /// While dragging: sets the drawn offset from the finger's overscroll and
+    /// returns it. Called every frame the finger moves; no clock runs.
+    pub fn drag(&mut self, overscroll: f32) -> f32 {
+        let offset = if self.reduce {
+            0.0
+        } else {
+            rubber_offset(overscroll)
+        };
+        self.offset.snap(offset);
+        offset
+    }
+
+    /// The finger lifted at `now`: the offset returns to 0 over [`BASE`].
+    pub fn release(&mut self, now: f64) {
+        if self.reduce {
+            self.offset.snap(0.0);
+            return;
+        }
+        self.offset.retarget(0.0, now, BASE, Curve::Ease);
+    }
+
+    /// The offset this frame, and whether it is still returning.
+    pub fn sample(&mut self, now: f64) -> (f32, bool) {
+        self.offset.sample(now)
+    }
+
+    /// Whether the release is still returning to 0.
+    pub fn is_running(&self) -> bool {
+        self.offset.running()
+    }
+}
+
+/// The frame-level repaint gate for the authored motion.
+///
+/// A screen aggregates every helper's `running` into one clock and calls
+/// [`AnimationClock::request`] at the end of its frame. While at least one
+/// helper is between endpoints the clock asks for exactly one repaint; once
+/// they have all ended it asks for none, so an idle screen returns to
+/// on-demand rendering. There is deliberately no `request_repaint_after`: a
+/// timer is how an animation silently becomes an idle loop.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AnimationClock {
+    running: bool,
+}
+
+impl AnimationClock {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records one helper's running state.
+    pub fn note(&mut self, running: bool) {
+        self.running |= running;
+    }
+
+    /// Whether any helper is still running this frame.
+    pub fn running(&self) -> bool {
+        self.running
+    }
+
+    /// Requests a repaint **only** while something runs.
+    pub fn request(&self, ctx: &egui::Context) {
+        if self.running {
+            ctx.request_repaint();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Token seconds as the `f64` clock the M20A helpers take.
+    fn at(seconds: f32) -> f64 {
+        f64::from(seconds)
+    }
 
     fn run_frame(ctx: &egui::Context, time: f64, f: impl Fn(&egui::Context) -> f32) -> f32 {
         let input = egui::RawInput {
@@ -873,6 +1396,296 @@ mod tests {
             run_frame(&ctx, 1.02, |ctx| reduced
                 .seek_ease(ctx, snap, 1_000.0, BASE)),
             1_000.0
+        );
+    }
+
+    // ---- M20A: the screen-facing helpers -----------------------------------
+
+    /// A push travels in from +24 and ends exactly at rest; a pop mirrors it.
+    #[test]
+    fn a_screen_push_and_pop_travel_then_end() {
+        let mut push = ScreenMotion::push(0.0, false);
+        let start = push.sample(0.0);
+        assert_eq!(start.incoming_dx, SCREEN_TRAVEL);
+        assert_eq!(start.incoming_alpha, 0.0);
+        assert_eq!(start.outgoing_dx, 0.0);
+        assert_eq!(start.outgoing_alpha, 1.0);
+        assert!(start.running);
+
+        let mid = push.sample(at(SLOW / 2.0));
+        assert!(mid.incoming_dx > 0.0 && mid.incoming_dx < SCREEN_TRAVEL);
+        assert!(mid.incoming_alpha > 0.0 && mid.incoming_alpha < 1.0);
+        assert!(mid.outgoing_dx < 0.0 && mid.outgoing_dx > -SCREEN_EXIT_TRAVEL);
+        assert!(mid.running);
+
+        let end = push.sample(at(SLOW));
+        assert_eq!(end.incoming_dx, 0.0);
+        assert_eq!(end.incoming_alpha, 1.0);
+        assert_eq!(end.outgoing_dx, -SCREEN_EXIT_TRAVEL);
+        assert_eq!(end.outgoing_alpha, 0.0);
+        assert!(!end.running);
+        assert!(!push.is_running());
+
+        let mut pop = ScreenMotion::pop(0.0, false);
+        assert_eq!(pop.sample(0.0).incoming_dx, -SCREEN_TRAVEL);
+        let pop_end = pop.sample(at(SLOW));
+        assert_eq!(pop_end.incoming_dx, 0.0);
+        assert_eq!(pop_end.outgoing_dx, SCREEN_EXIT_TRAVEL);
+        assert!(!pop_end.running);
+    }
+
+    /// A sheet slides from fully off to fully presented and ends exactly; a
+    /// dismiss runs the other way from the presented state.
+    #[test]
+    fn a_sheet_slides_and_scrims_then_ends() {
+        let mut present = SheetMotion::present(0.0, false);
+        let start = present.sample(0.0);
+        assert_eq!(start.slide, 1.0);
+        assert_eq!(start.scrim, 0.0);
+        assert_eq!(start.alpha, 0.0);
+        assert!(start.running);
+
+        let mid = present.sample(at(SLOW / 2.0));
+        assert!(mid.slide > 0.0 && mid.slide < 1.0);
+        assert!(mid.scrim > 0.0 && mid.scrim < 1.0);
+
+        let end = present.sample(at(SLOW));
+        assert_eq!(end.slide, 0.0);
+        assert_eq!(end.scrim, 1.0);
+        assert_eq!(end.alpha, 1.0);
+        assert!(!end.running);
+
+        let mut dismiss = SheetMotion::dismiss(1.0, false);
+        let held = dismiss.sample(1.0);
+        assert_eq!(held.slide, 0.0, "still presented on the dismiss frame");
+        assert_eq!(held.scrim, 1.0);
+        let gone = dismiss.sample(1.0 + at(SLOW));
+        assert_eq!(gone.slide, 1.0);
+        assert_eq!(gone.scrim, 0.0);
+        assert_eq!(gone.alpha, 0.0);
+        assert!(!gone.running);
+    }
+
+    /// The press: FAST in to 0.97 with the fill at 1, spring out to rest, both
+    /// ending exactly; the flip frame holds its value (no snap back).
+    #[test]
+    fn the_press_scales_and_fills_then_ends() {
+        let mut press = PressMotion::new(false);
+        let rest = press.sample(0.0);
+        assert_eq!(rest.scale, 1.0);
+        assert_eq!(rest.fill, 0.0);
+        assert!(!rest.running, "a press at rest asks for nothing");
+
+        press.set_pressed(true, 0.0);
+        assert_eq!(press.sample(0.0).scale, 1.0, "the press frame holds");
+        let mid = press.sample(at(FAST / 2.0));
+        assert!(mid.scale < 1.0 && mid.scale > PRESS_SCALE);
+        assert!(mid.fill > 0.0 && mid.fill < 1.0);
+        assert!(mid.running);
+        let held = press.sample(at(FAST));
+        assert_eq!(held.scale, PRESS_SCALE);
+        assert_eq!(held.fill, 1.0);
+        assert!(!held.running);
+
+        // Release: the flip frame holds the pressed scale, then the spring
+        // returns — bounded overshoot, exact rest at the end.
+        press.set_pressed(false, at(FAST));
+        assert_eq!(
+            press.sample(at(FAST)).scale,
+            PRESS_SCALE,
+            "the release frame holds the current scale"
+        );
+        let mut peak: f32 = 1.0;
+        let mut time = FAST;
+        for _ in 0..40 {
+            time += 0.006;
+            peak = peak.max(press.sample(at(time)).scale);
+        }
+        assert!(peak > 1.0, "the release springs past rest: {peak}");
+        assert!(
+            peak <= 1.0 + SPRING_OVERSHOOT * (1.0 - PRESS_SCALE) + 1e-6,
+            "the overshoot is bounded: {peak}"
+        );
+        let settled = press.sample(at(FAST + SPRING_DURATION));
+        assert_eq!(settled.scale, 1.0);
+        assert_eq!(settled.fill, 0.0);
+        assert!(!settled.running);
+    }
+
+    /// The success badge: the scale lands on BASE, the tint flash outlives it
+    /// on SLOW, and both end exactly.
+    #[test]
+    fn the_success_badge_flashes_then_ends() {
+        let mut badge = SuccessBadge::begin(0.0, false);
+        let start = badge.sample(0.0);
+        assert_eq!(start.scale, SUCCESS_SCALE_FROM);
+        assert_eq!(start.flash, SUCCESS_FLASH_ALPHA);
+        assert!(start.running);
+
+        let at_base = badge.sample(at(BASE));
+        assert_eq!(at_base.scale, 1.0, "the badge lands on the base token");
+        assert!(at_base.flash > 0.0 && at_base.flash < SUCCESS_FLASH_ALPHA);
+        assert!(at_base.running, "the flash is still fading");
+
+        let end = badge.sample(at(SLOW));
+        assert_eq!(end.scale, 1.0);
+        assert_eq!(end.flash, 0.0);
+        assert!(!end.running);
+    }
+
+    /// The rubber-band: signed, diminishing, bounded by 4 pt, and back to 0
+    /// within the base token after release.
+    #[test]
+    fn the_rubber_band_resists_and_returns() {
+        assert_eq!(rubber_offset(0.0), 0.0);
+        assert!(rubber_offset(8.0) > 0.0 && rubber_offset(8.0) < RUBBER_MAX);
+        assert!(rubber_offset(40.0) > rubber_offset(8.0));
+        assert!(rubber_offset(40.0) < RUBBER_MAX);
+        assert!(rubber_offset(-40.0) < 0.0);
+        assert!((rubber_offset(-40.0) + rubber_offset(40.0)).abs() < 1e-6);
+        // Diminishing: doubling the pull less than doubles the offset.
+        assert!(rubber_offset(16.0) < 2.0 * rubber_offset(8.0));
+        assert_eq!(rubber_offset(f32::INFINITY), 0.0);
+
+        let mut band = RubberBand::new(false);
+        let drawn = band.drag(40.0);
+        assert_eq!(drawn, rubber_offset(40.0));
+        let (still, running) = band.sample(0.0);
+        assert_eq!(still, drawn);
+        assert!(!running, "a drag is frame-following, not a clock");
+
+        band.release(1.0);
+        let (start, running) = band.sample(1.0);
+        assert_eq!(start, drawn, "the release starts where the finger left it");
+        assert!(running);
+        let (mid, _) = band.sample(1.0 + at(BASE / 2.0));
+        assert!(mid > 0.0 && mid < drawn);
+        let (end, running) = band.sample(1.0 + at(BASE));
+        assert_eq!(end, 0.0);
+        assert!(!running);
+        assert!(!band.is_running());
+    }
+
+    /// Reduce Motion's per-interaction substitution, helper by helper.
+    #[test]
+    fn reduce_motion_substitutes_each_helper() {
+        // Screen: FAST crossfade, no travel.
+        let mut screen = ScreenMotion::push(0.0, true);
+        let start = screen.sample(0.0);
+        assert_eq!(start.incoming_dx, 0.0);
+        assert_eq!(start.outgoing_dx, 0.0);
+        assert_eq!(start.incoming_alpha, 0.0);
+        let mid = screen.sample(at(FAST / 2.0));
+        assert_eq!((mid.incoming_dx, mid.outgoing_dx), (0.0, 0.0));
+        assert!(mid.incoming_alpha > 0.0 && mid.incoming_alpha < 1.0);
+        let end = screen.sample(at(FAST));
+        assert_eq!(end.incoming_alpha, 1.0);
+        assert_eq!(end.outgoing_alpha, 0.0);
+        assert!(!end.running, "the reduced crossfade ends at the fast token");
+
+        // Sheet: opacity crossfade, no slide.
+        let mut sheet = SheetMotion::present(0.0, true);
+        for time in [0.0_f32, FAST / 2.0, FAST] {
+            assert_eq!(sheet.sample(at(time)).slide, 0.0);
+        }
+        assert_eq!(sheet.sample(at(FAST)).alpha, 1.0);
+
+        // Press: fill swaps, the scale never moves.
+        let mut press = PressMotion::new(true);
+        press.set_pressed(true, 0.0);
+        let down = press.sample(0.0);
+        assert_eq!(down.scale, 1.0);
+        assert_eq!(down.fill, 1.0);
+        assert!(!down.running, "the reduced press is a swap, not a clock");
+        press.set_pressed(false, 0.01);
+        let up = press.sample(0.01);
+        assert_eq!(up.scale, 1.0);
+        assert_eq!(up.fill, 0.0);
+
+        // Success: instant checkmark, no flash.
+        let mut badge = SuccessBadge::begin(0.0, true);
+        let instant = badge.sample(0.0);
+        assert_eq!(instant.scale, 1.0);
+        assert_eq!(instant.flash, 0.0);
+        assert!(!instant.running);
+
+        // Rubber-band: hard clamp at the bound.
+        let mut band = RubberBand::new(true);
+        assert_eq!(band.drag(80.0), 0.0);
+        band.release(0.0);
+        assert_eq!(band.sample(0.0), (0.0, false));
+        assert!(!band.is_running());
+    }
+
+    /// THE repaint rule: while a helper runs the clock asks for a frame; once
+    /// every helper has ended (t ≥ 1) it asks for none — measured on a real
+    /// egui context, not inferred from the state machine.
+    #[test]
+    fn no_repaint_is_requested_once_every_helper_has_ended() {
+        let ctx = egui::Context::default();
+        let mut screen = ScreenMotion::push(0.0, false);
+        let mut sheet = SheetMotion::present(0.0, false);
+        let mut press = PressMotion::new(false);
+        press.set_pressed(true, 0.0);
+        let mut badge = SuccessBadge::begin(0.0, false);
+        let mut band = RubberBand::new(false);
+        band.drag(40.0);
+        band.release(0.0);
+
+        let mut asked = Vec::new();
+        for frame in 0..4 {
+            let time = 0.05 + frame as f64 * 0.02;
+            let mut clock = AnimationClock::new();
+            let _ = ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ctx| {
+                    clock.note(screen.sample(time).running);
+                    clock.note(sheet.sample(time).running);
+                    clock.note(press.sample(time).running);
+                    clock.note(badge.sample(time).running);
+                    clock.note(band.sample(time).1);
+                    clock.request(ctx);
+                    asked.push(ctx.has_requested_repaint());
+                },
+            );
+        }
+        assert!(
+            asked.iter().all(|asked| *asked),
+            "mid-flight frames must request a repaint: {asked:?}"
+        );
+
+        // The longest token is SLOW (240 ms); from t ≥ 1 everything is done.
+        // The first pass still carries the mid-flight pass's outstanding
+        // request (egui counts a request until the frame that consumes it), so
+        // the rule is measured from the frame after it — three steady passes.
+        let mut late = Vec::new();
+        for frame in 0..4 {
+            let time = 1.0 + frame as f64 * 0.1;
+            let mut clock = AnimationClock::new();
+            let _ = ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ctx| {
+                    clock.note(screen.sample(time).running);
+                    clock.note(sheet.sample(time).running);
+                    clock.note(press.sample(time).running);
+                    clock.note(badge.sample(time).running);
+                    clock.note(band.sample(time).1);
+                    assert!(!clock.running(), "every helper has ended at t = {time}");
+                    clock.request(ctx);
+                    late.push(ctx.has_requested_repaint());
+                },
+            );
+        }
+        assert_eq!(
+            &late[1..],
+            &[false, false, false],
+            "an ended animation must not keep the UI awake: {late:?}"
         );
     }
 }
