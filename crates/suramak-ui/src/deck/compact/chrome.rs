@@ -122,7 +122,8 @@ pub fn app_bar(
         Some((label, enabled)) => Trailing::Text { label, enabled },
         None => Trailing::Nothing,
     };
-    app_bar_with(ui, tokens, motion, rect, title, back, trailing)
+    let (back_hit, trailing_hit, _) = app_bar_with(ui, tokens, motion, rect, title, back, trailing);
+    (back_hit, trailing_hit)
 }
 
 /// [`app_bar`] with an explicit trailing slot — the M20C library passes a gear.
@@ -134,9 +135,11 @@ pub fn app_bar_with(
     title: &str,
     back: bool,
     trailing: Trailing<'_>,
-) -> (bool, bool) {
+) -> (bool, bool, Option<egui::Pos2>) {
     let mut back_hit = false;
     let mut trailing_hit = false;
+    // Where the trailing control was drawn (the Android smoke taps it).
+    let mut anchor: Option<egui::Pos2> = None;
     let _ = motion;
     let painter = ui.painter().clone();
     painter.rect_filled(rect, CornerRadius::ZERO, tokens.window);
@@ -227,6 +230,7 @@ pub fn app_bar_with(
             enabled,
         } => {
             let hit = icons::hit_rect(pos2(rect.right() - GUTTER - icons::HIT / 2.0, center_y));
+            anchor = Some(hit.center());
             title_right = hit.left() - 8.0;
             let response = icons::button(
                 ui,
@@ -262,7 +266,7 @@ pub fn app_bar_with(
         ],
         Stroke::new(1.0_f32, tokens.hairline),
     );
-    (back_hit, trailing_hit)
+    (back_hit, trailing_hit, anchor)
 }
 
 /// Paints the app-bar title inside `band`, one line, elided with `…` when the

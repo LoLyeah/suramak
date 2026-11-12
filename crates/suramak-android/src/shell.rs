@@ -272,18 +272,16 @@ impl CompactShell {
             }
             actions = compact::ui(ctx, app);
             // The gear's true position, once per Library visit (device pixels).
-            if app.nav.current() == compact::CompactRoute::Library {
+            // The Library records it while drawing; a tap in the smoke then
+            // lands on the control itself, not on a dp guess.
+            if app.settings_anchor.is_some() {
                 if !self.logged_settings_point {
-                    if let Some(gear) = compact::a11y::controls(ctx)
-                        .into_iter()
-                        .find(|control| control.label == "Settings")
-                    {
+                    if let Some(anchor) = app.settings_anchor {
                         self.logged_settings_point = true;
-                        let center = gear.rect.center();
                         log::info!(
                             "compact library: settings at {:.0},{:.0}",
-                            center.x * ppp,
-                            center.y * ppp
+                            anchor.x * ppp,
+                            anchor.y * ppp
                         );
                     }
                 }

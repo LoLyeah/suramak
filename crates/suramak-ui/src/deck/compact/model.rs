@@ -1399,6 +1399,10 @@ pub struct CompactApp {
     pub speakers_undo_available: bool,
     /// M22B: the voice-note offer being drawn (or about to be).
     pub voice_note: Option<VoiceNoteView>,
+    /// Where the Library's gear was last drawn (points, window coordinates).
+    /// The Android host turns it into device pixels for the emulator smoke, so
+    /// a tap on Settings never depends on a hard-coded dp guess.
+    pub settings_anchor: Option<egui::Pos2>,
     /// M22B: an offer that arrived before the next frame could timestamp it.
     voice_note_armed: Option<VoiceNoteView>,
     /// M22B: the offer was dismissed by BACK; the shell tells the Activity.
@@ -1499,6 +1503,7 @@ impl CompactApp {
             speakers_confirm_clear: false,
             speakers_undo_available: false,
             voice_note: None,
+            settings_anchor: None,
             voice_note_armed: None,
             voice_note_cancel_pending: false,
             sheet_anim: SheetAnim::closed(),

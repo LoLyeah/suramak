@@ -59,7 +59,7 @@ pub fn ui(
     // the gesture inset (the dock reserves its own space via list padding).
     let bands = chrome::bands(screen, state.insets.top, state.insets.bottom, None);
     chrome::background(ui, tokens, screen);
-    let (back, to_settings) = chrome::app_bar_with(
+    let (back, to_settings, anchor) = chrome::app_bar_with(
         ui,
         tokens,
         motion,
@@ -72,6 +72,7 @@ pub fn ui(
             enabled: true,
         },
     );
+    state.settings_anchor = anchor;
     debug_assert!(!back);
     if to_settings {
         state.open_settings(ui.input(|input| input.time));
