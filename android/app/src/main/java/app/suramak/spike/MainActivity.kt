@@ -1064,6 +1064,12 @@ class MainActivity : GameActivity() {
      * back is supposed to close the keyboard and the IME owns the gesture.
      */
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        // CI forensics: while a share is pending, every key that arrives is
+        // named, so a swallowed BACK is distinguishable from one the platform
+        // never delivered. Silent otherwise (no log spam on real devices).
+        if (pendingVoiceNote != null) {
+            logToRust("key: code=${event.keyCode} action=${event.action} ime=$lastImeBottom")
+        }
         if (event.keyCode == KeyEvent.KEYCODE_BACK) {
             // The IME owns back only when nothing modal is in front of it. A
             // pending voice-note share is a modal offer: with the keyboard up
@@ -1087,6 +1093,7 @@ class MainActivity : GameActivity() {
      * alone rather than closing it.
      */
     private fun handleBack(source: String) {
+        logToRust("back: arrived from $source")
         val now = SystemClock.uptimeMillis()
         if (now - lastBackAtMs < BACK_DEDUPE_MS) {
             logToRust("back ($source): same press already counted — ignored")
