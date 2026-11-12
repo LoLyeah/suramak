@@ -44,6 +44,21 @@ object UiBridge {
     /** Re-read the library (after an import/transcription completes). */
     fun library(): JSONObject = dispatch(JSONObject().put("op", "library"))
 
+    /**
+     * M24A — the watched inbox. The tree URI the `ACTION_OPEN_DOCUMENT_TREE`
+     * picker returned (the persistable grant was taken by the Activity); the
+     * host stores it and starts the 5 s poll.
+     */
+    fun watchFolder(uri: String): JSONObject =
+        dispatch(JSONObject().put("op", "watch_folder").put("uri", uri))
+
+    /** M24A — the Activity's visibility, for the battery rule (30 s window). */
+    fun watchForeground(foreground: Boolean): JSONObject =
+        dispatch(JSONObject().put("op", "watch_foreground").put("foreground", foreground))
+
+    /** M24A — the watcher's status (folder, import count, named failure). */
+    fun watchStatus(): JSONObject = dispatch(JSONObject().put("op", "watch_status"))
+
     fun saveSegment(idx: Int, text: String): JSONObject =
         dispatch(JSONObject().put("op", "save_segment").put("idx", idx).put("text", text))
 

@@ -32,6 +32,8 @@ pub mod model_host;
 pub mod shell;
 // M22B: the voice-note offer and the paged transcript notification (pure).
 pub mod voice_note;
+// M24A: the watched inbox host (SAF source behind the core trait).
+pub mod watch_host;
 
 /// android-activity's entry point (M13g3).
 ///

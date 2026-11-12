@@ -65,6 +65,30 @@ pub fn ui(
     // one search surface, there is no separate screen.
     ui.add_space(10.0);
     search_field(ui, tokens, state);
+    // M24A: the watch status row (one line, only when watching is configured).
+    // A named failure is painted in the error ink, never swallowed.
+    if let Some(watch) = &state.watch {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            let ink = if watch.failure.is_some() {
+                tokens.record_red_text
+            } else {
+                tokens.ink_soft
+            };
+            ui.label(
+                egui::RichText::new(watch.line())
+                    .font(FontId::new(11.0, FontFamily::Proportional))
+                    .color(ink),
+            );
+            ui.label(
+                egui::RichText::new(format!("· {}", watch.folder))
+                    .font(FontId::new(11.0, FontFamily::Proportional))
+                    .color(tokens.ink_faint),
+            );
+        });
+        ui.add_space(4.0);
+    }
     ui.add_space(2.0);
     if state.search.is_active() {
         search_results(ui, tokens, state, effects);

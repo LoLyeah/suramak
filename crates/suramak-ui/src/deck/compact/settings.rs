@@ -226,6 +226,66 @@ pub fn ui(
         }
         y = card.bottom() + SECTION_GAP;
 
+        // ---- Watched inbox --------------------------------------------
+        // M24A: two rows — the switch and the folder. Turning the switch on
+        // with no folder opens the tree picker instead of persisting a
+        // half-configured setting.
+        y = section(ui, tokens, x, y, "Watched inbox");
+        let watch_card = Rect::from_min_size(pos2(x, y), vec2(width, ROW_H * 2.0));
+        material::frosted_panel(ui, tokens, watch_card, tokens.radius.card, Plane::Card);
+
+        let watching = state.watch_enabled;
+        let watch_toggle = Rect::from_min_size(pos2(x, watch_card.top()), vec2(width, ROW_H));
+        if card_row(
+            ui,
+            tokens,
+            motion,
+            watch_toggle,
+            "settings-watch-enabled",
+            "Watch a folder",
+            "Import audio files that land there",
+            None,
+            true,
+            Affordance::Toggle(watching),
+            true,
+        )
+        .clicked()
+        {
+            if watching {
+                state.apply_setting(CompactSetting::WatchEnabled(false));
+                clicks.push(CompactAction::Setting(CompactSetting::WatchEnabled(false)));
+            } else if state.watch_folder.is_empty() {
+                clicks.push(CompactAction::PickWatchFolder);
+            } else {
+                state.apply_setting(CompactSetting::WatchEnabled(true));
+                clicks.push(CompactAction::Setting(CompactSetting::WatchEnabled(true)));
+            }
+        }
+
+        let folder_value = if state.watch_folder.is_empty() {
+            "Choose a folder…".to_string()
+        } else {
+            state.watch_folder.clone()
+        };
+        if card_row(
+            ui,
+            tokens,
+            motion,
+            Rect::from_min_size(pos2(x, watch_card.top() + ROW_H), vec2(width, ROW_H)),
+            "settings-watch-folder",
+            "Folder",
+            &folder_value,
+            None,
+            true,
+            Affordance::Chevron,
+            false,
+        )
+        .clicked()
+        {
+            clicks.push(CompactAction::PickWatchFolder);
+        }
+        y = watch_card.bottom() + SECTION_GAP;
+
         // ---- Models ---------------------------------------------------
         y = section(ui, tokens, x, y, "Models");
         let sentence = model_sentence(

@@ -138,6 +138,32 @@ class MainActivity : GameActivity() {
             enqueueImport(uris)
         }
 
+    /**
+     * M24A — the watched inbox's folder. `ACTION_OPEN_DOCUMENT_TREE` grants a
+     * persistable read permission for the whole subtree; the grant is taken
+     * here (it outlives the process) and the tree URI — never a raw path — is
+     * what the Rust host stores and walks through the content resolver.
+     */
+    private val watchFolderLauncher =
+        registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+            if (uri == null) {
+                logToRust("watch folder: cancelled at the picker")
+                return@registerForActivityResult
+            }
+            try {
+                contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                )
+            } catch (err: SecurityException) {
+                // The provider did not offer a persistable grant. Say so and
+                // keep the picker's transient grant only for this process.
+                logToRust("watch folder: no persistable grant (${err.message})")
+            }
+            val reply = UiBridge.watchFolder(uri.toString())
+            logToRust("watch folder: $uri → $reply")
+        }
+
     /** One recovery prompt per Activity instance (a rotation would repeat it). */
     private var recoveryShown = false
 
@@ -284,6 +310,7 @@ class MainActivity : GameActivity() {
          * `crates/suramak-android-spike/src/shell.rs`.
          */
         const val ACTION_COMPACT_IMPORT = "app.suramak.action.COMPACT_IMPORT"
+        const val ACTION_COMPACT_WATCH_FOLDER = "app.suramak.action.COMPACT_WATCH_FOLDER"
         const val ACTION_COMPACT_RECORD = "app.suramak.action.COMPACT_RECORD"
         const val ACTION_COMPACT_STOP_RECORDING = "app.suramak.action.COMPACT_STOP_RECORDING"
         const val ACTION_COMPACT_EXPORT = "app.suramak.action.COMPACT_EXPORT"
@@ -431,6 +458,9 @@ class MainActivity : GameActivity() {
     override fun onStart() {
         super.onStart()
         logToRust("onStart")
+        // M24A: the watcher may resume polling at once (it paused after the
+        // 30 s background window).
+        UiBridge.watchForeground(true)
     }
 
     override fun onResume() {
@@ -468,6 +498,9 @@ class MainActivity : GameActivity() {
     override fun onStop() {
         logToRust("onStop")
         logSettle("onStop")
+        // M24A: the watcher keeps scanning for a bounded 30 s window, then
+        // pauses until the Activity is visible again.
+        UiBridge.watchForeground(false)
         CrashFiles.endSession(this)
         super.onStop()
     }
@@ -548,6 +581,7 @@ class MainActivity : GameActivity() {
             }
             Notify.ACTION_OPEN_RECORDING -> logToRust("mic: recording notification tapped")
             ACTION_COMPACT_IMPORT -> importLauncher.launch(arrayOf("audio/*", "video/*"))
+            ACTION_COMPACT_WATCH_FOLDER -> watchFolderLauncher.launch(null)
             ACTION_COMPACT_RECORD -> recordFromCompact()
             ACTION_COMPACT_STOP_RECORDING -> {
                 RecordingService.stop(this)

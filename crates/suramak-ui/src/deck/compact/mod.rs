@@ -43,7 +43,7 @@ pub use model::{
     CompactSpeakers, CrashBanner, DiagnosticsView, DownloadState, DownloadView, ExportPhase,
     ExportSession, FlingProbe, Insets, JobView, LibraryFacets, LibraryHit, LibraryRow, ModelRow,
     ModelState, SegmentEdit, Sheet, SpeakerSheetState, TurnScope, TurnStripState, UndoToast,
-    VoiceNoteView, UNDO_TOAST_SECS,
+    VoiceNoteView, WatchView, UNDO_TOAST_SECS,
 };
 
 /// Paints one frame of the compact app and returns everything the host must do.

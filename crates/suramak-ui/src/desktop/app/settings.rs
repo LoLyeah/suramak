@@ -195,6 +195,7 @@ fn form(
         );
         dirty |= polish_section(ui, tokens, form);
         dirty |= updates_section(ui, tokens, form);
+        dirty |= watch_section(ui, tokens, motion, form);
     }
     dirty |= text_rules_section(ui, tokens, motion, state, effects);
     // M16B: the Compact HUD section applies itself (a hotkey must not wait for
@@ -1141,6 +1142,93 @@ fn updates_caption() -> &'static str {
          compiled out of this build (the `updates` cargo feature). The setting is persisted \
          and takes effect in a macOS build that has it."
     }
+}
+
+/// M24A — the watched inbox: one folder, polled every 5 s.
+///
+/// The row is the desktop's folder picker (`rfd::FileDialog::pick_folder` on
+/// macOS/Windows; the field is editable where rfd is not a dependency, the
+/// same split the Home view's import affordance uses). The poller itself is
+/// started/stopped by the runtime when the form saves.
+fn watch_section(
+    ui: &mut egui::Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    form: &mut SettingsForm,
+) -> bool {
+    let mut dirty = false;
+    section(ui, tokens, "Watched inbox");
+
+    row(ui, tokens, "Watch a folder", |ui| {
+        if ui
+            .checkbox(
+                &mut form.watch_enabled,
+                "import audio files that land in this folder",
+            )
+            .changed()
+        {
+            dirty = true;
+        }
+    });
+
+    row(ui, tokens, "Folder", |ui| {
+        if HAS_NATIVE_FOLDER_DIALOG {
+            let choose = controls::button(
+                ui,
+                tokens,
+                motion,
+                "settings-watch-folder",
+                "Choose folder…",
+                Tier::Tertiary,
+                true,
+            );
+            if choose.clicked() {
+                if let Some(dir) = pick_watch_folder() {
+                    form.watch_folder = dir.display().to_string();
+                    form.watch_enabled = true;
+                    dirty = true;
+                }
+            }
+            ui.add_space(8.0);
+        }
+        let width = ui.available_width().clamp(160.0, 420.0);
+        let response = ui.add_sized(
+            [width.min(420.0), 22.0],
+            egui::TextEdit::singleline(&mut form.watch_folder)
+                .hint_text("folder to watch")
+                .text_color(tokens.ink),
+        );
+        if response.changed() {
+            dirty = true;
+        }
+    });
+    row_caption(
+        ui,
+        tokens,
+        "Polled every 5 s; at most 200 entries per scan, three folders deep. A file is \
+         imported once its size has held for 2 s and no .part / .crdownload / .tmp \
+         sibling is present; the same bytes are never imported twice (sha256). \
+         Imports use the ordinary queue and your default model and language.",
+        false,
+    );
+    ui.add_space(12.0);
+    dirty
+}
+
+/// Whether this build offers the native folder picker (the same platform split
+/// as the Home view's file dialog).
+const HAS_NATIVE_FOLDER_DIALOG: bool = cfg!(any(target_os = "macos", target_os = "windows"));
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn pick_watch_folder() -> Option<std::path::PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Choose a folder to watch")
+        .pick_folder()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn pick_watch_folder() -> Option<std::path::PathBuf> {
+    None
 }
 
 /// M12: the in-app updates section — one row ("Automatic updates", ON by

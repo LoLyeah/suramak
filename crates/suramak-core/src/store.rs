@@ -147,7 +147,11 @@ pub const WAVEFORM_BARS: usize = 28;
 /// - **v10** — M23A, additive only: `speaker_edits` — the manual-tagging
 ///   revision stamp and the revision the last speaker-inclusive export saw.
 ///   No speaker, turn, segment or transcript row is touched.
-pub const SCHEMA_VERSION: i64 = 10;
+/// - **v11** — M24A, additive only: `watched_files` — one row per file the
+///   watched inbox actually imported (`path`, `size`, `mtime`, `sha256`,
+///   `imported_at`, `transcript_id`). The sha256 is the dedupe key: the same
+///   bytes under a new name never queue twice. No existing table is rebuilt.
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// SQLite-backed transcript library with WAL mode.
 pub struct Store {
@@ -331,6 +335,38 @@ impl JobRecord {
             .and_then(|failure| failure.strip_prefix(RESUME_UNAVAILABLE_PREFIX))
             .map(str::trim)
     }
+}
+
+/// One row of the watched inbox's import ledger (M24A).
+///
+/// `path` is the file's platform handle (absolute path on the desktop, SAF
+/// document locator on Android); `sha256` is the content identity that makes
+/// two differently-named copies one import. `transcript_id` is `None` until
+/// the job that imported it saves its transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchedFile {
+    pub path: String,
+    pub size: u64,
+    pub mtime: i64,
+    pub sha256: String,
+    pub imported_at: String,
+    pub transcript_id: Option<Uuid>,
+}
+
+/// Decodes one `watched_files` row (the six columns every query selects, in
+/// this order).
+fn watched_file_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WatchedFile> {
+    let size: i64 = row.get(1)?;
+    let transcript: Option<String> = row.get(5)?;
+    Ok(WatchedFile {
+        path: row.get(0)?,
+        size: u64::try_from(size).unwrap_or(0),
+        mtime: row.get(2)?,
+        sha256: row.get(3)?,
+        imported_at: row.get(4)?,
+        // A malformed id is not guessed at: the row still reads, without a link.
+        transcript_id: transcript.and_then(|raw| Uuid::parse_str(&raw).ok()),
+    })
 }
 
 /// A transcript's usable word timing (M15.6).
@@ -606,7 +642,21 @@ impl Store {
                  edited_at         TEXT NOT NULL DEFAULT '',
                  exported_revision INTEGER NOT NULL DEFAULT 0,
                  exported_at       TEXT
-             );",
+             );
+             -- M24A (schema v11): the watched inbox's import ledger. One row
+             -- per imported file. `sha256` is the content identity: a file
+             -- copied under a new name is the same bytes and never queues a
+             -- second time. `transcript_id` is filled when the job's transcript
+             -- is saved (NULL while the import is still queued/running).
+             CREATE TABLE IF NOT EXISTS watched_files (
+                 path          TEXT PRIMARY KEY,
+                 size          INTEGER NOT NULL,
+                 mtime         INTEGER NOT NULL,
+                 sha256        TEXT NOT NULL,
+                 imported_at   TEXT NOT NULL,
+                 transcript_id TEXT
+             );
+             CREATE INDEX IF NOT EXISTS watched_files_sha ON watched_files(sha256);",
         )?;
         self.migrate()?;
         self.recover_job_checkpoints()?;
@@ -697,6 +747,9 @@ impl Store {
         }
         if version < 10 {
             self.upgrade_to_v10()?;
+        }
+        if version < 11 {
+            self.upgrade_to_v11()?;
         }
         Ok(())
     }
@@ -1002,6 +1055,121 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// v10 → v11, one transaction: the watched inbox's import ledger. A fresh
+    /// database already has it from the DDL above, and a re-run is a no-op.
+    fn upgrade_to_v11(&self) -> Result<(), SuramakError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS watched_files (
+                 path          TEXT PRIMARY KEY,
+                 size          INTEGER NOT NULL,
+                 mtime         INTEGER NOT NULL,
+                 sha256        TEXT NOT NULL,
+                 imported_at   TEXT NOT NULL,
+                 transcript_id TEXT
+             );
+             CREATE INDEX IF NOT EXISTS watched_files_sha ON watched_files(sha256);",
+        )?;
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ---- M24A: the watched inbox ledger ------------------------------------
+
+    /// One `watched_files` row, as stored.
+    ///
+    /// `path` is the file's platform handle: the absolute path on the desktop,
+    /// the SAF document locator on Android. `transcript_id` is `None` until
+    /// the import finishes and its transcript is saved.
+    pub fn watched_file(&self, path: &str) -> Result<Option<WatchedFile>, SuramakError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT path, size, mtime, sha256, imported_at, transcript_id
+             FROM watched_files WHERE path = ?1",
+                params![path],
+                watched_file_row,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// The first row with this content hash — the dedupe lookup. `None` means
+    /// these bytes have never been imported.
+    pub fn watched_file_by_sha(&self, sha256: &str) -> Result<Option<WatchedFile>, SuramakError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT path, size, mtime, sha256, imported_at, transcript_id
+             FROM watched_files WHERE sha256 = ?1 ORDER BY imported_at LIMIT 1",
+                params![sha256],
+                watched_file_row,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Records one import. The path is the row's identity: re-recording the
+    /// same path updates its size/mtime/hash and keeps an existing
+    /// `transcript_id` when the new row has none (an import's transcript lands
+    /// after the row is written).
+    pub fn record_watched_file(&self, file: &WatchedFile) -> Result<(), SuramakError> {
+        self.conn.execute(
+            "INSERT INTO watched_files(path, size, mtime, sha256, imported_at, transcript_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(path) DO UPDATE SET
+                 size          = excluded.size,
+                 mtime         = excluded.mtime,
+                 sha256        = excluded.sha256,
+                 imported_at   = excluded.imported_at,
+                 transcript_id = COALESCE(excluded.transcript_id, watched_files.transcript_id)",
+            params![
+                file.path,
+                i64::try_from(file.size).unwrap_or(i64::MAX),
+                file.mtime,
+                file.sha256,
+                file.imported_at,
+                file.transcript_id.map(|id| id.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Attaches the transcript a watched import produced. `None` when the
+    /// audio path belongs to no watched row (an ordinary import) — that is a
+    /// no-op, not an error.
+    pub fn set_watched_transcript(
+        &self,
+        path: &str,
+        transcript_id: Uuid,
+    ) -> Result<(), SuramakError> {
+        self.conn.execute(
+            "UPDATE watched_files SET transcript_id = ?1 WHERE path = ?2",
+            params![transcript_id.to_string(), path],
+        )?;
+        Ok(())
+    }
+
+    /// How many files the watched inbox has imported (the status row's `N`).
+    pub fn watched_import_count(&self) -> Result<i64, SuramakError> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM watched_files", [], |row| row.get(0))?;
+        Ok(count)
+    }
+
+    /// Drops every ledger row (the watch folder changed: a new folder is a
+    /// new inbox, not a merged history).
+    pub fn clear_watched_files(&self) -> Result<usize, SuramakError> {
+        let deleted = self.conn.execute("DELETE FROM watched_files", [])?;
+        Ok(deleted)
     }
 
     /// Inserts (or replaces) one journal row. `created_at` is preserved on an
@@ -2636,6 +2804,15 @@ impl Store {
                 audio_path,
             ],
         )?;
+        // M24A: if this file came from the watched inbox, attach the
+        // transcript to its ledger row in the same transaction. An ordinary
+        // import has no row, and the UPDATE is a no-op.
+        if let Some(path) = audio_path.as_deref() {
+            tx.execute(
+                "UPDATE watched_files SET transcript_id = ?1 WHERE path = ?2",
+                params![t.id.to_string(), path],
+            )?;
+        }
         // The row writer only: the caller's `updated_at` is authoritative on
         // insert, so the public `upsert_segments` wrapper is deliberately bypassed.
         self.write_segments(t.id, &t.segments)?; // same connection → joins the transaction
@@ -7659,5 +7836,158 @@ mod tests {
         // The em-dash-free provenance line the desktop will show, and no model
         // pretence.
         assert_eq!(run.provenance_line(2), "manual tags · 2 speakers");
+    }
+
+    // ---- M24A: the watched-files ledger -------------------------------------
+
+    fn watched(path: &str, size: u64, sha: &str) -> WatchedFile {
+        WatchedFile {
+            path: path.to_string(),
+            size,
+            mtime: 1_700_000_000_000,
+            sha256: sha.to_string(),
+            imported_at: "2026-11-12T10:00:00+00:00".to_string(),
+            transcript_id: None,
+        }
+    }
+
+    #[test]
+    fn the_watched_ledger_reads_back_by_path_and_by_sha() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.watched_import_count().unwrap(), 0);
+        assert_eq!(store.watched_file("/inbox/a.m4a").unwrap(), None);
+        assert_eq!(store.watched_file_by_sha("deadbeef").unwrap(), None);
+
+        let mut row = watched("/inbox/a.m4a", 4_096, "deadbeef");
+        store.record_watched_file(&row).unwrap();
+        assert_eq!(store.watched_import_count().unwrap(), 1);
+        assert_eq!(
+            store.watched_file("/inbox/a.m4a").unwrap(),
+            Some(row.clone())
+        );
+        assert_eq!(
+            store
+                .watched_file_by_sha("deadbeef")
+                .unwrap()
+                .map(|f| f.path),
+            Some("/inbox/a.m4a".to_string())
+        );
+
+        // Its transcript lands later and the row follows. A second record of
+        // the same path (a later scan) must not drop the link.
+        let transcript = Uuid::new_v4();
+        store
+            .set_watched_transcript("/inbox/a.m4a", transcript)
+            .unwrap();
+        assert_eq!(
+            store
+                .watched_file("/inbox/a.m4a")
+                .unwrap()
+                .unwrap()
+                .transcript_id,
+            Some(transcript)
+        );
+        row.size = 4_097;
+        store.record_watched_file(&row).unwrap();
+        assert_eq!(
+            store
+                .watched_file("/inbox/a.m4a")
+                .unwrap()
+                .unwrap()
+                .transcript_id,
+            Some(transcript),
+            "a rescan keeps the transcript link"
+        );
+
+        // `clear` empties the ledger (a new folder is a new inbox).
+        assert_eq!(store.clear_watched_files().unwrap(), 1);
+        assert_eq!(store.watched_import_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn saving_a_watched_imports_transcript_links_the_row() {
+        let store = Store::open_in_memory().unwrap();
+        let mut row = watched("/inbox/meeting.m4a", 8_192, "cafebabe");
+        store.record_watched_file(&row).unwrap();
+        row.transcript_id = None;
+
+        let t = Transcript::new(
+            "meeting.m4a".to_string(),
+            Source::File {
+                name: "meeting.m4a".to_string(),
+            },
+            "turbo-q5-0".to_string(),
+            None,
+            Some(std::path::PathBuf::from("/inbox/meeting.m4a")),
+            vec![Segment {
+                idx: 0,
+                start_ms: 0,
+                end_ms: 1_000,
+                text: "halo".to_string(),
+            }],
+        );
+        store.insert_transcript(&t).unwrap();
+        assert_eq!(
+            store
+                .watched_file("/inbox/meeting.m4a")
+                .unwrap()
+                .unwrap()
+                .transcript_id,
+            Some(t.id),
+            "the save that finishes a watched import attaches its transcript"
+        );
+
+        // An ordinary import's audio path has no ledger row: still no error.
+        let ordinary = Transcript::new(
+            "call.wav".to_string(),
+            Source::File {
+                name: "call.wav".to_string(),
+            },
+            "turbo-q5-0".to_string(),
+            None,
+            Some(std::path::PathBuf::from("/elsewhere/call.wav")),
+            Vec::new(),
+        );
+        store.insert_transcript(&ordinary).unwrap();
+        assert_eq!(store.watched_import_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_v10_database_upgrades_to_v11_without_rebuilding_tables() {
+        let dir = std::env::temp_dir().join(format!("suramak-v10v11-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v10.db");
+        {
+            let store = Store::open(&path).expect("fresh store");
+            assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+            store.insert_transcript(&sample("keep.wav")).unwrap();
+        }
+        // Make the file a truthful v10 database: drop the new table/index and
+        // stamp the old version. Every other row must survive untouched.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "DROP TABLE watched_files;
+                 DROP INDEX IF EXISTS watched_files_sha;
+                 UPDATE meta SET value = '10' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).expect("v10 must upgrade");
+        assert_eq!(store.schema_version().unwrap(), 11);
+        assert_eq!(store.list_transcripts().unwrap().len(), 1, "rows survive");
+        assert_eq!(store.watched_import_count().unwrap(), 0);
+        store
+            .record_watched_file(&watched("/inbox/a.m4a", 1, "aa"))
+            .unwrap();
+        assert_eq!(store.watched_import_count().unwrap(), 1);
+        drop(store);
+        // Idempotent: a second open is still v11.
+        let again = Store::open(&path).expect("reopen");
+        assert_eq!(again.schema_version().unwrap(), 11);
+        assert_eq!(again.watched_import_count().unwrap(), 1);
+        drop(again);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

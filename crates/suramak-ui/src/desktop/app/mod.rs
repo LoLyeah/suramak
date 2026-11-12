@@ -1172,6 +1172,43 @@ pub struct AppState {
     /// M16B: the startup repair note from `hud.toml` (a corrupt or reserved
     /// chord was reset), shown once in the section.
     pub hud_loaded_note: Option<String>,
+    /// M24A: the watched inbox's Library status row (`None` until watching is
+    /// configured — no row at all when the feature is off).
+    pub watch: Option<WatchStatus>,
+    /// M24A: watched imports that arrived while a recording owned the audio
+    /// session; they queue as soon as it stops (`begin_imports` refuses a
+    /// live recording by design).
+    watch_deferred: Vec<PathBuf>,
+}
+
+/// M24A: what the Library's watch row says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchStatus {
+    /// The folder's display name (never a raw SAF URI).
+    pub folder: String,
+    /// How many files the inbox has imported (the ledger's row count).
+    pub imports: u64,
+    /// The named failure when the folder is unreachable; `None` when healthy.
+    pub failure: Option<String>,
+}
+
+impl WatchStatus {
+    /// The status row's one line: `Watching · 3 imports`, or the named
+    /// failure. The folder name is the caller's second line (the UI paints it
+    /// in the softer ink), so it is not repeated here.
+    pub fn line(&self) -> String {
+        match &self.failure {
+            Some(failure) => format!("Watching paused — {failure}"),
+            None => {
+                let noun = if self.imports == 1 {
+                    "import"
+                } else {
+                    "imports"
+                };
+                format!("Watching · {} {noun}", self.imports)
+            }
+        }
+    }
 }
 
 /// Which way an undo/redo row-set write moves the history cursor.
@@ -1418,6 +1455,8 @@ impl AppState {
             hud_hotkey_error: None,
             hud_status: None,
             hud_loaded_note: None,
+            watch: None,
+            watch_deferred: Vec::new(),
         }
     }
 
@@ -1633,12 +1672,24 @@ impl AppState {
     /// for a retry.
     pub fn on_recording_stopped(&mut self, wav: PathBuf, keep: bool) -> Vec<Effect> {
         self.record = RecordState::Idle;
+        // M24A: files the watcher found while the recording owned the audio
+        // session queue now, through the ordinary import path (behind the
+        // recording's own job).
+        let deferred = std::mem::take(&mut self.watch_deferred);
         if !wav.is_file() {
             self.record_failed(format!("recording file missing: {}", wav.display()));
-            return Vec::new();
+            let mut effects = Vec::new();
+            if !deferred.is_empty() {
+                effects.extend(self.begin_imports(deferred));
+            }
+            return effects;
         }
         self.pending_recording_cleanup = if keep { None } else { Some(wav.clone()) };
-        self.begin_import(wav)
+        let mut effects = self.begin_import(wav);
+        if !deferred.is_empty() {
+            effects.extend(self.begin_imports(deferred));
+        }
+        effects
     }
 
     /// Capture could not start (or the wav could not be written): show the runtime's
@@ -2352,6 +2403,30 @@ impl AppState {
             self.set_status(format!("added {noun} to the queue"), false);
         }
         effects
+    }
+
+    /// M24A: one poll of the watched inbox, as the runtime drained it.
+    ///
+    /// The status row is set even when there is no failure (that is how a
+    /// recovered folder clears the named message). New files go through
+    /// [`Self::begin_imports`] — the same path a picked file takes — so the
+    /// queue, model and language rules are the import path's, never a second
+    /// transcription route. While a recording owns the audio session the
+    /// imports wait in `watch_deferred` and queue when it stops.
+    pub fn on_watch_update(&mut self, update: crate::desktop::watch::WatchUpdate) -> Vec<Effect> {
+        self.watch = Some(WatchStatus {
+            folder: update.folder,
+            imports: update.imports,
+            failure: update.failure,
+        });
+        if update.imported.is_empty() {
+            return Vec::new();
+        }
+        if matches!(self.record, RecordState::Recording(_)) {
+            self.watch_deferred.extend(update.imported);
+            return Vec::new();
+        }
+        self.begin_imports(update.imported)
     }
 
     /// Starts the next waiting item on the single inference slot.
@@ -6453,5 +6528,86 @@ mod tests {
             [Effect::Hud(crate::hud::HudEffect::Save(settings))]
                 if settings.chord == "cmd+shift+space"
         ));
+    }
+
+    // ---- M24A: the watched inbox status row ---------------------------------
+
+    #[test]
+    fn the_watch_status_row_counts_imports_and_names_the_folder() {
+        let mut state = AppState::new();
+        assert!(state.watch.is_none(), "no row when watching is off");
+
+        let effects = state.on_watch_update(crate::desktop::watch::WatchUpdate {
+            folder: "Recordings".to_string(),
+            imports: 3,
+            imported: Vec::new(),
+            failure: None,
+        });
+        assert!(effects.is_empty());
+        let watch = state.watch.as_ref().expect("a row");
+        assert_eq!(watch.line(), "Watching · 3 imports");
+        assert_eq!(watch.folder, "Recordings");
+        assert!(watch.failure.is_none());
+
+        // Singular, then the named failure, then recovery clears it.
+        state.on_watch_update(crate::desktop::watch::WatchUpdate {
+            folder: "Recordings".to_string(),
+            imports: 1,
+            imported: Vec::new(),
+            failure: None,
+        });
+        assert_eq!(state.watch.as_ref().unwrap().line(), "Watching · 1 import");
+
+        state.on_watch_update(crate::desktop::watch::WatchUpdate {
+            folder: "Recordings".to_string(),
+            imports: 1,
+            imported: Vec::new(),
+            failure: Some(suramak_core::watch::FOLDER_UNREACHABLE.to_string()),
+        });
+        let watch = state.watch.as_ref().unwrap();
+        assert_eq!(
+            watch.line(),
+            "Watching paused — the folder is no longer reachable"
+        );
+        assert_eq!(watch.folder, "Recordings", "the folder name stays visible");
+
+        state.on_watch_update(crate::desktop::watch::WatchUpdate {
+            folder: "Recordings".to_string(),
+            imports: 1,
+            imported: Vec::new(),
+            failure: None,
+        });
+        assert!(state.watch.as_ref().unwrap().failure.is_none());
+    }
+
+    #[test]
+    fn watched_imports_take_the_ordinary_import_path() {
+        let dir = std::env::temp_dir().join(format!("suramak-watch-app-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("one.wav");
+        let second = dir.join("two.wav");
+        std::fs::write(&first, b"one").unwrap();
+        std::fs::write(&second, b"two").unwrap();
+
+        let mut state = AppState::new();
+        let effects = state.on_watch_update(crate::desktop::watch::WatchUpdate {
+            folder: "Inbox".to_string(),
+            imports: 2,
+            imported: vec![first.clone(), second.clone()],
+            failure: None,
+        });
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::SubmitJob { input }] if input == &first
+            ),
+            "the first watched file starts exactly like a picked one"
+        );
+        assert_eq!(state.queue.items().len(), 2, "the rest join the one queue");
+        assert_eq!(state.queue.waiting_count(), 1);
+        assert_eq!(state.queue.item(2).unwrap().input, second);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

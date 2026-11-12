@@ -316,7 +316,7 @@ fn a_v8_library_upgrades_and_backfills_the_segment_index() {
         .unwrap();
     }
     let store = Store::open(&path).expect("upgrade");
-    assert_eq!(store.schema_version().unwrap(), 10);
+    assert_eq!(store.schema_version().unwrap(), 11);
     assert_eq!(store.segment_index_rows().unwrap(), 2);
     assert_eq!(store.search_segments("jakarta", 10).unwrap().len(), 1);
     let _ = dir;

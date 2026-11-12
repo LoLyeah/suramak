@@ -64,6 +64,7 @@ use crate::app::{
     self, bilingual, diarization, model_manager, polish, record_source_label, settings_form,
     AppState, Effect, ExportFormat, RecordState,
 };
+use crate::desktop::watch;
 use crate::pending_transcription::{self, PendingTranscription};
 use suramak_core::diarization::Diarization;
 
@@ -132,6 +133,9 @@ pub struct Runtime {
     /// The latest runner event, kept until the frame loop drains it (the same
     /// shape as the translation event slot).
     diarization_event: Option<DiarizationEvent>,
+    /// M24A: the watched inbox's polling thread, when watching is configured.
+    /// The thread owns its own SQLite connection (WAL).
+    watch_job: Option<watch::WatchJob>,
 }
 
 /// A translation run on a detached thread (`suramak-translate`); the UI polls
@@ -309,7 +313,53 @@ impl Runtime {
             diarization_lane: DiarizationLane::new(),
             diarization_worker: DiarizationWorker::new(),
             diarization_event: None,
+            watch_job: None,
         }
+        .with_watch()
+    }
+
+    /// Starts the watch thread when the persisted settings ask for one. A
+    /// launch inherits the ledger (dedupe survives restarts); only an actual
+    /// folder change inside a session clears it.
+    fn with_watch(mut self) -> Self {
+        self.sync_watch(false);
+        self
+    }
+
+    /// Reconciles the running watch thread with `self.settings.watch`.
+    ///
+    /// `folder_changed` is true only when the user saved a different folder
+    /// while a job was running: a new folder is a new inbox, so the old
+    /// ledger is cleared. A launch (`false`) keeps the ledger — that is what
+    /// makes a re-import across restarts impossible.
+    fn sync_watch(&mut self, folder_changed: bool) {
+        let wanted = watch::configured(&self.settings).map(str::to_string);
+        let current = self.watch_job.as_ref().map(|job| job.folder().to_string());
+        if current == wanted {
+            return;
+        }
+        if let Some(mut job) = self.watch_job.take() {
+            job.stop();
+        }
+        if let Some(folder) = wanted {
+            if folder_changed {
+                if let Some(store) = &self.store {
+                    if let Err(err) = store.clear_watched_files() {
+                        tracing::warn!(error = %err, "watch: could not clear the old ledger");
+                    }
+                }
+            }
+            match watch::db_path() {
+                Some(db) => self.watch_job = Some(watch::WatchJob::spawn(&folder, db)),
+                None => tracing::warn!("watch: no library database path — not watching"),
+            }
+        }
+    }
+
+    /// One poll of the watched inbox (the frame loop calls this every frame;
+    /// the thread only produces an update every 5 s).
+    pub fn watch_update(&mut self) -> Option<watch::WatchUpdate> {
+        self.watch_job.as_mut().and_then(|job| job.take_update())
     }
 
     /// M16I: whether the runner is usable here (build linkage + platform
@@ -1217,7 +1267,9 @@ impl Runtime {
                     state.on_audio_processes(processes, error);
                 }
                 Effect::SaveSettings { form } => {
+                    let previous_watch = self.settings.watch.clone();
                     form.apply(&mut self.settings);
+                    let watch_folder_changed = previous_watch.folder != self.settings.watch.folder;
                     let result = self.persist_settings(&form);
                     // The form may have changed the polish base URL/key note —
                     // refresh the action's enable from the new snapshot.
@@ -1243,6 +1295,9 @@ impl Runtime {
                     // text fields are not touched here — their own save path
                     // owns them.
                     state.on_prompt_budget_changed(self.prompt_budget.clone());
+                    // M24A: start, stop or re-point the watch thread from the
+                    // saved settings (a folder change starts a fresh inbox).
+                    self.sync_watch(watch_folder_changed);
                 }
                 Effect::PolishTranscript { transcript } => {
                     if let Err(err) = self.start_polish(*transcript) {

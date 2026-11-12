@@ -30,7 +30,7 @@ use suramak_core::settings::{LangMode, Settings};
 use suramak_core::store::Store;
 use suramak_ui::deck::compact::{
     CompactAction, CompactApp, CompactExportFormat, CompactRoute, CompactSetting, CompactSettings,
-    CompactSpeakers, LibraryFacets, LibraryHit, Sheet, VoiceNoteView,
+    CompactSpeakers, LibraryFacets, LibraryHit, Sheet, VoiceNoteView, WatchView,
 };
 
 use crate::export_job::ExportJobs;
@@ -76,6 +76,22 @@ impl CompactHost {
         };
         app.settings.language = language;
         app.first_run_seen = settings.ui.first_run_seen;
+        // M24A: the watched inbox's persisted switch/folder and ledger count.
+        // The live status (failure, new imports) is refreshed by the shell.
+        let watch_imports = Store::open(&dirs.db_path)
+            .ok()
+            .and_then(|store| store.watched_import_count().ok())
+            .unwrap_or(0);
+        let watch_status = settings.watch.is_configured().then(|| WatchView {
+            folder: settings.watch.folder_name(),
+            imports: u64::try_from(watch_imports).unwrap_or(0),
+            failure: None,
+        });
+        app.set_watch(
+            settings.watch.enabled,
+            settings.watch.folder_name(),
+            watch_status,
+        );
         let mut inner = Inner {
             app,
             dirs,
@@ -129,6 +145,26 @@ impl CompactHost {
             "back" => inner.back(),
             "save_segment" => inner.save_segment(&value),
             "setting" => inner.setting(&value),
+            "watch_folder" => {
+                let uri = value.get("uri").and_then(Value::as_str).unwrap_or_default();
+                match crate::watch_host::set_folder(uri) {
+                    Ok(()) => {
+                        let (enabled, folder, status) = crate::watch_host::view();
+                        inner.app.set_watch(enabled, folder, status);
+                        inner.snapshot()
+                    }
+                    Err(err) => error(&err),
+                }
+            }
+            "watch_status" => crate::watch_host::status_json(),
+            "watch_foreground" => {
+                let foreground = value
+                    .get("foreground")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                crate::watch_host::set_foreground(foreground);
+                json!({ "ok": true, "foreground": foreground }).to_string()
+            }
             "device" => inner.device(&value),
             "download_state" => inner.download_state(),
             "refresh_models" => inner.refresh_models(),
@@ -528,11 +564,23 @@ impl Inner {
                 settings.ui.first_run_seen = seen;
                 self.app.apply_setting(CompactSetting::FirstRunSeen(seen));
             }
+            "watch_enabled" => {
+                let enabled = value.get("value").and_then(Value::as_bool).unwrap_or(false);
+                if enabled && settings.watch.folder.trim().is_empty() {
+                    return error("choose a folder before watching it");
+                }
+                settings.watch.enabled = enabled;
+                self.app
+                    .apply_setting(CompactSetting::WatchEnabled(enabled));
+            }
             other => return error(&format!("unknown setting '{other}'")),
         }
         if let Err(err) = settings.save(&self.settings_path) {
             return error(&err.to_string());
         }
+        // M24A: the watch switch may have changed; reconcile the poll thread
+        // (a no-op for every other setting). The folder op configures itself.
+        crate::watch_host::configure();
         self.snapshot()
     }
 
@@ -1197,6 +1245,8 @@ pub fn dispatch(request: &str) -> String {
         }
         #[cfg(target_os = "android")]
         suramak_core::android::set_data_dir(PathBuf::from(root));
+        #[cfg(target_os = "android")]
+        crate::watch_host::init(Path::new(root));
         let host = HOST.get_or_init(|| CompactHost::new(Path::new(root)));
         // `init` creates the host and answers with its first library snapshot.
         // It must NOT be forwarded to `CompactHost::dispatch`, which has no

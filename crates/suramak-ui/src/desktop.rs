@@ -62,6 +62,8 @@ pub(crate) mod runtime;
 pub(crate) mod shell;
 pub(crate) mod shutdown;
 pub(crate) mod updates;
+/// M24A: the desktop watch thread (5 s poll, ordinary import path).
+pub(crate) mod watch;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -1161,6 +1163,23 @@ impl App {
             if let Some(shell) = self.shell.as_mut() {
                 shell.app.on_peaks_loaded(transcript, result);
             }
+        }
+
+        // M24A: the watched inbox. The poll thread runs every 5 s; its update
+        // carries the status row (folder + N imports, or the named failure)
+        // and the files that are new. Those queue through the ordinary import
+        // path inside `on_watch_update`.
+        let watch = self
+            .runtime
+            .as_mut()
+            .and_then(|runtime| runtime.watch_update());
+        if let Some(update) = watch {
+            changed = true;
+            let effects = match self.shell.as_mut() {
+                Some(shell) => shell.app.on_watch_update(update),
+                None => Vec::new(),
+            };
+            self.apply(effects);
         }
 
         // Playback position (M8): polled per frame while an engine exists — the

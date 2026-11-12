@@ -22,6 +22,8 @@ pub mod textrules;
 pub mod time;
 pub mod transcript;
 pub mod translate;
+// M24A: the watched inbox (polling scanner, settle gate, sha256 dedupe).
+pub mod watch;
 
 pub use error::SuramakError;
 // M22A: the journal stores absolute timestamps; the same re-export rule as the

@@ -132,6 +132,11 @@ pub struct SettingsForm {
     /// background; the updater (when compiled in) follows this value at boot
     /// and on every save.
     pub updates_auto_check: bool,
+    /// M24A: "Watch a folder" — persisted as `settings.watch.enabled`.
+    pub watch_enabled: bool,
+    /// M24A: the chosen folder (a path, or a SAF tree URI on Android). The
+    /// desktop picker fills it; the host starts/stops the poller on Save.
+    pub watch_folder: String,
     /// Transient API-key input; **never** written to settings.toml (macOS/Windows
     /// keychain only).
     pub api_key: String,
@@ -199,6 +204,8 @@ impl SettingsForm {
                 .as_ref()
                 .is_some_and(|polish| polish.send_audio),
             updates_auto_check: settings.updates.auto_check,
+            watch_enabled: settings.watch.enabled,
+            watch_folder: settings.watch.folder.clone(),
             api_key: String::new(),
             dirty: false,
             status: None,
@@ -375,6 +382,8 @@ impl SettingsForm {
             })
         };
         settings.updates.auto_check = self.updates_auto_check;
+        settings.watch.enabled = self.watch_enabled;
+        settings.watch.folder = self.watch_folder.trim().to_string();
     }
 
     /// "Reset to defaults": the form goes back to [`Settings::default`] (the user
@@ -578,6 +587,45 @@ mod tests {
         form.apply(&mut settings);
         settings.save(&path).expect("save");
         assert!(Settings::load(&path).unwrap().updates.auto_check);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    // ---- M24A: the watched inbox --------------------------------------------
+
+    #[test]
+    fn watch_settings_roundtrip_form_settings_file_and_back() {
+        let mut settings = Settings::default();
+        let mut form = SettingsForm::from_settings(&settings);
+        assert!(!form.watch_enabled, "watching starts OFF");
+        assert!(form.watch_folder.is_empty());
+
+        form.watch_enabled = true;
+        form.watch_folder = "  /home/owner/Recordings  ".to_string();
+        form.apply(&mut settings);
+        assert!(settings.watch.enabled);
+        assert_eq!(
+            settings.watch.folder, "/home/owner/Recordings",
+            "the form trims the folder"
+        );
+        assert!(settings.watch.is_configured());
+
+        let path = temp_path("watch-folder");
+        settings.save(&path).expect("save");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[watch]"), "unexpected TOML: {text}");
+        assert!(
+            text.contains("folder = \"/home/owner/Recordings\""),
+            "unexpected TOML: {text}"
+        );
+        let reloaded = Settings::load(&path).expect("reload");
+        let form2 = SettingsForm::from_settings(&reloaded);
+        assert!(form2.watch_enabled, "the form follows the file");
+        assert_eq!(form2.watch_folder, "/home/owner/Recordings");
+
+        form.watch_enabled = false;
+        form.apply(&mut settings);
+        settings.save(&path).expect("save");
+        assert!(!Settings::load(&path).unwrap().watch.enabled);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 

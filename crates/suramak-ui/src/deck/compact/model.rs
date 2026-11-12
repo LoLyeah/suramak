@@ -409,6 +409,39 @@ pub enum CompactSetting {
     KeepAudio(bool),
     /// M13g3: the one-time intro has been shown (additive `first_run_seen`).
     FirstRunSeen(bool),
+    /// M24A: the watched inbox switch (`settings.watch.enabled`). Turning it
+    /// on without a folder opens the tree picker instead (the host only
+    /// persists `true` once a folder exists).
+    WatchEnabled(bool),
+}
+
+/// M24A: the Library's watch status row (the host fills it from the ledger).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchView {
+    /// The folder's display name (never a raw SAF URI).
+    pub folder: String,
+    /// Ledger rows — how many files the inbox has imported.
+    pub imports: u64,
+    /// The named failure when the folder or its grant is gone.
+    pub failure: Option<String>,
+}
+
+impl WatchView {
+    /// `Watching · 3 imports`, or the named failure. The folder is the row's
+    /// second text, not part of this line.
+    pub fn line(&self) -> String {
+        match &self.failure {
+            Some(failure) => format!("Watching paused — {failure}"),
+            None => {
+                let noun = if self.imports == 1 {
+                    "import"
+                } else {
+                    "imports"
+                };
+                format!("Watching · {} {noun}", self.imports)
+            }
+        }
+    }
 }
 
 /// One model row in Settings, derived from the core manifest + device tier.
@@ -746,6 +779,9 @@ pub enum CompactAction {
     },
     /// The library's Import button (SAF / share).
     Import,
+    /// M24A: open `ACTION_OPEN_DOCUMENT_TREE` and persist the chosen tree's
+    /// read grant (the host stores the URI, never a raw path).
+    PickWatchFolder,
     /// The library's Record button.
     Record,
     /// The library's Stop button while the mic host is recording.
@@ -1361,6 +1397,13 @@ pub struct CompactApp {
     pub editor: Option<CompactEditor>,
     pub sheet: Option<Sheet>,
     pub settings: CompactSettings,
+    /// M24A: the watched inbox switch + folder display name, seeded by the
+    /// host from `settings.watch` (the folder is a SAF tree URI there; this is
+    /// only its display name).
+    pub watch_enabled: bool,
+    pub watch_folder: String,
+    /// M24A: the status row, filled by the host while watching is on.
+    pub watch: Option<WatchView>,
     pub models: Vec<ModelRow>,
     /// The profile the model rows were derived from (`None` until the shell
     /// reports memory); a language change re-derives the rows through it.
@@ -1485,6 +1528,9 @@ impl CompactApp {
             editor: None,
             sheet: None,
             settings,
+            watch_enabled: false,
+            watch_folder: String::new(),
+            watch: None,
             models: Vec::new(),
             profile: None,
             free_bytes: None,
@@ -2564,7 +2610,29 @@ impl CompactApp {
             CompactSetting::Appearance(appearance) => self.settings.appearance = appearance,
             CompactSetting::KeepAudio(keep) => self.settings.keep_audio = keep,
             CompactSetting::FirstRunSeen(seen) => self.first_run_seen = seen,
+            CompactSetting::WatchEnabled(enabled) => {
+                self.watch_enabled = enabled;
+                if !enabled {
+                    // The row goes away with the switch; the ledger keeps its
+                    // rows (re-enabling the same folder must not re-import).
+                    self.watch = None;
+                }
+            }
         }
+    }
+
+    /// M24A: the host seeded (or refreshed) the watch state from the store
+    /// settings. `folder` is the display name; `status` is `None` while the
+    /// watcher has not polled yet (the Settings row still shows the folder).
+    pub fn set_watch(
+        &mut self,
+        enabled: bool,
+        folder: impl Into<String>,
+        status: Option<WatchView>,
+    ) {
+        self.watch_enabled = enabled;
+        self.watch_folder = folder.into();
+        self.watch = if enabled { status } else { None };
     }
 
     /// The host acknowledged a segment save.

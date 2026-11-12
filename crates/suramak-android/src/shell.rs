@@ -44,6 +44,7 @@ const DOWNLOAD_POLL: Duration = Duration::from_millis(500);
 
 /// The intent actions `MainActivity` answers (constants mirrored there).
 const ACTION_IMPORT: &str = "app.suramak.action.COMPACT_IMPORT";
+const ACTION_WATCH_FOLDER: &str = "app.suramak.action.COMPACT_WATCH_FOLDER";
 const ACTION_RECORD: &str = "app.suramak.action.COMPACT_RECORD";
 const ACTION_STOP_RECORDING: &str = "app.suramak.action.COMPACT_STOP_RECORDING";
 const ACTION_EXPORT: &str = "app.suramak.action.COMPACT_EXPORT";
@@ -253,6 +254,11 @@ impl CompactShell {
             app.clearance_floor = compact::settings::ANDROID_MIN_CLEARANCE;
             app.reduce_motion = platform_reduce_motion();
             app.set_diagnostics(diagnostics);
+            // M24A: the watched inbox's switch, folder and status row. The
+            // poll thread publishes through the host; this is a cheap mutex
+            // read and a no-op when the value has not changed.
+            let (watch_enabled, watch_folder, watch_status) = crate::watch_host::view();
+            app.set_watch(watch_enabled, watch_folder, watch_status);
             if !self.started_host {
                 self.started_host = true;
                 // A `.part` from a killed run becomes the resume offer at the
@@ -506,6 +512,7 @@ impl CompactShell {
                 log_reply("cancel download", &reply);
             }
             CompactAction::Import => send_intent(ACTION_IMPORT, &[]),
+            CompactAction::PickWatchFolder => send_intent(ACTION_WATCH_FOLDER, &[]),
             CompactAction::Record => {
                 // M19B: no verified model means nothing to transcribe; the
                 // Library's button is already disabled, and this guard stops a
@@ -726,6 +733,9 @@ impl CompactShell {
             ),
             CompactSetting::KeepAudio(keep) => ("keep_audio", serde_json::Value::Bool(keep)),
             CompactSetting::FirstRunSeen(seen) => ("first_run_seen", serde_json::Value::Bool(seen)),
+            CompactSetting::WatchEnabled(enabled) => {
+                ("watch_enabled", serde_json::Value::Bool(enabled))
+            }
         };
         let reply = host.dispatch(
             &serde_json::json!({

@@ -171,6 +171,20 @@ pub fn ui(
         list_top = rect.bottom() + 10.0;
     }
 
+    // --- watched inbox ------------------------------------------------------
+    // M24A: one status row while watching is on: `Watching · 3 imports` and
+    // the folder's display name; a named failure in the error ink when the
+    // folder (or its SAF grant) is gone. Nothing is drawn when watching is off.
+    if let Some(watch) = state.watch.clone() {
+        let rect = Rect::from_min_size(
+            pos2(bands.content.left() + GUTTER, list_top),
+            vec2(bands.content.width() - GUTTER * 2.0, 40.0),
+        );
+        paint_watch_row(ui, tokens, rect, &watch);
+        a11y::describe(ui, rect, &format!("{} · {}", watch.line(), watch.folder));
+        list_top = rect.bottom() + 8.0;
+    }
+
     // --- first-run model banner -------------------------------------------
     // A phone with no installed model must never see an empty library. The
     // banner is the release path's one recommendation; it is absent entirely
@@ -717,6 +731,37 @@ pub fn observe_fling(
     let probe = state.fling.observe(offset, velocity, released)?;
     state.note_fling(probe);
     Some(probe)
+}
+
+fn paint_watch_row(ui: &mut Ui, tokens: &Tokens, rect: Rect, watch: &super::model::WatchView) {
+    let failed = watch.failure.is_some();
+    let fill = if failed {
+        tokens.record_red.gamma_multiply(0.12)
+    } else {
+        tokens.panel_faint
+    };
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(tokens.radius.control), fill);
+    ui.painter().text(
+        pos2(rect.left() + 12.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        watch.line(),
+        type_scale::row_value().font,
+        if failed {
+            tokens.record_red_text
+        } else {
+            tokens.ink_soft
+        },
+    );
+    // The folder name is the row's second half, right-aligned so the import
+    // count never pushes it off the row.
+    ui.painter().text(
+        pos2(rect.right() - 12.0, rect.center().y),
+        Align2::RIGHT_CENTER,
+        &watch.folder,
+        type_scale::caption().font,
+        tokens.ink_soft,
+    );
 }
 
 fn paint_note(ui: &mut Ui, tokens: &Tokens, rect: Rect, text: &str, error: bool) {

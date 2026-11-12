@@ -269,6 +269,81 @@ pub struct UiSettings {
     pub first_run_seen: bool,
 }
 
+/// M24A: the watched inbox (`settings.watch`).
+///
+/// Additive: a settings file written before M24A has no `[watch]` section and
+/// reads as **off with no folder**, which is exactly the pre-M24A behaviour
+/// (nothing is scanned, no thread runs, no status row). `folder` is the
+/// platform's own handle for the folder: an absolute path on the desktop, a
+/// persisted `content://…/tree/…` URI on Android (the SAF tree, never a raw
+/// path — the content resolver is the only reader with permission).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchSettings {
+    /// Whether the folder is watched. Off by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The chosen folder (empty until one is picked).
+    #[serde(default)]
+    pub folder: String,
+}
+
+impl WatchSettings {
+    /// Whether the setting names a folder to watch: enabled **and** a folder.
+    /// A half-configured section is inert (no thread, no status row).
+    pub fn is_configured(&self) -> bool {
+        self.enabled && !self.folder.trim().is_empty()
+    }
+
+    /// The folder's display name — what the Library status row says.
+    ///
+    /// * Desktop: the last path component (`/Users/me/Inbox` → `Inbox`).
+    /// * Android: a SAF tree URI (`content://…/tree/primary%3ARecordings` →
+    ///   `Recordings`), percent-decoded, with the `primary:` volume prefix
+    ///   dropped. The URI is never shown raw.
+    /// * Anything that names no component: the folder string itself (or
+    ///   `Folder` when empty) — never a blank status row.
+    pub fn folder_name(&self) -> String {
+        let raw = self.folder.trim().trim_end_matches(['/', '\\']);
+        if raw.is_empty() {
+            return "Folder".to_string();
+        }
+        let decoded = percent_decode(raw);
+        let tail = decoded
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(decoded.as_str());
+        // A SAF tree segment is `primary:Recordings` (or `home:Inbox`):
+        // the volume prefix is not part of a person's folder name.
+        let name = tail.rsplit(':').next().unwrap_or(tail);
+        if name.trim().is_empty() {
+            "Folder".to_string()
+        } else {
+            name.to_string()
+        }
+    }
+}
+
+/// Decodes `%XX` escapes (SAF URIs encode `:` as `%3A` and `/` as `%2F`).
+/// Invalid escapes are left verbatim — this is display text, never a path.
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = &raw[index + 1..index + 3];
+            if let Ok(value) = u8::from_str_radix(hex, 16) {
+                out.push(value);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Top-level application settings persisted to `settings.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -283,6 +358,10 @@ pub struct Settings {
     /// files → defaults.
     #[serde(default)]
     pub updates: UpdatesSettings,
+    /// M24A: the watched inbox (enabled + folder). Missing in older files →
+    /// off with no folder.
+    #[serde(default)]
+    pub watch: WatchSettings,
 }
 
 impl Default for Settings {
@@ -307,6 +386,7 @@ impl Default for Settings {
             },
             recording: RecordingSettings::default(),
             updates: UpdatesSettings::default(),
+            watch: WatchSettings::default(),
         }
     }
 }
@@ -878,5 +958,85 @@ font_scale = 1.0
         assert!(text.contains("first_run_seen = true"), "{text}");
         let back: Settings = toml::from_str(&text).expect("deserialize settings");
         assert!(back.ui.first_run_seen);
+    }
+
+    // ---- M24A: the watched inbox --------------------------------------------
+
+    #[test]
+    fn watch_settings_are_additive_and_default_off() {
+        // A settings file written before M24A has no `[watch]` section.
+        let text = r#"
+[asr]
+model_id = "tiny"
+language = "auto"
+translate_to_english = false
+
+[storage]
+keep_audio = false
+
+[ui]
+glass = "auto"
+font_scale = 1.0
+"#;
+        let settings: Settings = toml::from_str(text).expect("pre-M24A settings must load");
+        assert!(!settings.watch.enabled, "missing section → OFF");
+        assert_eq!(settings.watch.folder, "");
+        assert!(!settings.watch.is_configured());
+        assert_eq!(Settings::default().watch, WatchSettings::default());
+
+        // Enabled + folder round-trips, and a half-configured section is inert.
+        for (enabled, folder) in [
+            (true, "/home/owner/Recordings"),
+            (false, "/home/owner/Recordings"),
+            (true, ""),
+        ] {
+            let settings = Settings {
+                watch: WatchSettings {
+                    enabled,
+                    folder: folder.to_string(),
+                },
+                ..Settings::default()
+            };
+            let text = toml::to_string_pretty(&settings).expect("serialize");
+            assert!(text.contains("[watch]"), "unexpected TOML: {text}");
+            let back: Settings = toml::from_str(&text).expect("deserialize");
+            assert_eq!(back.watch, settings.watch);
+            assert_eq!(
+                back.watch.is_configured(),
+                enabled && !folder.is_empty(),
+                "a half-configured section must stay inert"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_folder_name_is_the_last_component_never_a_raw_uri() {
+        let name = |folder: &str| {
+            WatchSettings {
+                enabled: true,
+                folder: folder.to_string(),
+            }
+            .folder_name()
+        };
+        // Desktop paths (including a trailing slash and Windows separators).
+        assert_eq!(name("/home/owner/Recordings"), "Recordings");
+        assert_eq!(name("/home/owner/Recordings/"), "Recordings");
+        assert_eq!(name(r"C:\Users\owner\Inbox"), "Inbox");
+        // Android SAF tree URIs: percent-decoded, volume prefix dropped.
+        assert_eq!(
+            name("content://com.android.externalstorage.documents/tree/primary%3ARecordings"),
+            "Recordings"
+        );
+        assert_eq!(
+            name("content://com.android.externalstorage.documents/tree/home%3AInbox"),
+            "Inbox"
+        );
+        assert_eq!(
+            name("content://com.android.externalstorage.documents/tree/primary%3AMusic%2FInbox"),
+            "Inbox"
+        );
+        // Never blank.
+        assert_eq!(name(""), "Folder");
+        assert_eq!(name("/"), "Folder");
     }
 }

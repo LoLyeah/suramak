@@ -134,8 +134,8 @@ pub fn foreground_type_for_api(api: i32) -> ForegroundType {
 /// Extensions the shared decoder probes by content anyway; the extension is a
 /// hint, but it is the hint the platform's own pickers and players use.
 const KNOWN_EXTENSIONS: &[&str] = &[
-    "wav", "mp3", "flac", "ogg", "oga", "opus", "m4a", "mp4", "mov", "m4v", "mkv", "webm", "3gp",
-    "aac",
+    "wav", "mp3", "flac", "ogg", "oga", "opus", "m4a", "m4b", "mp4", "mov", "m4v", "mkv", "webm",
+    "3gp", "aac", "aiff", "aif", "wma", "amr", "spx", "caf", "au",
 ];
 
 /// The extension for a copied import: the display name's own extension when it
