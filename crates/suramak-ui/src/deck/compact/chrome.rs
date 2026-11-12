@@ -568,6 +568,10 @@ pub fn toggle(
 }
 
 /// A primary action button across a bar. `width` is the designed body width.
+///
+/// Pressed with the control kit's spring: the body scales to
+/// [`motion::PRESS_SCALE`] on `FAST` and returns over `SPRING_DURATION`, while
+/// the tier's fill crossfades to its active tone. The hit rect never scales.
 pub fn action_button(
     ui: &mut Ui,
     tokens: &Tokens,
@@ -577,26 +581,73 @@ pub fn action_button(
     label: &str,
     primary: bool,
 ) -> Response {
-    let tier = if primary {
-        controls::Tier::Primary
-    } else {
-        controls::Tier::Secondary
-    };
-    let mut child = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(rect)
-            .layout(Layout::top_down(Align::Center)),
+    let response = a11y::touch(ui, tokens, rect, &id, WidgetType::Button, label, true);
+    let base = ui.id().with(&id);
+    let press = press_frame(
+        ui.ctx(),
+        base.with("press"),
+        response.is_pointer_button_down_on(),
+        motion.reduce,
     );
-    controls::button_sized(
-        &mut child,
-        tokens,
-        motion,
-        id,
-        label,
-        tier,
-        true,
-        rect.size(),
-    )
+    let hover = motion.factor(
+        ui.ctx(),
+        base.with("hover"),
+        response.hovered(),
+        motion::FAST,
+    );
+    let scale = press.scale;
+    let visual = Rect::from_center_size(rect.center(), rect.size() * scale);
+    let radius = CornerRadius::same((f32::from(tokens.radius.control) * scale).round() as u8);
+
+    let (rest, hovered, active, ink) = if primary {
+        (
+            tokens.accent,
+            tokens.accent_hover,
+            tokens.accent_active,
+            tokens.on_accent,
+        )
+    } else {
+        (
+            tokens.control_fill,
+            tokens.control_fill_hover,
+            tokens.surface_active,
+            tokens.ink,
+        )
+    };
+    let fill = motion::lerp_color(motion::lerp_color(rest, hovered, hover), active, press.fill);
+    ui.painter().rect_filled(visual, radius, fill);
+    if !primary {
+        ui.painter().rect_stroke(
+            visual,
+            radius,
+            Stroke::new(1.0_f32, tokens.hairline),
+            StrokeKind::Inside,
+        );
+    }
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            visual.expand(2.0),
+            CornerRadius::same(tokens.radius.control.saturating_add(2)),
+            Stroke::new(tokens.stroke.focus, tokens.accent),
+            StrokeKind::Outside,
+        );
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let token = scaled(&type_scale::row_title(), scale);
+    let galley =
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), token.font.clone(), Color32::PLACEHOLDER);
+    ui.painter().galley(
+        pos2(
+            visual.center().x - galley.size().x / 2.0,
+            visual.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        ink,
+    );
+    response
 }
 
 /// The search field's caption token (the placeholder's face and size).

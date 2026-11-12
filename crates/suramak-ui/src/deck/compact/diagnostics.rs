@@ -26,12 +26,41 @@ use crate::deck::type_scale;
 
 use super::a11y;
 use super::chrome::{self, GUTTER};
-use super::model::{CompactAction, CompactApp};
+use super::model::{CompactAction, CompactApp, ModelRow};
 
 /// The number of check groups this screen draws. Settings quotes it in the
 /// Diagnostics row, and the screen's row array is length-checked against it, so
 /// the count cannot drift from what is actually here.
 pub const CHECK_COUNT: usize = 4;
+
+/// One line of the "Model files" card (M20D2): the raw manifest id support
+/// needs, and the size + state of that file.
+///
+/// These ids left the primary Settings card in M20D2; Diagnostics is the only
+/// surface that still spells them. [`model_file_lines`] is both the paint
+/// source and the test path, so the two cannot drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelFileLine {
+    pub id: String,
+    pub value: String,
+}
+
+/// One line per **installed** model: the raw id, its pinned file size, and the
+/// state word the primary card shows in human terms.
+pub fn model_file_lines(models: &[ModelRow], selected: &str) -> Vec<ModelFileLine> {
+    models
+        .iter()
+        .filter(|row| row.installed)
+        .map(|row| ModelFileLine {
+            id: row.id.clone(),
+            value: format!(
+                "{} · {}",
+                row.tier_line(),
+                row.state(row.id == selected, None).label()
+            ),
+        })
+        .collect()
+}
 
 /// The 8 pt grid's card padding (the same 16 as the screen gutter).
 const PAD: f32 = 16.0;
@@ -154,67 +183,98 @@ pub fn ui(
             }
             y = card.bottom() + SECTION_GAP;
 
-            // ---- Models & engine: the vocabulary the phone screen hides ----
-            // M20D moved the raw ids, the diarization models and the platform
-            // triple here: support can still read them, the primary Settings
-            // surface never has to.
-            y = section_label(ui, tokens, x, y, "Models & engine");
-            let model_rows: Vec<_> = state
-                .models
-                .iter()
-                .filter(|row| row.offered || row.installed)
-                .collect();
-            let facts: Vec<(String, String, bool)> = model_rows
-                .iter()
-                .map(|row| {
-                    let selected = state.settings.model_id == row.id;
-                    let state_word = row.state(selected, state.download.as_ref());
-                    (
-                        row.id.clone(),
-                        format!("{} · {}", row.tier_line(), state_word.label()),
-                        true,
-                    )
-                })
-                .chain([
-                    (
-                        "Speech engine".to_string(),
-                        "whisper.cpp".to_string(),
-                        false,
-                    ),
-                    (
-                        "Speaker labels".to_string(),
-                        "pyannote 3.0 + CAM++".to_string(),
-                        false,
-                    ),
-                    (
-                        "Platform".to_string(),
-                        "Android · arm64".to_string(),
-                        false,
-                    ),
-                ])
-                .collect();
+            // ---- Model files: the vocabulary the primary card hides ------
+            // M20D2: the Settings card speaks human tier names only. Support
+            // still needs the exact manifest ids, so Diagnostics keeps one
+            // line per **installed** file — the ids live here and nowhere else
+            // on the phone's primary surface.
+            y = section_label(ui, tokens, x, y, "Model files");
+            let files = model_file_lines(&state.models, &state.settings.model_id);
+            let file_rows = files.len().max(1);
             let card = Rect::from_min_size(
                 pos2(x, y),
-                vec2(width, FACT_ROW * facts.len() as f32),
+                vec2(width, FACT_ROW * file_rows as f32),
             );
             material::frosted_panel(ui, tokens, card, tokens.radius.card, Plane::Card);
-            for (index, (label, value, mono)) in facts.iter().enumerate() {
+            if files.is_empty() {
+                let line = "No model files on this phone.";
+                let row = Rect::from_min_size(pos2(x, card.top()), vec2(width, FACT_ROW));
+                ui.painter().text(
+                    pos2(row.left() + PAD, row.center().y),
+                    Align2::LEFT_CENTER,
+                    line,
+                    type_scale::caption().font,
+                    tokens.ink_soft,
+                );
+                a11y::describe(ui, row, line);
+            }
+            for (index, line) in files.iter().enumerate() {
                 let row = Rect::from_min_size(
                     pos2(x, card.top() + index as f32 * FACT_ROW),
                     vec2(width, FACT_ROW),
                 );
                 // The raw id is data, so it is mono — but it is not a link:
                 // the active row's *state* takes the accent, not its name.
-                let font = if *mono {
-                    type_scale::mono().font
-                } else {
-                    type_scale::row_value().font
-                };
+                ui.painter().text(
+                    pos2(row.left() + PAD, row.center().y),
+                    Align2::LEFT_CENTER,
+                    &line.id,
+                    type_scale::mono().font,
+                    tokens.ink,
+                );
+                ui.painter().text(
+                    pos2(row.right() - PAD, row.center().y),
+                    Align2::RIGHT_CENTER,
+                    &line.value,
+                    type_scale::caption().font,
+                    if line.value.contains("in use") {
+                        tokens.accent
+                    } else {
+                        tokens.ink_soft
+                    },
+                );
+                a11y::describe(
+                    ui,
+                    Rect::from_min_size(
+                        pos2(row.left() + PAD, row.top()),
+                        vec2(row.width() - PAD * 2.0, FACT_ROW - 1.0),
+                    ),
+                    &format!("{}: {}", line.id, line.value),
+                );
+                if index + 1 < files.len() {
+                    ui.painter().line_segment(
+                        [
+                            pos2(row.left() + PAD, row.bottom() - 0.5),
+                            pos2(row.right() - PAD, row.bottom() - 0.5),
+                        ],
+                        Stroke::new(1.0_f32, tokens.hairline),
+                    );
+                }
+            }
+            y = card.bottom() + SECTION_GAP;
+
+            // ---- Engine: the rest of the build vocabulary -----------------
+            y = section_label(ui, tokens, x, y, "Engine");
+            let facts: [(&str, &str); 3] = [
+                ("Speech engine", "whisper.cpp"),
+                ("Speaker labels", "pyannote 3.0 + CAM++"),
+                ("Platform", "Android · arm64"),
+            ];
+            let card = Rect::from_min_size(
+                pos2(x, y),
+                vec2(width, FACT_ROW * facts.len() as f32),
+            );
+            material::frosted_panel(ui, tokens, card, tokens.radius.card, Plane::Card);
+            for (index, (label, value)) in facts.iter().enumerate() {
+                let row = Rect::from_min_size(
+                    pos2(x, card.top() + index as f32 * FACT_ROW),
+                    vec2(width, FACT_ROW),
+                );
                 ui.painter().text(
                     pos2(row.left() + PAD, row.center().y),
                     Align2::LEFT_CENTER,
                     label,
-                    font,
+                    type_scale::row_value().font,
                     tokens.ink,
                 );
                 ui.painter().text(
@@ -222,11 +282,7 @@ pub fn ui(
                     Align2::RIGHT_CENTER,
                     value,
                     type_scale::caption().font,
-                    if value.contains("in use") {
-                        tokens.accent
-                    } else {
-                        tokens.ink_soft
-                    },
+                    tokens.ink_soft,
                 );
                 a11y::describe(
                     ui,

@@ -11,14 +11,12 @@
 //! hairlines. The palette's six slots are token values asserted by the theme
 //! contrast test on both ladders.
 
-use egui::{
-    pos2, vec2, Align2, Color32, CornerRadius, FontFamily, FontId, Rect, Response, Sense, Stroke,
-    StrokeKind, Ui,
-};
+use egui::{pos2, vec2, Color32, CornerRadius, Rect, Response, Sense, Stroke, StrokeKind, Ui};
 
 use suramak_core::diarization::{badge_text, Speaker, SpeakerTurn};
 
 use super::theme::Tokens;
+use super::type_scale;
 
 /// The badge's chip size.
 pub const BADGE: f32 = 18.0;
@@ -135,13 +133,15 @@ pub fn badge(
         CornerRadius::same(5),
         chip_fill(tokens, color_slot).gamma_multiply(alpha),
     );
-    painter.text(
-        chip.center(),
-        Align2::CENTER_CENTER,
-        badge_text(label),
-        FontId::new(10.5, FontFamily::Proportional),
-        tokens.ink.gamma_multiply(alpha),
-    );
+    // The badge's numeral/initial is a **caption** (12.5 / +0.1 / 17) from the
+    // type scale, laid out as a galley so the token's tracking lands. Colour is
+    // never the only channel: the chip always carries this character.
+    let caption = type_scale::caption();
+    let ink = tokens.ink.gamma_multiply(alpha);
+    let mut job = egui::text::LayoutJob::default();
+    job.append(&badge_text(label), 0.0, caption.format(ink));
+    let galley = painter.layout_job(job);
+    painter.galley(chip.center() - galley.size() / 2.0, galley, ink);
     if response.hovered() {
         painter.rect_stroke(
             chip,

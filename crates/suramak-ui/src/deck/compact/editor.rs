@@ -10,13 +10,18 @@
 //! phone's M13F/M8 edges).
 
 use egui::{
-    pos2, vec2, Align, Align2, Color32, CornerRadius, FontFamily, FontId, Layout, Rect, ScrollArea,
-    Sense, Stroke, StrokeKind, Ui, WidgetType,
+    pos2, vec2, Align, Align2, Color32, CornerRadius, FontId, Layout, Rect, ScrollArea, Sense,
+    Stroke, StrokeKind, Ui, WidgetType,
 };
 
+use suramak_core::diagnostics::{diagnose, Level, SubtitleLimits};
+
+use crate::deck::icons::{self, Icon};
+use crate::deck::material::{self, Plane};
 use crate::deck::motion::{self, Motion};
 use crate::deck::speakers;
 use crate::deck::theme::Tokens;
+use crate::deck::type_scale;
 
 use super::a11y;
 use super::chrome::{self, GUTTER, MIN_TOUCH};
@@ -24,10 +29,19 @@ use super::model::{
     clock, CompactAction, CompactApp, CompactExportFormat, ExportPhase, ExportSession,
 };
 
-/// One segment row's height (read mode).
-const SEGMENT_ROW: f32 = 66.0;
+/// One segment's header band (timecode · speaker · advisory) at the row
+/// title's 20 pt line height.
+const SEGMENT_HEADER: f32 = 20.0;
+/// The row's top padding before the header.
+const SEGMENT_TOP: f32 = 10.0;
+/// The row's bottom padding under the body.
+const SEGMENT_BOTTOM: f32 = 10.0;
+/// Header → body gap.
+const BODY_GAP: f32 = 4.0;
 /// The karaoke chips' band under a row (M15.6 compact behaviour).
 const WORD_STRIP: f32 = 40.0;
+/// The inline editor's fixed body height (field + Save/Cancel).
+const EDIT_HEIGHT: f32 = 160.0;
 
 pub fn ui(
     ui: &mut Ui,
@@ -84,16 +98,27 @@ pub fn ui(
         .language
         .clone()
         .unwrap_or_else(|| "auto".to_string());
-    ui.painter().text(
+    // The duration is a numeral, so it paints on the tabular grid (a reload
+    // from 0:09 to 0:10 cannot shift the line); the words after it are caption.
+    let numerals = type_scale::numerals();
+    let caption = type_scale::caption();
+    let duration_width = type_scale::paint_tabular(
+        ui.painter(),
         pos2(meta_rect.left(), meta_rect.center().y),
         Align2::LEFT_CENTER,
+        &clock(duration),
+        &numerals.font,
+        tokens.ink_soft,
+    );
+    ui.painter().text(
+        pos2(meta_rect.left() + duration_width, meta_rect.center().y),
+        Align2::LEFT_CENTER,
         format!(
-            "{} · {} · {}",
-            clock(duration),
+            " · {} · {}",
             super::model::count_noun(editor.transcript.segments.len(), "segment"),
             language.to_uppercase()
         ),
-        FontId::proportional(12.5),
+        caption.font.clone(),
         tokens.ink_soft,
     );
     if editor.has_unsaved() {
@@ -101,7 +126,7 @@ pub fn ui(
             pos2(meta_rect.right(), meta_rect.center().y),
             Align2::RIGHT_CENTER,
             "unsaved",
-            FontId::proportional(12.0),
+            caption.font.clone(),
             tokens.record_red_text,
         );
     }
@@ -156,7 +181,7 @@ pub fn ui(
             pos2(search_rect.right() + 8.0, search_rect.top()),
             vec2(48.0, MIN_TOUCH),
         );
-        if a11y::touch(
+        let close_response = a11y::touch(
             ui,
             tokens,
             close,
@@ -164,9 +189,15 @@ pub fn ui(
             WidgetType::Button,
             "Close search",
             true,
-        )
-        .clicked()
-        {
+        );
+        icons::paint(
+            ui.painter(),
+            Rect::from_center_size(close.center(), vec2(16.0, 16.0)),
+            Icon::Close,
+            16.0,
+            tokens.ink_soft,
+        );
+        if close_response.clicked() {
             editor.search_open = false;
             editor.search.clear();
         }
@@ -185,13 +216,15 @@ pub fn ui(
             .layout(Layout::top_down(Align::Min)),
     );
     let mut scroll = ScrollArea::vertical().auto_shrink([false, false]);
-    // The row being edited must stay visible when the keyboard opens.
+    // The row being edited must stay visible when the keyboard opens. Rows are
+    // variable height now (a header band + wrapped body), so this is the
+    // designed estimate, not an exact offset.
     if let Some((idx, _)) = &editor.edit_buffer {
         let position = matches
             .iter()
             .position(|index| editor.transcript.segments[*index].idx == *idx)
             .unwrap_or(0);
-        scroll = scroll.vertical_scroll_offset((position as f32 * SEGMENT_ROW).max(0.0));
+        scroll = scroll.vertical_scroll_offset(position as f32 * 96.0);
     }
     let mut row_actions: Vec<CompactAction> = Vec::new();
     scroll.show(&mut child, |ui| {
@@ -200,16 +233,25 @@ pub fn ui(
             ui.vertical_centered(|ui| {
                 ui.label(
                     egui::RichText::new("No matching lines")
-                        .size(14.0)
+                        .size(type_scale::caption().size())
                         .color(tokens.ink_soft),
                 );
             });
             return;
         }
+        let numerals = type_scale::numerals();
+        let body_token = type_scale::body();
+        // The speaker header belongs to a turn, not to every row: it is drawn
+        // when the visible sequence changes speaker. A filtered list groups by
+        // what is on screen, which is what the reader sees.
+        let mut previous_speaker: Option<u32> = None;
         for index in matches {
             let segment = editor.transcript.segments[index].clone();
             let speaker_view = editor.speakers.clone();
-            let speaker_pad = if speaker_view.is_some() { 29.0 } else { 0.0 };
+            let speaker_row = speaker_view.as_ref().and_then(|view| view.row(segment.idx));
+            let primary = speaker_row.map(|row| row.primary);
+            let show_name = primary.is_some() && primary != previous_speaker;
+            previous_speaker = primary;
             let selected = editor.selected == Some(segment.idx);
             let editing = editor
                 .edit_buffer
@@ -218,20 +260,56 @@ pub fn ui(
             // M15.6: the chips ride under the row the reader is on — the
             // selected row, or the row the transport is reading while playing.
             let words = editor.words_for(segment.idx).to_vec();
-            let show_words = !editing && !words.is_empty() && (editor.playing || selected);
-            let row_h = if editing {
-                150.0
-            } else if show_words {
-                SEGMENT_ROW + WORD_STRIP
+            let show_words = !editing
+                && !words.is_empty()
+                && (selected || (editor.playing && editor.playhead_segment() == Some(segment.idx)));
+            let text = editor.text(&segment);
+            // The line-length advisory belongs to the segment being worked on,
+            // not to every row: the desktop can badge a whole column because
+            // its reader is a subtitle editor; on the phone one quiet read-out
+            // on the selected row is enough. It is also spoken with the row.
+            let advisory = if selected {
+                advisory_for(&text, segment.start_ms, segment.end_ms)
             } else {
-                SEGMENT_ROW
+                None
+            };
+
+            // Geometry: the speaker lane keeps its 8 px strip above; inside a
+            // row the badge sits in the leading gutter and the header band
+            // carries the timecode, the turn's name and the line-length
+            // advisory. The body is the type scale's 15.5/24.
+            let lead = if speaker_view.is_some() {
+                speakers::SLOT_W + 6.0
+            } else {
+                0.0
+            };
+            let text_left = list_rect.left() + GUTTER + lead;
+            let body_width = (list_rect.right() - GUTTER - 8.0 - text_left).max(80.0);
+            let body_galley = {
+                let mut job = egui::text::LayoutJob::default();
+                job.append(&text, 0.0, body_token.format(tokens.ink));
+                job.wrap.max_width = body_width;
+                job.wrap.break_anywhere = false;
+                job.wrap.overflow_character = Some('…');
+                ui.painter().layout_job(job)
+            };
+            let body_h = body_galley.size().y.max(body_token.line_height);
+            let row_h = if editing {
+                EDIT_HEIGHT
+            } else {
+                SEGMENT_TOP
+                    + SEGMENT_HEADER
+                    + BODY_GAP
+                    + body_h
+                    + SEGMENT_BOTTOM
+                    + if show_words { WORD_STRIP } else { 0.0 }
             };
             let (rect, _) = ui.allocate_exact_size(vec2(list_rect.width(), row_h), Sense::hover());
-            let label = format!(
-                "Segment {} · {}",
-                segment.idx + 1,
-                truncate(&editor.text(&segment), 96)
-            );
+            let mut label = format!("Segment {} · {}", segment.idx + 1, truncate(&text, 96));
+            if let Some(advisory) = &advisory {
+                label.push_str(" · ");
+                label.push_str(advisory);
+            }
             let response = a11y::touch(
                 ui,
                 tokens,
@@ -241,57 +319,150 @@ pub fn ui(
                 &label,
                 true,
             );
+            // The active-segment highlight is a crossfade on the FAST token:
+            // the row under the playhead lights as playback enters it and
+            // yields when it leaves. A tap's selection is a state, so it is
+            // solid on the very first frame; only the playback highlight
+            // animates its opacity.
+            let playing_here =
+                editor.playing && editor.playhead_segment() == Some(segment.idx) && !selected;
+            let fill_id = ui.id().with(("segment-fill", segment.idx));
+            let highlight =
+                motion.factor(ui.ctx(), fill_id.with("active"), playing_here, motion::FAST);
+            let hover = motion.factor(
+                ui.ctx(),
+                fill_id.with("hover"),
+                response.hovered() && !selected,
+                motion::FAST,
+            );
             let fill = if selected {
                 tokens.accent_tint
-            } else if response.hovered() {
-                tokens.surface_hover
             } else {
-                Color32::TRANSPARENT
+                motion::tint_over(
+                    tokens.surface_hover.gamma_multiply(hover),
+                    tokens.accent_tint,
+                    highlight,
+                )
             };
-            ui.painter()
-                .rect_filled(rect, CornerRadius::same(tokens.radius.row), fill);
-            // Speaker badge (M16I): the same 3 px bar + chip as the desktop,
-            // in the row's leading slot.
-            if let Some(view) = &speaker_view {
+            if fill.a() > 0 {
+                ui.painter()
+                    .rect_filled(rect, CornerRadius::same(tokens.radius.row), fill);
+            }
+            if selected {
+                // One hairline of accent names the row being edited; the tint
+                // alone is too quiet at this density.
+                ui.painter().rect_stroke(
+                    rect,
+                    CornerRadius::same(tokens.radius.row),
+                    Stroke::new(1.0_f32, tokens.accent.gamma_multiply(0.55)),
+                    StrokeKind::Inside,
+                );
+            }
+
+            let header_center = rect.top() + SEGMENT_TOP + SEGMENT_HEADER / 2.0;
+            // Speaker badge (M16I): the shared 3 px bar + chip, in the row's
+            // leading gutter. Tapping it selects the segment.
+            if let (Some(view), Some(row)) = (&speaker_view, speaker_row) {
                 let slot = Rect::from_min_size(
-                    pos2(
-                        rect.left() + GUTTER,
-                        rect.top() + 18.0 - speakers::BADGE / 2.0,
-                    ),
+                    pos2(rect.left() + GUTTER, header_center - speakers::BADGE / 2.0),
                     vec2(speakers::SLOT_W, speakers::BADGE),
                 );
-                if let Some(row) = view.row(segment.idx) {
-                    let label = view.label(row.primary);
-                    let response = speakers::badge(
-                        ui,
-                        tokens,
-                        segment.idx,
-                        slot,
-                        speakers::BadgeLook {
-                            label: &label,
-                            color_slot: view.color_slot(row.primary),
-                            secondary: row.secondary.map(|second| view.color_slot(second)),
-                            dim: if view.stale { 0.55 } else { 1.0 },
-                        },
-                    );
-                    if response.clicked() {
-                        editor.select(segment.idx);
-                    }
+                let label = view.label(row.primary);
+                let badge_response = speakers::badge(
+                    ui,
+                    tokens,
+                    segment.idx,
+                    slot,
+                    speakers::BadgeLook {
+                        label: &label,
+                        color_slot: view.color_slot(row.primary),
+                        secondary: row.secondary.map(|second| view.color_slot(second)),
+                        dim: if view.stale { 0.55 } else { 1.0 },
+                    },
+                );
+                if badge_response.clicked() {
+                    editor.select(segment.idx);
                 }
             }
-            // Time gutter.
-            ui.painter().text(
-                pos2(rect.left() + GUTTER + speaker_pad, rect.top() + 18.0),
+
+            // Time gutter, on the tabular grid: `0:09 → 0:10` is the same
+            // width, so a playing transcript never twitches.
+            let time_width = type_scale::paint_tabular(
+                ui.painter(),
+                pos2(text_left, header_center),
                 Align2::LEFT_CENTER,
-                clock(segment.start_ms),
-                FontId::new(12.0, FontFamily::Monospace),
+                &clock(segment.start_ms),
+                &numerals.font,
                 tokens.ink_soft,
             );
-            if editing {
-                let edit_rect = Rect::from_min_size(
-                    pos2(rect.left() + 62.0 + speaker_pad, rect.top() + 34.0),
-                    vec2(rect.width() - 62.0 - GUTTER - speaker_pad, 74.0),
+
+            let play_center = pos2(rect.right() - GUTTER - 12.0, header_center);
+            let advisory_right = play_center.x - 28.0;
+            if let Some(advisory_text) = &advisory {
+                // Advisory, not an alarm: amber at this weight, never the
+                // record red (that belongs to failures that block work).
+                type_scale::paint_tabular(
+                    ui.painter(),
+                    pos2(advisory_right, header_center),
+                    Align2::RIGHT_CENTER,
+                    advisory_text,
+                    &numerals.font,
+                    tokens.warn,
                 );
+            }
+
+            // The turn's name, at the type scale's row title (15/20), with the
+            // kit's pencil marking the in-place rename affordance. It is not a
+            // second control: the badge beside it owns the rename target, and
+            // the name is part of the row's spoken label.
+            if show_name {
+                let name = speaker_view
+                    .as_ref()
+                    .map(|view| view.label(primary.expect("named turn")))
+                    .unwrap_or_default();
+                let name_x = text_left + time_width + 10.0;
+                let name_right = if advisory.is_some() {
+                    advisory_right - 8.0
+                } else {
+                    play_center.x - 24.0
+                };
+                let mut job = egui::text::LayoutJob::default();
+                job.append(&name, 0.0, type_scale::row_title().format(tokens.ink));
+                job.wrap.max_width = (name_right - name_x).max(40.0);
+                job.wrap.max_rows = 1;
+                job.wrap.break_anywhere = true;
+                job.wrap.overflow_character = Some('…');
+                let name_galley = ui.painter().layout_job(job);
+                ui.painter().galley(
+                    pos2(name_x, header_center - name_galley.size().y / 2.0),
+                    name_galley.clone(),
+                    tokens.ink,
+                );
+                let pencil = Rect::from_center_size(
+                    pos2(name_x + name_galley.size().x + 9.0, header_center),
+                    vec2(12.0, 12.0),
+                );
+                if pencil.right() < name_right {
+                    icons::paint(ui.painter(), pencil, Icon::Pencil, 12.0, tokens.ink_faint);
+                }
+            }
+
+            // The row's seek mark (the whole row is the target; this is the
+            // visible affordance).
+            ui.painter().add(egui::Shape::convex_polygon(
+                vec![
+                    pos2(play_center.x - 5.0, play_center.y - 8.0),
+                    pos2(play_center.x - 5.0, play_center.y + 8.0),
+                    pos2(play_center.x + 8.0, play_center.y),
+                ],
+                tokens.ink_soft,
+                Stroke::NONE,
+            ));
+
+            let body_top = rect.top() + SEGMENT_TOP + SEGMENT_HEADER + BODY_GAP;
+            if editing {
+                let edit_rect =
+                    Rect::from_min_size(pos2(text_left, body_top), vec2(body_width, 74.0));
                 let idx = editor
                     .edit_buffer
                     .as_ref()
@@ -309,7 +480,7 @@ pub fn ui(
                             .desired_rows(3)
                             .desired_width(edit_rect.width())
                             .frame(false)
-                            .font(FontId::proportional(15.0)),
+                            .font(FontId::proportional(body_token.size())),
                     );
                 }
                 let save = Rect::from_min_size(
@@ -363,7 +534,7 @@ pub fn ui(
                         rect.center(),
                         Align2::CENTER_CENTER,
                         label,
-                        FontId::proportional(13.0),
+                        type_scale::row_value().font,
                         if primary {
                             tokens.on_accent
                         } else {
@@ -372,39 +543,15 @@ pub fn ui(
                     );
                 }
             } else {
-                let text = editor.text(&segment).to_string();
-                let galley = ui.painter().layout(
-                    text,
-                    FontId::proportional(15.5),
-                    tokens.ink,
-                    (rect.width() - 62.0 - GUTTER - 24.0 - speaker_pad).max(60.0),
-                );
-                ui.painter().galley(
-                    pos2(rect.left() + 62.0 + speaker_pad, rect.top() + 12.0),
-                    galley,
-                    tokens.ink,
-                );
+                ui.painter()
+                    .galley(pos2(text_left, body_top), body_galley, tokens.ink);
                 if editor.dirty.contains(&segment.idx) {
                     ui.painter().circle_filled(
-                        pos2(rect.left() + 14.0, rect.top() + 40.0),
+                        pos2(rect.left() + 8.0, header_center),
                         3.0,
                         tokens.accent,
                     );
                 }
-                // The speaker mark: seek to this line.
-                let speaker = Rect::from_center_size(
-                    pos2(rect.right() - GUTTER - 12.0, rect.center().y),
-                    vec2(40.0, 40.0),
-                );
-                ui.painter().add(egui::Shape::convex_polygon(
-                    vec![
-                        pos2(speaker.center().x - 5.0, speaker.center().y - 8.0),
-                        pos2(speaker.center().x - 5.0, speaker.center().y + 8.0),
-                        pos2(speaker.center().x + 8.0, speaker.center().y),
-                    ],
-                    tokens.ink_soft,
-                    Stroke::NONE,
-                ));
                 if response.clicked() {
                     if editor.selected == Some(segment.idx) {
                         editor.begin_edit(segment.idx);
@@ -418,8 +565,8 @@ pub fn ui(
             }
             // M15.6: the word chips under the selected/playing row. Each chip
             // is a seek target; the word the transport is inside carries the
-            // accent, its underline springs in (Reduce Motion snaps it in — the
-            // state stays). Same rule as the desktop's karaoke strip.
+            // accent, its tint crossfading on the FAST token. Reduce Motion
+            // snaps the swap (the state stays).
             if show_words {
                 word_strip(
                     ui,
@@ -428,6 +575,8 @@ pub fn ui(
                     &mut editor,
                     &segment,
                     rect,
+                    text_left,
+                    body_top + body_h + 2.0,
                     &words,
                     &mut row_actions,
                 );
@@ -493,21 +642,31 @@ pub fn ui(
         if editor.playing { "Pause" } else { "Play" },
         true,
     );
+    let play_press = chrome::press_frame(
+        ui.ctx(),
+        ui.id().with("editor-play-press"),
+        play.is_pointer_button_down_on(),
+        motion.reduce,
+    );
+    let radius = 26.0 * play_press.scale;
     ui.painter()
-        .circle_filled(play_rect.center(), 26.0, tokens.accent);
+        .circle_filled(play_rect.center(), radius, tokens.accent);
     if editor.playing {
         let c = play_rect.center();
+        let side = vec2(13.0, 16.0) * play_press.scale;
         ui.painter().rect_filled(
-            Rect::from_center_size(c, vec2(13.0, 16.0)),
+            Rect::from_center_size(c, side),
             CornerRadius::same(2),
             tokens.on_accent,
         );
     } else {
+        let c = play_rect.center();
+        let s = play_press.scale;
         ui.painter().add(egui::Shape::convex_polygon(
             vec![
-                pos2(play_rect.center().x - 5.0, play_rect.center().y - 8.0),
-                pos2(play_rect.center().x - 5.0, play_rect.center().y + 8.0),
-                pos2(play_rect.center().x + 9.0, play_rect.center().y),
+                pos2(c.x - 5.0 * s, c.y - 8.0 * s),
+                pos2(c.x - 5.0 * s, c.y + 8.0 * s),
+                pos2(c.x + 9.0 * s, c.y),
             ],
             tokens.on_accent,
             Stroke::NONE,
@@ -520,18 +679,22 @@ pub fn ui(
     }
     let time_rect = Rect::from_min_size(
         pos2(bar.left() + GUTTER + 64.0, bar.center().y - 10.0),
-        vec2(96.0, 20.0),
+        vec2(112.0, 20.0),
     );
     a11y::describe(
         ui,
         time_rect,
         &format!("{} of {}", clock(editor.playhead_ms), clock(duration)),
     );
-    ui.painter().text(
+    // The live transport read-out is the one numeral a reader watches tick:
+    // both runs and the separator sit on fixed cells, so the bar does not
+    // twitch at 0:09 → 0:10.
+    type_scale::paint_tabular(
+        ui.painter(),
         pos2(bar.left() + GUTTER + 64.0, bar.center().y),
         Align2::LEFT_CENTER,
-        format!("{} / {}", clock(editor.playhead_ms), clock(duration)),
-        FontId::new(12.5, FontFamily::Monospace),
+        &format!("{} / {}", clock(editor.playhead_ms), clock(duration)),
+        &type_scale::numerals().font,
         tokens.ink_soft,
     );
     let search_btn = Rect::from_center_size(
@@ -551,11 +714,28 @@ pub fn ui(
     {
         editor.search_open = !editor.search_open;
     }
-    ui.painter().text(
-        search_btn.center(),
-        Align2::CENTER_CENTER,
-        "Find",
-        FontId::proportional(14.0),
+    let find_token = type_scale::row_value();
+    let find_galley = ui
+        .painter()
+        .layout_no_wrap("Find".to_owned(), find_token.font, tokens.ink);
+    let find_total = 16.0 + 6.0 + find_galley.size().x;
+    let find_start = search_btn.center().x - find_total / 2.0;
+    icons::paint(
+        ui.painter(),
+        Rect::from_center_size(
+            pos2(find_start + 8.0, search_btn.center().y),
+            vec2(16.0, 16.0),
+        ),
+        Icon::Search,
+        16.0,
+        tokens.ink_soft,
+    );
+    ui.painter().galley(
+        pos2(
+            find_start + 22.0,
+            search_btn.center().y - find_galley.size().y / 2.0,
+        ),
+        find_galley,
         tokens.ink,
     );
     let export_btn = Rect::from_center_size(
@@ -584,7 +764,7 @@ pub fn ui(
 }
 
 /// The M15.6 karaoke chips for one row: wrapped word targets under the text,
-/// the current word carrying the accent tint and a spring-grown underline.
+/// the current word carrying the accent tint and a FAST crossfade underline.
 /// A tap parks the playhead at the word's estimated start and emits a Seek.
 #[allow(clippy::too_many_arguments)]
 fn word_strip(
@@ -594,21 +774,22 @@ fn word_strip(
     editor: &mut super::model::CompactEditor,
     segment: &suramak_core::transcript::Segment,
     rect: Rect,
+    text_left: f32,
+    top: f32,
     words: &[suramak_core::transcript::WordTiming],
     actions: &mut Vec<CompactAction>,
 ) {
     let current = editor.current_word(segment.idx);
     let playing = editor.playing;
-    let mut x = rect.left() + 62.0;
-    let mut y = rect.top() + SEGMENT_ROW + 4.0;
+    let caption = type_scale::caption();
+    let mut x = text_left;
+    let mut y = top;
     let max_x = rect.right() - GUTTER - 8.0;
     let line_start = x;
     for (word_index, word) in words.iter().enumerate() {
-        let galley = ui.painter().layout_no_wrap(
-            word.text.clone(),
-            FontId::proportional(13.0),
-            tokens.ink_soft,
-        );
+        let galley =
+            ui.painter()
+                .layout_no_wrap(word.text.clone(), caption.font.clone(), tokens.ink_soft);
         let width = galley.size().x + 14.0;
         if x + width > max_x && x > line_start {
             x = line_start;
@@ -616,8 +797,12 @@ fn word_strip(
         }
         let chip = Rect::from_min_size(pos2(x, y), vec2(width, 18.0));
         let id = egui::Id::new(("compact-word", segment.idx, word_index));
-        let highlight =
-            motion.highlight_spring(ui.ctx(), id, playing && current == Some(word_index));
+        let highlight = motion.factor(
+            ui.ctx(),
+            id,
+            playing && current == Some(word_index),
+            motion::FAST,
+        );
         let response = a11y::touch(
             ui,
             tokens,
@@ -659,6 +844,25 @@ fn word_strip(
     }
 }
 
+/// The phone's advisory read for one segment, in human words.
+///
+/// The desktop editor keeps the trade shorthand (`CPL 44 · CPS 21.3`) because
+/// its audience is subtitle editors; the phone says **Line length** and
+/// **Pace**. Only crossed dimensions appear, exactly like `Metrics::badge`.
+/// Thresholds are the documented defaults (37/42 and 17/20); the phone has no
+/// settings surface for them.
+fn advisory_for(text: &str, start_ms: i64, end_ms: i64) -> Option<String> {
+    let metrics = diagnose(text, start_ms, end_ms, &SubtitleLimits::default());
+    let mut parts = Vec::new();
+    if metrics.cpl_level != Level::Ok {
+        parts.push(format!("Line length {}", metrics.longest_line));
+    }
+    if metrics.cps_level != Level::Ok {
+        parts.push(format!("Pace {:.1}", metrics.cps));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 /// The export sheet's body: the format chips, the bilingual switch and the two
 /// ways out (picker or one-file share), then the picker/write result.
 ///
@@ -674,14 +878,10 @@ pub fn export_sheet(
 ) -> Vec<CompactAction> {
     let now = ui.input(|input| input.time);
     let mut actions = Vec::new();
-    ui.painter().text(
+    paint_display_centered(
+        ui,
         pos2(body.center().x, body.top() + 30.0),
-        Align2::CENTER_CENTER,
         "Export transcript",
-        FontId::new(
-            19.0,
-            FontFamily::Name(crate::deck::theme::SERIF_FAMILY.into()),
-        ),
         tokens.ink,
     );
     let Some(editor) = state.editor.as_ref() else {
@@ -702,7 +902,7 @@ pub fn export_sheet(
         pos2(body.center().x, body.top() + 54.0),
         Align2::CENTER_CENTER,
         "Same bytes as the desktop. Choose where it goes.",
-        FontId::proportional(12.5),
+        type_scale::caption().font,
         tokens.ink_soft,
     );
     let chip_w = (body.width() - GUTTER * 2.0 - 8.0 * 2.0) / 3.0;
@@ -727,6 +927,15 @@ pub fn export_sheet(
             &format!("Export format: {}", format.label()),
             true,
         );
+        // The chip takes the sheet's spring: its body scales, the hit rect does
+        // not. Selected keeps the plan's tint + 45 % accent rim.
+        let press = chrome::press_frame(
+            ui.ctx(),
+            ui.id().with(("export-chip-press", format.label())),
+            response.is_pointer_button_down_on(),
+            motion.reduce,
+        );
+        let visual = Rect::from_center_size(rect.center(), rect.size() * press.scale);
         let fill = if selected {
             tokens.accent_tint
         } else if response.hovered() {
@@ -735,7 +944,7 @@ pub fn export_sheet(
             tokens.control_fill
         };
         ui.painter().rect(
-            rect,
+            visual,
             CornerRadius::same(tokens.radius.control),
             fill,
             Stroke::new(
@@ -749,10 +958,10 @@ pub fn export_sheet(
             StrokeKind::Inside,
         );
         ui.painter().text(
-            rect.center(),
+            visual.center(),
             Align2::CENTER_CENTER,
             format.label(),
-            FontId::proportional(13.5),
+            type_scale::row_value().font,
             if selected { tokens.accent } else { tokens.ink },
         );
         if response.clicked() {
@@ -794,14 +1003,7 @@ pub fn export_sheet(
             StrokeKind::Inside,
         );
         if state.export_bilingual && has_translation {
-            ui.painter().add(egui::Shape::line(
-                vec![
-                    pos2(box_rect.left() + 5.0, box_rect.center().y),
-                    pos2(box_rect.center().x, box_rect.bottom() - 5.0),
-                    pos2(box_rect.right() - 4.0, box_rect.top() + 5.0),
-                ],
-                Stroke::new(2.0_f32, tokens.on_accent),
-            ));
+            icons::paint(ui.painter(), box_rect, Icon::Check, 13.0, tokens.on_accent);
         }
         ui.painter().text(
             pos2(box_rect.right() + 10.0, toggle_rect.center().y),
@@ -811,7 +1013,7 @@ pub fn export_sheet(
             } else {
                 "No translation to include"
             },
-            FontId::proportional(13.0),
+            type_scale::caption().font,
             if has_translation {
                 tokens.ink
             } else {
@@ -828,15 +1030,15 @@ pub fn export_sheet(
         pos2(body.left() + GUTTER, body.top() + 232.0),
         Align2::LEFT_CENTER,
         "Picker: the system file chooser writes to the frame you pick.",
-        FontId::proportional(11.5),
-        tokens.ink_faint,
+        type_scale::caption().font,
+        tokens.ink_soft,
     );
     ui.painter().text(
         pos2(body.left() + GUTTER, body.top() + 250.0),
         Align2::LEFT_CENTER,
         "Share: hands this one file to another app (ACTION_SEND).",
-        FontId::proportional(11.5),
-        tokens.ink_faint,
+        type_scale::caption().font,
+        tokens.ink_soft,
     );
     let share = Rect::from_min_size(
         pos2(body.left() + GUTTER, body.bottom() - 128.0),
@@ -931,35 +1133,41 @@ fn export_result(
         pos2(body.left() + GUTTER, body.top() + 76.0),
         vec2(body.width() - GUTTER * 2.0, 132.0),
     );
-    chrome::card(ui, tokens, card);
+    material::frosted_panel(ui, tokens, card, tokens.radius.card, Plane::Card);
     let spoken = format!("{line}: {detail}");
-    ui.painter().text(
-        pos2(card.left() + 16.0, card.top() + 30.0),
-        Align2::LEFT_CENTER,
-        line,
-        FontId::new(
-            20.0,
-            FontFamily::Name(crate::deck::theme::SERIF_FAMILY.into()),
-        ),
-        if error {
+    let display = type_scale::editorial_display();
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        &line,
+        0.0,
+        display.format(if error {
             tokens.record_red_text
         } else {
             tokens.ink
-        },
+        }),
+    );
+    let line_galley = ui.painter().layout_job(job);
+    ui.painter().galley(
+        pos2(
+            card.left() + 16.0,
+            card.top() + 30.0 - line_galley.size().y / 2.0,
+        ),
+        line_galley,
+        tokens.ink,
     );
     ui.painter().text(
         pos2(card.left() + 16.0, card.top() + 60.0),
         Align2::LEFT_CENTER,
         truncate(&detail, 58),
-        FontId::proportional(12.5),
+        type_scale::caption().font,
         tokens.ink_soft,
     );
     ui.painter().text(
         pos2(card.left() + 16.0, card.top() + 96.0),
         Align2::LEFT_CENTER,
         format!("{} · {}", session.format.label(), session.format.mime()),
-        FontId::new(11.5, FontFamily::Monospace),
-        tokens.ink_faint,
+        type_scale::mono().font,
+        tokens.ink_soft,
     );
     a11y::describe(ui, card, &spoken);
 
@@ -998,21 +1206,17 @@ fn export_result(
 /// The quit confirm sheet (Settings' Quit action). Returns `Some(true)` when
 /// Quit is confirmed, `Some(false)` when cancelled.
 pub fn quit_sheet(ui: &mut Ui, tokens: &Tokens, motion: &Motion, body: Rect) -> Option<bool> {
-    ui.painter().text(
+    paint_display_centered(
+        ui,
         pos2(body.center().x, body.top() + 40.0),
-        Align2::CENTER_CENTER,
         "Quit Suramak?",
-        FontId::new(
-            21.0,
-            FontFamily::Name(crate::deck::theme::SERIF_FAMILY.into()),
-        ),
         tokens.ink,
     );
     ui.painter().text(
         pos2(body.center().x, body.top() + 70.0),
         Align2::CENTER_CENTER,
         "Any recording is saved and handed to the inbox first;\nrunning transcription pauses, services stop, then the app exits.",
-        FontId::proportional(13.0),
+        type_scale::caption().font,
         tokens.ink_soft,
     );
     let width = body.width() - GUTTER * 2.0;
@@ -1036,6 +1240,18 @@ pub fn quit_sheet(ui: &mut Ui, tokens: &Tokens, motion: &Motion, body: Rect) -> 
     answer
 }
 
+/// A centred serif line at the type scale's **editorial display** (Newsreader
+/// 21 / −0.2 / 27) — sheet titles and result states. Laid out as a job so the
+/// token's tracking and line height are real, not a bare `FontId`.
+fn paint_display_centered(ui: &Ui, center: egui::Pos2, text: &str, ink: Color32) {
+    let token = type_scale::editorial_display();
+    let mut job = egui::text::LayoutJob::default();
+    job.append(text, 0.0, token.format(ink));
+    let galley = ui.painter().layout_job(job);
+    ui.painter()
+        .galley(center - galley.size() / 2.0, galley, ink);
+}
+
 /// A file size for the result line: bytes/KB below a megabyte (an SRT export
 /// is a few kilobytes; "0 MB" would read as an empty file).
 fn file_size_label(bytes: u64) -> String {
@@ -1056,4 +1272,40 @@ fn truncate(text: &str, chars: usize) -> String {
     let mut out: String = text.chars().take(chars.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The phone names the metric. `CPL` is trade shorthand the review flagged;
+    /// the read-out says **Line length** (and Pace for the other dimension).
+    #[test]
+    fn the_advisory_speaks_line_length_not_cpl() {
+        let long = "a".repeat(48);
+        let advisory = advisory_for(&long, 0, 4_000).expect("48 graphemes crosses 42");
+        assert!(advisory.starts_with("Line length 48"), "{advisory}");
+        assert!(!advisory.contains("CPL"), "{advisory}");
+        assert!(!advisory.contains("CPS"), "{advisory}");
+
+        // A clean line has no advisory at all.
+        assert!(advisory_for("A short line.", 0, 4_000).is_none());
+
+        // A dense segment crosses pace only: each hard line stays under the
+        // line-length threshold, so the read-out says Pace and nothing else.
+        let dense = "word word word word\n".repeat(8);
+        let advisory = advisory_for(&dense, 0, 2_000).expect("40 CPS crosses 17");
+        assert!(advisory.starts_with("Pace "), "{advisory}");
+    }
+
+    /// Both numerals in the advisory sit on fixed cells: the widening from
+    /// `99` to `100` is the only change, never a digit swap.
+    #[test]
+    fn the_advisory_numerals_are_tabular() {
+        let size = type_scale::numerals().size();
+        assert_eq!(
+            type_scale::tabular_width("Line length 44", size),
+            type_scale::tabular_width("Line length 84", size)
+        );
+    }
 }

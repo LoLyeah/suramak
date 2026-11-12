@@ -1,6 +1,6 @@
 //! M20B — the painted icon kit.
 //!
-//! Eleven hand-drawn glyphs at one stroke (1.75 px, round caps and joins) and
+//! Twelve hand-drawn glyphs at one stroke (1.75 px, round caps and joins) and
 //! two designed sizes (18 pt inline, 20 pt chrome). No SVG parser, no icon
 //! font, no unicode stand-ins: every curve is an `egui` shape, so the kit looks
 //! like the product's own hand on Android and macOS alike.
@@ -44,7 +44,7 @@ impl IconSize {
     }
 }
 
-/// The eleven icons the plan names.
+/// The twelve icons the plan names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
     /// Settings (the app bar's trailing affordance).
@@ -69,6 +69,8 @@ pub enum Icon {
     Close,
     /// Delete a transcript.
     Trash,
+    /// Rename in place (beside a speaker's name).
+    Pencil,
 }
 
 impl Icon {
@@ -87,6 +89,7 @@ impl Icon {
             Self::Speaker => "Play",
             Self::Close => "Close",
             Self::Trash => "Delete",
+            Self::Pencil => "Rename",
         }
     }
 }
@@ -171,6 +174,19 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, size: f32, color: Color3
             pen.line(&[(-1.8, -0.4), (-1.8, 5.2)]);
             pen.line(&[(1.8, -0.4), (1.8, 5.2)]);
         }
+        Icon::Pencil => {
+            // The body is one closed outline with the ferrule line across it;
+            // the nib is the short stroke at the lower-left.
+            pen.line(&[
+                (-6.2, 6.2),
+                (-4.9, 1.7),
+                (2.7, -5.9),
+                (5.9, -2.7),
+                (-1.7, 4.9),
+                (-6.2, 6.2),
+            ]);
+            pen.line(&[(-4.9, 1.7), (-1.7, 4.9)]);
+        }
     }
 }
 
@@ -244,6 +260,7 @@ icon_button!(share, Share);
 icon_button!(speaker, Speaker);
 icon_button!(close, Close);
 icon_button!(trash, Trash);
+icon_button!(pencil, Pencil);
 
 /// One 20-unit design grid, centred on the hit box, scaled to the ink size.
 struct Pen<'a> {
@@ -327,6 +344,7 @@ mod tests {
             Icon::Speaker,
             Icon::Close,
             Icon::Trash,
+            Icon::Pencil,
         ];
         for icon in icons {
             for size in [IconSize::Inline, IconSize::Chrome] {
@@ -382,6 +400,7 @@ mod tests {
                     Icon::Speaker,
                     Icon::Close,
                     Icon::Trash,
+                    Icon::Pencil,
                 ];
                 for (index, icon) in icons.into_iter().enumerate() {
                     let rect =
@@ -404,7 +423,7 @@ mod tests {
                 .into_iter()
                 .map(|control| (control.label, control.role)),
         );
-        assert_eq!(seen.len(), 11);
+        assert_eq!(seen.len(), 12);
         for (label, role) in &seen {
             assert!(!label.is_empty());
             assert_eq!(*role, WidgetType::Button);

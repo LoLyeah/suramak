@@ -19,6 +19,7 @@
 
 use egui::{pos2, vec2, Align2, Rect, Stroke, Ui, WidgetType};
 
+use crate::deck::icons::{self, Icon};
 use crate::deck::motion::Motion;
 use crate::deck::theme::Tokens;
 use crate::deck::type_scale;
@@ -34,9 +35,9 @@ pub enum OnboardingChoice {
     Skip,
 }
 
-/// One row of the intro: the number, the spoken title, the body line.
+/// One row of the intro: the kit icon, the spoken title, the body line.
 struct Path {
-    number: &'static str,
+    icon: Icon,
     title: &'static str,
     body: &'static str,
     a11y: &'static str,
@@ -44,19 +45,19 @@ struct Path {
 
 const PATHS: [Path; 3] = [
     Path {
-        number: "1",
+        icon: Icon::Share,
         title: "Share a voice note",
         body: "From WhatsApp or a recorder, choose Share to Suramak. It transcribes here, on the phone.",
         a11y: "Share a voice note into Suramak from another app",
     },
     Path {
-        number: "2",
+        icon: Icon::ImportWave,
         title: "Open a file",
         body: "Tap Import to pick an audio or video file. Suramak copies it, so the transcript survives the original moving.",
         a11y: "Open an audio or video file with Import",
     },
     Path {
-        number: "3",
+        icon: Icon::Mic,
         title: "Record in-app",
         body: "Tap Record. It keeps recording with the screen off, then lands in this library.",
         a11y: "Record from the microphone in the app",
@@ -68,11 +69,17 @@ pub fn sheet(ui: &mut Ui, tokens: &Tokens, motion: &Motion, body: Rect) -> Onboa
     let mut choice = OnboardingChoice::None;
     let display = type_scale::editorial_display();
     let caption = type_scale::caption();
-    ui.painter().text(
-        pos2(body.center().x, body.top() + 34.0),
-        Align2::CENTER_CENTER,
-        "Welcome to Suramak",
-        display.font,
+    // The hero is the editorial display token: Newsreader 21 / −0.2 / 27. The
+    // tracking only lands through a layout job, so the token is used whole.
+    let mut hero = egui::text::LayoutJob::default();
+    hero.append("Welcome to Suramak", 0.0, display.format(tokens.ink));
+    let hero = ui.painter().layout_job(hero);
+    ui.painter().galley(
+        pos2(
+            body.center().x - hero.size().x / 2.0,
+            body.top() + 34.0 - hero.size().y / 2.0,
+        ),
+        hero,
         tokens.ink,
     );
     ui.painter().text(
@@ -95,25 +102,25 @@ pub fn sheet(ui: &mut Ui, tokens: &Tokens, motion: &Motion, body: Rect) -> Onboa
     let mut y = body.top() + 84.0;
     for path in PATHS {
         let row = Rect::from_min_size(pos2(body.left() + GUTTER, y), vec2(width, 76.0));
-        let number = Rect::from_min_size(pos2(row.left() + 4.0, row.top() + 4.0), vec2(30.0, 30.0));
+        let mark = Rect::from_min_size(pos2(row.left() + 4.0, row.top() + 4.0), vec2(30.0, 30.0));
         ui.painter().circle(
-            number.center(),
+            mark.center(),
             15.0,
             tokens.accent_tint,
             Stroke::new(1.0_f32, tokens.accent.gamma_multiply(0.55)),
         );
-        ui.painter().text(
-            number.center(),
-            Align2::CENTER_CENTER,
-            path.number,
-            type_scale::row_value().font,
+        icons::paint(
+            ui.painter(),
+            Rect::from_center_size(mark.center(), vec2(16.0, 16.0)),
+            path.icon,
+            16.0,
             tokens.accent,
         );
-        ui.painter().text(
-            pos2(row.left() + 44.0, row.top() + 12.0),
-            Align2::LEFT_CENTER,
-            path.title,
-            type_scale::row_title().font,
+        let mut title = egui::text::LayoutJob::default();
+        title.append(path.title, 0.0, type_scale::row_title().format(tokens.ink));
+        ui.painter().galley(
+            pos2(row.left() + 44.0, row.top() + 12.0 - 10.0),
+            ui.painter().layout_job(title),
             tokens.ink,
         );
         let mut job = egui::text::LayoutJob::default();

@@ -6,10 +6,15 @@
 //! section label, 24 between sections), hairlines only *inside* a grouped card,
 //! and the type scale's 11 pt CAPS section labels.
 //!
-//! The model table is ONE card: each row leads with a human tier name and its
-//! size, keeps the manifest id on a small mono second line (and in Diagnostics)
-//! for support, and says what the tier is for in plain words. The five-state
-//! actions of M19B are unchanged — `In use` still requires a verified file.
+//! The model table is ONE card: each row leads with a human tier name, its
+//! size and a truthful one-line purpose. The raw manifest ids (`tiny`, `base`,
+//! `small`, `turbo-q5-0`) are support vocabulary and live in Diagnostics only
+//! (M20D2) — the phone's primary card never asks a person to read them. A
+//! recommendation is a real capsule badge, and the selected row is a full-bleed
+//! tint band with a 3 px accent bar, not a pill nested inside the card. The
+//! five-state actions of M19B are unchanged — `In use` still requires a
+//! verified file — with one wording change: the recommended row's missing file
+//! offers `Download`.
 //!
 //! The primary surface carries no build vocabulary: no `CI + tests`, no
 //! `optional/legacy`, no `default (macOS)`, no diarization model strings, no
@@ -66,7 +71,7 @@ const LABEL_H: f32 = 16.0;
 const CARD_PAD: f32 = 16.0;
 /// One setting row: 48 pt body minimum, two text lines.
 const ROW_H: f32 = 64.0;
-/// One model row: tier name, mono id, one guidance line.
+/// One model row: tier name (plus the optional badge) and one guidance line.
 const MODEL_ROW_H: f32 = 80.0;
 /// The device card's facts block (version, memory, the disk-truth note).
 const DEVICE_FACTS_H: f32 = 80.0;
@@ -223,7 +228,12 @@ pub fn ui(
 
         // ---- Models ---------------------------------------------------
         y = section(ui, tokens, x, y, "Models");
-        let sentence = tier_sentence(state.tier);
+        let sentence = model_sentence(
+            state.tier,
+            state.ram_bytes,
+            state.recommended_model(),
+            state.configured_model(),
+        );
         let sentence_galley = paint_elided(
             ui.painter(),
             pos2(x, y),
@@ -279,7 +289,10 @@ pub fn ui(
                     )
             });
             let row_state = row.state(selected, live.as_ref());
-            let last = index + 1 == offered.len();
+            let edges = RowEdges {
+                first: index == 0,
+                last: index + 1 == offered.len(),
+            };
             let (row_clicked, action_clicked) = model_row(
                 ui,
                 tokens,
@@ -289,7 +302,7 @@ pub fn ui(
                 selected,
                 live.as_ref(),
                 row_state,
-                !last,
+                edges,
             );
             if action_clicked && row.offered && row_state.is_actionable() {
                 match row_state {
@@ -731,12 +744,116 @@ fn readout_row(
     );
 }
 
-/// One model row in the grouped card (M20D): the human tier name and size on
-/// the first line, the manifest id in mono plus an optional "Recommended" tag
-/// on the second, and one truthful third line (a job's progress, a stale-file
-/// warning, the configured-but-missing sentence, or the tier's purpose). The
-/// state action stays the M19B pill: `Get`, `Resume`, `Cancel`, `Re-download`,
-/// `Use`, or `In use` (only ever with a verified file).
+/// The leading and trailing edges of one row inside the grouped card (M20D2).
+///
+/// The selected band is full-bleed, so it borrows the card's corner radius at
+/// the top and bottom instead of painting a square tint over the rounded frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowEdges {
+    first: bool,
+    last: bool,
+}
+
+impl RowEdges {
+    fn radius(self, card: u8) -> CornerRadius {
+        CornerRadius {
+            nw: if self.first { card } else { 0 },
+            ne: if self.first { card } else { 0 },
+            sw: if self.last { card } else { 0 },
+            se: if self.last { card } else { 0 },
+        }
+    }
+}
+
+/// The word the recommendation capsule carries.
+pub const RECOMMENDED: &str = "Recommended";
+
+/// The text one model row paints on the primary Settings card (M20D2).
+///
+/// This is the row's paint source, not a parallel description: [`model_row`]
+/// lays these strings out verbatim, and the tests read the same struct to prove
+/// the manifest ids never reach a person on this surface. The raw id belongs to
+/// Diagnostics ([`super::diagnostics::model_file_lines`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRowText {
+    /// The human tier name, e.g. `Balanced`.
+    pub name: &'static str,
+    /// The pinned size, e.g. `488 MB`.
+    pub size: String,
+    /// The recommendation capsule's word, when this row is the tier default.
+    pub badge: Option<&'static str>,
+    /// The truthful second line: progress, a stale-file warning, or purpose.
+    pub note: String,
+    /// The action word: `Get`, `Download`, `Resume`, `Cancel`, `Re-download`,
+    /// `Use`, or `In use`.
+    pub action: &'static str,
+}
+
+impl ModelRowText {
+    /// Every string the row paints, joined. The test surface for "no raw ids on
+    /// the primary card"; keeping it here means the check cannot drift from the
+    /// paint paths below.
+    pub fn painted(&self) -> String {
+        let mut out = format!("{} · {}", self.name, self.size);
+        if let Some(badge) = self.badge {
+            out.push(' ');
+            out.push_str(badge);
+        }
+        out.push(' ');
+        out.push_str(&self.note);
+        out.push(' ');
+        out.push_str(self.action);
+        out
+    }
+}
+
+/// Builds one row's painted text. `selected` is the configured id; `live` is
+/// the row's job, when one is running.
+pub fn model_row_text(
+    row: &ModelRow,
+    state: ModelState,
+    selected: bool,
+    live: Option<&DownloadView>,
+) -> ModelRowText {
+    let note = match (state, live) {
+        (ModelState::Downloading, Some(download)) => format!(
+            "Downloading · {}% · {} of {}",
+            download.percent,
+            super::model::bytes_label(download.bytes_done),
+            super::model::bytes_label(download.bytes_total)
+        ),
+        (ModelState::StaleCorrupt, _) => {
+            "The file on this phone is incomplete — download it again.".to_string()
+        }
+        (ModelState::NotDownloaded, _) if selected => {
+            "This is the model Suramak is set to, but its file is not here yet.".to_string()
+        }
+        _ => row.phone_note(),
+    };
+    let action = match (state, live.is_some()) {
+        (ModelState::Downloading, false) => "Resume",
+        // The recommended row with no file — which may also be the configured
+        // row — asks for a Download, not a vague Get.
+        (ModelState::NotDownloaded, _) if selected || row.recommended => "Download",
+        _ => state.action(),
+    };
+    ModelRowText {
+        name: row.tier_name(),
+        size: row.tier_line(),
+        badge: row.recommended.then_some(RECOMMENDED),
+        note,
+        action,
+    }
+}
+
+/// One model row in the grouped card (M20D2): the human tier name and size on
+/// the first line, the recommendation capsule beside it when this is the tier
+/// default, and one truthful second line (a job's progress, a stale-file
+/// warning, the configured-but-missing sentence, or the tier's purpose).
+///
+/// The raw manifest id is **not** painted here; Diagnostics owns it. The state
+/// action stays the M19B pill: `Get`, `Download`, `Resume`, `Cancel`,
+/// `Re-download`, `Use`, or `In use` (only ever with a verified file).
 ///
 /// Returns `(row_clicked, action_clicked)`; the caller owns the state machine.
 #[allow(clippy::too_many_arguments)]
@@ -749,10 +866,11 @@ fn model_row(
     selected: bool,
     live: Option<&DownloadView>,
     row_state: ModelState,
-    divider: bool,
+    edges: RowEdges,
 ) -> (bool, bool) {
     let in_use = row_state.is_in_use();
-    let spoken = format!("{} model, {}", row.tier_name(), row_state.label());
+    let text = model_row_text(row, row_state, selected, live);
+    let spoken = format!("{} model, {}", text.name, row_state.label());
     let response = a11y::touch(
         ui,
         tokens,
@@ -771,31 +889,37 @@ fn model_row(
     );
     let scale = press.scale;
     let visual = Rect::from_center_size(rect.center(), rect.size() * scale);
+    let radius = edges.radius(tokens.radius.card);
 
-    // The selection / hover / press band is inset from the card's rim so it
-    // never paints over the card's rounded corners.
-    let band = Rect::from_min_max(
-        pos2(visual.left() + 8.0, visual.top() + 2.0),
-        pos2(visual.right() - 8.0, visual.bottom() - 2.0),
-    );
-    let radius = CornerRadius::same(tokens.radius.control);
+    // M20D2: the selected row is a FULL-BLEED tint band — the card's whole
+    // width, no inset, no inner border — with a 3 px accent bar on its leading
+    // edge. It groups with the card instead of reading as a pill nested in it.
     if in_use {
-        // The plan's selected rule: tint fill + 1 px accent stroke at 45 %.
-        ui.painter().rect(
-            band,
-            radius,
-            tokens.accent_tint,
-            Stroke::new(1.0_f32, tokens.accent.gamma_multiply(0.45)),
-            StrokeKind::Inside,
-        );
+        ui.painter().rect_filled(rect, radius, tokens.accent_tint);
+        // The bar starts and ends where the card's rounded corner meets its
+        // straight edge: a 3 px rect cannot follow a 12 pt curve (egui clamps
+        // the radius to half its width), and letting it run to the square top
+        // pokes a nub outside the card on a first/last row.
+        let trim = tokens.radius.card as f32;
+        let bar_top = rect.top() + if edges.first { trim } else { 0.0 };
+        let bar_bottom = rect.bottom() - if edges.last { trim } else { 0.0 };
+        if bar_bottom > bar_top {
+            let bar = Rect::from_min_max(
+                pos2(rect.left(), bar_top),
+                pos2(rect.left() + 3.0, bar_bottom),
+            );
+            ui.painter()
+                .rect_filled(bar, CornerRadius::ZERO, tokens.accent);
+        }
     } else if press.fill > 0.0 {
         ui.painter().rect_filled(
-            band,
+            visual,
             radius,
             tokens.surface_active.gamma_multiply(press.fill),
         );
     } else if row.offered && response.hovered() {
-        ui.painter().rect_filled(band, radius, tokens.surface_hover);
+        ui.painter()
+            .rect_filled(visual, radius, tokens.surface_hover);
     }
 
     let ink = if row.offered {
@@ -805,15 +929,29 @@ fn model_row(
     };
     let name_token = chrome::scaled(&type_scale::row_title(), scale);
     let caption = chrome::scaled(&type_scale::caption(), scale);
-    let mono = chrome::scaled(&type_scale::mono(), scale);
     let text_width = visual.width() - CARD_PAD * 2.0 - ACTION_W - 12.0;
 
-    // Line 1: "Balanced · 488 MB".
+    // Measure the badge first so the title can elide around it. The note line
+    // below keeps the card's full width: losing a few points off the size on
+    // the narrowest 360 dp column is cheaper than truncating the one sentence
+    // that explains a missing file.
+    let badge = text.badge.map(|word| {
+        ui.painter()
+            .layout_no_wrap(word.to_owned(), caption.font.clone(), tokens.ink)
+    });
+    let badge_w = badge
+        .as_ref()
+        .map_or(0.0, |galley| galley.size().x + 16.0 * scale);
+    let badge_gap = if badge.is_some() { 8.0 * scale } else { 0.0 };
+    let title_width = (text_width - badge_w - badge_gap).max(48.0);
+
+    // Line 1: "Balanced · 488 MB", then the recommendation capsule. The badge
+    // is a shape with a word in it — not grey text appended to a raw id.
     let mut job = egui::text::LayoutJob::default();
-    job.append(row.tier_name(), 0.0, name_token.format(ink));
+    job.append(text.name, 0.0, name_token.format(ink));
     job.append(" · ", 0.0, caption.format(tokens.ink_soft));
-    job.append(&row.tier_line(), 0.0, caption.format(tokens.ink_soft));
-    job.wrap.max_width = text_width.max(48.0);
+    job.append(&text.size, 0.0, caption.format(tokens.ink_soft));
+    job.wrap.max_width = title_width;
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = false;
     job.wrap.overflow_character = Some('…');
@@ -821,56 +959,42 @@ fn model_row(
     ui.painter().galley(
         pos2(
             visual.left() + CARD_PAD * scale,
-            visual.top() + 12.0 * scale,
+            visual.top() + 16.0 * scale,
         ),
-        name_galley,
+        name_galley.clone(),
         ink,
     );
-
-    // Line 2: the manifest id in mono (support can name the file), then the
-    // Recommended tag — attached to the id, never floating beside the action
-    // pill. `ink_soft`, not `ink_faint`: the id is the line support reads
-    // aloud, and the light ladder's faint is under the small-text floor.
-    let mut id_job = egui::text::LayoutJob::default();
-    id_job.append(&row.id, 0.0, mono.format(tokens.ink_soft));
-    if row.recommended {
-        id_job.append("  ·  ", 0.0, caption.format(tokens.ink_soft));
-        // Ink, not accent: on the selected row's accent tint the ladder's
-        // accent is 3.7:1 in light and 4.47:1 in dark — under the small-text
-        // floor. The tint band and the check carry the accent instead.
-        id_job.append("Recommended", 0.0, caption.format(tokens.ink));
+    if let (Some(galley), Some(word)) = (badge, text.badge) {
+        let height = 20.0 * scale;
+        let width = galley.size().x + 16.0 * scale;
+        let capsule = Rect::from_min_size(
+            pos2(
+                visual.left() + CARD_PAD * scale + name_galley.size().x + badge_gap,
+                visual.top() + 16.0 * scale,
+            ),
+            vec2(width, height),
+        );
+        ui.painter().rect(
+            capsule,
+            CornerRadius::same((height / 2.0).round() as u8),
+            tokens.accent_tint,
+            Stroke::new(1.0_f32, tokens.accent.gamma_multiply(0.45)),
+            StrokeKind::Inside,
+        );
+        ui.painter().galley(
+            pos2(
+                capsule.center().x - galley.size().x / 2.0,
+                capsule.center().y - galley.size().y / 2.0,
+            ),
+            galley,
+            tokens.ink,
+        );
+        a11y::describe(ui, capsule, word);
     }
-    id_job.wrap.max_width = text_width.max(48.0);
-    id_job.wrap.max_rows = 1;
-    id_job.wrap.break_anywhere = false;
-    id_job.wrap.overflow_character = Some('…');
-    let id_galley = ui.painter().layout_job(id_job);
-    ui.painter().galley(
-        pos2(
-            visual.left() + CARD_PAD * scale,
-            visual.top() + 34.0 * scale,
-        ),
-        id_galley,
-        tokens.ink_soft,
-    );
 
-    // Line 3: the truth — a live job's progress, the stale-file sentence, the
-    // configured-but-missing sentence, or the tier's purpose.
-    let note = match (row_state, live) {
-        (ModelState::Downloading, Some(download)) => format!(
-            "Downloading · {}% · {} of {}",
-            download.percent,
-            super::model::bytes_label(download.bytes_done),
-            super::model::bytes_label(download.bytes_total)
-        ),
-        (ModelState::StaleCorrupt, _) => {
-            "The file on this phone is incomplete — download it again.".to_string()
-        }
-        (ModelState::NotDownloaded, _) if selected => {
-            "This is the model Suramak is set to, but its file is not here yet.".to_string()
-        }
-        _ => row.phone_note(),
-    };
+    // Line 2: the truth — a live job's progress, the stale-file sentence, the
+    // configured-but-missing sentence, or the tier's purpose. It sits below
+    // the action pill, so it can use the card's full width.
     let note_ink = if row.offered {
         tokens.ink_soft
     } else {
@@ -880,9 +1004,9 @@ fn model_row(
         ui.painter(),
         pos2(
             visual.left() + CARD_PAD * scale,
-            visual.top() + 55.0 * scale,
+            visual.top() + 48.0 * scale,
         ),
-        &note,
+        &text.note,
         &caption,
         note_ink,
         visual.width() - CARD_PAD * 2.0,
@@ -890,53 +1014,43 @@ fn model_row(
     a11y::describe(
         ui,
         Rect::from_min_size(
-            pos2(visual.left() + CARD_PAD, visual.top() + 53.0),
+            pos2(visual.left() + CARD_PAD, visual.top() + 46.0),
             vec2(
                 visual.width() - CARD_PAD * 2.0,
                 note_galley.size().y.max(16.0),
             ),
         ),
-        &format!("{}, {}: {note}", row.tier_name(), row.tier_line()),
+        &format!("{}, {}: {}", text.name, text.size, text.note),
     );
 
-    // The action pill: a 48 pt hit area around a 36 pt painted body, on the
-    // title line's trailing edge.
-    // The action sits on the two text lines (name + id); the note underneath
-    // takes the row's full width, so a manifest sentence can never run under
-    // the pill. The hit area is 48 pt even though the painted pill is 36.
+    // The action pill: a 48 pt hit area around a 36 pt painted body, centred
+    // on the title line.
     let action_hit = Rect::from_min_size(
         pos2(rect.right() - CARD_PAD - ACTION_W, rect.top() + 4.0),
         vec2(ACTION_W, MIN_TOUCH),
     );
     let action_rect = Rect::from_min_size(
-        pos2(action_hit.left(), rect.top() + 10.0),
+        pos2(action_hit.left(), rect.top() + 8.0),
         vec2(ACTION_W, ACTION_H * scale),
     );
-    let action = match (row_state, live.is_some()) {
-        (ModelState::Downloading, false) => "Resume",
-        // The configured model with no file is the one the row must not lie
-        // about: a primary Download, not "In use"/"Get".
-        (ModelState::NotDownloaded, _) if selected => "Download",
-        _ => row_state.action(),
-    };
     let action_response = a11y::touch(
         ui,
         tokens,
         action_hit,
         ("model-action", &row.id),
         WidgetType::Button,
-        &format!("{action} {}", row.tier_name()),
+        &format!("{} {}", text.action, text.name),
         row.offered && row_state.is_actionable(),
     );
-    let primary =
-        row_state == ModelState::Installed || (row_state == ModelState::NotDownloaded && selected);
+    let primary = row_state == ModelState::Installed
+        || (row_state == ModelState::NotDownloaded && (selected || row.recommended));
     let (fill, stroke, action_ink) = if !row.offered {
         (Color32::TRANSPARENT, tokens.hairline, tokens.ink_faint)
     } else if in_use {
-        // A status, not a button: the tint fill and an accent check, no
-        // outline. The word is ink — accent text on the tint is 3.7:1 in the
-        // light ladder (4.47:1 in the dark), under the 4.5:1 floor.
-        (tokens.accent_tint, Color32::TRANSPARENT, tokens.ink)
+        // A status, not a button — and since the row itself is already the
+        // tint band, the pill paints no fill of its own (that would be the
+        // nested pill M20D2 removed). The check and the word carry it.
+        (Color32::TRANSPARENT, Color32::TRANSPARENT, tokens.ink)
     } else if primary {
         (tokens.accent, tokens.accent, tokens.on_accent)
     } else {
@@ -951,9 +1065,11 @@ fn model_row(
     );
     if in_use {
         // The check makes "In use" read as a state instead of a tap target.
-        let text =
-            ui.painter()
-                .layout_no_wrap(action.to_owned(), type_scale::caption().font, action_ink);
+        let text = ui.painter().layout_no_wrap(
+            text.action.to_owned(),
+            type_scale::caption().font,
+            action_ink,
+        );
         let icon = 15.0_f32;
         let gap = 5.0;
         let start = action_rect.center().x - (icon + gap + text.size().x) / 2.0;
@@ -979,14 +1095,14 @@ fn model_row(
         paint_elided_centered(
             ui.painter(),
             action_rect,
-            action,
+            text.action,
             &type_scale::caption(),
             action_ink,
             action_rect.width() - 12.0,
         );
     }
 
-    if divider {
+    if !edges.last {
         ui.painter().line_segment(
             [
                 pos2(rect.left() + CARD_PAD, rect.bottom() - 0.5),
@@ -1243,16 +1359,59 @@ fn next_language(language: &str) -> String {
     }
 }
 
-/// The Models section's supporting sentence: the phone's memory class in human
-/// words. The tier's raw model ids never appear here (M20D).
-pub fn tier_sentence(tier: Option<PhoneTier>) -> String {
+/// The Models section's one-line truth (M20D2): the phone's RAM, what is in
+/// use, and what the tier recommends — in that order, naming RAM explicitly.
+///
+/// Three states carry the review's copy:
+///
+/// * tier default in use — `12 GB RAM · using Balanced`;
+/// * another model in use — `12 GB RAM · using Compact — Balanced recommended`;
+/// * nothing installed — `12 GB RAM · Balanced recommended`.
+///
+/// Display only: every fact comes from rows the caller already has, and the
+/// model state machine is untouched.
+pub fn model_sentence(
+    tier: Option<PhoneTier>,
+    ram_bytes: Option<u64>,
+    recommended: Option<&ModelRow>,
+    configured: Option<&ModelRow>,
+) -> String {
+    if tier == Some(PhoneTier::Unsupported) {
+        return "This phone can't run a model".to_string();
+    }
+    if tier.is_none() && ram_bytes.is_none() {
+        return "Reading this phone's memory…".to_string();
+    }
+    let ram = ram_label(tier, ram_bytes);
+    let Some(recommended) = recommended else {
+        return match tier {
+            Some(PhoneTier::BelowFloor) => format!("{ram} RAM · only Quick test runs here"),
+            _ => format!("{ram} RAM · no model fits this phone"),
+        };
+    };
+    let name = recommended.tier_name();
+    match configured.filter(|row| row.installed) {
+        Some(row) if row.id == recommended.id => format!("{ram} RAM · using {name}"),
+        Some(row) => format!("{ram} RAM · using {} — {name} recommended", row.tier_name()),
+        // The tier default is on the phone but not selected: say so rather
+        // than recommending a download that already happened.
+        None if recommended.installed => format!("{ram} RAM · {name} downloaded — not in use"),
+        None => format!("{ram} RAM · {name} recommended"),
+    }
+}
+
+/// The RAM number the sentence quotes: the shell's report when it exists,
+/// otherwise the tier's band. "RAM" is appended by [`model_sentence`].
+fn ram_label(tier: Option<PhoneTier>, ram_bytes: Option<u64>) -> String {
+    if let Some(bytes) = ram_bytes.filter(|bytes| *bytes > 0) {
+        return format!("{:.0} GB", bytes as f64 / 1_000_000_000.0);
+    }
     match tier {
-        Some(PhoneTier::High) => "8 GB or more · Suramak picks Balanced here".to_string(),
-        Some(PhoneTier::Mid) => "6 GB · Suramak picks Compact here".to_string(),
-        Some(PhoneTier::Low) => "4 GB · Suramak picks Compact here".to_string(),
-        Some(PhoneTier::BelowFloor) => "Below 4 GB · only Quick test runs here".to_string(),
-        Some(PhoneTier::Unsupported) => "This phone can't run a model".to_string(),
-        None => "Reading this phone's memory…".to_string(),
+        Some(PhoneTier::High) => "8 GB or more".to_string(),
+        Some(PhoneTier::Mid) => "6 GB".to_string(),
+        Some(PhoneTier::Low) => "4 GB".to_string(),
+        Some(PhoneTier::BelowFloor) => "Below 4 GB".to_string(),
+        Some(PhoneTier::Unsupported) | None => "Unknown".to_string(),
     }
 }
 
@@ -1460,8 +1619,152 @@ mod tests {
         );
     }
 
+    const RAW_IDS: [&str; 4] = ["tiny", "base", "small", "turbo-q5-0"];
+
+    fn model_row(id: &str, size_bytes: u64, installed: bool, recommended: bool) -> ModelRow {
+        ModelRow {
+            id: id.to_string(),
+            size_bytes,
+            role: String::new(),
+            note: String::new(),
+            offered: true,
+            installed,
+            disk: if installed {
+                suramak_core::models::ModelFileState::Verified
+            } else {
+                suramak_core::models::ModelFileState::Absent
+            },
+            recommended,
+        }
+    }
+
+    /// M20D2: the Models header names RAM and tells the truth in each of the
+    /// three states the review called out.
     #[test]
-    fn the_tier_sentence_names_human_tiers_and_never_a_raw_id() {
+    fn the_models_header_names_ram_and_the_state_across_the_three_states() {
+        let recommended = model_row("small", 488_000_000, false, true);
+        let other = model_row("base", 148_000_000, true, false);
+        let recommended_installed = model_row("small", 488_000_000, true, true);
+        let high = Some(PhoneTier::High);
+        let ram = Some(12_000_000_000);
+
+        assert_eq!(
+            model_sentence(high, ram, Some(&recommended), None),
+            "12 GB RAM · Balanced recommended",
+            "nothing installed: name the recommendation, not a fake 'in use'"
+        );
+        assert_eq!(
+            model_sentence(high, ram, Some(&recommended), Some(&other)),
+            "12 GB RAM · using Compact — Balanced recommended",
+            "a different model in use: say which, then what the tier recommends"
+        );
+        assert_eq!(
+            model_sentence(
+                high,
+                ram,
+                Some(&recommended_installed),
+                Some(&recommended_installed)
+            ),
+            "12 GB RAM · using Balanced",
+            "the tier default is in use: one truth, no redundant recommendation"
+        );
+
+        // The same sentence at the mid tier, off the shell's own RAM report.
+        let compact = model_row("base", 148_000_000, true, true);
+        assert_eq!(
+            model_sentence(
+                Some(PhoneTier::Mid),
+                Some(6_000_000_000),
+                Some(&compact),
+                Some(&compact)
+            ),
+            "6 GB RAM · using Compact"
+        );
+    }
+
+    /// M20D2: the primary model card paints human tier names only; the raw
+    /// manifest ids live in Diagnostics' "Model files" lines. The row struct is
+    /// the paint source ([`model_row`] lays it out verbatim), so this reads the
+    /// exact strings a person sees.
+    #[test]
+    fn the_primary_card_paints_no_raw_id_but_diagnostics_keeps_them() {
+        let rows = [
+            model_row("tiny", 78_000_000, false, false),
+            model_row("base", 148_000_000, true, false),
+            model_row("small", 488_000_000, false, true),
+            model_row("turbo-q5-0", 574_000_000, false, false),
+        ];
+        let selected = "base";
+        for row in &rows {
+            let state = row.state(row.id == selected, None);
+            let text = model_row_text(row, state, row.id == selected, None);
+            for id in RAW_IDS {
+                assert!(
+                    !text.painted().split_whitespace().any(|word| word == id),
+                    "the primary card must not paint the manifest id {id:?}: {text:?}"
+                );
+            }
+        }
+
+        // The action wording the review asked for: the recommended row's
+        // missing file downloads; other missing rows keep Get; an installed
+        // row offers Use.
+        let balanced = rows[2].state(false, None);
+        assert_eq!(
+            model_row_text(&rows[2], balanced, false, None).action,
+            "Download",
+            "recommended but not installed is a Download"
+        );
+        assert_eq!(
+            model_row_text(&rows[0], ModelState::NotDownloaded, false, None).action,
+            "Get",
+            "a non-recommended missing model keeps Get"
+        );
+        assert_eq!(
+            model_row_text(&rows[1], ModelState::Installed, false, None).action,
+            "Use",
+            "an installed, unselected model offers Use"
+        );
+
+        // Diagnostics keeps the raw vocabulary: one line per installed file.
+        let files = crate::deck::compact::diagnostics::model_file_lines(&rows, selected);
+        assert_eq!(
+            files
+                .iter()
+                .map(|line| line.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["base"],
+            "the installed model is the one Diagnostics names"
+        );
+        assert_eq!(files[0].value, "148 MB · in use");
+
+        // With more than one verified file, every id that left the card is
+        // still spelled in Diagnostics — one line each, none collapsed.
+        let installed_rows = [
+            model_row("tiny", 78_000_000, true, false),
+            model_row("base", 148_000_000, true, false),
+            model_row("small", 488_000_000, true, true),
+            model_row("turbo-q5-0", 574_000_000, false, false),
+        ];
+        let files = crate::deck::compact::diagnostics::model_file_lines(&installed_rows, selected);
+        assert_eq!(
+            files
+                .iter()
+                .map(|line| line.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tiny", "base", "small"],
+            "a 'Model files' line per installed model, in manifest order"
+        );
+        assert!(
+            files.iter().all(|line| RAW_IDS.contains(&line.id.as_str())),
+            "Diagnostics speaks the raw manifest vocabulary: {files:?}"
+        );
+    }
+
+    #[test]
+    fn the_models_sentence_names_human_tiers_and_never_a_raw_id() {
+        let recommended = model_row("small", 488_000_000, false, true);
+        let installed = model_row("base", 148_000_000, true, false);
         for tier in [
             Some(PhoneTier::High),
             Some(PhoneTier::Mid),
@@ -1470,15 +1773,33 @@ mod tests {
             Some(PhoneTier::Unsupported),
             None,
         ] {
-            let sentence = tier_sentence(tier);
-            for id in ["tiny", "base", "small", "turbo-q5-0"] {
-                assert!(
-                    !sentence.split_whitespace().any(|word| word == id),
-                    "{tier:?}: {sentence}"
-                );
+            for (ram, configured) in [
+                (Some(12_000_000_000), None),
+                (Some(12_000_000_000), Some(&installed)),
+                (None, None),
+            ] {
+                let sentence = model_sentence(tier, ram, Some(&recommended), configured);
+                for id in RAW_IDS {
+                    assert!(
+                        !sentence.split_whitespace().any(|word| word == id),
+                        "{tier:?}: {sentence}"
+                    );
+                }
             }
         }
-        assert!(tier_sentence(Some(PhoneTier::High)).contains("Balanced"));
-        assert!(tier_sentence(Some(PhoneTier::Mid)).contains("Compact"));
+        assert!(model_sentence(
+            Some(PhoneTier::High),
+            Some(12_000_000_000),
+            Some(&recommended),
+            None
+        )
+        .contains("Balanced"));
+        assert!(model_sentence(
+            Some(PhoneTier::Mid),
+            Some(6_000_000_000),
+            Some(&installed),
+            Some(&installed)
+        )
+        .contains("Compact"));
     }
 }

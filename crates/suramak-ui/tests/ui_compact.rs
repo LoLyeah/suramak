@@ -254,6 +254,83 @@ fn the_phone_viewport_shoots_library_editor_and_settings() {
 }
 
 #[test]
+fn the_editor_scrolls_with_fixed_width_timecodes() {
+    // A take long enough to scroll, with the 0:09 → 0:10 second boundary on
+    // screen. The numeral cell is the proof: the two runs have one width.
+    use suramak_ui::deck::type_scale;
+    let size = type_scale::numerals().size();
+    assert_eq!(
+        type_scale::tabular_width("0:09", size),
+        type_scale::tabular_width("0:10", size),
+        "a ticking timecode must not change width"
+    );
+    assert_eq!(
+        type_scale::tabular_width("0:04 / 0:12", size),
+        type_scale::tabular_width("0:09 / 0:12", size)
+    );
+
+    let segments: Vec<Segment> = (0..16u32)
+        .map(|index| Segment {
+            idx: index,
+            start_ms: i64::from(index) * 1_000,
+            // The selected row is given a realistic 8 s duration so its pace
+            // read-out stays inside the advisory threshold; only the line
+            // length crosses, which is the read-out this golden proves.
+            end_ms: i64::from(index) * 1_000 + if index == 8 { 8_000 } else { 900 },
+            text: if index == 8 {
+                "This one line is deliberately long enough to cross the line-length advisory, twice over, so the selected row shows the read-out.".to_string()
+            } else {
+                format!("Line {} of the long take.", index + 1)
+            },
+        })
+        .collect();
+    let long = Transcript::new(
+        "Long take".to_string(),
+        Source::File {
+            name: "long-take.m4a".to_string(),
+        },
+        "base".to_string(),
+        Some("en".to_string()),
+        None,
+        segments,
+    );
+    let mut app = seeded_app();
+    app.set_library(vec![long.clone()]);
+    app.open_editor(long, 0.0);
+    app.advance(10.0);
+    app.editor.as_mut().expect("editor").select(8);
+    let mut h = Harness::new(app);
+    h.frame();
+    h.frame();
+
+    // One finger swipe moves the list past the first rows; the 0:09/0:10
+    // rows stay in frame.
+    let start = egui::pos2(230.0, 760.0);
+    h.touch(1, egui::TouchPhase::Start, start);
+    for step in 1..=6 {
+        h.touch(
+            1,
+            egui::TouchPhase::Move,
+            start - egui::vec2(0.0, 25.0 * step as f32),
+        );
+    }
+    h.touch(1, egui::TouchPhase::End, start - egui::vec2(0.0, 150.0));
+    for _ in 0..6 {
+        h.frame();
+    }
+    let labels: Vec<String> = a11y::controls(&h.ctx)
+        .into_iter()
+        .map(|control| control.label)
+        .collect();
+    assert!(
+        labels.iter().any(|label| label.starts_with("Segment 10")),
+        "the list scrolled to the 0:09 row: {labels:?}"
+    );
+    let shot = h.shot("editor-scrolled");
+    assert!(shot.painted_fraction(egui::Color32::BLACK) > 0.5);
+}
+
+#[test]
 fn the_export_sheet_and_its_picker_result_are_shots() {
     let mut app = seeded_app();
     let target = app.transcripts[0].clone();

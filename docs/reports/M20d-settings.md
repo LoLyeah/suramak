@@ -150,6 +150,98 @@ Setting and model rows press with the M20A grammar — `FAST` (120 ms) down to
 via the same `chrome::press_frame` the Library uses. Reduce Motion keeps the wash
 and drops the scale. The scroll/cancel behaviour from M19A is untouched.
 
+### 7 · M20D2 — the design-review follow-up
+
+The design-director review of M20D found six issues; four were real, two were
+wording. This slice changes **display and copy only** — no model-state logic, no
+new crate, no CI edit. It supersedes §1's mono id line and its "Recommended"
+placement.
+
+**1 · Raw ids leave the primary card.** The mono second line is gone. A model
+row is now two lines: `Balanced · 488 MB` on the title line, the truthful
+sentence underneath. The manifest vocabulary (`tiny`, `base`, `small`,
+`turbo-q5-0`, …) is painted only in **Diagnostics → Model files**, one line per
+**installed** model, in manifest order (`base` → `148 MB · in use`). The
+`SURAMAK-MODEL` log lines in `crates/suramak-android/src/shell.rs` are untouched
+and still carry the raw ids and the five state slugs.
+
+**2 · The selected row is a full-bleed band.** It spans the card's whole width
+with `accent_tint` and a **3 px `accent` bar on the leading edge** — no inset, no
+1 px inner border. First and last rows borrow the card's 12 pt radius on the
+edges they touch (a single-row card rounds all four); a middle row is square, and
+the bar is trimmed where the rounded corner meets the straight edge so it never
+pokes a nub past the frame. The `In use` pill also loses its tint fill, because a
+tinted pill on a tinted row would be the same nested-pill problem in miniature:
+the row carries the state, the check and the word sit on it.
+
+**3 · "Recommended" is a capsule badge.** A 20 pt pill with `accent_tint` fill,
+a 1 px `accent` rim at 45 %, and the word in `ink` — accent text on the tint is
+3.7:1 in the light ladder, under the small-text floor. It sits inline after the
+tier name and size. At the 360 dp floor the title elides around the badge (the
+size is the first thing to go); the note line keeps the card's full width.
+
+**4 · State-aware header copy, with RAM named.** The Models sentence is one
+line, read off the rows the screen already has:
+
+| State | Copy |
+|---|---|
+| Tier default in use | `12 GB RAM · using Balanced` |
+| Another model in use | `12 GB RAM · using Compact — Balanced recommended` |
+| Nothing installed | `12 GB RAM · Balanced recommended` |
+
+`12 GB` is the shell's reported RAM (`CompactApp::ram_bytes`, the same number
+the DEVICE card quotes); before a report, the tier's band is the fallback
+(`8 GB or more`, `6 GB`, `4 GB`, `Below 4 GB`). A fourth state — nothing
+installed is configured, but the tier default is already on the phone — reads
+`12 GB RAM · Balanced downloaded — not in use` instead of recommending a file
+that is already there. Unsupported phones and the pre-report frame keep their
+existing sentences.
+
+**5 · The action word.** A recommended row with no file offers **`Download`**
+(primary accent), whether or not it is also the configured row. Non-recommended
+missing rows keep `Get`, the installed-not-selected row keeps `Use`, and the
+M19B states still own `Resume` / `Cancel` / `Re-download` / `In use`. A stale
+recommended file therefore stays `Re-download`, not `Download`: the word names
+the recovery, and the state machine is unchanged.
+
+**Structure exposed for tests.** `ModelRowText` (`name`, `size`, `badge`,
+`note`, `action`) is the row's paint source — `model_row` lays those exact
+strings out — so `ModelRowText::painted()` is what the "no raw ids" test reads
+instead of parsing pixels. Diagnostics exposes the matching `model_file_lines`
+paint source.
+
+Tests added (both in `settings.rs`'s unit module):
+
+* `the_models_header_names_ram_and_the_state_across_the_three_states` — pins the
+  three exact strings above, plus the 6 GB mid-tier sentence.
+* `the_primary_card_paints_no_raw_id_but_diagnostics_keeps_them` — walks every
+  offered row's painted text for all four raw ids; pins `Download` / `Get` /
+  `Use`; then asserts Diagnostics returns one raw-id line per installed file
+  and none for an absent one.
+
+Goldens re-blessed: `settings`, `settings-light`, `settings-tiers`,
+`settings-model-truth`, `settings-models-grouped`, `settings-bottom-inset`, and
+`diagnostics` (the screen that now owns the ids). They are the committed PNGs
+under `tests/ui-compact/shots/`.
+
+| Gate | Command | Result |
+|---|---|---|
+| Formatting | `rustfmt --check` on both touched files | clean |
+| Lints (host) | `cargo clippy -p suramak-ui --all-targets -- -D warnings` | exit 0 |
+| NDK check | `cargo ndk -t arm64-v8a --platform 29 check -p suramak-android -p suramak-android-spike` | exit 0 |
+| NDK lints | `cargo ndk -t arm64-v8a --platform 29 clippy -p suramak-android -p suramak-android-spike --all-targets -- -D warnings` | exit 0 |
+| Unit suite (`--lib`) | `cargo test -p suramak-ui --lib` | **160 passed**, 0 failed |
+| Workspace suite | `cargo test --workspace` | **1236 passed, 0 failed, 10 ignored** (baseline 1230; this slice adds 2, the editor slice sharing the tree adds 4) |
+
+| Screen | Re-blessed golden |
+|---|---|
+| Settings — dark, 6 GB | `tests/ui-compact/shots/settings.png` |
+| Settings — light | `tests/ui-compact/shots/settings-light.png` |
+| Settings — 3 GB | `tests/ui-compact/shots/settings-tiers.png` |
+| Settings — configured model missing | `tests/ui-compact/shots/settings-model-truth.png` |
+| Settings — grouped, 12 GB | `tests/ui-compact/shots/settings-models-grouped.png` |
+| Diagnostics — Model files + Engine | `tests/ui-compact/shots/diagnostics.png` |
+
 ---
 
 ## Machine contracts

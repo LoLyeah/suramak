@@ -20,7 +20,7 @@
 //! tokens and helpers only, no screen restyling. The goldens shift because the
 //! faces changed, not because a size did.
 
-use egui::{FontId, RichText};
+use egui::{Align2, FontId, RichText};
 
 use crate::deck::theme;
 
@@ -175,6 +175,79 @@ pub fn numeral_run(digits: usize, colons: usize, size: f32) -> f32 {
     numeral_cell(digits, size) + colons as f32 * size * NUMERAL_COLON_EM
 }
 
+/// Inter Medium's tabular period advance (0.2600 em) — the decimal point in a
+/// pace read-out, given its own cell for the same reason as the colon.
+pub const NUMERAL_PERIOD_EM: f32 = 0.26;
+
+/// The fixed advance of one character in a tabular run. Digits and the two
+/// separators use the face's `tnum` widths; every other character (the words
+/// around a number) is measured by the caller's painter.
+pub fn tabular_char_advance(ch: char, size: f32) -> Option<f32> {
+    match ch {
+        '0'..='9' => Some(size * NUMERAL_CELL_EM),
+        ':' => Some(size * NUMERAL_COLON_EM),
+        '.' => Some(size * NUMERAL_PERIOD_EM),
+        _ => None,
+    }
+}
+
+/// The width of a **numeric** run (`0:09`, `12.4`) in fixed cells. Words are
+/// not part of this contract; [`paint_tabular`] measures them.
+///
+/// This is the M20E jitter proof: `00:09` and `00:10` answer the same width,
+/// so a live counter cannot move its surrounding layout.
+pub fn tabular_width(text: &str, size: f32) -> f32 {
+    text.chars()
+        .map(|ch| tabular_char_advance(ch, size).unwrap_or(size * 0.55))
+        .sum()
+}
+
+/// Paints `text` on a fixed-cell grid and returns the run's width.
+///
+/// Digits, `:` and `.` are centred in cells whose advances are the face's own
+/// `tnum` widths, so a `0:09 → 0:10` (or `9 → 10`) swap never changes the
+/// run's width. Any other character is laid out proportionally at its
+/// measured advance — the words around a number are not tabular data, but the
+/// number inside them still is. `pos` is the vertical centre and the
+/// `align.x()` edge of the run.
+pub fn paint_tabular(
+    painter: &egui::Painter,
+    pos: egui::Pos2,
+    align: Align2,
+    text: &str,
+    font: &FontId,
+    color: egui::Color32,
+) -> f32 {
+    let size = font.size;
+    let glyph =
+        |ch: char| painter.layout_no_wrap(ch.to_string(), font.clone(), egui::Color32::PLACEHOLDER);
+    let advance = |ch: char| tabular_char_advance(ch, size).unwrap_or_else(|| glyph(ch).size().x);
+    let width: f32 = text.chars().map(advance).sum();
+    let start = match align.x() {
+        egui::Align::Min => pos.x,
+        egui::Align::Center => pos.x - width / 2.0,
+        egui::Align::Max => pos.x - width,
+    };
+    let mut x = start;
+    for ch in text.chars() {
+        let cell = advance(ch);
+        let galley = glyph(ch);
+        let centred = tabular_char_advance(ch, size).is_some();
+        let offset = if centred {
+            (cell - galley.size().x).max(0.0) / 2.0
+        } else {
+            0.0
+        };
+        painter.galley(
+            egui::pos2(x + offset, pos.y - galley.size().y / 2.0),
+            galley,
+            color,
+        );
+        x += cell;
+    }
+    width
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +339,27 @@ mod tests {
         // The cell is at least as wide as the proportional face's widest digit
         // (0.6455 em in Inter Regular), so no glyph can overflow it.
         assert!(numeral_cell(1, 12.5) >= 0.6455 * 12.5);
+    }
+
+    /// The sequential-swap proof: the digits that change during playback all
+    /// sit in cells of one width, so `0:09 → 0:10` cannot move anything.
+    #[test]
+    fn a_counting_run_never_changes_width() {
+        for size in [12.5, 11.5] {
+            let widths: Vec<f32> = ["0:08", "0:09", "0:10", "0:11", "10:00"]
+                .iter()
+                .map(|run| tabular_width(run, size))
+                .collect();
+            // `10:00` carries one more digit than the four-character runs —
+            // the only legitimate width change. The mm:ss runs must be
+            // identical.
+            assert_eq!(widths[0], widths[1]);
+            assert_eq!(widths[1], widths[2]);
+            assert_eq!(widths[2], widths[3]);
+            assert!(widths[4] > widths[0]);
+            // The helper agrees with the older `numeral_run` seam.
+            assert!((tabular_width("0:09", size) - numeral_run(3, 1, size)).abs() < 1e-4);
+        }
     }
 
     /// `format` carries the token's whole contract — face, tracking, line
