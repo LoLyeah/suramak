@@ -206,6 +206,18 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
+      # M16F follow-up: sherpa-rs-sys downloads its prebuilt runtime into
+      # ~/Library/Caches/sherpa-rs on first build. rust-cache can restore a
+      # target/ whose sherpa build script counts as fresh while this cache dir
+      # is absent — the link then fails with "library 'onnxruntime.1.17.1' not
+      # found" and an empty OUT_DIR/lib. Cache the runtime dir itself so the
+      # -L path always resolves.
+      - name: Restore the sherpa-onnx prebuilt runtime (parakeet link deps)
+        uses: actions/cache@v6
+        with:
+          path: ~/Library/Caches/sherpa-rs
+          key: sherpa-rs-v1.12.9-osx-universal2
+
       - name: Build workspace (release, Metal)
         run: cargo build --release --workspace
 
