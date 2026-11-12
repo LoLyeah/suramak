@@ -703,7 +703,13 @@ if [ "$MODEL_PRESENT" != "yes" ]; then
     echo "   sheet:    NOTE — this emulator did not deliver BACK to the app"
     echo "             (no key event logged; the reply-level dismissal is unit-tested)"
   fi
+  # Leave a live app behind: the steps after this one drive the Library, and a
+  # force-stopped process makes every tap dead (run 43221792050 failed exactly
+  # there). Relaunch and wait for the real surface marker, not a sleep.
   "$ADB" shell am force-stop "$PACKAGE" 2>/dev/null || true
+  "$ADB" logcat -c 2>/dev/null || true
+  "$ADB" shell am start -W -n "$ACTIVITY" >"$OUT/am-start-after-share.txt" 2>&1 || true
+  wait_for_library_ready || fail "the app did not come back after the share step (no library marker)"
 else
   # Run 1 — cancel while it is transcribing. The key is the service's own log
   # line, never a guess; Cancel is the same broadcast the notification uses.
