@@ -175,7 +175,8 @@ job and the terminal event is a `failed(checkpoint: …)`, never a fake `done`.
 
 ## What this slice deliberately does not do
 
-* **The desktop UI's queue and the Android host do not call `resume_pending` yet.**
+* **The desktop UI's queue and the Android host do not call `resume_pending` yet**
+  in M22A. (M22A2 wires both — see §“Wiring (M22A2)” below.)
   The desktop queue is in-memory by design and the Android service keeps its own
   JSON job journal (`crates/suramak-android/src/jobs.rs`); adopting the store
   journal there is a behaviour change in those hosts, and this order forbids UI
@@ -245,3 +246,102 @@ that starts at the wrong millisecond or index changes the bytes. The parent:
 
 The run completed in ~0.25 s wall clock and passed three consecutive times on
 this 2-core host.
+
+## Wiring (M22A2): the three hosts call one helper
+
+M22A left `resume_pending` implemented but called only by the CLI. M22A2 wires
+the desktop app and the Android jobs host without touching the journal schema,
+the checkpoint rules or `plan_resume`; the only new mechanism-level code is the
+host constructor.
+
+### The shared helper
+
+`crates/suramak-asr/src/queue/host.rs`:
+
+* `open_durable_queue(backend, prefetch, options, db_path)` — **the one way a
+  host starts its queue.** It `Store::open`s the private library (which runs the
+  M22A torn-write reconciliation), builds `QueueDriver::new(...).with_journal(store)`,
+  calls `resume_pending()` and returns `DurableQueue { driver, resumed }`.
+* `DurableQueue::into_parts()` — splits the driver from the resume report the
+  host surfaces.
+
+Nothing else opens a journaled driver in the three hosts. The CLI was refactored
+onto this call, so a host that forgot the resume cannot compile through a
+different path.
+
+### Exact call sites
+
+| host | call site | what happens there |
+|---|---|---|
+| CLI | `crates/suramak-cli/src/cmd/transcribe.rs:317` (`transcribe`) | `suramak_asr::open_durable_queue(...)` replaces the hand-built `QueueDriver::new` + `with_journal` + `resume_pending`; its `resumed` vector is the report printed before `enqueue_all`. `--db` still gates it; without `--db` the driver is the unchanged in-memory one. |
+| Desktop | `crates/suramak-ui/src/desktop/runtime.rs:2461` (`Bridge::spawn_durable`), called from `Runtime::new` (`runtime.rs:281`) | Opens the app's `paths::db_path()` through `suramak_ui::durable_queue::DurableQueue::open` (`crates/suramak-ui/src/durable_queue.rs:36`). The driver is moved into the bridge thread; its `resume_pending` report is taken by the shell at startup. |
+| Desktop (surface) | `crates/suramak-ui/src/desktop.rs:1612` (`App::resumed`) | Seeds `AppState.jobs_are_journaled`, calls `AppState::adopt_resumed` (`app/mod.rs:2400`) for `Resumed`/`Fresh` rows and `show_resume_outcomes` (`app/mod.rs:2426`) for the rest — all before the first frame. |
+| Android | `crates/suramak-android/src/jobs.rs:1576` (`accept`, the host's driver creation) | `open_durable_queue(engine, prefetcher, options, &shared.dirs.db_path)` — the app's private DB path. `adopt_resumed_jobs` (`jobs.rs:1641`) puts every resumed row on the existing job list with the driver's queue id; `Unavailable` becomes the existing `last_failed`, `Skipped` the status message. |
+
+### What the surfaces show
+
+* **Desktop.** `JobQueue::enqueue_resumed` sets `QueueItem.resumed`; the queue
+  rows print `queued · resumed` and the running card's caption is prefixed
+  `resumed · …` (`app/transcribe.rs`). `Unavailable` fills the existing
+  `queue_failure` line (the row's named `resume_unavailable: …` reason);
+  `Skipped` is a status note. No sheet, no layout change.
+* **Desktop save rule.** When the queue is journaled, the driver's
+  `Store::finish_job` already wrote the transcript and the `done` row in one
+  transaction. `AppState.jobs_are_journaled` makes `on_worker_event(Finished)`
+  adopt that row through `on_transcript_persisted` (status, library refresh,
+  quit-mid-recording cleanup) instead of emitting a second `SaveTranscript`.
+  The in-memory fallback keeps the historical save.
+* **Android.** A resumed row is added to the same `jobs` list the notification
+  and prompt read; `QueueEvent::Resumed` writes `resumed: <title> — continues
+  where it stopped` into the existing status message. `finish` reads the row
+  back and only inserts when the driver did not journal it (the in-memory
+  fallback), so a driver-written transcript is never re-inserted.
+* **Host display identity.** The journal schema stores path + model only, so a
+  resumed phone share cannot recover its display title from the row. The driver
+  accepts `enqueue_named` / `set_item_meta` (`driver.rs`) and uses that identity
+  for checkpoints, the final transcript and `QueueEvent::Finished`; Android
+  fills it from the job record (or the copied file's stem for an orphan row).
+  The CLI/desktop pass no meta, so their titles are byte-for-byte the file name
+  as before.
+
+### Wiring tests (mechanism untouched)
+
+* `crates/suramak-ui/tests/durable_resume.rs` — seeds the M22A fixture (three
+  committed segments at 3 s) in a real temp-db, builds the desktop host with
+  `DurableQueue::open` and a deterministic backend, pumps `run_once` until idle,
+  and asserts the row is `done`, `resumed = 1`, and the transcript is the
+  committed prefix plus a tail starting at 3 000 ms.
+* `crates/suramak-android/tests/jobs_host.rs` —
+  `the_android_host_resumes_a_journal_row_when_the_driver_is_created` seeds the
+  same fixture with a real Opus copy and the installed `tiny` model, imports a
+  second file (which creates the host's driver), and asserts both jobs finish,
+  the seeded row is `done` with `resumed = 1`, and the library title is the
+  host's title rather than the opaque `<key>.opus`.
+
+Neither test changes the journal schema or the resume arithmetic; both fail if
+`resume_pending` is removed from the host's creation path.
+
+### Verification (M22A2)
+
+| gate | command | result |
+|---|---|---|
+| desktop wiring test | `cargo test -p suramak-ui --test durable_resume` | **1 passed** |
+| Android wiring test | `cargo test -p suramak-android --test jobs_host` | **16 passed** (1 new) |
+| host unit suites | `cargo test -p suramak-asr --lib` / `-p suramak-ui --bin suramak` | 173 / 359 passed |
+| CLI | `cargo test -p suramak-cli` | 5 passed |
+| crash proof (unchanged) | `cargo test -p suramak-asr --test durable_resume` | 2 passed, 3 consecutive runs |
+| fmt | `rustfmt --edition 2021 --config skip_children=true` on every changed file | clean |
+| clippy | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| NDK cross-check | `cargo ndk -t arm64-v8a --platform 29 check -p suramak-android -p suramak-android-spike --locked` and the same `clippy -D warnings` | clean (exit 0) |
+| workspace | `cargo test --workspace` | **1287 passed, 0 failed, 11 ignored** (one full run at `87ec788` + this slice) |
+
+The workspace gate was run in a clean worktree at `87ec788` with only this slice
+applied: the shared checkout also carried the concurrent M22C work, whose own
+in-flight UI/perf tests are outside this order. The M22A2 files and both Android
+crates were additionally checked in the shared checkout with the same commands;
+their suites passed there.
+
+The Android resume is still lazy in one respect worth stating: the driver is
+created by the first accepted job (the host's existing design), so a killed
+process resumes when the next job is accepted, not while the app sits idle on
+the notification. The desktop resumes at `Runtime::new`, before the first frame.

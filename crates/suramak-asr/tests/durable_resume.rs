@@ -150,7 +150,30 @@ fn child_main(mode: &str) {
         .and_then(|raw| raw.parse().ok())
         .unwrap_or(0);
 
-    let store = Store::open(&db).expect("open journal");
+    // The parent polls `crash.db` every 10 ms; a cross-process open can lose a
+    // busy race under a loaded test host. Retry briefly instead of turning a
+    // lock into a child panic (the journal itself is unchanged).
+    let store = {
+        let mut last = None;
+        let mut opened = None;
+        for _ in 0..100 {
+            match Store::open(&db) {
+                Ok(store) => {
+                    opened = Some(store);
+                    break;
+                }
+                Err(err) => {
+                    last = Some(err);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        match (opened, last) {
+            (Some(store), _) => store,
+            (None, Some(err)) => panic!("open journal: {err}"),
+            (None, None) => unreachable!("the retry loop always sets one"),
+        }
+    };
     let options = JobOptions {
         model_path: model,
         lang: LangMode::Fixed("en".to_string()),

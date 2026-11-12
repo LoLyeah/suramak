@@ -1134,6 +1134,30 @@ impl App {
             .and_then(|runtime| runtime.peaks_status());
         if let Some((transcript, result)) = peaks {
             changed = true;
+            // M22C: the library row's mini-waveform is a pure down-sample of
+            // the envelope this job just computed — store those bars once, so
+            // no library row ever decodes audio again.
+            if let Ok(peaks) = &result {
+                let bars = peaks.bars(suramak_core::store::WAVEFORM_BARS);
+                if let Ok(db) = paths::db_path() {
+                    match Store::open(&db) {
+                        Ok(store) => {
+                            if let Err(err) = store.set_waveform(transcript, &bars) {
+                                tracing::warn!(
+                                    transcript = %transcript,
+                                    error = %err,
+                                    "peaks: could not store the row waveform"
+                                );
+                            }
+                        }
+                        Err(err) => tracing::warn!(
+                            transcript = %transcript,
+                            error = %err,
+                            "peaks: could not open the store for the row waveform"
+                        ),
+                    }
+                }
+            }
             if let Some(shell) = self.shell.as_mut() {
                 shell.app.on_peaks_loaded(transcript, result);
             }
@@ -1578,6 +1602,31 @@ impl ApplicationHandler<UserEvent> for App {
                 );
                 let initial = shell.app.initial_effects();
                 runtime.apply(initial, &mut shell.app);
+
+                // M22A2: the bridge opened the queue journal and resumed every
+                // interrupted row before this first frame. Seed the app's queue
+                // with those rows (the `resumed` marker rides each row/card) and
+                // surface anything the launch could not take on the existing
+                // failure/status line. The driver already holds the items, so
+                // the app adopts them instead of submitting twins.
+                shell.app.jobs_are_journaled = runtime.journaled_queue();
+                let resumed_outcomes = runtime.take_resume_outcomes();
+                if !resumed_outcomes.is_empty() {
+                    let inputs: Vec<PathBuf> = resumed_outcomes
+                        .iter()
+                        .filter(|outcome| {
+                            matches!(
+                                outcome.outcome,
+                                suramak_asr::ResumeOutcome::Resumed { .. }
+                                    | suramak_asr::ResumeOutcome::Fresh
+                            )
+                        })
+                        .map(|outcome| outcome.path.clone())
+                        .collect();
+                    let effects = shell.app.adopt_resumed(&inputs);
+                    runtime.apply(effects, &mut shell.app);
+                    shell.app.show_resume_outcomes(&resumed_outcomes);
+                }
 
                 // M9e (P1-1): a quit-mid-recording Stop & Save left a pending
                 // entry — auto-run its transcription now (the status line says

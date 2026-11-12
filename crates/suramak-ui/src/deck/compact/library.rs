@@ -35,7 +35,7 @@ use crate::deck::type_scale::{self, TypeToken};
 use super::a11y;
 use super::chrome::{self, GUTTER, MIN_TOUCH, ROW};
 use super::first_run;
-use super::model::{clock, CompactAction, CompactApp, CompactRoute};
+use super::model::{clock, CompactAction, CompactApp, CompactRoute, LibraryHit, LibraryRow};
 
 /// The job strip's height (between the search field and the list).
 pub const JOB_STRIP: f32 = 46.0;
@@ -85,7 +85,7 @@ pub fn ui(
         ),
         vec2(bands.content.width() - GUTTER * 2.0, MIN_TOUCH),
     );
-    chrome::search_field(
+    let query_changed = chrome::search_field(
         ui,
         tokens,
         search_rect,
@@ -93,6 +93,16 @@ pub fn ui(
         "Search transcripts",
     );
     a11y::describe(ui, search_rect, "Search transcripts");
+    if query_changed {
+        // The field's spoken-text half is the store's index, not the phone's
+        // loaded headers: ask the host for the ranked segment hits (M22C). The
+        // previous hits are dropped at once so a snippet never describes a
+        // question the reader has moved past.
+        state.search_hits.clear();
+        actions.push(CompactAction::SearchLibrary {
+            query: state.library_query.clone(),
+        });
+    }
     let mut list_top = search_rect.bottom() + SECTION_GAP;
 
     // --- status / error ----------------------------------------------------
@@ -265,69 +275,19 @@ pub fn ui(
                             .editor
                             .as_ref()
                             .is_some_and(|editor| editor.transcript.id == row.id);
-                        let (response, scale) = chrome::row(
+                        let drawn = draw_library_row(
                             &mut row_ui,
                             tokens,
                             motion,
                             rect,
-                            ("library-row", index),
-                            &row.title,
-                            &row.meta(),
+                            row,
+                            index,
                             selected,
                             index + 1 < state.rows.len(),
                         );
-                        // The press scales the whole painted row about its
-                        // centre; the trailing affordances map with it.
-                        let map = |point: egui::Pos2| {
-                            pos2(
-                                rect.center().x + (point.x - rect.center().x) * scale,
-                                rect.center().y + (point.y - rect.center().y) * scale,
-                            )
-                        };
-                        // The play affordance: a 48 dp target at the row's
-                        // trailing edge opens the transcript with the transport
-                        // running (the compact editor's karaoke surface).
-                        let play = Rect::from_center_size(
-                            pos2(rect.right() - GUTTER - 58.0, rect.center().y),
-                            vec2(48.0, MIN_TOUCH),
-                        );
-                        let play_response = a11y::touch(
-                            &mut row_ui,
-                            tokens,
-                            play,
-                            ("library-play", index),
-                            WidgetType::Button,
-                            &format!("Play {}", row.title),
-                            true,
-                        );
-                        let triangle = map(pos2(play.center().x + 1.0, play.center().y));
-                        let half_w = 6.5 * scale;
-                        let half_h = 8.0 * scale;
-                        row_ui.painter().add(egui::Shape::convex_polygon(
-                            vec![
-                                pos2(triangle.x - half_w, triangle.y - half_h),
-                                pos2(triangle.x - half_w, triangle.y + half_h),
-                                pos2(triangle.x + half_w * 1.2, triangle.y),
-                            ],
-                            tokens.ink_soft,
-                            Stroke::NONE,
-                        ));
-                        // The tap affordance: a right chevron, in the row's
-                        // quiet ink (the row itself is the 64 dp target).
-                        {
-                            let c = map(pos2(rect.right() - GUTTER - 8.0, rect.center().y));
-                            row_ui.painter().add(egui::Shape::line(
-                                vec![
-                                    pos2(c.x - 2.5 * scale, c.y - 5.0 * scale),
-                                    pos2(c.x + 2.5 * scale, c.y),
-                                    pos2(c.x - 2.5 * scale, c.y + 5.0 * scale),
-                                ],
-                                Stroke::new(1.6_f32 * scale, tokens.ink_faint),
-                            ));
-                        }
-                        if play_response.clicked() {
+                        if drawn.play_clicked {
                             actions.push(CompactAction::PlayTranscript(row.id));
-                        } else if response.clicked() {
+                        } else if drawn.response.clicked() {
                             actions.push(CompactAction::OpenTranscript {
                                 id: row.id,
                                 segment: None,
@@ -345,8 +305,13 @@ pub fn ui(
             observe_fling(state, output.state.offset.y, velocity, released);
         }
     } else {
-        let hits = state.hits();
-        if hits.is_empty() {
+        // Two sections (M22C): title matches first, in the library's own
+        // newest-first order, then the store's spoken-text hits under an "in
+        // transcripts" heading. Clearing the field restores the plain list
+        // (the branch above) and drops the hits.
+        let title_hits = state.title_matches();
+        let segment_hits = state.transcript_hits();
+        if title_hits.is_empty() && segment_hits.is_empty() {
             empty_search(ui, tokens, list_rect, &state.library_query);
         } else {
             let mut child = ui.new_child(
@@ -361,73 +326,63 @@ pub fn ui(
                     ..Default::default()
                 })
                 .show(&mut child, |ui| {
-                    for (index, hit) in hits.iter().enumerate() {
-                        let (rect, _) = ui.allocate_exact_size(
-                            vec2(list_rect.width(), ROW + 18.0),
-                            Sense::hover(),
+                    for (index, row) in title_hits.iter().enumerate() {
+                        let (rect, _) =
+                            ui.allocate_exact_size(vec2(list_rect.width(), ROW), Sense::hover());
+                        let mut row_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .id_salt(("library-title-hit", index))
+                                .max_rect(rect)
+                                .layout(Layout::top_down(Align::Min)),
                         );
-                        let response = a11y::touch(
-                            ui,
+                        let selected = state
+                            .editor
+                            .as_ref()
+                            .is_some_and(|editor| editor.transcript.id == row.id);
+                        let drawn = draw_library_row(
+                            &mut row_ui,
                             tokens,
+                            motion,
                             rect,
-                            ("hit", index),
-                            WidgetType::Button,
-                            &format!("Open {} · {}", hit.title, hit.snippet),
+                            row,
+                            index,
+                            selected,
                             true,
                         );
-                        if response.clicked() {
+                        if drawn.play_clicked {
+                            actions.push(CompactAction::PlayTranscript(row.id));
+                        } else if drawn.response.clicked() {
                             actions.push(CompactAction::OpenTranscript {
-                                id: hit.id,
-                                segment: hit.segment_idx,
+                                id: row.id,
+                                segment: None,
                             });
                         }
-                        let fill = if response.hovered() {
-                            tokens.surface_hover
-                        } else {
-                            Color32::TRANSPARENT
-                        };
-                        ui.painter()
-                            .rect_filled(rect, CornerRadius::same(tokens.radius.row), fill);
-                        ui.painter().text(
-                            pos2(rect.left() + GUTTER, rect.top() + 18.0),
-                            Align2::LEFT_CENTER,
-                            &hit.title,
-                            type_scale::row_title().font,
-                            tokens.ink,
+                    }
+                    if !segment_hits.is_empty() {
+                        let (heading, _) =
+                            ui.allocate_exact_size(vec2(list_rect.width(), 30.0), Sense::hover());
+                        chrome::section_label(
+                            ui,
+                            tokens,
+                            pos2(heading.left() + GUTTER, heading.top() + 4.0),
+                            "In transcripts",
                         );
-                        let time = if hit.segment_idx.is_some() {
-                            clock(hit.start_ms)
-                        } else {
-                            String::new()
-                        };
-                        if !time.is_empty() {
-                            ui.painter().text(
-                                pos2(rect.right() - GUTTER, rect.top() + 18.0),
-                                Align2::RIGHT_CENTER,
-                                time,
-                                type_scale::numerals().font,
-                                tokens.ink_soft,
+                        for (index, hit) in segment_hits.iter().enumerate() {
+                            let (rect, _) = ui
+                                .allocate_exact_size(vec2(list_rect.width(), ROW), Sense::hover());
+                            let mut row_ui = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .id_salt(("library-hit", index))
+                                    .max_rect(rect)
+                                    .layout(Layout::top_down(Align::Min)),
                             );
+                            if draw_hit_row(&mut row_ui, tokens, motion, rect, hit, index) {
+                                actions.push(CompactAction::OpenTranscript {
+                                    id: hit.id,
+                                    segment: hit.segment_idx,
+                                });
+                            }
                         }
-                        let snippet = type_scale::caption();
-                        let mut job = egui::text::LayoutJob::default();
-                        job.append(&hit.snippet, 0.0, snippet.format(tokens.ink_soft));
-                        job.wrap.max_width = (rect.width() - GUTTER * 2.0).max(40.0);
-                        job.wrap.max_rows = 1;
-                        job.wrap.break_anywhere = false;
-                        job.wrap.overflow_character = Some('…');
-                        ui.painter().galley(
-                            pos2(rect.left() + GUTTER, rect.top() + 42.0),
-                            ui.painter().layout_job(job),
-                            tokens.ink_soft,
-                        );
-                        ui.painter().line_segment(
-                            [
-                                pos2(rect.left() + GUTTER, rect.bottom() - 0.5),
-                                pos2(rect.right() - GUTTER, rect.bottom() - 0.5),
-                            ],
-                            Stroke::new(1.0_f32, tokens.hairline),
-                        );
                     }
                     ui.add_space(bottom_pad);
                 });
@@ -496,6 +451,223 @@ pub fn ui(
 
     let _ = state.nav.current() == CompactRoute::Library;
     actions
+}
+
+/// What a drawn library row reported: the row's hit response and whether its
+/// play affordance (not the row body) was tapped.
+struct DrawnLibraryRow {
+    response: egui::Response,
+    play_clicked: bool,
+}
+
+/// Draws one full library row: the M20C press, the M22C anatomy (waveform,
+/// pips, tabular duration), the play target and the chevron. The caller owns
+/// the action mapping, so the plain list and the search's title section share
+/// exactly one row implementation.
+#[allow(clippy::too_many_arguments)]
+fn draw_library_row(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    rect: Rect,
+    row: &LibraryRow,
+    index: usize,
+    selected: bool,
+    divider: bool,
+) -> DrawnLibraryRow {
+    let (response, scale) = chrome::row(
+        ui,
+        tokens,
+        motion,
+        rect,
+        ("library-row", index),
+        &row.title,
+        &row.meta(),
+        chrome::RowExtras {
+            waveform: &row.waveform,
+            speakers: row.speakers,
+            duration_ms: row.duration_ms,
+        },
+        selected,
+        divider,
+    );
+    // The press scales the whole painted row about its centre; the trailing
+    // affordances map with it.
+    let map = |point: egui::Pos2| {
+        pos2(
+            rect.center().x + (point.x - rect.center().x) * scale,
+            rect.center().y + (point.y - rect.center().y) * scale,
+        )
+    };
+    // The play affordance: a 48 dp target at the row's trailing edge opens the
+    // transcript with the transport running (the compact editor's karaoke
+    // surface).
+    let play = Rect::from_center_size(
+        pos2(rect.right() - GUTTER - 58.0, rect.center().y),
+        vec2(48.0, MIN_TOUCH),
+    );
+    let play_response = a11y::touch(
+        ui,
+        tokens,
+        play,
+        ("library-play", index),
+        WidgetType::Button,
+        &format!("Play {}", row.title),
+        true,
+    );
+    let triangle = map(pos2(play.center().x + 1.0, play.center().y));
+    let half_w = 6.5 * scale;
+    let half_h = 8.0 * scale;
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![
+            pos2(triangle.x - half_w, triangle.y - half_h),
+            pos2(triangle.x - half_w, triangle.y + half_h),
+            pos2(triangle.x + half_w * 1.2, triangle.y),
+        ],
+        tokens.ink_soft,
+        Stroke::NONE,
+    ));
+    // The tap affordance: a right chevron, in the row's quiet ink (the row
+    // itself is the 64 dp target).
+    {
+        let c = map(pos2(rect.right() - GUTTER - 8.0, rect.center().y));
+        ui.painter().add(egui::Shape::line(
+            vec![
+                pos2(c.x - 2.5 * scale, c.y - 5.0 * scale),
+                pos2(c.x + 2.5 * scale, c.y),
+                pos2(c.x - 2.5 * scale, c.y + 5.0 * scale),
+            ],
+            Stroke::new(1.6_f32 * scale, tokens.ink_faint),
+        ));
+    }
+    DrawnLibraryRow {
+        response,
+        play_clicked: play_response.clicked(),
+    }
+}
+
+/// Draws one "in transcripts" hit: the transcript's title, its timecode on the
+/// tabular grid, and the ±60-char snippet with the matched span in the accent
+/// ink (the store's `[`/`]` markers are display syntax, never shown). Returns
+/// whether the row was tapped.
+fn draw_hit_row(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    rect: Rect,
+    hit: &LibraryHit,
+    index: usize,
+) -> bool {
+    let label = format!("Open {} · {}", hit.title, hit.snippet);
+    let response = a11y::touch(
+        ui,
+        tokens,
+        rect,
+        ("library-hit", index),
+        WidgetType::Button,
+        &label,
+        true,
+    );
+    let press = chrome::press_frame(
+        ui.ctx(),
+        ui.id().with(("library-hit-press", index)),
+        response.is_pointer_button_down_on(),
+        motion.reduce,
+    );
+    let scale = press.scale;
+    let visual = Rect::from_center_size(rect.center(), rect.size() * scale);
+    if press.fill > 0.0 {
+        ui.painter().rect_filled(
+            visual,
+            CornerRadius::same((f32::from(tokens.radius.row) * scale).round() as u8),
+            tokens.surface_active.gamma_multiply(press.fill),
+        );
+    } else if response.hovered() {
+        ui.painter().rect_filled(
+            visual,
+            CornerRadius::same(tokens.radius.row),
+            tokens.surface_hover,
+        );
+    }
+
+    let numerals = chrome::scaled(&type_scale::numerals(), scale);
+    let time = clock(hit.start_ms);
+    let time_width = type_scale::tabular_width(&time, numerals.size());
+    type_scale::paint_tabular(
+        ui.painter(),
+        pos2(
+            visual.right() - GUTTER * scale,
+            visual.top() + 12.0 * scale + numerals.line_height / 2.0,
+        ),
+        Align2::RIGHT_CENTER,
+        &time,
+        &numerals.font,
+        tokens.ink_soft,
+    );
+
+    let title = chrome::scaled(&type_scale::row_title(), scale);
+    let mut job = egui::text::LayoutJob::default();
+    job.append(&hit.title, 0.0, title.format(tokens.ink));
+    job.wrap.max_width =
+        (visual.width() - GUTTER * 2.0 * scale - time_width - 10.0 * scale).max(40.0);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('…');
+    ui.painter().galley(
+        pos2(visual.left() + GUTTER * scale, visual.top() + 12.0 * scale),
+        ui.painter().layout_job(job),
+        tokens.ink,
+    );
+
+    let caption = chrome::scaled(&type_scale::caption(), scale);
+    let (before, matched, after) = split_brackets(&hit.snippet);
+    let mut job = egui::text::LayoutJob::default();
+    job.append(before, 0.0, caption.format(tokens.ink_soft));
+    if let Some(matched) = matched {
+        job.append(matched, 0.0, caption.format(tokens.accent));
+    }
+    job.append(after, 0.0, caption.format(tokens.ink_soft));
+    job.wrap.max_width = (visual.width() - GUTTER * 2.0 * scale).max(40.0);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = false;
+    job.wrap.overflow_character = Some('…');
+    ui.painter().galley(
+        pos2(visual.left() + GUTTER * scale, visual.top() + 40.0 * scale),
+        ui.painter().layout_job(job),
+        tokens.ink_soft,
+    );
+    ui.painter().line_segment(
+        [
+            pos2(rect.left() + GUTTER, rect.bottom() - 0.5),
+            pos2(rect.right() - GUTTER, rect.bottom() - 0.5),
+        ],
+        Stroke::new(1.0_f32, tokens.hairline),
+    );
+    response.clicked()
+}
+
+/// Splits the store's `prefix[match]suffix` snippet into its three display
+/// spans. A snippet without markers (no locatable term) is all `before`.
+fn split_brackets(snippet: &str) -> (&str, Option<&str>, &str) {
+    let Some(open) = snippet.find('[') else {
+        return (snippet, None, "");
+    };
+    let Some(close) = snippet[open + 1..].find(']') else {
+        return (snippet, None, "");
+    };
+    let close = open + 1 + close;
+    (
+        &snippet[..open],
+        Some(&snippet[open + 1..close]),
+        &snippet[close + 1..],
+    )
+}
+
+/// How many pips a row shows and how many it folds into `+N` (M22C: up to
+/// four, then the overflow count). A pure helper so the rule is testable
+/// without a frame.
+pub fn pip_layout(speakers: usize) -> (usize, usize) {
+    (speakers.min(4), speakers.saturating_sub(4))
 }
 
 /// The list's bottom padding: enough to scroll the last row clear of the

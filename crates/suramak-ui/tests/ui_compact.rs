@@ -25,7 +25,8 @@ use suramak_core::store::WordAlignment;
 use suramak_core::transcript::{Segment, Source, Transcript, WordTiming};
 use suramak_ui::deck::compact::{
     self, a11y, chrome, first_run, library, CompactAction, CompactApp, CompactRoute,
-    CompactSettings, CrashBanner, DiagnosticsView, DownloadState, Insets, Sheet, VoiceNoteView,
+    CompactSettings, CrashBanner, DiagnosticsView, DownloadState, Insets, LibraryFacets,
+    LibraryHit, Sheet, VoiceNoteView,
 };
 use suramak_ui::deck::snapshot;
 use suramak_ui::deck::theme::{self, AppTheme};
@@ -123,6 +124,30 @@ fn seeded_app() -> CompactApp {
             0,
         ),
     ]);
+    // M22C fixtures: the host attaches these in one batch after a library load.
+    // Two, five (four pips + "+1") and one speaker make all three pip states
+    // visible in the goldens; the bars are a deterministic speech-like shape.
+    let facets: std::collections::BTreeMap<_, _> = app
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            // Nine distinct levels, each repeated across the 28 stored bars:
+            // after the painter's 9-column reduction the row shows a real
+            // speech-like contour, different per transcript.
+            let mut levels = [0.9f32, 0.5, 0.25, 0.7, 0.35, 1.0, 0.45, 0.8, 0.2];
+            levels.rotate_left(index * 2);
+            let waveform = (0..28).map(|bar| levels[bar * levels.len() / 28]).collect();
+            (
+                row.id,
+                LibraryFacets {
+                    speakers: [2usize, 5, 1][index],
+                    waveform,
+                },
+            )
+        })
+        .collect();
+    app.set_library_facets(facets);
     app.seed_device(
         DeviceProfile::new(6_000_000_000, 2_000_000_000, false, true),
         &["base".to_string()],
@@ -2356,4 +2381,250 @@ fn the_voice_note_sheet_is_a_frosted_micro_sheet() {
     );
     let window_px = shot.pixel((shot.width / 2) as usize, (40.0 * scale) as usize);
     assert_ne!(sheet_px, window_px, "the sheet must sit above the page");
+}
+
+// ---------------------------------------------------------------------------
+// M22C: the Library field searches titles AND spoken text, in two sections;
+// the transcript rows carry the mini-waveform, pips and tabular duration.
+// ---------------------------------------------------------------------------
+
+fn search_hit(
+    app: &CompactApp,
+    title: &str,
+    snippet: &str,
+    segment: u32,
+    start_ms: i64,
+) -> LibraryHit {
+    let id = app
+        .rows
+        .iter()
+        .find(|row| row.title == title)
+        .unwrap_or_else(|| panic!("no row titled {title:?}"))
+        .id;
+    LibraryHit {
+        id,
+        title: title.to_string(),
+        snippet: snippet.to_string(),
+        segment_idx: Some(segment),
+        start_ms,
+        speaker: Some("Budi".to_string()),
+        rank: -1.0,
+    }
+}
+
+#[test]
+fn the_library_search_shows_titles_first_then_transcript_hits() {
+    let mut app = seeded_app();
+    app.set_library_query("rapat");
+    let hit = search_hit(
+        &app,
+        "Rapat tim produk",
+        "Kita membahas [rapat] anggaran kuartal depan",
+        0,
+        12_000,
+    );
+    app.set_search_hits(vec![hit.clone()]);
+
+    assert_eq!(app.title_matches().len(), 1, "the title half");
+    assert_eq!(app.transcript_hits().len(), 1, "the spoken-text half");
+    assert_eq!(
+        app.transcript_hits()[0].segment_idx,
+        Some(0),
+        "the hit carries its segment for tap-through"
+    );
+
+    let mut h = Harness::new(app);
+    h.frame();
+    h.frame();
+    let title_row = h.control("Rapat tim produk");
+    let hit_label = format!("Open {} · {}", hit.title, hit.snippet);
+    let hit_row = h.control(&hit_label);
+    assert!(
+        hit_row.top() > title_row.bottom(),
+        "title matches come first: title {:?}, hit {:?}",
+        title_row,
+        hit_row
+    );
+    let heading_gap = hit_row.top() - title_row.bottom();
+    assert!(
+        (30.0..=50.0).contains(&heading_gap),
+        "the 'IN TRANSCRIPTS' heading occupies its own band before the hit: {heading_gap}"
+    );
+
+    // A tap on the hit lands on the transcript with that segment.
+    let start = hit_row.center();
+    h.touch(1, egui::TouchPhase::Start, start);
+    let actions = h.touch(1, egui::TouchPhase::End, start);
+    assert!(
+        actions.contains(&CompactAction::OpenTranscript {
+            id: hit.id,
+            segment: Some(0),
+        }),
+        "the hit taps through with its segment: {actions:?}"
+    );
+
+    // Clearing the field restores the plain list and drops the hits.
+    h.app.set_library_query("");
+    assert!(h.app.search_hits.is_empty());
+    assert_eq!(h.app.rows.len(), 3);
+    h.frame();
+    let labels: Vec<String> = a11y::controls(&h.ctx)
+        .into_iter()
+        .map(|control| control.label)
+        .collect();
+    assert!(
+        labels.iter().any(|label| label == "Morning notes"),
+        "{labels:?}"
+    );
+    assert!(
+        !labels.iter().any(|label| label.starts_with("Open ")),
+        "no search rows remain after clearing: {labels:?}"
+    );
+}
+
+#[test]
+fn the_library_search_shot_has_both_sections() {
+    let mut app = seeded_app();
+    app.set_library_query("fox");
+    // A title match ("Morning notes" does not contain fox) is not fabricated:
+    // the shot's title section is empty and the transcript section carries the
+    // two spoken hits, which is a legitimate library state.
+    let mut first = search_hit(
+        &app,
+        "Morning notes",
+        "The quick brown [fox] jumps over the lazy dog.",
+        0,
+        0,
+    );
+    first.rank = -3.0;
+    let mut second = search_hit(
+        &app,
+        "Interview — field recording",
+        "We walked through the market and recorded a [fox] in the ambience.",
+        0,
+        0,
+    );
+    second.rank = -2.0;
+    app.set_search_hits(vec![first, second]);
+    let shot = render(&mut app, "library-search");
+    assert!(shot.painted_fraction(egui::Color32::BLACK) > 0.5);
+
+    let ctx = fresh_context(&app);
+    let (_, _, scale) = compact::phone_viewport();
+    let screen = compact::phone_screen_rect();
+    let _ = snapshot::render(&ctx, screen, scale, |ctx| {
+        let _ = compact::ui(ctx, &mut app);
+    });
+    let labels: Vec<String> = a11y::controls(&ctx)
+        .into_iter()
+        .map(|control| control.label)
+        .collect();
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.contains("Open Morning notes") && label.contains("[fox]")),
+        "the transcript hit is a spoken control: {labels:?}"
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.contains("Open Interview — field recording")),
+        "{labels:?}"
+    );
+}
+
+#[test]
+fn pips_stop_at_four_and_fold_the_rest_into_a_count() {
+    assert_eq!(library::pip_layout(0), (0, 0));
+    assert_eq!(library::pip_layout(3), (3, 0));
+    assert_eq!(library::pip_layout(4), (4, 0));
+    assert_eq!(library::pip_layout(6), (4, 2));
+    assert_eq!(library::pip_layout(20), (4, 16));
+
+    // A row's facets arrive from the host in one batch and land on the row.
+    let mut app = seeded_app();
+    let id = app.rows[0].id;
+    let waveform: Vec<f32> = (0..28).map(|index| index as f32 / 28.0).collect();
+    app.set_library_facets(
+        [(
+            id,
+            LibraryFacets {
+                speakers: 6,
+                waveform: waveform.clone(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+    );
+    assert_eq!(app.rows[0].speakers, 6);
+    assert_eq!(app.rows[0].waveform, waveform);
+    assert_eq!(app.rows[0].duration_ms, 3 * 4_200 - 300);
+}
+
+#[test]
+fn the_richer_rows_keep_the_press_and_the_dock_clearance() {
+    // The same 14-row scroll as the M20C gate, now with every facet present:
+    // ripple bars, six speakers (four pips + 2), and a duration on every row.
+    let mut app = seeded_app();
+    app.set_library(
+        (1..=14)
+            .map(|index| {
+                transcript(
+                    &format!("Note {index:02}"),
+                    "en",
+                    &["A short recording that fills one library row."],
+                    index as i64 * 60_000,
+                )
+            })
+            .collect(),
+    );
+    let ids: Vec<uuid::Uuid> = app.rows.iter().map(|row| row.id).collect();
+    app.set_library_facets(
+        ids.into_iter()
+            .map(|id| {
+                (
+                    id,
+                    LibraryFacets {
+                        speakers: 6,
+                        waveform: vec![0.2, 0.5, 0.9, 0.4, 0.7, 0.3, 0.8, 0.6],
+                    },
+                )
+            })
+            .collect(),
+    );
+    let mut h = Harness::new(app);
+    h.frame();
+    h.frame();
+    let dock = chrome::dock_rect(h.screen, h.app.insets.bottom);
+    for _ in 0..3 {
+        let start = egui::pos2(120.0, 820.0);
+        h.touch(1, egui::TouchPhase::Start, start);
+        for step in 1..=8 {
+            h.touch(
+                1,
+                egui::TouchPhase::Move,
+                start - egui::vec2(0.0, 50.0 * step as f32),
+            );
+        }
+        h.touch(1, egui::TouchPhase::End, start - egui::vec2(0.0, 400.0));
+        for _ in 0..8 {
+            h.frame();
+        }
+    }
+    let mut raw = h.raw();
+    raw.events
+        .push(egui::Event::PointerMoved(egui::pos2(12.0, 40.0)));
+    h.run(raw);
+    for _ in 0..8 {
+        h.frame();
+    }
+    let last = h.control("Note 14");
+    assert!(
+        last.bottom() <= dock.top() - 8.0,
+        "facet rows still clear the dock: row bottom {} vs dock top {}",
+        last.bottom(),
+        dock.top()
+    );
+    let shot = h.shot("library-bottom");
+    assert!(shot.painted_fraction(egui::Color32::BLACK) > 0.5);
 }

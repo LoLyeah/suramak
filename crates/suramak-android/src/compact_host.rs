@@ -28,7 +28,7 @@ use suramak_core::settings::{LangMode, Settings};
 use suramak_core::store::Store;
 use suramak_ui::deck::compact::{
     CompactAction, CompactApp, CompactExportFormat, CompactRoute, CompactSetting, CompactSettings,
-    Sheet, VoiceNoteView,
+    LibraryFacets, LibraryHit, Sheet, VoiceNoteView,
 };
 
 use crate::export_job::ExportJobs;
@@ -110,8 +110,13 @@ impl CompactHost {
                     .get("transcript_id")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                inner.open_transcript(id)
+                let segment = value
+                    .get("segment")
+                    .and_then(Value::as_u64)
+                    .map(|idx| idx as u32);
+                inner.open_transcript(id, segment)
             }
+            "search" => inner.search_library(&value),
             "voice_note_offer" => inner.voice_note_offer(&value),
             "back" => inner.back(),
             "save_segment" => inner.save_segment(&value),
@@ -136,10 +141,74 @@ impl Inner {
     fn reload_library(&mut self) {
         match Store::open(&self.dirs.db_path) {
             Ok(store) => match store.list_transcripts() {
-                Ok(items) => self.app.set_library(items),
+                Ok(items) => {
+                    // M22C: the row facets are two batched reads, never one
+                    // query per row (the phone library can be hundreds of
+                    // headers).
+                    let waveforms = store.waveforms().unwrap_or_default();
+                    let speaker_counts = store.speaker_counts().unwrap_or_default();
+                    let facets = items
+                        .iter()
+                        .map(|transcript| {
+                            (
+                                transcript.id,
+                                LibraryFacets {
+                                    speakers: speaker_counts
+                                        .get(&transcript.id)
+                                        .copied()
+                                        .unwrap_or(0),
+                                    waveform: waveforms
+                                        .get(&transcript.id)
+                                        .cloned()
+                                        .unwrap_or_default(),
+                                },
+                            )
+                        })
+                        .collect();
+                    self.app.set_library(items);
+                    self.app.set_library_facets(facets);
+                }
                 Err(err) => self.app.set_library_error(err.to_string()),
             },
             Err(err) => self.app.set_library_error(err.to_string()),
+        }
+    }
+
+    /// M22C: the Library field's spoken-text half. The store's segment index
+    /// answers with ranked hits, snippets and segment indices; the app stores
+    /// them for the "in transcripts" section. An empty query clears the hits
+    /// (which is also what the UI does when the field is cleared).
+    fn search_library(&mut self, value: &Value) -> String {
+        let query = value
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        self.app.set_library_query(query);
+        if query.trim().is_empty() {
+            self.app.set_search_hits(Vec::new());
+            return self.snapshot();
+        }
+        match Store::open(&self.dirs.db_path) {
+            Ok(store) => match store.search_segments(query, 50) {
+                Ok(hits) => {
+                    self.app.set_search_hits(
+                        hits.into_iter()
+                            .map(|hit| LibraryHit {
+                                id: hit.transcript_id,
+                                title: hit.transcript_title,
+                                snippet: hit.snippet,
+                                segment_idx: Some(hit.segment_idx),
+                                start_ms: hit.start_ms,
+                                speaker: hit.speaker,
+                                rank: hit.rank,
+                            })
+                            .collect(),
+                    );
+                    self.snapshot()
+                }
+                Err(err) => self.snapshot_with_error(&err.to_string()),
+            },
+            Err(err) => self.snapshot_with_error(&err.to_string()),
         }
     }
 
@@ -181,6 +250,19 @@ impl Inner {
             "sheet": match self.app.sheet { Some(Sheet::Export) => "export", Some(Sheet::Quit) => "quit", Some(Sheet::Onboarding) => "onboarding", Some(Sheet::VoiceNote) => "voice_note", None => "none" },
             "status": self.app.status.as_ref().map(|(text, error)| json!({"text": text, "error": error})),
             "library_rows": self.app.rows.len(),
+            // M22C: the Library field's state and its "in transcripts" section,
+            // in the shape the Kotlin mirror and the host tests read.
+            "library_query": self.app.library_query.clone(),
+            "library_hits": self.app.transcript_hits().iter().map(|hit| json!({
+                "transcript_id": hit.id.to_string(),
+                "title": &hit.title,
+                "snippet": &hit.snippet,
+                "segment_idx": hit.segment_idx,
+                "start_ms": hit.start_ms,
+                "speaker": &hit.speaker,
+                "rank": hit.rank,
+            })).collect::<Vec<_>>(),
+            "library_waveforms": self.app.rows.iter().filter(|row| !row.waveform.is_empty()).count(),
             "first_run_seen": self.app.first_run_seen,
             "recording": self.app.recording,
             "model_id": self.app.settings.model_id,
@@ -208,7 +290,7 @@ impl Inner {
         .to_string()
     }
 
-    fn open_transcript(&mut self, id: &str) -> String {
+    fn open_transcript(&mut self, id: &str, segment: Option<u32>) -> String {
         let now = self.started_now();
         let Ok(uuid) = uuid::Uuid::parse_str(id) else {
             self.app.deep_link_missing(uuid::Uuid::nil(), now);
@@ -232,6 +314,12 @@ impl Inner {
                 self.app.deep_link_words(transcript, words, now);
                 if let Some(editor) = self.app.editor.as_mut() {
                     editor.has_translation = !translations.is_empty();
+                    // M22C: the search hit's landing — select the row, park the
+                    // playhead on its start and ask the next editor frame to
+                    // scroll it into view (the existing seek path).
+                    if let Some(idx) = segment {
+                        editor.reveal_segment(idx);
+                    }
                 }
                 self.snapshot()
             }
@@ -864,6 +952,65 @@ mod tests {
         assert_eq!(reply["depth"], 2);
         assert_eq!(reply["title"], "Field notes");
         assert_eq!(reply["transcript_id"], id.to_string());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_library_search_op_returns_ranked_segment_hits() {
+        let dir =
+            std::env::temp_dir().join(format!("suramak-compact-host-{}", uuid::Uuid::new_v4()));
+        let (_store, id) = fixture(&dir);
+        let host = CompactHost::new(&dir);
+        let reply: Value =
+            serde_json::from_str(&host.dispatch(r#"{"op":"search","query":"second"}"#))
+                .expect("json");
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["library_query"], "second");
+        let hits = reply["library_hits"].as_array().expect("hits");
+        assert_eq!(hits.len(), 1, "{reply}");
+        assert_eq!(hits[0]["transcript_id"], id.to_string());
+        assert_eq!(hits[0]["segment_idx"], 1);
+        assert_eq!(hits[0]["start_ms"], 3_000);
+        assert!(
+            hits[0]["snippet"]
+                .as_str()
+                .is_some_and(|snippet| snippet.contains("[second]")),
+            "the wire snippet is bracketed: {}",
+            hits[0]["snippet"]
+        );
+        assert!(hits[0]["rank"].as_f64().is_some());
+
+        // Clearing the field clears the section.
+        let cleared: Value =
+            serde_json::from_str(&host.dispatch(r#"{"op":"search","query":""}"#)).expect("json");
+        assert!(cleared["library_hits"].as_array().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_search_hit_opens_the_editor_on_its_segment() {
+        let dir =
+            std::env::temp_dir().join(format!("suramak-compact-host-{}", uuid::Uuid::new_v4()));
+        let (_store, id) = fixture(&dir);
+        let host = CompactHost::new(&dir);
+        let reply: Value = serde_json::from_str(
+            &host.dispatch(
+                &json!({
+                    "op": "open_transcript",
+                    "transcript_id": id.to_string(),
+                    "segment": 1,
+                })
+                .to_string(),
+            ),
+        )
+        .expect("json");
+        assert_eq!(reply["screen"], "editor");
+        host.with_app(|app| {
+            let editor = app.editor.as_ref().expect("editor");
+            assert_eq!(editor.selected, Some(1), "the hit's row is selected");
+            assert_eq!(editor.focus_segment, Some(1));
+            assert_eq!(editor.playhead_ms, 3_000, "the seek path parks at 3 s");
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 

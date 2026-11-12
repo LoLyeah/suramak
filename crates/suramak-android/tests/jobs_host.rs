@@ -23,7 +23,7 @@ use suramak_asr::queue::driver::{DecodeDone, DecodeFailure, DecodeTask};
 use suramak_asr::{
     EngineId, FileDecoder, InferenceBackend, Job, Prefetcher, ThreadedPrefetch, WorkerEvent,
 };
-use suramak_core::store::Store;
+use suramak_core::store::{JobRecord, JobStatus, Store};
 use suramak_core::transcript::{Segment, Source, Transcript};
 
 fn fixtures() -> PathBuf {
@@ -820,6 +820,93 @@ fn a_voice_note_notification_is_built_from_the_stored_row() {
     assert_eq!(staged.mime, "image/png");
     assert!(std::path::Path::new(&staged.path).is_file());
     assert!(staged.bytes > 1_000);
+    let _ = std::fs::remove_dir_all(dirs.db_path.parent().unwrap());
+}
+
+/// M22A2 — the jobs host's driver creation resumes the store journal.
+///
+/// This is the wiring, not the M22A mechanism: an interrupted row is seeded
+/// with three committed segments, the next import creates the host's driver
+/// (the exact `open_durable_queue` call `accept` makes), and the resumed job
+/// runs to `done` with the journal's `resumed` marker — on the host's existing
+/// status/completed surface, with the shared title, not the opaque copy name.
+#[test]
+fn the_android_host_resumes_a_journal_row_when_the_driver_is_created() {
+    let dirs = dirs("durable-resume");
+    let source = fixtures().join("speech-en.opus");
+    std::fs::create_dir_all(&dirs.media_dir).unwrap();
+    std::fs::copy(&source, dirs.media_dir.join("speech-resumed.opus")).unwrap();
+    let media = dirs.media_dir.join("speech-resumed.opus");
+    let model = dirs.models_dir.join("ggml-tiny.bin");
+
+    let seeded = {
+        let store = Store::open(&dirs.db_path).unwrap();
+        let now = suramak_core::Utc::now();
+        let record = JobRecord {
+            id: suramak_core::Uuid::new_v4(),
+            path: media.display().to_string(),
+            model: model.display().to_string(),
+            status: JobStatus::Transcribing,
+            created_at: now,
+            updated_at: now,
+            transcript_id: Some(suramak_core::Uuid::new_v4()),
+            last_committed_segment: 0,
+            last_committed_ms: 0,
+            resumed: false,
+            failure: None,
+        };
+        store.insert_job(&record).unwrap();
+        let mut transcript = Transcript::new(
+            "speech-resumed".to_string(),
+            Source::File {
+                name: "speech-resumed.opus".to_string(),
+            },
+            "tiny".to_string(),
+            Some("en".to_string()),
+            Some(media.clone()),
+            Vec::new(),
+        );
+        transcript.segments = (0..3)
+            .map(|idx| Segment {
+                idx,
+                start_ms: i64::from(idx) * 1_000,
+                end_ms: (i64::from(idx) + 1) * 1_000,
+                text: format!("committed {idx}"),
+            })
+            .collect();
+        store.commit_job_checkpoint(record.id, &transcript).unwrap();
+        record.id
+    };
+
+    // The next launch's host: the first accepted job creates the driver, and
+    // the driver's creation resumes the seeded row before the new item.
+    let (backend, _steps, _control) = FakeBackend::new(true);
+    let host = JobHost::with_prefetcher(
+        backend,
+        ThreadedPrefetch::new(Box::new(FileDecoder)),
+        dirs.clone(),
+    );
+    let size = std::fs::metadata(&source).unwrap().len();
+    let (key, dest) = host
+        .begin_import("after-crash.opus", "audio/ogg", size, "tiny", "auto")
+        .unwrap();
+    std::fs::copy(&source, &dest).unwrap();
+    host.import_done(&key).unwrap();
+
+    wait_until("both jobs to finish", || host.status().done == 2);
+    let status = host.status();
+    assert_eq!(status.failed, 0, "{:?}", status.last_failed);
+    assert_eq!(status.total, 2, "the resumed row is on the host's surface");
+
+    let store = Store::open(&dirs.db_path).unwrap();
+    let row = store.job(seeded).unwrap().expect("the seeded job row");
+    assert_eq!(row.status, JobStatus::Done);
+    assert!(row.resumed, "the journal row carries the resumed marker");
+    let transcript = store.get_transcript(row.transcript_id.unwrap()).unwrap();
+    assert_eq!(
+        transcript.title, "speech-resumed",
+        "the host's title, not the copied key"
+    );
     let _ = std::fs::remove_dir_all(dirs.db_path.parent().unwrap());
 }
 

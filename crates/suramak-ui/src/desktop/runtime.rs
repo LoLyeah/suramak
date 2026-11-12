@@ -37,12 +37,16 @@ use suramak_asr::diarization::{
 };
 use suramak_asr::live;
 use suramak_asr::mix;
-use suramak_asr::worker::{Job, Worker, WorkerEvent};
+use suramak_asr::queue::driver::{
+    FileDecoder, JobOptions as QueueOptions, PendingResume as JournalResume, QueueDriver,
+    QueueEvent, ThreadedPrefetch,
+};
+use suramak_asr::worker::{Job, JobStage, Worker, WorkerEvent};
 use suramak_core::models as core_models;
 use suramak_core::paths;
 use suramak_core::polish::{OpenAiCompat, PolishBackend, PolishOutcome};
 use suramak_core::resample;
-use suramak_core::settings::{LangMode, PolishSettings, RecordSource, Settings};
+use suramak_core::settings::{EngineSetting, LangMode, PolishSettings, RecordSource, Settings};
 use suramak_core::store::Store;
 use suramak_core::textrules::{
     build_prompt, EstimatedTokens, PromptBudget, PromptMeasurement, TextSettings,
@@ -73,6 +77,12 @@ pub struct Runtime {
     settings: Settings,
     models_dir: PathBuf,
     bridge: Bridge,
+    /// M22A2: what the launch-time store-journal resume did, taken once by the
+    /// shell to seed the app's job surface before the first frame.
+    resume_outcomes: Vec<JournalResume>,
+    /// M22A2: the bridge's queue owns a journal, so the driver writes finished
+    /// transcripts itself and `AppState` must not insert them a second time.
+    journaled_queue: bool,
     /// Kept for the polish thread's `request_repaint` wake-up (M4).
     ctx: egui::Context,
     next_job_id: u64,
@@ -242,11 +252,45 @@ impl Runtime {
             })
             .map(|measurement| measurement.budget())
             .unwrap_or_else(PromptBudget::unmeasured);
+        // M22A2: the launch-time durable resume runs here — before the shell's
+        // first frame — through the one host helper. A missing model or store
+        // means there is nothing this launch can honestly resume, so the bridge
+        // keeps its in-memory behaviour and the journal rows stay pending.
+        let resume_options = app::resolve_model_path(&settings.asr.model_id, &models_dir)
+            .ok()
+            .map(|model_path| {
+                let prompt = build_prompt(
+                    settings.asr.initial_prompt.as_deref(),
+                    &text_settings.glossary,
+                    &prompt_budget,
+                    &EstimatedTokens,
+                )
+                .prompt()
+                .map(str::to_string);
+                QueueOptions {
+                    model_path,
+                    lang: settings.asr.language.clone(),
+                    initial_prompt: prompt,
+                    engine: settings.asr.engine,
+                    fast_engine: settings.asr.fast_engine,
+                }
+            });
+        let (bridge, resume_outcomes, journaled_queue) =
+            match (paths::db_path().ok(), resume_options) {
+                (Some(db), Some(options)) => {
+                    let (bridge, outcomes) = Bridge::spawn_durable(ctx.clone(), &db, options);
+                    let journaled = bridge.journaled();
+                    (bridge, outcomes, journaled)
+                }
+                _ => (Bridge::spawn(ctx.clone()), Vec::new(), false),
+            };
         Self {
             store,
             settings,
             models_dir,
-            bridge: Bridge::spawn(ctx.clone()),
+            bridge,
+            resume_outcomes,
+            journaled_queue,
             ctx,
             next_job_id: 0,
             startup_error,
@@ -482,6 +526,19 @@ impl Runtime {
         self.text_settings.clone()
     }
 
+    /// M22A2: what the launch resume did, taken exactly once by the shell.
+    /// `Resumed`/`Fresh` entries are already enqueued in the bridge's durable
+    /// driver; the shell seeds the app's queue so their events land on a row.
+    pub fn take_resume_outcomes(&mut self) -> Vec<JournalResume> {
+        std::mem::take(&mut self.resume_outcomes)
+    }
+
+    /// M22A2: whether the bridge's queue owns the store journal (and therefore
+    /// writes finished transcripts itself).
+    pub fn journaled_queue(&self) -> bool {
+        self.journaled_queue
+    }
+
     /// M15.5: the budget the next job's prompt will be built with.
     pub fn prompt_budget(&self) -> PromptBudget {
         self.prompt_budget.clone()
@@ -600,6 +657,9 @@ impl Runtime {
     /// it at its next stage boundary and answers with `WorkerEvent::Cancelled`.
     /// A no-op when no job is in flight.
     pub fn cancel_job(&mut self) {
+        // M22A2: the bridge owns the durable driver now, so the cancel is its
+        // command (the driver sets the job's own cooperative token).
+        self.bridge.cancel();
         match &self.job_cancel {
             Some(token) => {
                 token.cancel();
@@ -821,6 +881,15 @@ impl Runtime {
         while let Some(effect) = queue.pop_front() {
             match effect {
                 Effect::SubmitJob { input } => queue.extend(self.submit_job(input, state)),
+                // M22A2: the launch-resumed job is already enqueued in the
+                // bridge's durable driver; the app only adopted its row. There
+                // is nothing to submit — the bridge pumps it from startup.
+                Effect::AdoptResumed { input } => {
+                    tracing::debug!(
+                        path = %input.display(),
+                        "adopted the journal-resumed job already queued in the driver"
+                    );
+                }
                 Effect::SaveTranscript { transcript, words } => {
                     let result = self.insert(&transcript, &words);
                     queue.extend(state.on_transcript_saved(*transcript, result));
@@ -1954,11 +2023,12 @@ impl Runtime {
             engine: self.settings.asr.engine,
             fast_engine: self.settings.asr.fast_engine,
             cancel: cancel.clone(),
-            // M16.1: the UI's queue has no decode-ahead pool (the bridge's one
-            // job at a time is the stricter bound); the worker decodes.
+            // M22A2: the durable driver owns decoding ahead (the bridge's queue
+            // is the batch model); this field is unused on that path.
             samples: None,
-            // M22A: the desktop runtime has no journal on this path (the queue
-            // driver owns durability); the job is a plain in-memory run.
+            // M22A2: the bridge's queue driver builds the durable identity from
+            // the journal; this hand-built job only carries the runtime's
+            // resolved options to it.
             durable: None,
         };
         if let Err(err) = self.bridge.submit(job) {
@@ -2346,27 +2416,97 @@ fn write_export(
     std::fs::write(dest, text).map_err(|err| err.to_string())
 }
 
-/// The bridge thread: owns the `suramak-asr` worker, forwards events to the UI.
+/// One command for the bridge thread (M22A2: jobs and cancels share the
+/// channel so a cancel cannot race a submit).
+enum BridgeCommand {
+    Submit(Box<Job>),
+    Cancel,
+}
+
+/// The bridge thread: owns the durable queue driver (and its `suramak-asr`
+/// worker), forwards its per-job events to the UI.
 pub struct Bridge {
-    jobs: Option<Sender<Job>>,
+    jobs: Option<Sender<BridgeCommand>>,
     events: Arc<Mutex<Vec<WorkerEvent>>>,
     handle: Option<JoinHandle<()>>,
+    /// M22A2: the driver owns the store journal (the app must not insert the
+    /// finished transcript a second time).
+    journaled: bool,
 }
 
 impl Bridge {
+    /// The in-memory bridge (no journal) — the fallback when the library or a
+    /// model is unavailable at launch, and the shape the headless tests use.
     pub fn spawn(ctx: egui::Context) -> Bridge {
-        let (job_tx, job_rx) = mpsc::channel::<Job>();
+        let options = QueueOptions {
+            model_path: PathBuf::new(),
+            lang: LangMode::Auto,
+            initial_prompt: None,
+            engine: EngineSetting::Auto,
+            fast_engine: false,
+        };
+        let driver = QueueDriver::new(
+            Worker::spawn(),
+            ThreadedPrefetch::new(Box::new(FileDecoder)),
+            options,
+        );
+        Self::spawn_with_driver(ctx, driver)
+    }
+
+    /// M22A2: the production bridge — opens the app's store, attaches it as the
+    /// queue journal and resumes every interrupted job at launch. Returns the
+    /// resume report so the shell can seed the job surface before the first
+    /// frame. A store that will not open degrades to [`Self::spawn`] (the app
+    /// still runs; nothing is silently claimed as durable).
+    pub fn spawn_durable(
+        ctx: egui::Context,
+        db_path: &Path,
+        options: QueueOptions,
+    ) -> (Bridge, Vec<JournalResume>) {
+        let opened = suramak_ui::durable_queue::DurableQueue::open(
+            Worker::spawn(),
+            ThreadedPrefetch::new(Box::new(FileDecoder)),
+            options,
+            db_path,
+        );
+        match opened {
+            Ok(queue) => {
+                let (driver, resumed) = queue.into_parts();
+                (Self::spawn_with_driver(ctx, driver), resumed)
+            }
+            Err(err) => {
+                tracing::error!(
+                    path = %db_path.display(),
+                    "the queue journal could not be opened — running in memory: {err}"
+                );
+                (Self::spawn(ctx), Vec::new())
+            }
+        }
+    }
+
+    fn spawn_with_driver(
+        ctx: egui::Context,
+        driver: QueueDriver<Worker, ThreadedPrefetch>,
+    ) -> Bridge {
+        let journaled = driver.journal().is_some();
+        let (job_tx, job_rx) = mpsc::channel::<BridgeCommand>();
         let events = Arc::new(Mutex::new(Vec::new()));
         let queue = Arc::clone(&events);
         let handle = thread::Builder::new()
             .name("suramak-ui-bridge".to_string())
-            .spawn(move || run_bridge(job_rx, queue, ctx))
+            .spawn(move || run_bridge(job_rx, queue, ctx, driver))
             .expect("failed to spawn the suramak-ui bridge thread");
         Bridge {
             jobs: Some(job_tx),
             events,
             handle: Some(handle),
+            journaled,
         }
+    }
+
+    /// Whether the queue owns the store journal.
+    pub fn journaled(&self) -> bool {
+        self.journaled
     }
 
     /// Queues a job on the bridge thread. Fails when it has shut down.
@@ -2374,8 +2514,16 @@ impl Bridge {
         self.jobs
             .as_ref()
             .ok_or_else(|| "worker bridge is shut down".to_string())?
-            .send(job)
+            .send(BridgeCommand::Submit(Box::new(job)))
             .map_err(|_| "suramak-worker exited unexpectedly".to_string())
+    }
+
+    /// Asks the bridge to cancel the job currently holding the slot (M22A2).
+    /// A no-op when the bridge has shut down or nothing is running.
+    pub fn cancel(&self) {
+        if let Some(jobs) = &self.jobs {
+            let _ = jobs.send(BridgeCommand::Cancel);
+        }
     }
 
     /// Non-blocking: takes everything queued since the last drain.
@@ -2430,47 +2578,95 @@ impl Drop for Bridge {
 }
 
 fn run_bridge(
-    job_rx: mpsc::Receiver<Job>,
+    job_rx: mpsc::Receiver<BridgeCommand>,
     queue: Arc<Mutex<Vec<WorkerEvent>>>,
     ctx: egui::Context,
+    mut driver: QueueDriver<Worker, ThreadedPrefetch>,
 ) {
-    let worker = Worker::spawn();
-    while let Ok(job) = job_rx.recv() {
-        let job_id = job.id;
-        if worker.submit(job).is_err() {
-            push(&queue, worker_gone(job_id));
-            ctx.request_repaint();
+    let mut current: Option<u64> = None;
+    loop {
+        driver.run_once();
+        for event in driver.drain_events() {
+            if matches!(
+                event,
+                QueueEvent::Finished { .. }
+                    | QueueEvent::Failed { .. }
+                    | QueueEvent::Cancelled { .. }
+            ) {
+                current = None;
+            }
+            if let QueueEvent::Started { id, .. } = &event {
+                current = Some(*id);
+            }
+            if let Some(event) = worker_event(event) {
+                push(&queue, event);
+                ctx.request_repaint();
+            }
+        }
+        if !driver.is_idle() {
+            // The driver's threads do the blocking work; this pump only moves
+            // the state machine, exactly like the CLI batch loop.
+            thread::sleep(Duration::from_millis(10));
             continue;
         }
-        loop {
-            match worker.recv() {
-                Some(event) => {
-                    let terminal = matches!(
-                        event,
-                        WorkerEvent::Finished { .. }
-                            | WorkerEvent::Error { .. }
-                            | WorkerEvent::Cancelled { .. }
-                    );
-                    push(&queue, event);
-                    ctx.request_repaint();
-                    if terminal {
-                        break;
-                    }
-                }
-                None => {
-                    push(&queue, worker_gone(job_id));
-                    ctx.request_repaint();
-                    break;
+        match job_rx.recv() {
+            Ok(BridgeCommand::Submit(job)) => {
+                // The app submits one job at a time (its queue is the batch
+                // model), so the driver is idle here. The options ride the job
+                // the runtime already resolved, keeping a settings change from
+                // binding the next row to the previous model.
+                let options = QueueOptions {
+                    model_path: job.model_path.clone(),
+                    lang: job.lang.clone(),
+                    initial_prompt: job.initial_prompt.clone(),
+                    engine: job.engine,
+                    fast_engine: job.fast_engine,
+                };
+                driver.set_options(options);
+                current = Some(driver.enqueue(job.input));
+            }
+            Ok(BridgeCommand::Cancel) => {
+                if let Some(id) = current {
+                    driver.cancel(id);
                 }
             }
+            Err(_) => return,
         }
     }
 }
 
-fn worker_gone(job_id: u64) -> WorkerEvent {
-    WorkerEvent::Error {
-        job_id,
-        message: "suramak-worker exited unexpectedly".to_string(),
+/// The driver's event vocabulary → the UI's (the app only ever needed the
+/// worker events; this keeps `AppState` unchanged).
+fn worker_event(event: QueueEvent) -> Option<WorkerEvent> {
+    match event {
+        QueueEvent::Started { id, .. } => Some(WorkerEvent::Stage {
+            job_id: id,
+            stage: JobStage::Decoding,
+        }),
+        QueueEvent::Progress { id, pct, .. } => Some(WorkerEvent::Progress { job_id: id, pct }),
+        QueueEvent::Stage { id, stage, .. } => Some(WorkerEvent::Stage { job_id: id, stage }),
+        QueueEvent::Finished {
+            id,
+            transcript,
+            words,
+            engine,
+            warnings,
+            ..
+        } => Some(WorkerEvent::Finished {
+            job_id: id,
+            transcript,
+            words,
+            engine_used: engine,
+            warnings,
+        }),
+        QueueEvent::Failed { id, reason, .. } => Some(WorkerEvent::Error {
+            job_id: id,
+            message: reason,
+        }),
+        QueueEvent::Cancelled { id, .. } => Some(WorkerEvent::Cancelled { job_id: id }),
+        // The host's own resume markers are seeded before the first frame; the
+        // event itself has no worker analogue.
+        QueueEvent::Resumed { .. } => None,
     }
 }
 

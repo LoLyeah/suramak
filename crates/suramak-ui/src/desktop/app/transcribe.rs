@@ -47,44 +47,48 @@ pub fn ui(
     let left = rect.left() + PANE_PAD_X;
     let right = rect.right() - PANE_PAD_X;
 
-    let (file_name, pct, model, planned, warnings, failure, cancelling, stage) = match &state.job {
-        Job::Running(run) => (
-            run.input
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| run.input.display().to_string()),
-            run.pct,
-            run.model.clone(),
-            run.planned_engine.clone(),
-            run.warnings.clone(),
-            None,
-            run.cancelling,
-            run.stage,
-        ),
-        Job::Failed { input, message } => (
-            input
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| input.display().to_string()),
-            0,
-            None,
-            None,
-            Vec::new(),
-            Some(message.clone()),
-            false,
-            None,
-        ),
-        Job::Idle => (
-            "—".to_string(),
-            0,
-            None,
-            None,
-            Vec::new(),
-            None,
-            false,
-            None,
-        ),
-    };
+    let (file_name, pct, model, planned, warnings, failure, cancelling, stage, resumed) =
+        match &state.job {
+            Job::Running(run) => (
+                run.input
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| run.input.display().to_string()),
+                run.pct,
+                run.model.clone(),
+                run.planned_engine.clone(),
+                run.warnings.clone(),
+                None,
+                run.cancelling,
+                run.stage,
+                run.resumed,
+            ),
+            Job::Failed { input, message } => (
+                input
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| input.display().to_string()),
+                0,
+                None,
+                None,
+                Vec::new(),
+                Some(message.clone()),
+                false,
+                None,
+                false,
+            ),
+            Job::Idle => (
+                "—".to_string(),
+                0,
+                None,
+                None,
+                Vec::new(),
+                None,
+                false,
+                None,
+                false,
+            ),
+        };
     let running = matches!(state.job, Job::Running(_));
     // M14e: the bar moves between the engine's sparse progress events — from the
     // wall clock against the input's duration, clamped below 97 % until a real
@@ -130,6 +134,13 @@ pub fn ui(
                     Some(JobStage::Decoding) => "decoding the audio…".to_string(),
                     _ => "transcribing on this machine…".to_string(),
                 },
+            };
+            // M22A2: a job the journal resumed says so on the same caption line
+            // (no new sheet, no layout change).
+            let caption = if resumed {
+                format!("resumed · {caption}")
+            } else {
+                caption
             };
             pane_caption(ui, &caption, tokens, failure.is_some());
         });
@@ -276,10 +287,16 @@ pub fn ui(
     // controls are the house painted buttons. Nothing here animates on its own
     // — a queue row only repaints on input or on the worker events that changed
     // it, so the card never adds an idle frame.
-    let rows: Vec<(u64, usize, String, &'static str)> = state
+    let rows: Vec<(u64, usize, String, String)> = state
         .queue_rows()
         .iter()
-        .map(|item| (item.id, item.seq, item.name(), item.state.label()))
+        .map(|item| {
+            let mut label = item.state.label().to_string();
+            if item.resumed {
+                label.push_str(" · resumed");
+            }
+            (item.id, item.seq, item.name(), label)
+        })
         .collect();
     let mut bottom = y;
     if !rows.is_empty() {
@@ -317,7 +334,7 @@ pub fn ui(
                     row_top + QUEUE_ROW_HEIGHT / 2.0,
                 ),
                 Align2::RIGHT_CENTER,
-                *label,
+                label,
                 FontId::new(10.5, FontFamily::Monospace),
                 tokens.ink_soft,
             );

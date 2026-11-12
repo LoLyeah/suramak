@@ -1233,6 +1233,7 @@ mod tests {
             queue_id: None,
             auto: false,
             stage: Some(suramak_asr::worker::JobStage::Transcribing),
+            resumed: false,
         });
         state.sync_from_app(&RecordState::Idle, &running, None, &chrome(), now);
         match &state {

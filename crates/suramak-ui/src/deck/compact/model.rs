@@ -45,6 +45,12 @@ pub struct LibraryRow {
     pub segments: usize,
     pub duration_ms: i64,
     pub language: Option<String>,
+    /// M22C: how many speaker labels the transcript has (0 = none). The row
+    /// shows up to four pips, then `+N`.
+    pub speakers: usize,
+    /// M22C: down-sampled RMS bars (`0..=1`) for the 28 px mini-waveform.
+    /// Empty means no stored peaks: the row draws its flat baseline.
+    pub waveform: Vec<f32>,
 }
 
 impl LibraryRow {
@@ -62,18 +68,31 @@ impl LibraryRow {
             segments: transcript.segments.len(),
             duration_ms,
             language: transcript.language.clone(),
+            speakers: 0,
+            waveform: Vec::new(),
         }
     }
 
-    /// `"12 Mar · 4:32 · 21 segments"` — the phone row's one meta line.
+    /// `"12 Mar · 21 segments"` — the phone row's meta line. The duration
+    /// lives in the row's tabular right-hand column (M22C), so it is not
+    /// repeated here.
     pub fn meta(&self) -> String {
         format!(
-            "{} · {} · {}",
+            "{} · {}",
             self.created_at.format("%-d %b"),
-            clock(self.duration_ms),
             crate::deck::compact::count_noun(self.segments, "segment")
         )
     }
+}
+
+/// The per-transcript facets a library load attaches to a row (M22C): the
+/// speaker count for the pips and the stored waveform bars. Kept separate from
+/// [`LibraryRow::from_transcript`] because the compact host reads them in one
+/// batched query rather than one per row.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LibraryFacets {
+    pub speakers: usize,
+    pub waveform: Vec<f32>,
 }
 
 /// `m:ss` (or `h:mm:ss` past an hour) — the phone's compact time format.
@@ -101,9 +120,16 @@ pub fn count_noun(count: usize, noun: &str) -> String {
 pub struct LibraryHit {
     pub id: Uuid,
     pub title: String,
+    /// The ±60-char window with the match wrapped in `[`/`]` (the store's wire
+    /// shape; the row paints the inner span in the accent ink, without the
+    /// brackets).
     pub snippet: String,
     pub segment_idx: Option<u32>,
     pub start_ms: i64,
+    /// The segment's speaker label, when the transcript is diarized.
+    pub speaker: Option<String>,
+    /// FTS5 `bm25`; lower is better. Kept for the phone JSON and stable order.
+    pub rank: f64,
 }
 
 /// The compact export formats — the desktop export list's set, in the same
@@ -682,6 +708,11 @@ pub enum CompactAction {
         id: Uuid,
         segment: Option<u32>,
     },
+    /// M22C: the Library field changed — run the store's segment search and
+    /// hand the hits back through [`CompactApp::set_search_hits`].
+    SearchLibrary {
+        query: String,
+    },
     /// Re-read the library after a load error.
     ReloadLibrary,
     /// Persist one edited segment (the desktop's update path, one row).
@@ -826,6 +857,9 @@ pub struct CompactEditor {
     pub playhead_ms: i64,
     /// The search hit the editor jumped to (a transient highlight).
     pub focus_segment: Option<u32>,
+    /// M22C: the next frame should scroll the focused segment into view. Set
+    /// by [`CompactEditor::reveal_segment`], consumed by the editor's list.
+    pub focus_scroll: bool,
     /// Whether the transcript has at least one stored translation (seeded by
     /// the host from `Store::segment_translations`). The bilingual export
     /// switch is offered only when there is a second line to stack.
@@ -854,6 +888,7 @@ impl CompactEditor {
             playing: false,
             playhead_ms: 0,
             focus_segment: None,
+            focus_scroll: false,
             has_translation: false,
             words: WordAlignment::default(),
             speakers: None,
@@ -1034,6 +1069,18 @@ impl CompactEditor {
         }
     }
 
+    /// M22C: the Library hit's landing. Selects the row (the editor's own
+    /// highlight), parks the playhead on its start and asks the next frame to
+    /// scroll it into view — the phone's existing seek path, one call.
+    pub fn reveal_segment(&mut self, idx: u32) {
+        if let Some(segment) = self.transcript.segments.iter().find(|s| s.idx == idx) {
+            self.selected = Some(idx);
+            self.playhead_ms = segment.start_ms;
+            self.focus_segment = Some(idx);
+            self.focus_scroll = true;
+        }
+    }
+
     /// The export request for the current transcript. `bilingual` adds the
     /// stacked translation (SRT/VTT only; the sheet gates the switch).
     pub fn export_request(&self, bilingual: bool) -> CompactAction {
@@ -1111,6 +1158,10 @@ pub struct CompactApp {
     pub transcripts: Vec<Transcript>,
     pub rows: Vec<LibraryRow>,
     pub library_query: String,
+    /// M22C: the store's spoken-text hits for the current query, already ranked
+    /// and limited. The library draws them under its "in transcripts" heading;
+    /// title matches stay in `rows` and come first.
+    pub search_hits: Vec<LibraryHit>,
     /// Library load failure, shown as an honest note (never a fake empty list).
     pub library_error: Option<String>,
     pub editor: Option<CompactEditor>,
@@ -1218,6 +1269,7 @@ impl CompactApp {
             transcripts: Vec::new(),
             rows: Vec::new(),
             library_query: String::new(),
+            search_hits: Vec::new(),
             library_error: None,
             editor: None,
             sheet: None,
@@ -1594,23 +1646,76 @@ impl CompactApp {
         self.library_error = None;
     }
 
+    /// Attaches the batched per-row facets (M22C): speaker counts for the pips
+    /// and stored waveform bars. Rows without an entry keep the honest empty
+    /// facets (no pips, flat baseline).
+    pub fn set_library_facets(&mut self, facets: BTreeMap<Uuid, LibraryFacets>) {
+        for row in &mut self.rows {
+            if let Some(facet) = facets.get(&row.id) {
+                row.speakers = facet.speakers;
+                row.waveform = facet.waveform.clone();
+            }
+        }
+    }
+
     pub fn set_library_error(&mut self, error: impl Into<String>) {
         self.library_error = Some(error.into());
         self.rows.clear();
         self.transcripts.clear();
+        self.search_hits.clear();
     }
 
     /// Applies a library query (the field's text).
+    ///
+    /// Changing the query drops the previous spoken-text hits immediately: a
+    /// row must never show a snippet for a question the reader has moved past.
+    /// Clearing the field also restores the plain list.
     pub fn set_library_query(&mut self, query: impl Into<String>) {
-        self.library_query = query.into();
+        let next = query.into();
+        if next.trim() != self.library_query.trim() {
+            self.search_hits.clear();
+        }
+        self.library_query = next;
+        if self.library_query.trim().is_empty() {
+            self.search_hits.clear();
+        }
+    }
+
+    /// The store's ranked spoken-text hits for the current query (M22C).
+    pub fn set_search_hits(&mut self, hits: Vec<LibraryHit>) {
+        self.search_hits = hits;
+    }
+
+    /// Whether the current query has anything to show in either section.
+    pub fn search_has_results(&self) -> bool {
+        !self.title_matches().is_empty() || !self.search_hits.is_empty()
+    }
+
+    /// Title matches for the current field text, in the library's own order
+    /// (`rows` is already newest-first). These render first, as plain rows.
+    pub fn title_matches(&self) -> Vec<&LibraryRow> {
+        let needle = self.library_query.trim().to_lowercase();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        self.rows
+            .iter()
+            .filter(|row| row.title.to_lowercase().contains(&needle))
+            .collect()
+    }
+
+    /// The "in transcripts" section: the store's segment hits, best first.
+    pub fn transcript_hits(&self) -> &[LibraryHit] {
+        &self.search_hits
     }
 
     /// Ranked-in-order search hits over the loaded transcripts. The query is
     /// matched case-insensitively against the title (a title hit ranks first)
     /// and then each segment; the first matching segment is the snippet. This
-    /// is the phone's search: the same data as the desktop's FTS panel, with a
-    /// deterministic in-memory rule (the library is already loaded for the
-    /// list, and a phone library is small enough that this never needs FTS).
+    /// is the pre-M22C in-memory helper kept for callers that hold full
+    /// transcripts (tests and previews); the product's Library uses
+    /// [`CompactApp::transcript_hits`], which the host fills from the store's
+    /// FTS5 segment index.
     pub fn hits(&self) -> Vec<LibraryHit> {
         let needle = self.library_query.trim().to_lowercase();
         if needle.is_empty() {
@@ -1640,6 +1745,8 @@ impl CompactApp {
                 snippet,
                 segment_idx: idx,
                 start_ms: start,
+                speaker: None,
+                rank: 0.0,
             });
         }
         // Title hits first, then by start time — stable and explainable.
@@ -2220,6 +2327,79 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].title, "budget review");
         assert!(hits[0].segment_idx.is_none());
+    }
+
+    #[test]
+    fn the_two_search_sections_are_separate_and_clear_together() {
+        let mut app = app();
+        // Capture the fixture's size rather than a magic number: the plain
+        // list is what must survive a search round-trip, whatever it holds.
+        let plain_rows = app.rows.len();
+        app.set_library_query("rapat");
+        // Title matches come from the loaded rows; spoken hits come from the
+        // store (the host fills them). One of each here.
+        assert_eq!(app.title_matches().len(), 1);
+        assert_eq!(app.title_matches()[0].title, "Rapat tim");
+        let id = app.title_matches()[0].id;
+        app.set_search_hits(vec![LibraryHit {
+            id,
+            title: "Rapat tim".to_string(),
+            snippet: "Kita membahas [rapat] anggaran".to_string(),
+            segment_idx: Some(0),
+            start_ms: 12_000,
+            speaker: Some("Budi".to_string()),
+            rank: -1.5,
+        }]);
+        assert_eq!(app.transcript_hits().len(), 1);
+        assert_eq!(app.transcript_hits()[0].segment_idx, Some(0));
+        assert!(app.search_has_results());
+
+        // A new query drops the old hits immediately; clearing restores the
+        // plain list. The title section is a live filter, not stale state.
+        app.set_library_query("zzz");
+        assert!(app.search_hits.is_empty());
+        assert_eq!(app.title_matches().len(), 0, "wrong query, no title hit");
+        app.set_library_query("");
+        assert!(app.search_hits.is_empty());
+        assert!(app.title_matches().is_empty());
+        assert_eq!(app.rows.len(), plain_rows, "the plain list is intact");
+    }
+
+    #[test]
+    fn a_search_hit_reveals_its_segment_on_the_existing_seek_path() {
+        let mut app = app();
+        let first = app.transcripts[0].clone();
+        app.open_editor(first, 0.0);
+        let editor = app.editor.as_mut().expect("editor");
+        editor.reveal_segment(1);
+        assert_eq!(editor.selected, Some(1));
+        assert_eq!(editor.focus_segment, Some(1));
+        assert!(editor.focus_scroll);
+        assert_eq!(
+            editor.playhead_ms, 4_000,
+            "the playhead parks on the hit's start"
+        );
+    }
+
+    #[test]
+    fn library_facets_attach_by_transcript_id() {
+        let mut app = app();
+        let id = app.rows[1].id;
+        app.set_library_facets(
+            [(
+                id,
+                LibraryFacets {
+                    speakers: 5,
+                    waveform: vec![0.1, 0.9],
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(app.rows[1].speakers, 5);
+        assert_eq!(app.rows[1].waveform, [0.1, 0.9]);
+        assert_eq!(app.rows[0].speakers, 0, "absent facets stay honest");
+        assert!(app.rows[0].waveform.is_empty());
     }
 
     #[test]

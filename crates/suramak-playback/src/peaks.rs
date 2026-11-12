@@ -131,6 +131,41 @@ impl Peaks {
         let buffer = decode::decode_file(path).map_err(|err| err.to_string())?;
         Ok(Peaks::from_samples(&buffer.samples, bucket_count))
     }
+
+    /// M22C: `count` down-sampled **RMS** bars in `0..=1`, the shape a library
+    /// row's 28 px mini-waveform draws.
+    ///
+    /// This is a pure reduction of the envelope the editor already computes —
+    /// no audio is decoded here and no new analysis is introduced. Each bar is
+    /// the RMS of the `(min, max)` buckets it covers
+    /// (`sqrt((min² + max²) / 2)`), scaled by the file's own peak so a quiet
+    /// recording still has a readable shape. A silent file is all zeros: the
+    /// row then draws its flat baseline rather than invented height.
+    pub fn bars(&self, count: usize) -> Vec<f32> {
+        if count == 0 || self.buckets.is_empty() {
+            return Vec::new();
+        }
+        if self.peak <= SILENCE {
+            return vec![0.0; count];
+        }
+        let scale = 1.0 / self.peak;
+        let mut bars = Vec::with_capacity(count);
+        for index in 0..count {
+            let start = index * self.buckets.len() / count;
+            let end = (index + 1) * self.buckets.len() / count;
+            if start >= end {
+                bars.push(0.0);
+                continue;
+            }
+            let mut sum_sq = 0.0f32;
+            for (min, max) in &self.buckets[start..end] {
+                sum_sq += (min * min + max * max) / 2.0;
+            }
+            let rms = (sum_sq / (end - start) as f32).sqrt();
+            bars.push((rms * scale).clamp(0.0, 1.0));
+        }
+        bars
+    }
 }
 
 #[cfg(test)]
@@ -285,5 +320,33 @@ mod tests {
         assert!(normalized
             .iter()
             .all(|(min, max)| *min >= -1.0 && *max <= 1.0));
+        // M22C: the library's down-sample is the same envelope, reduced.
+        let bars = peaks.bars(28);
+        assert_eq!(bars.len(), 28);
+        assert!(bars.iter().all(|bar| (0.0..=1.0).contains(bar)));
+        assert!(
+            bars.iter().any(|bar| *bar > 0.2),
+            "the fixture's speech survives the down-sample"
+        );
+    }
+
+    #[test]
+    fn bars_are_rms_downsampled_and_normalized() {
+        // Four buckets: [0.25], [0.5], [0.75], [1.0] — peak 1.0.
+        let samples = vec![0.25, 0.5, 0.75, 1.0];
+        let peaks = Peaks::from_samples(&samples, 4);
+        let bars = peaks.bars(2);
+        assert_eq!(bars.len(), 2);
+        let first = ((0.25f32 * 0.25 + 0.5 * 0.5) / 2.0).sqrt();
+        assert!((bars[0] - first).abs() < 1e-6, "{bars:?}");
+        // A quiet file is normalized by its own peak: the same shape as a loud
+        // one, not a flat line.
+        let quiet = Peaks::from_samples(&[0.025, 0.05, 0.075, 0.1], 4);
+        let quiet_bars = quiet.bars(2);
+        assert!((quiet_bars[0] - first).abs() < 1e-5, "{quiet_bars:?}");
+        // Silence is an honest zero, never invented height.
+        assert_eq!(Peaks::from_samples(&[0.0; 16], 4).bars(3), [0.0, 0.0, 0.0]);
+        assert!(Peaks::from_samples(&[], 0).bars(4).is_empty());
+        assert!(peaks.bars(0).is_empty());
     }
 }

@@ -60,9 +60,10 @@ pub use parakeet::{ParakeetCache, ParakeetRecognizer, ParakeetResult};
 pub use pipeline::{model_id_from_path, parse_lang, transcribe_file, PipelineOutcome};
 pub use prompt_budget::{measure_model, ModelTokenizer};
 pub use queue::driver::{
-    AudioDecoder, DecodeFailure, DecodeTask, FileDecoder, InferenceBackend, JobOptions, Prefetcher,
-    QueueDriver, QueueEvent, ThreadedPrefetch,
+    AudioDecoder, DecodeFailure, DecodeTask, FileDecoder, InferenceBackend, JobOptions,
+    PendingResume, Prefetcher, QueueDriver, QueueEvent, ResumeOutcome, ThreadedPrefetch,
 };
+pub use queue::host::{open_durable_queue, DurableQueue};
 pub use queue::{
     CancelDecision, DecodeAdmission, DecodeTicket, InferenceTicket, ItemState, JobQueue,
     QueueCounts, QueueItem, BYTES_PER_AUDIO_SECOND, MAX_DECODE_AHEAD, MAX_PREFETCH_BYTES,

@@ -178,8 +178,9 @@ fn opening_a_populated_v1_library_upgrades_it_in_place_without_losing_text() {
     // v1 → v2 (source_text + backfill) → v3 (derived marker, M15.5 tables) →
     // v4 (the FTS5 search index) → v5 (the M15.8 bilingual columns) → v6 (the
     // M15.6 word-timing table) → v7 (M16I's diarization tables) → v8 (M22A's
-    // job journal): the upgrade walks the whole chain in one open.
-    assert_eq!(SCHEMA_VERSION, 8);
+    // job journal) → v9 (M22C's segment index/waveforms): the upgrade walks the
+    // whole chain in one open.
+    assert_eq!(SCHEMA_VERSION, 9);
     assert_eq!(store.integrity_check().unwrap(), "ok");
     // v4 backfilled the search index for the rows the fixture carried.
     let stats = store.search_index_stats().expect("stats");

@@ -35,7 +35,7 @@ use super::journal::{self, CheckpointPolicy, CheckpointWriter, DurableJob, Resum
 use super::{CancelDecision, DecodeAdmission, InferenceTicket, JobQueue, QueueCounts};
 
 /// The per-job options the CLI resolved once for the whole batch.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct JobOptions {
     pub model_path: PathBuf,
     pub lang: LangMode,
@@ -276,6 +276,13 @@ struct Run {
     checkpoint_error: Option<String>,
 }
 
+/// The host-supplied display identity for one queue item (M22A2).
+#[derive(Debug, Clone)]
+struct ItemMeta {
+    title: String,
+    source_name: String,
+}
+
 /// The active job's handles kept beside its cancel token.
 struct Running {
     id: u64,
@@ -309,6 +316,11 @@ pub struct QueueDriver<B: InferenceBackend, P: Prefetcher> {
     durable_ids: HashMap<u64, Uuid>,
     /// Running item id → its durable state.
     runs: HashMap<u64, Run>,
+    /// M22A2: per-item display metadata a host supplies (the Android job's
+    /// human title and the original shared file name). The CLI and desktop
+    /// derive both from the input path; the phone cannot — its copied media is
+    /// named by the opaque job key.
+    meta: HashMap<u64, ItemMeta>,
     /// The checkpoint cadence (constant in production; tests may tighten it).
     policy: CheckpointPolicy,
 }
@@ -328,6 +340,7 @@ impl<B: InferenceBackend, P: Prefetcher> QueueDriver<B, P> {
             journal: None,
             durable_ids: HashMap::new(),
             runs: HashMap::new(),
+            meta: HashMap::new(),
             policy: CheckpointPolicy::default(),
         }
     }
@@ -343,6 +356,18 @@ impl<B: InferenceBackend, P: Prefetcher> QueueDriver<B, P> {
     /// The journal, when this driver owns one (tests read it back through this).
     pub fn journal(&self) -> Option<&Store> {
         self.journal.as_ref()
+    }
+
+    /// M22A2: updates the per-batch options between jobs (the desktop app
+    /// resolves the model/language at submit time; a settings change must not
+    /// bind the next row to the previous model). Only legal while the driver
+    /// has no live item — the host serializes its submits.
+    pub fn set_options(&mut self, options: JobOptions) {
+        debug_assert!(
+            self.is_idle(),
+            "options change while the queue still owns work"
+        );
+        self.options = options;
     }
 
     /// Changes the checkpoint cadence (test seam; production uses the defaults).
@@ -445,6 +470,24 @@ impl<B: InferenceBackend, P: Prefetcher> QueueDriver<B, P> {
             .into_iter()
             .map(|input| self.enqueue(input))
             .collect()
+    }
+
+    /// Accepts a file with the host's display identity (M22A2).
+    ///
+    /// The journal row cannot carry a title (its schema is M22A's and does not
+    /// change); a resumed row therefore gets its title from the host after
+    /// `resume_pending` through [`Self::set_item_meta`]. The driver uses these
+    /// strings when it builds the durable transcript, so a phone share keeps the
+    /// name the user saw instead of the copied media's opaque key.
+    pub fn enqueue_named(&mut self, input: PathBuf, title: String, source_name: String) -> u64 {
+        let id = self.enqueue(input);
+        self.set_item_meta(id, title, source_name);
+        id
+    }
+
+    /// Sets (or replaces) one queue item's display identity.
+    pub fn set_item_meta(&mut self, id: u64, title: String, source_name: String) {
+        self.meta.insert(id, ItemMeta { title, source_name });
     }
 
     pub fn queue(&self) -> &JobQueue {
@@ -567,7 +610,8 @@ impl<B: InferenceBackend, P: Prefetcher> QueueDriver<B, P> {
                     });
                 }
                 Ok(plan) => {
-                    let id = self.queue.enqueue(source.clone());
+                    // M22A2: the queue row carries the marker the hosts surface.
+                    let id = self.queue.enqueue_resumed(source.clone());
                     self.tokens.insert(id, CancelToken::new());
                     self.durable_ids.insert(id, record.id);
                     match plan {
@@ -752,7 +796,15 @@ impl<B: InferenceBackend, P: Prefetcher> QueueDriver<B, P> {
                 };
                 self.tokens.remove(&job_id);
                 self.samples.remove(&job_id);
+                let mut transcript = transcript;
                 let run = self.runs.remove(&job_id);
+                // M22A2: the host's display identity wins over the copied media
+                // name (the phone's `<key>.opus`). The CLI/desktop meta is the
+                // file name itself, so their rows are unchanged.
+                if let Some(run) = &run {
+                    transcript.title = run.durable.title.clone();
+                    transcript.source = run.durable.source.clone();
+                }
                 if let Some(run) = run {
                     // A checkpoint that failed earlier means the committed text
                     // is not the text this run produced: report the failure.
@@ -1006,11 +1058,17 @@ impl<B: InferenceBackend, P: Prefetcher> QueueDriver<B, P> {
                 next_idx: resume.next_idx,
             });
         }
-        let title = ticket
-            .input
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "transcript".to_string());
+        let (title, source_name) = match self.meta.get(&ticket.id) {
+            Some(meta) => (meta.title.clone(), meta.source_name.clone()),
+            None => {
+                let name = ticket
+                    .input
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "transcript".to_string());
+                (name.clone(), name)
+            }
+        };
         let language = match &self.options.lang {
             LangMode::Auto => None,
             LangMode::Fixed(code) => Some(code.clone()),
@@ -1020,7 +1078,7 @@ impl<B: InferenceBackend, P: Prefetcher> QueueDriver<B, P> {
             transcript_id: record.transcript_id.unwrap_or_else(Uuid::new_v4),
             created_at: record.created_at,
             title: title.clone(),
-            source: Source::File { name: title },
+            source: Source::File { name: source_name },
             model: model_id_from_path(&self.options.model_path),
             language,
             audio_path: Some(ticket.input.clone()),

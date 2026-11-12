@@ -213,6 +213,7 @@ mod tests {
             queue_id: None,
             auto: false,
             stage: None,
+            resumed: false,
         });
         assert_eq!(classify(&state), FrameState::Job);
 

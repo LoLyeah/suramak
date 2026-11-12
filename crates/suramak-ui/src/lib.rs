@@ -17,3 +17,7 @@
 //! nothing for one app. See `docs/reports/M13g1-compact-library.md` §1.
 
 pub mod deck;
+/// M22A2: the desktop host's durable queue creation (non-Android only; the
+/// phone has its own jobs host).
+#[cfg(not(target_os = "android"))]
+pub mod durable_queue;

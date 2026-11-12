@@ -38,6 +38,7 @@
 //! inference slot, bounded decode-ahead — used by the CLI.
 
 pub mod driver;
+pub mod host;
 pub mod journal;
 
 use std::collections::HashSet;
@@ -135,6 +136,10 @@ pub struct QueueItem {
     pub cancelling: bool,
     /// Bytes this item contributed to the prefetch pool while decoded-ahead.
     pub decoded_bytes: usize,
+    /// M22A2: this item continues a job the journal left interrupted — the
+    /// app's existing job surface says so instead of presenting it as a fresh
+    /// import.
+    pub resumed: bool,
 }
 
 impl QueueItem {
@@ -211,6 +216,8 @@ pub struct InferenceTicket {
     /// the item is already `transcribing`; when `false` it starts in `decoding`
     /// because the worker will decode it inline.
     pub prefetched: bool,
+    /// M22A2: the item continues a journal row (the host marks its surface).
+    pub resumed: bool,
 }
 
 /// The answer to a cancellation request.
@@ -254,6 +261,17 @@ impl JobQueue {
 
     /// Accepts a file at the end of the queue.
     pub fn enqueue(&mut self, input: PathBuf) -> u64 {
+        self.enqueue_marked(input, false)
+    }
+
+    /// M22A2: accepts a file that continues a journal row left by an earlier
+    /// process. The queue rules are identical; only the row carries the
+    /// `resumed` marker the host surfaces.
+    pub fn enqueue_resumed(&mut self, input: PathBuf) -> u64 {
+        self.enqueue_marked(input, true)
+    }
+
+    fn enqueue_marked(&mut self, input: PathBuf, resumed: bool) -> u64 {
         self.next_id += 1;
         self.next_seq += 1;
         let id = self.next_id;
@@ -267,6 +285,7 @@ impl JobQueue {
             warnings: Vec::new(),
             cancelling: false,
             decoded_bytes: 0,
+            resumed,
         });
         id
     }
@@ -446,6 +465,7 @@ impl JobQueue {
             seq: item.seq,
             input: item.input.clone(),
             prefetched,
+            resumed: item.resumed,
         })
     }
 

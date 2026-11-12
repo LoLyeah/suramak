@@ -62,6 +62,49 @@ const SEARCH_DOCS_DDL: &str = "CREATE TABLE IF NOT EXISTS search_docs (
     );
     CREATE INDEX IF NOT EXISTS search_docs_transcript ON search_docs(transcript_id);";
 
+/// The M22C segment index. One row per **spoken segment**, in the workorder's
+/// exact column shape. `text` is the only indexed column; the transcript id,
+/// index and speaker label are `UNINDEXED` (they are display/filter data, not
+/// words). `remove_diacritics 2` is the workorder's tokenizer: accents fold on
+/// both the document and the query, so `cafe` finds `café` at index time as
+/// well as snippet time.
+///
+/// The companion map ([`SEGMENT_MAP_DDL`]) gives the index a stable rowid per
+/// `(transcript, segment)` so an edit is O(log n) instead of a scan of the
+/// virtual table — the same design `search_docs` already uses above.
+const SEGMENT_FTS_DDL: &str = "CREATE VIRTUAL TABLE IF NOT EXISTS segment_fts USING fts5(
+        transcript_id UNINDEXED,
+        seg_index UNINDEXED,
+        speaker UNINDEXED,
+        text,
+        tokenize = 'unicode61 remove_diacritics 2'
+    );";
+
+/// The segment index's document map: one row per indexed segment, with the
+/// FTS rowid and the speaker label used by the `speaker:` filter.
+const SEGMENT_MAP_DDL: &str = "CREATE TABLE IF NOT EXISTS segment_fts_map (
+        rowid         INTEGER PRIMARY KEY,
+        transcript_id TEXT NOT NULL,
+        seg_index     INTEGER NOT NULL,
+        speaker       TEXT NOT NULL DEFAULT '',
+        UNIQUE(transcript_id, seg_index)
+    );
+    CREATE INDEX IF NOT EXISTS segment_fts_map_transcript
+        ON segment_fts_map(transcript_id);";
+
+/// M22C rows' 28 px mini-waveform. The editor already computes a `Peaks`
+/// envelope when it opens a source; this table only stores the **down-sampled
+/// RMS** bars that envelope yields, so a library row never decodes audio.
+/// `bars` is little-endian `f32` values in `0..=1` (28 of them today).
+const WAVEFORMS_DDL: &str = "CREATE TABLE IF NOT EXISTS waveforms (
+        transcript_id TEXT PRIMARY KEY REFERENCES transcripts(id) ON DELETE CASCADE,
+        bars          BLOB NOT NULL,
+        updated_at    TEXT NOT NULL
+    );";
+
+/// How many waveform bars a library row stores (the 28 px mark's data).
+pub const WAVEFORM_BARS: usize = 28;
+
 /// The library schema this build writes and reads.
 ///
 /// - **v1** — the schema shipped in app 0.3.0/0.3.1 (`meta.schema_version = 1`):
@@ -95,7 +138,11 @@ const SEARCH_DOCS_DDL: &str = "CREATE TABLE IF NOT EXISTS search_docs (
 ///   (`last_committed_segment` / `last_committed_ms`). The transcript text keeps
 ///   living in `segments`; the journal only says how much of it is committed, so
 ///   a resume continues at that boundary. No existing table is rebuilt.
-pub const SCHEMA_VERSION: i64 = 8;
+/// - **v9** — M22C, additive only: `segment_fts` (the FTS5 segment index) and
+///   `segment_fts_map` (its document map), plus `waveforms` (the down-sampled
+///   RMS bars the library rows draw). Existing tables are untouched; an empty
+///   index is rebuilt one transcript per transaction on open.
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// SQLite-backed transcript library with WAL mode.
 pub struct Store {
@@ -127,6 +174,42 @@ impl SearchIndexStats {
     pub fn total(&self) -> i64 {
         self.segments + self.titles + self.glossary + self.dictionary
     }
+}
+
+/// One hit from [`Store::search_segments`] (M22C).
+///
+/// `snippet` is a one-line ±60-char window with the located match wrapped in
+/// `[`/`]` (the wire shape the Library field and the phone JSON share).
+/// `rank` is FTS5's `bm25` value: **lower is better**, and the results are
+/// returned already sorted by it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentHit {
+    pub transcript_id: Uuid,
+    pub transcript_title: String,
+    pub segment_idx: u32,
+    pub speaker: Option<String>,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub snippet: String,
+    pub rank: f64,
+}
+
+/// The eight columns [`Store::search_segments`] reads, in order.
+type SegmentHitColumns = (String, String, u32, String, i64, i64, String, f64);
+
+/// Decodes one row of [`SegmentHitColumns`] (outside the impl so both the
+/// speaker-filtered and the plain statement can share it).
+fn segment_hit_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<SegmentHitColumns> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+    ))
 }
 
 /// How many word rows a write actually landed, and how many segment groups it
@@ -473,11 +556,37 @@ impl Store {
                  failure                TEXT
              );
              CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
-             CREATE INDEX IF NOT EXISTS jobs_path ON jobs(path);",
+             CREATE INDEX IF NOT EXISTS jobs_path ON jobs(path);
+             -- M22C (schema v9): the segment index, its document map, and the
+             -- library rows' stored mini-waveform bars. Additive; the rebuild
+             -- for an older library runs after the migration, one transcript
+             -- per transaction.
+             CREATE VIRTUAL TABLE IF NOT EXISTS segment_fts USING fts5(
+                 transcript_id UNINDEXED,
+                 seg_index UNINDEXED,
+                 speaker UNINDEXED,
+                 text,
+                 tokenize = 'unicode61 remove_diacritics 2'
+             );
+             CREATE TABLE IF NOT EXISTS segment_fts_map (
+                 rowid         INTEGER PRIMARY KEY,
+                 transcript_id TEXT NOT NULL,
+                 seg_index     INTEGER NOT NULL,
+                 speaker       TEXT NOT NULL DEFAULT '',
+                 UNIQUE(transcript_id, seg_index)
+             );
+             CREATE INDEX IF NOT EXISTS segment_fts_map_transcript
+                 ON segment_fts_map(transcript_id);
+             CREATE TABLE IF NOT EXISTS waveforms (
+                 transcript_id TEXT PRIMARY KEY REFERENCES transcripts(id) ON DELETE CASCADE,
+                 bars          BLOB NOT NULL,
+                 updated_at    TEXT NOT NULL
+             );",
         )?;
         self.migrate()?;
         self.recover_job_checkpoints()?;
-        self.ensure_search_index()
+        self.ensure_search_index()?;
+        self.ensure_segment_index()
     }
 
     /// Reads `meta.schema_version`, if the database has one. A non-numeric
@@ -557,6 +666,9 @@ impl Store {
         }
         if version < 8 {
             self.upgrade_to_v8()?;
+        }
+        if version < 9 {
+            self.upgrade_to_v9()?;
         }
         Ok(())
     }
@@ -811,6 +923,26 @@ impl Store {
              CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
              CREATE INDEX IF NOT EXISTS jobs_path ON jobs(path);",
         )?;
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ---- M22C: the segment index ------------------------------------------
+
+    /// v8 → v9, one transaction: the index objects. The rebuild is deliberately
+    /// **after** the stamp and is driven by [`Store::ensure_segment_index`], so
+    /// a crash mid-rebuild leaves a coherent v9 library whose next open
+    /// resumes the (idempotent) rebuild instead of replaying the migration.
+    fn upgrade_to_v9(&self) -> Result<(), SuramakError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(SEGMENT_FTS_DDL)?;
+        tx.execute_batch(SEGMENT_MAP_DDL)?;
+        tx.execute_batch(WAVEFORMS_DDL)?;
         tx.execute(
             "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -1810,6 +1942,562 @@ impl Store {
         }
     }
 
+    // ---- M22C: the segment index ------------------------------------------
+
+    /// The segment index's own self-repair gate: empty (a fresh upgrade), or
+    /// a map/FTS count that disagrees with `segments`, is rebuilt once. The
+    /// rebuild is one transaction **per transcript**, so a killed process
+    /// loses at most one transcript's rows and the next open finishes the job.
+    fn ensure_segment_index(&self) -> Result<(), SuramakError> {
+        match self.segment_index_consistent() {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                tracing::info!(
+                    "segment index is empty or out of date; rebuilding it one transcript per transaction"
+                );
+                self.rebuild_segment_index()?;
+                Ok(())
+            }
+            Err(err) => {
+                tracing::warn!("segment index is unreadable ({err}); rebuilding it");
+                self.rebuild_segment_index()?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Whether every searchable segment has exactly one map row and one FTS
+    /// row. The cheap count gate is what an interrupted rebuild and a partial
+    /// write are caught by; a full content comparison would cost an open.
+    pub fn segment_index_consistent(&self) -> Result<bool, SuramakError> {
+        let expected: i64 = self.conn.query_row(
+            "SELECT count(*) FROM segments
+             WHERE length(trim(text, char(9) || char(10) || char(13) || ' ')) > 0",
+            [],
+            |row| row.get(0),
+        )?;
+        let mapped: i64 =
+            self.conn
+                .query_row("SELECT count(*) FROM segment_fts_map", [], |row| row.get(0))?;
+        let indexed: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM segment_fts", [], |row| row.get(0))?;
+        Ok(expected == mapped && mapped == indexed)
+    }
+
+    /// How many segments the M22C index holds (the report's and the tests'
+    /// window into it).
+    pub fn segment_index_rows(&self) -> Result<i64, SuramakError> {
+        Ok(self
+            .conn
+            .query_row("SELECT count(*) FROM segment_fts_map", [], |row| row.get(0))?)
+    }
+
+    /// Drops and rebuilds the segment index from `segments`, **one transaction
+    /// per transcript**. Progress is logged every 25 transcripts, so a large
+    /// first open is visibly working and a crash resumes idempotently.
+    pub fn rebuild_segment_index(&self) -> Result<usize, SuramakError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM segment_fts", [])?;
+        tx.execute("DELETE FROM segment_fts_map", [])?;
+        tx.commit()?;
+
+        let ids: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM transcripts ORDER BY created_at, id")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut written = 0usize;
+        for (done, raw) in ids.iter().enumerate() {
+            let Ok(id) = Uuid::parse_str(raw) else {
+                continue;
+            };
+            let tx = self.conn.unchecked_transaction()?;
+            let segments = Self::index_segments(&tx, id)?;
+            let labels = Self::speaker_labels_for(&tx, id, &segments)?;
+            for segment in &segments {
+                if !Self::has_searchable_text(&segment.text) {
+                    continue;
+                }
+                Self::put_segment_fts(
+                    &tx,
+                    id,
+                    segment.idx,
+                    labels.get(&segment.idx).map(String::as_str),
+                    &segment.text,
+                )?;
+                written += 1;
+            }
+            tx.commit()?;
+            if (done + 1) % 25 == 0 {
+                tracing::info!(
+                    transcripts = done + 1,
+                    total = ids.len(),
+                    segments = written,
+                    "segment index rebuild progress"
+                );
+            }
+        }
+        tracing::info!(
+            transcripts = ids.len(),
+            segments = written,
+            "segment index rebuild complete"
+        );
+        Ok(written)
+    }
+
+    /// The segments the index reads for one transcript (no provenance columns:
+    /// the index only needs the row identity and the spoken text).
+    fn index_segments(conn: &Connection, id: Uuid) -> Result<Vec<Segment>, SuramakError> {
+        let mut stmt = conn.prepare(
+            "SELECT idx, start_ms, end_ms, text FROM segments
+             WHERE transcript_id = ?1 ORDER BY idx",
+        )?;
+        let rows = stmt.query_map(params![id.to_string()], |row| {
+            Ok(Segment {
+                idx: row.get(0)?,
+                start_ms: row.get(1)?,
+                end_ms: row.get(2)?,
+                text: row.get(3)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(SuramakError::Sqlite)
+    }
+
+    /// One speaker label per segment row, using the same read-time projection
+    /// the editor badge uses (turns are time-anchored; segments are the rows).
+    /// Empty when the transcript has no diarization.
+    fn speaker_labels_for(
+        conn: &Connection,
+        id: Uuid,
+        segments: &[Segment],
+    ) -> Result<BTreeMap<u32, String>, SuramakError> {
+        let speakers: BTreeMap<u32, String> = {
+            let mut stmt = conn.prepare(
+                "SELECT speaker_id, label FROM speakers WHERE transcript_id = ?1 ORDER BY speaker_id",
+            )?;
+            let rows = stmt.query_map(params![id.to_string()], |row| {
+                Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<BTreeMap<_, _>, _>>()?
+        };
+        if speakers.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let turns: Vec<SpeakerTurn> = {
+            let mut stmt = conn.prepare(
+                "SELECT turn_idx, start_ms, end_ms, speaker_id, source
+                 FROM speaker_turns WHERE transcript_id = ?1 ORDER BY start_ms, turn_idx",
+            )?;
+            let rows = stmt.query_map(params![id.to_string()], |row| {
+                Ok(SpeakerTurn {
+                    turn_idx: row.get(0)?,
+                    start_ms: row.get(1)?,
+                    end_ms: row.get(2)?,
+                    speaker_id: row.get(3)?,
+                    source: TurnSource::parse(&row.get::<_, String>(4)?),
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let projection = speaker_for_segments(segments, &turns);
+        let mut labels = BTreeMap::new();
+        for (segment, row) in segments.iter().zip(projection) {
+            if let Some(Some(label)) = row.map(|row| speakers.get(&row.primary).cloned()) {
+                labels.insert(segment.idx, label);
+            }
+        }
+        Ok(labels)
+    }
+
+    /// Writes (or rewrites) one segment's index document. The map row supplies
+    /// the stably-addressed FTS rowid; the FTS row is replaced in full so an
+    /// edit can never leave two versions of a segment behind.
+    fn put_segment_fts(
+        conn: &Connection,
+        id: Uuid,
+        idx: u32,
+        speaker: Option<&str>,
+        text: &str,
+    ) -> Result<(), SuramakError> {
+        if !Self::has_searchable_text(text) {
+            return Self::delete_segment_fts(conn, id, idx);
+        }
+        let speaker = speaker.unwrap_or_default();
+        conn.execute(
+            "INSERT INTO segment_fts_map(transcript_id, seg_index, speaker)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(transcript_id, seg_index) DO UPDATE SET speaker = excluded.speaker",
+            params![id.to_string(), idx, speaker],
+        )?;
+        let rowid: i64 = conn.query_row(
+            "SELECT rowid FROM segment_fts_map WHERE transcript_id = ?1 AND seg_index = ?2",
+            params![id.to_string(), idx],
+            |row| row.get(0),
+        )?;
+        conn.execute("DELETE FROM segment_fts WHERE rowid = ?1", params![rowid])?;
+        conn.execute(
+            "INSERT INTO segment_fts(rowid, transcript_id, seg_index, speaker, text)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![rowid, id.to_string(), idx, speaker, text],
+        )?;
+        Ok(())
+    }
+
+    /// Removes one segment's index document (both halves).
+    fn delete_segment_fts(conn: &Connection, id: Uuid, idx: u32) -> Result<(), SuramakError> {
+        let rowid: Option<i64> = conn
+            .query_row(
+                "SELECT rowid FROM segment_fts_map WHERE transcript_id = ?1 AND seg_index = ?2",
+                params![id.to_string(), idx],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(rowid) = rowid {
+            conn.execute("DELETE FROM segment_fts WHERE rowid = ?1", params![rowid])?;
+            conn.execute(
+                "DELETE FROM segment_fts_map WHERE transcript_id = ?1 AND seg_index = ?2",
+                params![id.to_string(), idx],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Drops the index documents at or after `from_idx` (the stale tail of an
+    /// upsert that shrinks a transcript).
+    fn delete_segment_fts_from(
+        conn: &Connection,
+        id: Uuid,
+        from_idx: u32,
+    ) -> Result<(), SuramakError> {
+        let rowids: Vec<i64> = {
+            let mut stmt = conn.prepare(
+                "SELECT rowid FROM segment_fts_map
+                 WHERE transcript_id = ?1 AND seg_index >= ?2",
+            )?;
+            let rows = stmt.query_map(params![id.to_string(), from_idx], |row| row.get(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for rowid in &rowids {
+            conn.execute("DELETE FROM segment_fts WHERE rowid = ?1", params![rowid])?;
+        }
+        conn.execute(
+            "DELETE FROM segment_fts_map WHERE transcript_id = ?1 AND seg_index >= ?2",
+            params![id.to_string(), from_idx],
+        )?;
+        Ok(())
+    }
+
+    /// Drops every index document a transcript owns (delete / structural
+    /// replace). The FTS table has no foreign key, so this is explicit.
+    fn delete_all_segment_fts(conn: &Connection, id: Uuid) -> Result<(), SuramakError> {
+        let rowids: Vec<i64> = {
+            let mut stmt =
+                conn.prepare("SELECT rowid FROM segment_fts_map WHERE transcript_id = ?1")?;
+            let rows = stmt.query_map(params![id.to_string()], |row| row.get(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for rowid in &rowids {
+            conn.execute("DELETE FROM segment_fts WHERE rowid = ?1", params![rowid])?;
+        }
+        conn.execute(
+            "DELETE FROM segment_fts_map WHERE transcript_id = ?1",
+            params![id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Re-reads one segment's current text and re-syncs its index document.
+    fn sync_segment_fts(conn: &Connection, id: Uuid, idx: u32) -> Result<(), SuramakError> {
+        let segments = Self::index_segments(conn, id)?;
+        let labels = Self::speaker_labels_for(conn, id, &segments)?;
+        let Some(segment) = segments.iter().find(|segment| segment.idx == idx) else {
+            return Self::delete_segment_fts(conn, id, idx);
+        };
+        Self::put_segment_fts(
+            conn,
+            id,
+            idx,
+            labels.get(&idx).map(String::as_str),
+            &segment.text,
+        )
+    }
+
+    /// Re-points every indexed segment at its current speaker label (a rename,
+    /// merge, split, reassignment or delete changes the projection without
+    /// touching a segment row).
+    fn refresh_segment_speakers(conn: &Connection, id: Uuid) -> Result<(), SuramakError> {
+        let segments = Self::index_segments(conn, id)?;
+        if segments.is_empty() {
+            return Ok(());
+        }
+        let labels = Self::speaker_labels_for(conn, id, &segments)?;
+        let rows: Vec<(i64, u32, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT rowid, seg_index, speaker FROM segment_fts_map WHERE transcript_id = ?1",
+            )?;
+            let rows = stmt.query_map(params![id.to_string()], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (rowid, idx, current) in rows {
+            let wanted = labels.get(&idx).map(String::as_str).unwrap_or_default();
+            if wanted != current {
+                conn.execute(
+                    "UPDATE segment_fts_map SET speaker = ?1 WHERE rowid = ?2",
+                    params![wanted, rowid],
+                )?;
+                conn.execute(
+                    "UPDATE segment_fts SET speaker = ?1 WHERE rowid = ?2",
+                    params![wanted, rowid],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// M22C: search **spoken segment text** across the whole library.
+    ///
+    /// The query language is the Library field's: quoted phrases, bare terms
+    /// AND-ed, and a `speaker:` label filter. Each hit carries its transcript,
+    /// segment index, speaker, timestamps, a ±60-char bracketed snippet and
+    /// FTS5's `bm25` rank (lower is better; results are already sorted).
+    /// Empty or punctuation-only input returns an empty list, never an error.
+    pub fn search_segments(
+        &self,
+        query_text: &str,
+        limit: usize,
+    ) -> Result<Vec<SegmentHit>, SuramakError> {
+        let Some(query) = search::segment_query(query_text) else {
+            return Ok(Vec::new());
+        };
+        let limit = limit.clamp(1, search::MAX_LIMIT) as i64;
+        let mut hits = Vec::new();
+
+        if query.expression.is_empty() {
+            // A speaker-only query: no MATCH expression exists, so answer from
+            // the map. The limit applies before the transcript/segment joins,
+            // so a prolific speaker costs 50 joins, not thousands.
+            let mut stmt = self.conn.prepare(
+                "SELECT m.transcript_id, t.title, m.seg_index, m.speaker,
+                        s.start_ms, s.end_ms, s.text
+                 FROM (
+                     SELECT rowid, transcript_id, seg_index, speaker
+                     FROM segment_fts_map
+                     WHERE speaker COLLATE NOCASE = ?1
+                     ORDER BY rowid
+                     LIMIT ?2
+                 ) m
+                 JOIN transcripts t ON t.id = m.transcript_id
+                 JOIN segments s
+                   ON s.transcript_id = m.transcript_id AND s.idx = m.seg_index
+                 ORDER BY m.rowid",
+            )?;
+            let rows = stmt.query_map(
+                params![query.speaker.as_deref().unwrap_or(""), limit],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u32>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (id, title, idx, speaker, start, end, text) = row?;
+                let Ok(id) = Uuid::parse_str(&id) else {
+                    continue;
+                };
+                hits.push(SegmentHit {
+                    transcript_id: id,
+                    transcript_title: title,
+                    segment_idx: idx,
+                    speaker: Some(speaker).filter(|speaker| !speaker.is_empty()),
+                    start_ms: start,
+                    end_ms: end,
+                    snippet: search::bracketed(&search::snippet(
+                        &text,
+                        &query.terms,
+                        search::SEGMENT_CONTEXT_CHARS,
+                    )),
+                    rank: 0.0,
+                });
+            }
+            return Ok(hits);
+        }
+
+        let mut stmt = if query.speaker.is_some() {
+            self.conn.prepare(
+                "SELECT m.transcript_id, t.title, m.seg_index, m.speaker,
+                        s.start_ms, s.end_ms, f.text, hit.rank
+                 FROM (
+                     SELECT segment_fts.rowid AS rowid, bm25(segment_fts) AS rank
+                     FROM segment_fts
+                     JOIN segment_fts_map sm ON sm.rowid = segment_fts.rowid
+                     WHERE segment_fts MATCH ?1
+                       AND sm.speaker COLLATE NOCASE = ?2
+                     ORDER BY rank
+                     LIMIT ?3
+                 ) hit
+                 JOIN segment_fts f ON f.rowid = hit.rowid
+                 JOIN segment_fts_map m ON m.rowid = hit.rowid
+                 JOIN transcripts t ON t.id = m.transcript_id
+                 JOIN segments s
+                   ON s.transcript_id = m.transcript_id AND s.idx = m.seg_index
+                 ORDER BY hit.rank",
+            )?
+        } else {
+            self.conn.prepare(
+                "SELECT m.transcript_id, t.title, m.seg_index, m.speaker,
+                        s.start_ms, s.end_ms, f.text, hit.rank
+                 FROM (
+                     SELECT rowid, bm25(segment_fts) AS rank
+                     FROM segment_fts
+                     WHERE segment_fts MATCH ?1
+                     ORDER BY rank
+                     LIMIT ?2
+                 ) hit
+                 JOIN segment_fts f ON f.rowid = hit.rowid
+                 JOIN segment_fts_map m ON m.rowid = hit.rowid
+                 JOIN transcripts t ON t.id = m.transcript_id
+                 JOIN segments s
+                   ON s.transcript_id = m.transcript_id AND s.idx = m.seg_index
+                 ORDER BY hit.rank",
+            )?
+        };
+        let rows: Vec<SegmentHitColumns> = if query.speaker.is_some() {
+            stmt.query_map(
+                params![query.expression, query.speaker.as_deref(), limit],
+                segment_hit_columns,
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map(params![query.expression, limit], segment_hit_columns)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (id, title, idx, speaker, start, end, text, rank) in rows {
+            let Ok(id) = Uuid::parse_str(&id) else {
+                continue;
+            };
+            hits.push(SegmentHit {
+                transcript_id: id,
+                transcript_title: title,
+                segment_idx: idx,
+                speaker: Some(speaker).filter(|speaker| !speaker.is_empty()),
+                start_ms: start,
+                end_ms: end,
+                snippet: search::bracketed(&search::snippet(
+                    &text,
+                    &query.terms,
+                    search::SEGMENT_CONTEXT_CHARS,
+                )),
+                rank,
+            });
+        }
+        Ok(hits)
+    }
+
+    // ---- M22C: the rows' stored mini-waveform ------------------------------
+
+    /// Stores the down-sampled RMS bars a library row draws. Values are
+    /// clamped to `0..=1`; an empty slice removes the row (no waveform is an
+    /// honest state, and the row then draws its flat baseline).
+    pub fn set_waveform(&self, id: Uuid, bars: &[f32]) -> Result<(), SuramakError> {
+        if bars.is_empty() {
+            self.conn.execute(
+                "DELETE FROM waveforms WHERE transcript_id = ?1",
+                params![id.to_string()],
+            )?;
+            return Ok(());
+        }
+        let clamped: Vec<f32> = bars
+            .iter()
+            .map(|value| value.clamp(0.0, 1.0))
+            .take(WAVEFORM_BARS)
+            .collect();
+        let mut bytes = Vec::with_capacity(clamped.len() * 4);
+        for value in &clamped {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        self.conn.execute(
+            "INSERT INTO waveforms(transcript_id, bars, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(transcript_id) DO UPDATE SET
+                 bars = excluded.bars, updated_at = excluded.updated_at",
+            params![id.to_string(), bytes, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// One transcript's stored mini-waveform, when it has one.
+    pub fn waveform(&self, id: Uuid) -> Result<Option<Vec<f32>>, SuramakError> {
+        let bytes: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT bars FROM waveforms WHERE transcript_id = ?1",
+                params![id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(bytes.map(|bytes| Self::decode_waveform(&bytes)))
+    }
+
+    /// Every stored waveform, keyed by transcript (the library's one read).
+    pub fn waveforms(&self) -> Result<BTreeMap<Uuid, Vec<f32>>, SuramakError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT transcript_id, bars FROM waveforms")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = BTreeMap::new();
+        for row in rows {
+            let (id, bytes) = row?;
+            if let Ok(id) = Uuid::parse_str(&id) {
+                out.insert(id, Self::decode_waveform(&bytes));
+            }
+        }
+        Ok(out)
+    }
+
+    fn decode_waveform(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .chunks_exact(4)
+            .filter_map(|chunk| chunk.try_into().ok().map(f32::from_le_bytes))
+            .take(WAVEFORM_BARS)
+            .collect()
+    }
+
+    /// How many speaker labels each transcript has, for the library rows' pips
+    /// (one query for the whole list, not one per row).
+    pub fn speaker_counts(&self) -> Result<BTreeMap<Uuid, usize>, SuramakError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT transcript_id, count(*) FROM speakers GROUP BY transcript_id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut out = BTreeMap::new();
+        for row in rows {
+            let (id, count) = row?;
+            if let Ok(id) = Uuid::parse_str(&id) {
+                out.insert(id, count as usize);
+            }
+        }
+        Ok(out)
+    }
+
     /// How many documents of each kind the index holds (the report's and the
     /// tests' window into the index).
     pub fn search_index_stats(&self) -> Result<SearchIndexStats, SuramakError> {
@@ -2102,6 +2790,10 @@ impl Store {
     /// marks an existing translation stale in the same statement — the derived
     /// text no longer describes what the row says, and the badge must say so.
     fn write_segments(&self, id: Uuid, segments: &[Segment]) -> Result<(), SuramakError> {
+        // M22C: the speaker projection is computed once for the whole set (its
+        // turns are time-anchored, so every row's label follows from the times
+        // being written), never once per row.
+        let labels = Self::speaker_labels_for(&self.conn, id, segments)?;
         for seg in segments {
             self.conn.execute(
                 "INSERT INTO segments(transcript_id, idx, start_ms, end_ms, text, source_text)
@@ -2120,6 +2812,14 @@ impl Store {
             // M15.7: read the row back — `source_text` is COALESCE-preserved,
             // so the upserted value is not necessarily what `seg` carried.
             Self::sync_segment_doc(&self.conn, id, seg.idx)?;
+            // M22C: the segment index follows the same write.
+            Self::put_segment_fts(
+                &self.conn,
+                id,
+                seg.idx,
+                labels.get(&seg.idx).map(String::as_str),
+                &seg.text,
+            )?;
         }
         let deleted = self.conn.execute(
             "DELETE FROM segments WHERE transcript_id = ?1 AND idx >= ?2",
@@ -2127,6 +2827,7 @@ impl Store {
         )?;
         if deleted > 0 {
             Self::delete_segment_docs_from(&self.conn, id, segments.len() as u32)?;
+            Self::delete_segment_fts_from(&self.conn, id, segments.len() as u32)?;
         }
         // M15.6: any row whose text is no longer exactly the text its word
         // timing was computed from becomes stale — in the same transaction as
@@ -2217,6 +2918,8 @@ impl Store {
             // M15.7: the index follows the same transaction — an edit that
             // fails to reindex must fail as a whole, not leave search stale.
             Self::sync_segment_doc(&self.conn, transcript_id, idx)?;
+            // M22C: the segment index follows the edit too.
+            Self::sync_segment_fts(&self.conn, transcript_id, idx)?;
             // M16I: a text edit changes the row set the badge projection was
             // computed against; the turns stay time-valid but the view is
             // provisional until a re-run (the sticky M15 rule).
@@ -2355,6 +3058,18 @@ impl Store {
         // segment documents are replaced with the new row set in one go. The
         // title document is untouched (same id, same title).
         Self::delete_all_segment_docs(conn, id)?;
+        // M22C: the segment index index-shifts with them.
+        Self::delete_all_segment_fts(conn, id)?;
+        let segments: Vec<Segment> = rows
+            .iter()
+            .map(|row| Segment {
+                idx: row.idx,
+                start_ms: row.start_ms,
+                end_ms: row.end_ms,
+                text: row.text.clone(),
+            })
+            .collect();
+        let labels = Self::speaker_labels_for(conn, id, &segments)?;
         let mut stmt = conn.prepare(
             "INSERT INTO segments(transcript_id, idx, start_ms, end_ms, text, source_text, derived,
                                   translation, translation_model, translation_at,
@@ -2401,6 +3116,13 @@ impl Store {
                 Some(row.idx),
                 &row.text,
                 original,
+            )?;
+            Self::put_segment_fts(
+                conn,
+                id,
+                row.idx,
+                labels.get(&row.idx).map(String::as_str),
+                &row.text,
             )?;
         }
         // M15.6: a structural edit rewrites the row set (a split shifts the tail
@@ -2820,6 +3542,8 @@ impl Store {
                )",
             params![transcript_id.to_string(), run.run_id],
         )?;
+        // M22C: every indexed segment now carries the label this run gives it.
+        Self::refresh_segment_speakers(&tx, transcript_id)?;
         tx.commit()?;
         Ok(run.run_id)
     }
@@ -2966,17 +3690,32 @@ impl Store {
             .iter()
             .find(|speaker| speaker.speaker_id == speaker_id)
             .ok_or_else(|| SuramakError::Diarization(format!("no speaker {speaker_id}")))?;
-        self.conn.execute(
-            "UPDATE speakers SET label = ?1, source = 'manual', updated_at = ?2
-             WHERE transcript_id = ?3 AND speaker_id = ?4",
-            params![
-                speaker.label,
-                speaker.updated_at,
-                transcript_id.to_string(),
-                speaker_id
-            ],
-        )?;
-        Ok(())
+        self.conn.execute_batch("SAVEPOINT rename_speaker")?;
+        let renamed = (|| -> Result<(), SuramakError> {
+            self.conn.execute(
+                "UPDATE speakers SET label = ?1, source = 'manual', updated_at = ?2
+                 WHERE transcript_id = ?3 AND speaker_id = ?4",
+                params![
+                    speaker.label,
+                    speaker.updated_at,
+                    transcript_id.to_string(),
+                    speaker_id
+                ],
+            )?;
+            Self::refresh_segment_speakers(&self.conn, transcript_id)
+        })();
+        match renamed {
+            Ok(()) => {
+                self.conn.execute_batch("RELEASE rename_speaker")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self
+                    .conn
+                    .execute_batch("ROLLBACK TO rename_speaker; RELEASE rename_speaker");
+                Err(err)
+            }
+        }
     }
 
     /// Sets one speaker's colour slot (0..6; the Deck palette's first N hues).
@@ -3042,6 +3781,7 @@ impl Store {
         if changed == 0 {
             return Err(SuramakError::Diarization(format!("no turn {turn_idx}")));
         }
+        Self::refresh_segment_speakers(&self.conn, transcript_id)?;
         Ok(())
     }
 
@@ -3106,6 +3846,8 @@ impl Store {
                 params![new_id, label, transcript_id.to_string(), old_id],
             )?;
         }
+        // M22C: ids and labels both may have moved; the segment index follows.
+        Self::refresh_segment_speakers(&tx, transcript_id)?;
         tx.commit()?;
         Ok(())
     }
@@ -3154,6 +3896,7 @@ impl Store {
                 )?;
             }
         }
+        Self::refresh_segment_speakers(&tx, transcript_id)?;
         tx.commit()?;
         Ok(id)
     }
@@ -3171,6 +3914,8 @@ impl Store {
             "DELETE FROM speakers WHERE transcript_id = ?1",
             params![transcript_id.to_string()],
         )?;
+        // M22C: with the labels gone, the index's speaker column is cleared.
+        Self::refresh_segment_speakers(&tx, transcript_id)?;
         tx.commit()?;
         Ok(())
     }
@@ -3632,6 +4377,7 @@ impl Store {
         self.conn.execute_batch("SAVEPOINT delete_transcript")?;
         let deleted = (|| -> Result<usize, SuramakError> {
             Self::delete_docs_for_transcript(&self.conn, id)?;
+            Self::delete_all_segment_fts(&self.conn, id)?;
             Ok(self.conn.execute(
                 "DELETE FROM transcripts WHERE id = ?1",
                 params![id.to_string()],
@@ -6127,7 +6873,7 @@ mod tests {
         write_fixture(&path, 7);
 
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 8);
+        assert_eq!(store.schema_version().unwrap(), 9);
         assert_eq!(store.list_transcripts().unwrap().len(), 1);
         assert_eq!(
             store

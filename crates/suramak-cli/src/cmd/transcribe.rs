@@ -309,19 +309,32 @@ pub fn run(args: TranscribeArgs) -> Result<()> {
     // connection for the run: job rows, checkpoints and the final write all go
     // through it (one writer), and a relaunch resumes a crashed batch instead of
     // starting it from zero.
-    let mut driver = QueueDriver::new(
-        Worker::spawn(),
-        ThreadedPrefetch::new(Box::new(FileDecoder)),
-        options,
-    );
+    // M22A2: one shared host helper opens the library, attaches the journal and
+    // resumes every interrupted row — the same call the desktop and Android
+    // hosts make, so the three cannot drift.
     let journal_on = args.db;
-    if journal_on {
-        driver = driver.with_journal(Store::open(&paths::db_path()?)?);
-    }
+    let (mut driver, pending) = if journal_on {
+        let durable = suramak_asr::open_durable_queue(
+            Worker::spawn(),
+            ThreadedPrefetch::new(Box::new(FileDecoder)),
+            options.clone(),
+            &paths::db_path()?,
+        )?;
+        durable.into_parts()
+    } else {
+        (
+            QueueDriver::new(
+                Worker::spawn(),
+                ThreadedPrefetch::new(Box::new(FileDecoder)),
+                options,
+            ),
+            Vec::new(),
+        )
+    };
 
-    // Every journal row a previous process left mid-job is resumed (or named
-    // failed when its source/model is gone) before the new arguments are queued.
-    let pending = driver.resume_pending();
+    // Every journal row a previous process left mid-job was resumed (or named
+    // failed when its source/model is gone) by the shared helper before the new
+    // arguments are queued; this is its report.
     for resume in &pending {
         match &resume.outcome {
             ResumeOutcome::Resumed { .. } => {

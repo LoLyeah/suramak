@@ -216,6 +216,18 @@ pub fn ui(
             .layout(Layout::top_down(Align::Min)),
     );
     let mut scroll = ScrollArea::vertical().auto_shrink([false, false]);
+    // M22C: a Library hit lands on its segment (the existing seek path), so
+    // the first editor frame scrolls that row into view. The flag is consumed
+    // once; later frames leave the reader's own scroll alone.
+    if std::mem::take(&mut editor.focus_scroll) {
+        if let Some(idx) = editor.focus_segment {
+            let position = matches
+                .iter()
+                .position(|index| editor.transcript.segments[*index].idx == idx)
+                .unwrap_or(0);
+            scroll = scroll.vertical_scroll_offset(position as f32 * 96.0);
+        }
+    }
     // The row being edited must stay visible when the keyboard opens. Rows are
     // variable height now (a header band + wrapped body), so this is the
     // designed estimate, not an exact offset.

@@ -433,6 +433,11 @@ impl CompactShell {
                 );
                 log_reply("open transcript", &reply);
             }
+            CompactAction::SearchLibrary { query } => {
+                let reply = host
+                    .dispatch(&serde_json::json!({ "op": "search", "query": query }).to_string());
+                log_reply("search library", &reply);
+            }
             CompactAction::PlayTranscript(id) => {
                 let reply = host.dispatch(
                     &serde_json::json!({

@@ -56,7 +56,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use suramak_asr::queue::driver::InferenceBackend;
 use suramak_asr::queue::driver::Prefetcher;
-use suramak_asr::{FileDecoder, JobOptions, QueueDriver, QueueEvent, ThreadedPrefetch, Worker};
+use suramak_asr::{
+    open_durable_queue, FileDecoder, JobOptions, PendingResume, QueueDriver, QueueEvent,
+    ResumeOutcome, ThreadedPrefetch, Worker,
+};
 use suramak_core::models;
 use suramak_core::settings::{EngineSetting, LangMode};
 use suramak_core::store::Store;
@@ -1560,20 +1563,64 @@ fn accept<B: InferenceBackend + Send + 'static, P: Prefetcher + Send + 'static>(
             engine: EngineSetting::Auto,
             fast_engine: false,
         };
-        *batch_model = Some(model);
+        *batch_model = Some(model.clone());
         // The prefetcher is created before this thread exists and handed to the
         // driver exactly once, at the first accepted job.
         let Some(prefetcher) = prefetcher.take() else {
             fail(shared, key, "the decode pool is not available");
             return;
         };
-        *driver = Some(QueueDriver::new(engine, prefetcher, options));
+        // M22A2: the same helper the CLI and the desktop use — the app's private
+        // library is the journal, and every row a killed process left mid-job is
+        // resumed before this new job is enqueued.
+        let durable = match open_durable_queue(engine, prefetcher, options, &shared.dirs.db_path) {
+            Ok(durable) => durable,
+            Err(err) => {
+                fail(
+                    shared,
+                    key,
+                    &format!("the job journal could not be opened: {err}"),
+                );
+                return;
+            }
+        };
+        let (mut active, resumed) = durable.into_parts();
+        let items: Vec<(PathBuf, u64)> = active
+            .queue()
+            .items()
+            .iter()
+            .map(|item| (item.input.clone(), item.id))
+            .collect();
+        let meta = {
+            let mut state = shared.state.lock().expect("job state lock");
+            let meta = adopt_resumed_jobs(&mut state, &items, &resumed, &model);
+            state.prune();
+            shared.persist(&state);
+            meta
+        };
+        for (id, title, source_name) in meta {
+            active.set_item_meta(id, title, source_name);
+        }
+        *driver = Some(active);
     }
 
     let Some(active) = driver.as_mut() else {
         return;
     };
-    let queue_id = active.enqueue(path);
+    let (title, source_name) = {
+        let state = shared.state.lock().expect("job state lock");
+        match state.job(key) {
+            Some(job) => (job.title.clone(), job.source_name.clone()),
+            None => {
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Voice note".to_string());
+                (title_for(&name), name)
+            }
+        }
+    };
+    let queue_id = active.enqueue_named(path, title, source_name);
     let mut state = shared.state.lock().expect("job state lock");
     if let Some(job) = state.job_mut(key) {
         job.queue_id = Some(queue_id);
@@ -1581,6 +1628,127 @@ fn accept<B: InferenceBackend + Send + 'static, P: Prefetcher + Send + 'static>(
         job.percent = 0;
     }
     shared.persist(&state);
+}
+
+/// M22A2: makes the host's job list (and its notification/failure surfaces)
+/// agree with what the store journal just resumed.
+///
+/// A row whose source is gone is a named failure on the existing failure
+/// surface; a row another model owns is left pending with its reason in the
+/// message. Every resumed row that finds its copy gets the queue id the driver
+/// assigned, so the events that follow land on it. The returned tuples are the
+/// display identity the driver must use when it writes the transcript.
+fn adopt_resumed_jobs(
+    state: &mut InnerState,
+    items: &[(PathBuf, u64)],
+    outcomes: &[PendingResume],
+    batch_model: &str,
+) -> Vec<(u64, String, String)> {
+    let mut meta = Vec::new();
+    for outcome in outcomes {
+        let id = items
+            .iter()
+            .find(|(path, _)| path == &outcome.path)
+            .map(|(_, id)| *id);
+        match &outcome.outcome {
+            ResumeOutcome::Resumed { .. } | ResumeOutcome::Fresh => {
+                let Some(id) = id else { continue };
+                let name = outcome
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Voice note".to_string());
+                let existing = state
+                    .jobs
+                    .iter()
+                    .position(|job| job.media_path == outcome.path);
+                let job = match existing {
+                    Some(index) => &mut state.jobs[index],
+                    None => {
+                        let mut job = JobRecord::new(
+                            new_key(),
+                            title_for(&name),
+                            name,
+                            "import",
+                            None,
+                            outcome.path.clone(),
+                            batch_model.to_string(),
+                            "auto".to_string(),
+                            fs::metadata(&outcome.path)
+                                .map(|meta| meta.len())
+                                .unwrap_or(0),
+                        );
+                        job.copy_complete = true;
+                        state.total += 1;
+                        state.jobs.push(job);
+                        state.jobs.last_mut().expect("just pushed")
+                    }
+                };
+                job.queue_id = Some(id);
+                job.phase = Phase::Queued;
+                job.pausing = false;
+                job.percent = 0;
+                job.message = "resumed from the job journal".to_string();
+                meta.push((id, job.title.clone(), job.source_name.clone()));
+            }
+            ResumeOutcome::Unavailable { reason } => {
+                let name = outcome
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Voice note".to_string());
+                let (key, title, kind, sender) = match state
+                    .jobs
+                    .iter()
+                    .position(|job| job.media_path == outcome.path)
+                {
+                    Some(index) => {
+                        let job = &mut state.jobs[index];
+                        job.phase = Phase::Failed;
+                        job.message = reason.clone();
+                        (
+                            job.key.clone(),
+                            job.title.clone(),
+                            job.kind.clone(),
+                            job.sender.clone(),
+                        )
+                    }
+                    None => {
+                        let job = JobRecord::new(
+                            new_key(),
+                            title_for(&name),
+                            name,
+                            "import",
+                            None,
+                            outcome.path.clone(),
+                            batch_model.to_string(),
+                            "auto".to_string(),
+                            0,
+                        );
+                        let key = job.key.clone();
+                        let title = job.title.clone();
+                        let kind = job.kind.clone();
+                        state.total += 1;
+                        state.jobs.push(job);
+                        (key, title, kind, None)
+                    }
+                };
+                state.failed += 1;
+                state.message = reason.clone();
+                state.last_failed = Some(Failed {
+                    key,
+                    title,
+                    reason: reason.clone(),
+                    kind,
+                    sender,
+                });
+            }
+            ResumeOutcome::Skipped { reason } => {
+                state.message = format!("left pending: {} — {reason}", outcome.path.display());
+            }
+        }
+    }
+    meta
 }
 
 fn stop_running<B: InferenceBackend + Send + 'static, P: Prefetcher + Send + 'static>(
@@ -1675,10 +1843,17 @@ fn apply_event(shared: &Arc<Shared>, store: &mut Option<Store>, event: QueueEven
             }
             shared.persist(&state);
         }
-        // M22A: the driver-level journal continued this job at a committed
-        // boundary. This host keeps its own job journal for resume; the event
-        // is informational here.
-        QueueEvent::Resumed { .. } => {}
+        // M22A2: the driver-level journal continued this job at a committed
+        // boundary. The host record already carries the marker; the message is
+        // what the service's existing status/notification surface reads.
+        QueueEvent::Resumed { id, .. } => {
+            let mut state = shared.state.lock().expect("job state lock");
+            let title = state.by_queue(id).map(|job| job.title.clone());
+            if let Some(title) = title {
+                state.message = format!("resumed: {title} — continues where it stopped");
+                shared.persist(&state);
+            }
+        }
         QueueEvent::Progress { id, pct, .. } => {
             let mut state = shared.state.lock().expect("job state lock");
             let mut persist = false;
@@ -1798,7 +1973,19 @@ fn finish(
         fail(shared, &key, "the library could not be opened");
         return;
     };
-    match library.insert_transcript_with_words(&transcript, words) {
+    // M22A2: with the store journal attached the driver already wrote this
+    // transcript + its `done` row in one transaction. Re-inserting it would hit
+    // the transcript's primary key and turn a finished job into a failure, so
+    // the host only saves jobs the driver did not journal (the in-memory
+    // fallback). The row is read back to keep the host's state honest either
+    // way.
+    let already_written = library.get_transcript(transcript.id).is_ok();
+    let saved = if already_written {
+        Ok(())
+    } else {
+        library.insert_transcript_with_words(&transcript, words)
+    };
+    match saved {
         Ok(()) => {
             let mut state = shared.state.lock().expect("job state lock");
             let segments = transcript.segments.len();

@@ -40,8 +40,8 @@ pub use model::{
     bytes_label, clock, count_noun, row_key, sanitise_stem, snippet, word_at, CompactAction,
     CompactApp, CompactEditor, CompactExportFormat, CompactRoute, CompactSetting, CompactSettings,
     CompactSpeakers, CrashBanner, DiagnosticsView, DownloadState, DownloadView, ExportPhase,
-    ExportSession, FlingProbe, Insets, JobView, LibraryHit, LibraryRow, ModelRow, ModelState,
-    SegmentEdit, Sheet, VoiceNoteView,
+    ExportSession, FlingProbe, Insets, JobView, LibraryFacets, LibraryHit, LibraryRow, ModelRow,
+    ModelState, SegmentEdit, Sheet, VoiceNoteView,
 };
 
 /// Paints one frame of the compact app and returns everything the host must do.

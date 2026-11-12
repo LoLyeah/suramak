@@ -283,6 +283,28 @@ fn paint_title(ui: &Ui, tokens: &Tokens, title: &str, band: Rect) {
         .galley(pos2(band.left(), y), galley, tokens.ink);
 }
 
+/// M22C: the extra anatomy a library row carries. All three are display data:
+/// no decode happens here, and an empty waveform is drawn as an honest flat
+/// baseline rather than invented height.
+#[derive(Debug, Clone, Copy)]
+pub struct RowExtras<'a> {
+    /// Down-sampled RMS bars in `0..=1` (the store's stored peaks).
+    pub waveform: &'a [f32],
+    /// Speaker labels the transcript carries (`0` = no pips).
+    pub speakers: usize,
+    /// The transcript's duration, painted on the tabular grid.
+    pub duration_ms: i64,
+}
+
+impl RowExtras<'_> {
+    /// A row with no facets (kept for callers that do not have them).
+    pub const NONE: RowExtras<'static> = RowExtras {
+        waveform: &[],
+        speakers: 0,
+        duration_ms: 0,
+    };
+}
+
 /// A full-width tappable row: title + optional meta, optional selected state.
 /// The body is `ROW` tall; the caller positions it.
 ///
@@ -291,6 +313,11 @@ fn paint_title(ui: &Ui, tokens: &Tokens, title: &str, band: Rect) {
 /// with the M20A motion (`FAST` in, spring out): the whole painted body scales
 /// to [`motion::PRESS_SCALE`] while the finger is down and the active wash
 /// ramps with it. The hit rect never scales — touch stays 64 pt.
+///
+/// M22C adds the row's anatomy: a 28 px mini-waveform in the leading gutter,
+/// up to four speaker pips (then `+N`) on the meta line, and the duration on
+/// the tabular numeral grid at the trailing edge. Every extra maps through the
+/// press scale with the body, so the M20C motion is unchanged.
 ///
 /// Returns the response and the painted scale (1.0 at rest) so the caller can
 /// keep its own affordances (the play triangle, the chevron) on the same body.
@@ -303,6 +330,7 @@ pub fn row(
     id: impl std::hash::Hash,
     title: &str,
     meta: &str,
+    extras: RowExtras<'_>,
     selected: bool,
     divider: bool,
 ) -> (Response, f32) {
@@ -341,28 +369,102 @@ pub fn row(
         );
     }
 
+    // --- M22C: the 28 px mini-waveform -------------------------------------
+    let mark = Rect::from_min_size(
+        pos2(
+            visual.left() + GUTTER * scale,
+            visual.center().y - 14.0 * scale,
+        ),
+        vec2(28.0 * scale, 28.0 * scale),
+    );
+    paint_waveform(ui.painter(), mark, extras.waveform, tokens.ink_faint);
+
+    // The title and meta start after the mark; the trailing 96 pt stays the
+    // play/chevron lane (`chrome::row`'s pre-M22C reserve).
+    let text_left = GUTTER * scale + 40.0 * scale;
+    let trailing = 96.0 * scale;
     let title_token = scaled(&type_scale::row_title(), scale);
     let mut job = egui::text::LayoutJob::default();
     job.append(title, 0.0, title_token.format(tokens.ink));
-    job.wrap.max_width = (visual.width() - GUTTER * 2.0 - 96.0).max(40.0);
+    job.wrap.max_width = (visual.width() - text_left - trailing).max(40.0);
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
     job.wrap.overflow_character = Some('…');
     ui.painter().galley(
-        pos2(visual.left() + GUTTER * scale, visual.top() + 12.0 * scale),
+        pos2(visual.left() + text_left, visual.top() + 12.0 * scale),
         ui.painter().layout_job(job),
         tokens.ink,
     );
+
+    // Duration: right-aligned on the title line, in the tabular face so a
+    // column of rows never twitches (M22C).
+    if extras.duration_ms > 0 {
+        let numerals = scaled(&type_scale::numerals(), scale);
+        type_scale::paint_tabular(
+            ui.painter(),
+            pos2(
+                visual.right() - trailing,
+                visual.top() + 12.0 * scale + numerals.line_height / 2.0,
+            ),
+            Align2::RIGHT_CENTER,
+            &crate::deck::compact::model::clock(extras.duration_ms),
+            &numerals.font,
+            tokens.ink_soft,
+        );
+    }
+
+    // Pips: up to four speaker hues, then `+N`. They sit at the start of the
+    // meta line, before the date.
+    let mut meta_left = visual.left() + text_left;
+    let pip_diameter = 6.0 * scale;
+    let pip_gap = 9.0 * scale;
+    let shown = extras.speakers.min(4);
+    for index in 0..shown {
+        let center = pos2(
+            meta_left + pip_diameter / 2.0 + index as f32 * pip_gap,
+            visual.top() + 36.0 * scale + 8.0 * scale,
+        );
+        ui.painter().circle_filled(
+            center,
+            pip_diameter / 2.0,
+            tokens.speaker[index % tokens.speaker.len()],
+        );
+    }
+    if extras.speakers > 4 {
+        let more = format!("+{}", extras.speakers - 4);
+        let caption = scaled(&type_scale::caption(), scale);
+        ui.painter().text(
+            pos2(
+                meta_left + shown as f32 * pip_gap + 1.0 * scale,
+                visual.top() + 36.0 * scale + 8.0 * scale,
+            ),
+            Align2::LEFT_CENTER,
+            more,
+            caption.font.clone(),
+            tokens.ink_soft,
+        );
+        meta_left += shown as f32 * pip_gap + caption.size() + 8.0 * scale;
+    } else if shown > 0 {
+        meta_left += shown as f32 * pip_gap + 4.0 * scale;
+    }
+
     if !meta.is_empty() {
+        // The pips are a separate fact from the date; a middle dot keeps the
+        // overflow (`+1`) from reading as part of `12 Nov` (M22C).
+        let meta_text = if extras.speakers > 0 {
+            format!("· {meta}")
+        } else {
+            meta.to_string()
+        };
         let meta_token = scaled(&type_scale::caption(), scale);
         let mut job = egui::text::LayoutJob::default();
-        job.append(meta, 0.0, meta_token.format(tokens.ink_soft));
-        job.wrap.max_width = (visual.width() - GUTTER * 2.0 - 96.0).max(40.0);
+        job.append(&meta_text, 0.0, meta_token.format(tokens.ink_soft));
+        job.wrap.max_width = (visual.right() - trailing - meta_left).max(40.0);
         job.wrap.max_rows = 1;
         job.wrap.break_anywhere = true;
         job.wrap.overflow_character = Some('…');
         ui.painter().galley(
-            pos2(visual.left() + GUTTER * scale, visual.top() + 36.0 * scale),
+            pos2(meta_left, visual.top() + 36.0 * scale),
             ui.painter().layout_job(job),
             tokens.ink_soft,
         );
@@ -377,6 +479,45 @@ pub fn row(
         );
     }
     (response, scale)
+}
+
+/// Paints `bars` as a quiet 9-column mark inside `rect`; an empty slice draws
+/// the one-line baseline (no stored peaks, never invented height).
+fn paint_waveform(painter: &egui::Painter, rect: Rect, bars: &[f32], color: Color32) {
+    let columns = 9usize;
+    let gap = (rect.width() * 0.035).max(1.0);
+    let bar_w = ((rect.width() - gap * (columns as f32 - 1.0)) / columns as f32).max(1.0);
+    let baseline_y = rect.center().y + rect.height() * 0.5 - 1.0;
+    if bars.is_empty() {
+        painter.line_segment(
+            [
+                pos2(rect.left(), baseline_y),
+                pos2(rect.right(), baseline_y),
+            ],
+            Stroke::new(1.0_f32, color.gamma_multiply(0.5)),
+        );
+        return;
+    }
+    for index in 0..columns {
+        // Sample the stored bars evenly; the last column takes the tail.
+        let start = index * bars.len() / columns;
+        let end = ((index + 1) * bars.len() / columns)
+            .max(start + 1)
+            .min(bars.len());
+        let value = bars[start..end]
+            .iter()
+            .copied()
+            .fold(0.0f32, f32::max)
+            .clamp(0.0, 1.0);
+        let height = (rect.height() - 2.0) * value;
+        let x = rect.left() + index as f32 * (bar_w + gap);
+        let top = baseline_y - height.max(1.0);
+        painter.rect_filled(
+            Rect::from_min_max(pos2(x, top), pos2(x + bar_w, baseline_y)),
+            CornerRadius::same(1),
+            color,
+        );
+    }
 }
 
 /// The row's press state, kept across frames in `ctx.data`: `FAST` down,

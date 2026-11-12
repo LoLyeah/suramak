@@ -317,6 +317,9 @@ pub struct RunningJob {
     /// M16.1: the pipeline stage the worker reported (`None` until the first
     /// stage event). The card says `decoding…` until transcription begins.
     pub stage: Option<JobStage>,
+    /// M22A2: this run continues a job the store journal left interrupted.
+    /// The card says so; the queue row carries the same marker.
+    pub resumed: bool,
 }
 
 /// The transcribe card's bar state for one frame (M14e).
@@ -1018,6 +1021,12 @@ pub struct AppState {
     /// mirrored in `job`; the whole queue (including the running item) lives
     /// here so order, reorder and cancel operate on one model.
     pub queue: JobQueue,
+    /// M22A2: the bridge's queue owns the store journal, so a finished job's
+    /// transcript is already written by the driver (the app only adopts the
+    /// event and refreshes the library). Seeded by the shell before the first
+    /// frame; `false` keeps the historical save path when the journal could not
+    /// open.
+    pub jobs_are_journaled: bool,
     /// The most recent queued-item failure (name + reason). Kept while the next
     /// item runs so a failure never vanishes with the card.
     pub queue_failure: Option<QueueFailure>,
@@ -1177,6 +1186,9 @@ pub enum HistoryStep {
 pub enum Effect {
     /// Submit the current import to the background worker.
     SubmitJob { input: PathBuf },
+    /// M22A2: a launch-resumed job is already queued in the host's durable
+    /// driver — adopt its row without submitting it a second time.
+    AdoptResumed { input: PathBuf },
     /// Persist a finished transcript to the library (in-app jobs always save),
     /// together with the word timing the same engine run produced (M15.6).
     SaveTranscript {
@@ -1340,6 +1352,7 @@ impl AppState {
             home: HomeState::default(),
             job: Job::Idle,
             queue: JobQueue::new(),
+            jobs_are_journaled: false,
             queue_failure: None,
             library: LibraryState::default(),
             editor: None,
@@ -2349,6 +2362,7 @@ impl AppState {
         let Some(ticket) = self.queue.next_inference() else {
             return Vec::new();
         };
+        let resumed = ticket.resumed;
         self.job = Job::Running(RunningJob {
             input: ticket.input.clone(),
             pct: 0,
@@ -2363,10 +2377,95 @@ impl AppState {
             queue_id: Some(ticket.id),
             auto,
             stage: None,
+            resumed,
         });
-        vec![Effect::SubmitJob {
-            input: ticket.input,
-        }]
+        if resumed {
+            // M22A2: the host's durable driver already holds this item (it was
+            // enqueued by `resume_pending` at launch) — adopting it must not
+            // submit a second, twin job.
+            vec![Effect::AdoptResumed {
+                input: ticket.input,
+            }]
+        } else {
+            vec![Effect::SubmitJob {
+                input: ticket.input,
+            }]
+        }
+    }
+
+    /// M22A2: adopts the jobs the launch-time journal resume enqueued in the
+    /// host's durable driver. They become the first rows of the existing queue
+    /// (with the `resumed` marker) and the first one starts immediately; the
+    /// later ones start through [`Self::start_next_from_queue`] as usual.
+    pub fn adopt_resumed(&mut self, inputs: &[PathBuf]) -> Vec<Effect> {
+        if inputs.is_empty() {
+            return Vec::new();
+        }
+        let starting = !matches!(self.job, Job::Running(_));
+        if starting {
+            self.status = None;
+            self.last_insert = None;
+            self.queue.retain_live();
+            self.queue_failure = None;
+            self.job = Job::Idle;
+        }
+        let mut effects = self.stop_playback();
+        self.route = Route::Transcribe;
+        for input in inputs {
+            self.queue.enqueue_resumed(input.clone());
+        }
+        if starting {
+            effects.extend(self.start_next_from_queue(false));
+        }
+        effects
+    }
+
+    /// M22A2: surfaces what the launch resume could not take. A missing
+    /// source/model is the existing queue-failure line (the row's named
+    /// reason); a model mismatch is an informational status, never a failure.
+    pub fn show_resume_outcomes(&mut self, outcomes: &[suramak_asr::PendingResume]) {
+        let mut unavailable = None;
+        let mut notes = Vec::new();
+        let mut resumed = 0usize;
+        for outcome in outcomes {
+            let name = file_label(&outcome.path);
+            match &outcome.outcome {
+                suramak_asr::ResumeOutcome::Resumed { from_ms, .. } => {
+                    resumed += 1;
+                    notes.push(format!(
+                        "resumed {name} at {}:{:02}",
+                        from_ms / 60_000,
+                        (from_ms / 1_000) % 60
+                    ));
+                }
+                suramak_asr::ResumeOutcome::Fresh => resumed += 1,
+                suramak_asr::ResumeOutcome::Unavailable { reason } => {
+                    unavailable = Some(QueueFailure {
+                        input: outcome.path.clone(),
+                        message: reason.clone(),
+                    });
+                }
+                suramak_asr::ResumeOutcome::Skipped { reason } => {
+                    notes.push(format!("left pending: {name} — {reason}"));
+                }
+            }
+        }
+        if let Some(failure) = unavailable {
+            self.queue_failure = Some(failure.clone());
+            self.set_status(failure.message, true);
+            return;
+        }
+        if !notes.is_empty() {
+            self.set_status(notes.join(" · "), false);
+        } else if resumed > 0 && self.status.is_none() {
+            self.set_status(
+                format!(
+                    "resumed {resumed} interrupted {}",
+                    count_noun(resumed, "job")
+                ),
+                false,
+            );
+        }
     }
 
     /// Import from the home path field (Enter / Import button).
@@ -2498,7 +2597,15 @@ impl AppState {
                     let alignment = WordAlignment::from_words(&words);
                     self.on_word_alignment_loaded(transcript.id, alignment);
                 }
-                effects.push(Effect::SaveTranscript { transcript, words });
+                if self.jobs_are_journaled {
+                    // M22A2: the durable driver wrote the transcript and its
+                    // `done` row in one transaction already. The app adopts the
+                    // finished row (status, library refresh, quit-mid-recording
+                    // cleanup) without a second insert.
+                    effects.extend(self.on_transcript_persisted((*transcript).clone()));
+                } else {
+                    effects.push(Effect::SaveTranscript { transcript, words });
+                }
                 effects.extend(self.start_next_from_queue(true));
                 effects
             }
@@ -2538,48 +2645,7 @@ impl AppState {
         result: Result<(), String>,
     ) -> Vec<Effect> {
         match result {
-            Ok(()) => {
-                // Keep the engaged-engine line from `Finished` visible next to
-                // the save confirmation (M1.5 outcome reporting).
-                let engine_line = self
-                    .status
-                    .as_ref()
-                    .filter(|status| !status.error && status.text.starts_with("engine:"))
-                    .map(|status| status.text.clone());
-                let title = transcript.title.trim();
-                let saved_line = if title.is_empty() {
-                    "saved to library".to_string()
-                } else {
-                    format!("saved to library: {title}")
-                };
-                let text = match engine_line {
-                    Some(line) => format!("{line} — {saved_line}"),
-                    None => saved_line,
-                };
-                self.set_status(text, false);
-                self.last_insert = Some(SaveOutcome {
-                    transcript: transcript.clone(),
-                    error: None,
-                });
-                let mut effects = vec![Effect::RefreshLibrary];
-                // keep_audio off: the temp recording goes now that its transcript
-                // is safely in the library (a failed save keeps it for a retry).
-                if let Some(path) = self.pending_recording_cleanup.clone() {
-                    if transcript.audio_path.as_deref() == Some(path.as_path()) {
-                        self.pending_recording_cleanup = None;
-                        effects.push(Effect::DiscardRecording { path });
-                    }
-                }
-                // M9e (P1-1): the save completes a pending transcription that
-                // was auto-resumed at startup — its entry is cleared now.
-                if let Some(pending) = self.resumed_pending.clone() {
-                    if transcript.audio_path.as_deref() == Some(pending.as_path()) {
-                        self.resumed_pending = None;
-                        effects.push(Effect::ClearPendingTranscription);
-                    }
-                }
-                effects
-            }
+            Ok(()) => self.on_transcript_persisted(transcript),
             Err(err) => {
                 self.set_status(format!("could not save to library: {err}"), true);
                 self.last_insert = Some(SaveOutcome {
@@ -2589,6 +2655,53 @@ impl AppState {
                 Vec::new()
             }
         }
+    }
+
+    /// The bookkeeping a finished transcript needs once it is in the library —
+    /// whoever wrote it. M22A2: the durable driver writes journaled jobs in its
+    /// own transaction, so the app adopts that row through this same path
+    /// instead of inserting it again.
+    fn on_transcript_persisted(&mut self, transcript: Transcript) -> Vec<Effect> {
+        // Keep the engaged-engine line from `Finished` visible next to the save
+        // confirmation (M1.5 outcome reporting).
+        let engine_line = self
+            .status
+            .as_ref()
+            .filter(|status| !status.error && status.text.starts_with("engine:"))
+            .map(|status| status.text.clone());
+        let title = transcript.title.trim();
+        let saved_line = if title.is_empty() {
+            "saved to library".to_string()
+        } else {
+            format!("saved to library: {title}")
+        };
+        let text = match engine_line {
+            Some(line) => format!("{line} — {saved_line}"),
+            None => saved_line,
+        };
+        self.set_status(text, false);
+        self.last_insert = Some(SaveOutcome {
+            transcript: transcript.clone(),
+            error: None,
+        });
+        let mut effects = vec![Effect::RefreshLibrary];
+        // keep_audio off: the temp recording goes now that its transcript
+        // is safely in the library (a failed save keeps it for a retry).
+        if let Some(path) = self.pending_recording_cleanup.clone() {
+            if transcript.audio_path.as_deref() == Some(path.as_path()) {
+                self.pending_recording_cleanup = None;
+                effects.push(Effect::DiscardRecording { path });
+            }
+        }
+        // M9e (P1-1): the save completes a pending transcription that
+        // was auto-resumed at startup — its entry is cleared now.
+        if let Some(pending) = self.resumed_pending.clone() {
+            if transcript.audio_path.as_deref() == Some(pending.as_path()) {
+                self.resumed_pending = None;
+                effects.push(Effect::ClearPendingTranscription);
+            }
+        }
+        effects
     }
 
     /// Library list refreshed from the store.

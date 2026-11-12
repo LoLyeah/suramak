@@ -172,12 +172,202 @@ impl SearchResults {
     }
 }
 
+/// Context chars on each side of a **segment** hit (M22C: the workorder's
+/// ±60-char window; the transcript-wide search above keeps its own default).
+pub const SEGMENT_CONTEXT_CHARS: usize = 60;
+
 /// A shaped FTS5 query: the expression to bind to `MATCH`, plus the words it
 /// is made of (the snippet builder re-finds them in the text).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchQuery {
     pub expression: String,
     pub terms: Vec<String>,
+}
+
+/// A shaped segment query (M22C): `expression` is what `segment_fts` is
+/// matched against; `terms` are the words the snippet builder re-finds; and
+/// `speaker` is the literal label filter from a `speaker:` prefix.
+///
+/// Unlike [`match_query`], quoted groups are kept as **phrases** (adjacent
+/// tokens), which is what the Library's field promises. A query that is only a
+/// speaker filter has an empty expression — the store answers it from the
+/// document map instead of asking FTS5 to match nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentQuery {
+    pub expression: String,
+    pub terms: Vec<String>,
+    pub speaker: Option<String>,
+}
+
+/// Shapes the Library field's text into a segment query, or `None` when there
+/// is nothing searchable in it (empty, punctuation, or a bare `speaker:`).
+///
+/// Rules:
+/// - bare words are quoted and AND-ed (`anggaran jadwal` finds rows with both);
+/// - a `"quoted group"` is one FTS5 phrase (adjacent words, in order);
+/// - `speaker:Name` (or `speaker:"Budi Santoso"`) filters by the literal label
+///   the user typed, case-insensitively;
+/// - a trailing `*` on a bare word is an explicit prefix search;
+/// - quotes, operators and colons inside a word are text, never FTS5 syntax.
+pub fn segment_query(input: &str) -> Option<SegmentQuery> {
+    let mut expression = String::new();
+    let mut terms = Vec::new();
+    let mut speaker: Option<String> = None;
+    let tokens = split_terms(input);
+    let mut index = 0;
+    while index < tokens.len() {
+        let (raw, quoted) = tokens[index].clone();
+        index += 1;
+        if !quoted {
+            if let Some(rest) = strip_speaker_prefix(&raw) {
+                let name = if rest.trim().is_empty() {
+                    // `speaker: "Budi Santoso"` — the next token is the name.
+                    match tokens.get(index) {
+                        Some((next, _)) => {
+                            index += 1;
+                            next.trim().to_string()
+                        }
+                        None => String::new(),
+                    }
+                } else {
+                    rest.trim().to_string()
+                };
+                let name = clean_speaker(&name);
+                if !name.is_empty() {
+                    speaker = Some(name);
+                }
+                continue;
+            }
+        }
+        let prefix = !quoted && raw.ends_with('*');
+        let cleaned = if quoted {
+            clean_phrase(&raw)
+        } else {
+            clean_word(&raw)
+        };
+        if cleaned.is_empty() {
+            continue;
+        }
+        if !expression.is_empty() {
+            expression.push(' ');
+        }
+        expression.push('"');
+        expression.push_str(&cleaned);
+        expression.push('"');
+        if prefix && cleaned.chars().last().is_some_and(|c| c.is_alphanumeric()) {
+            expression.push('*');
+        }
+        if quoted {
+            terms.extend(cleaned.split_whitespace().map(str::to_string));
+        } else {
+            terms.push(cleaned);
+        }
+    }
+    if expression.is_empty() && speaker.is_none() {
+        return None;
+    }
+    Some(SegmentQuery {
+        expression,
+        terms,
+        speaker,
+    })
+}
+
+/// Whether `word` starts with `speaker:` (ASCII case-insensitive) and, if so,
+/// what follows the colon.
+fn strip_speaker_prefix(word: &str) -> Option<&str> {
+    let (head, rest) = word.split_once(':')?;
+    if head.eq_ignore_ascii_case("speaker") {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+/// Splits input into `(text, was_quoted)` tokens, keeping a quoted group's
+/// interior spaces. An unmatched opening quote runs to the end of the input —
+/// still one phrase, never a syntax error.
+fn split_terms(input: &str) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+    for ch in input.chars() {
+        match ch {
+            '"' if in_quote => {
+                out.push((std::mem::take(&mut current), true));
+                in_quote = false;
+            }
+            '"' => {
+                if !current.trim().is_empty() {
+                    out.push((current.trim().to_string(), false));
+                }
+                current.clear();
+                in_quote = true;
+            }
+            c if c.is_whitespace() && !in_quote => {
+                if !current.is_empty() {
+                    out.push((std::mem::take(&mut current), false));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        out.push((current, in_quote));
+    }
+    out
+}
+
+/// A bare word: quotes/stars are edges, punctuation-only is dropped.
+fn clean_word(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| *c != '"' && *c != '*')
+        .take(MAX_TERM_CHARS)
+        .collect();
+    trim_to_alnum(&cleaned)
+}
+
+/// A quoted group: whitespace collapses, edges trim to alphanumerics, the
+/// interior (including spaces) is preserved as one phrase.
+fn clean_phrase(raw: &str) -> String {
+    let collapsed = collapse_whitespace(raw);
+    let cleaned: String = collapsed.chars().take(MAX_TERM_CHARS).collect();
+    trim_to_alnum(&cleaned)
+}
+
+/// Speaker names keep their interior spaces and punctuation; only the ends and
+/// stray quotes are cleaned (`"Budi Santoso"` → `Budi Santoso`).
+fn clean_speaker(raw: &str) -> String {
+    raw.trim()
+        .trim_matches('"')
+        .trim()
+        .chars()
+        .take(MAX_TERM_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Puts `[`/`]` around a snippet's located match (M22C's wire shape: the
+/// Library field — and any other consumer — can find the emphasised term
+/// without a second highlight field). A snippet whose term could not be
+/// located is returned unchanged.
+pub fn bracketed(snippet: &Snippet) -> String {
+    let Some((start, len)) = snippet.highlight else {
+        return snippet.text.clone();
+    };
+    let end = start.saturating_add(len);
+    if start > snippet.text.len() || end > snippet.text.len() || start > end {
+        return snippet.text.clone();
+    }
+    let mut out = String::with_capacity(snippet.text.len() + 2);
+    out.push_str(&snippet.text[..start]);
+    out.push('[');
+    out.push_str(&snippet.text[start..end]);
+    out.push(']');
+    out.push_str(&snippet.text[end..]);
+    out
 }
 
 /// Shapes user input into an FTS5 `MATCH` expression, or `None` when there is
@@ -537,5 +727,81 @@ mod tests {
             assert_eq!(HitKind::parse(kind.as_str()), Some(kind));
         }
         assert_eq!(HitKind::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn a_segment_query_ands_bare_words_and_keeps_quoted_groups_as_phrases() {
+        let q = segment_query("anggaran \"kuartal depan\" jadwal").expect("a query");
+        assert_eq!(q.expression, "\"anggaran\" \"kuartal depan\" \"jadwal\"");
+        assert_eq!(q.terms, ["anggaran", "kuartal", "depan", "jadwal"]);
+        assert_eq!(q.speaker, None);
+    }
+
+    #[test]
+    fn a_speaker_prefix_filters_without_becoming_a_text_term() {
+        let q = segment_query("anggaran speaker:Budi").expect("a query");
+        assert_eq!(q.expression, "\"anggaran\"");
+        assert_eq!(q.speaker.as_deref(), Some("Budi"));
+
+        let q = segment_query("speaker:\"Budi Santoso\" rapat").expect("a query");
+        assert_eq!(q.speaker.as_deref(), Some("Budi Santoso"));
+        assert_eq!(q.expression, "\"rapat\"");
+    }
+
+    #[test]
+    fn a_speaker_only_query_has_an_empty_expression() {
+        let q = segment_query("speaker:Budi").expect("a query");
+        assert_eq!(q.expression, "");
+        assert!(q.terms.is_empty());
+        assert_eq!(q.speaker.as_deref(), Some("Budi"));
+    }
+
+    #[test]
+    fn a_garbage_or_empty_segment_query_is_not_a_query() {
+        assert_eq!(segment_query(""), None);
+        assert_eq!(segment_query("   "), None);
+        assert_eq!(segment_query("- -- …"), None);
+        assert_eq!(segment_query("speaker:"), None);
+        assert_eq!(segment_query("speaker:   "), None);
+    }
+
+    #[test]
+    fn a_segment_query_treats_fts_syntax_as_text() {
+        let q = segment_query("\"jakarta -rapat\" (besok) OR NEAR").expect("a query");
+        assert_eq!(q.expression, "\"jakarta -rapat\" \"besok\" \"OR\" \"NEAR\"");
+        assert_eq!(q.speaker, None);
+    }
+
+    #[test]
+    fn a_bracketed_snippet_marks_the_located_match() {
+        let s = snippet(
+            "Kita bahas anggaran di Jakarta besok",
+            &["jakarta".into()],
+            SEGMENT_CONTEXT_CHARS,
+        );
+        let marked = bracketed(&s);
+        assert_eq!(marked, "Kita bahas anggaran di [Jakarta] besok");
+
+        // No located term: the snippet is returned exactly.
+        let s = snippet("αβγδε ζηθικ", &["πρσ".into()], 20);
+        assert_eq!(bracketed(&s), s.text);
+    }
+
+    #[test]
+    fn a_bracketed_snippet_keeps_the_60_char_window_and_ellipses() {
+        let text = format!("{} anggaran {}", "kata ".repeat(30), "lanjut ".repeat(30));
+        let s = snippet(&text, &["anggaran".into()], SEGMENT_CONTEXT_CHARS);
+        let marked = bracketed(&s);
+        assert!(marked.contains("[anggaran]"), "{marked}");
+        assert!(marked.starts_with('…') && marked.ends_with('…'), "{marked}");
+        let inner = marked
+            .trim_start_matches('…')
+            .trim_end_matches('…')
+            .replace(['[', ']'], "");
+        assert!(
+            inner.chars().count() <= SEGMENT_CONTEXT_CHARS * 2 + "anggaran".len() + 2,
+            "the window is bounded: {} chars",
+            inner.chars().count()
+        );
     }
 }
