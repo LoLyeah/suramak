@@ -1,62 +1,169 @@
-//! The first-run model card (M13g3): the release path's zero-empty launch.
+//! The first-run model banner (M13g3, redrawn in M20C): the release path's
+//! zero-empty launch.
 //!
 //! A phone with no installed model does not land on an empty library. It
 //! lands here, on M13D's one recommendation for *this* device and language:
 //!
-//! * the tier's headline and the recommendation's detail (the same strings
-//!   `suramak_core::device::recommend` produces, so the guidance cannot drift);
-//! * Indonesian's `tiny` warning verbatim, when it applies;
-//! * the recommended model first, then the other offered models, each with its
-//!   size — and **no** model this phone refuses (that statement lives on
-//!   Settings' model table, where it can be read without a download card);
-//! * the free-space preflight, from the number the shell reports (`None` says
-//!   so instead of pretending there is room);
+//! * the banner's headline and the recommendation's one-line reason (the
+//!   strings `suramak_core::device::recommend` produces, so the guidance
+//!   cannot drift);
+//! * Indonesian's `tiny` warning verbatim, when it applies (two lines at most);
+//! * one inline model pill (`base · 148 MB`) and the primary Download action —
+//!   **one** banner, no nested card and no dead space;
+//! * the free-space preflight as the footer caption, from the number the shell
+//!   reports (`None` says so instead of pretending there is room);
 //! * a running download's **job percent** and the resume offer for a `.part`
 //!   left by an interrupted run.
 //!
+//! The full model table is Settings' job (slice 4); this is a recommendation,
+//! not a manifest. The banner disappears entirely once a model is verified on
+//! the phone (`CompactApp::model_card_needed`).
+//!
 //! The card is a view: every tap becomes a [`CompactAction`] the host runs.
 
-use egui::{pos2, vec2, Align2, CornerRadius, FontId, Rect, Stroke, StrokeKind, Ui, WidgetType};
+use egui::{pos2, vec2, Align2, CornerRadius, Rect, Stroke, StrokeKind, Ui, WidgetType};
 
+use crate::deck::material::{self, Plane};
 use crate::deck::motion::Motion;
 use crate::deck::theme::Tokens;
+use crate::deck::type_scale;
 
 use super::a11y;
-use super::chrome;
-use super::model::{bytes_label, CompactAction, CompactApp, DownloadState, ModelRow};
+use super::model::{bytes_label, CompactAction, CompactApp, DownloadState};
 
-/// The card's maximum height (the Library places the list below it).
-pub const CARD_HEIGHT: f32 = 356.0;
-/// One offered-model row's height.
-const ROW: f32 = 58.0;
+/// The banner's internal padding (the 8 pt rhythm: 16 in, 16 out).
+pub const PAD: f32 = 16.0;
+/// The action row's designed height (the pill and the button share it).
+const ACTION_H: f32 = 36.0;
+/// The headline's line height, from the editorial display token.
+const HEADLINE_H: f32 = 27.0;
+/// The reason / footer caption line height.
+const CAPTION_H: f32 = 17.0;
+/// The gap between the headline and the reason line.
+const GAP_REASON: f32 = 4.0;
+/// The gap above the action row.
+const GAP_ACTION: f32 = 14.0;
+/// The gap above the footer.
+const GAP_FOOTER: f32 = 12.0;
+/// The Download/resume button's width.
+const BUTTON_W: f32 = 104.0;
 
-/// The card's measured height for the current state: the shared parts plus the
-/// language note and the download block when they are present. A card that is
-/// always `CARD_HEIGHT` tall leaves a visible hole on the release-path shot;
-/// a card that grows must never clip the progress line.
-pub fn height(state: &CompactApp) -> f32 {
-    let mut height = 272.0;
-    if state.language_note().is_some() {
-        height += 48.0;
-    }
-    let alternatives = state
-        .offered_models()
-        .into_iter()
-        .filter(|row| !row.recommended && !row.installed && row.id != "tiny")
-        .count();
-    if alternatives > 1 {
-        height += ROW;
-    }
-    if state.download.is_some() {
-        height += 34.0;
-    }
-    height.clamp(220.0, CARD_HEIGHT)
-}
-
-/// The card's title, shared by the screenshot suite's assertions.
+/// The banner's title, shared by the screenshot suite's assertions.
 pub const TITLE: &str = "Get a model for this phone";
 
-/// Draws the card into `rect`. Returns the actions its controls requested.
+/// One measured banner: every rect the painter uses, plus the height the parts
+/// occupy. [`height`] and [`card`] both come through here, so a golden can
+/// never disagree with the space the Library reserved.
+struct BannerLayout {
+    headline: Rect,
+    reason: Rect,
+    note: Option<Rect>,
+    pill: Rect,
+    action: Rect,
+    footer: Rect,
+    job: Option<Rect>,
+    progress: Option<Rect>,
+    message: Option<Rect>,
+    used: f32,
+}
+
+fn layout(ctx: &egui::Context, state: &CompactApp, rect: Rect) -> BannerLayout {
+    let content = rect.shrink(PAD);
+    let mut y = rect.top() + PAD;
+
+    let headline = Rect::from_min_size(pos2(content.left(), y), vec2(content.width(), HEADLINE_H));
+    y = headline.bottom() + GAP_REASON;
+    let reason = Rect::from_min_size(pos2(content.left(), y), vec2(content.width(), CAPTION_H));
+    y = reason.bottom();
+
+    let note = state.language_note().map(|note| {
+        let height = note_height(ctx, &note, content.width());
+        let rect =
+            Rect::from_min_size(pos2(content.left(), y + 4.0), vec2(content.width(), height));
+        y = rect.bottom();
+        rect
+    });
+
+    let action = Rect::from_min_size(
+        pos2(content.left(), y + GAP_ACTION),
+        vec2(content.width(), ACTION_H),
+    );
+    y = action.bottom() + GAP_FOOTER;
+
+    // The pill is measured at paint time (its text width depends on the model
+    // and the face); this rect carries its left/top anchor and row height.
+    let pill = Rect::from_min_size(pos2(content.left(), action.top()), vec2(0.0, ACTION_H));
+    let button = Rect::from_min_size(
+        pos2(content.right() - BUTTON_W, action.top()),
+        vec2(BUTTON_W, ACTION_H),
+    );
+
+    let footer = Rect::from_min_size(pos2(content.left(), y), vec2(content.width(), CAPTION_H));
+    y = footer.bottom();
+
+    let job = state.download.as_ref().map(|_| {
+        let rect = Rect::from_min_size(
+            pos2(content.left(), y + 6.0),
+            vec2(content.width(), CAPTION_H),
+        );
+        y = rect.bottom();
+        rect
+    });
+    let progress = job.map(|job| {
+        let rect = Rect::from_min_size(
+            pos2(content.left(), job.bottom() + 5.0),
+            vec2(content.width(), 4.0),
+        );
+        y = rect.bottom();
+        rect
+    });
+    let message = state
+        .download
+        .as_ref()
+        .filter(|download| download.state == DownloadState::Failed && !download.message.is_empty())
+        .map(|_| {
+            let rect = Rect::from_min_size(
+                pos2(content.left(), y + 5.0),
+                vec2(content.width(), CAPTION_H),
+            );
+            y = rect.bottom();
+            rect
+        });
+
+    BannerLayout {
+        headline,
+        reason,
+        note,
+        pill,
+        action: button,
+        footer,
+        job,
+        progress,
+        message,
+        used: y + PAD - rect.top(),
+    }
+}
+
+/// The banner's measured height for the current state. A shrink-wrapped banner
+/// is the point (the M20C order): the old card carried ~80 pt of dead space.
+pub fn height(ctx: &egui::Context, state: &CompactApp, width: f32) -> f32 {
+    let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(width.max(1.0), 0.0));
+    layout(ctx, state, rect).used
+}
+
+fn note_height(ctx: &egui::Context, note: &str, width: f32) -> f32 {
+    let token = type_scale::caption();
+    let mut job = egui::text::LayoutJob::default();
+    job.append(note, 0.0, token.format(egui::Color32::PLACEHOLDER));
+    job.wrap.max_width = width.max(1.0);
+    job.wrap.max_rows = 2;
+    job.wrap.break_anywhere = false;
+    job.wrap.overflow_character = Some('…');
+    ctx.fonts_mut(|fonts| fonts.layout_job(job).size().y)
+        .min(token.line_height * 2.0)
+}
+
+/// Draws the banner into `rect`. Returns the actions its controls requested.
 pub fn card(
     ui: &mut Ui,
     tokens: &Tokens,
@@ -65,50 +172,96 @@ pub fn card(
     rect: Rect,
 ) -> Vec<CompactAction> {
     let mut actions = Vec::new();
-    chrome::card(ui, tokens, rect);
-    let x = rect.left() + 14.0;
-    let width = rect.width() - 28.0;
-    ui.painter().text(
-        pos2(x, rect.top() + 26.0),
-        Align2::LEFT_CENTER,
-        TITLE,
-        FontId::new(
-            20.0,
-            egui::FontFamily::Name(crate::deck::theme::SERIF_FAMILY.into()),
-        ),
-        tokens.ink,
+    material::frosted_panel(ui, tokens, rect, tokens.radius.card, Plane::Card);
+    let measured = layout(ui.ctx(), state, rect);
+    debug_assert!(
+        (rect.height() - measured.used).abs() <= 0.5,
+        "the Library reserved {} pt but the banner measures {} pt",
+        rect.height(),
+        measured.used
     );
-    a11y::describe(
-        ui,
-        Rect::from_min_size(pos2(x, rect.top() + 10.0), vec2(width, 32.0)),
-        TITLE,
+    // Every glyph stays inside the banner, whatever the space preflight says.
+    let painter = ui.painter().with_clip_rect(rect);
+
+    let title = type_scale::editorial_display();
+    let mut job = egui::text::LayoutJob::default();
+    job.append(TITLE, 0.0, title.format(tokens.ink));
+    job.wrap.max_width = measured.headline.width();
+    job.wrap.max_rows = 1;
+    job.wrap.overflow_character = Some('…');
+    painter.galley(measured.headline.min, painter.layout_job(job), tokens.ink);
+    a11y::describe(ui, measured.headline, TITLE);
+
+    let caption = type_scale::caption();
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        &state.model_headline(),
+        0.0,
+        caption.format(tokens.ink_soft),
     );
-    ui.painter().text(
-        pos2(x, rect.top() + 50.0),
-        Align2::LEFT_CENTER,
-        state.model_headline(),
-        FontId::proportional(12.5),
+    job.wrap.max_width = measured.reason.width();
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = false;
+    job.wrap.overflow_character = Some('…');
+    painter.galley(
+        measured.reason.min,
+        painter.layout_job(job),
         tokens.ink_soft,
     );
 
-    let mut y = rect.top() + 66.0;
-    if let Some(note) = state.language_note() {
-        let galley =
-            ui.painter()
-                .layout(note.clone(), FontId::proportional(11.5), tokens.warn, width);
-        ui.painter().galley(pos2(x, y), galley.clone(), tokens.warn);
-        a11y::describe(
-            ui,
-            Rect::from_min_size(pos2(x, y), vec2(width, galley.size().y.max(14.0))),
-            &note,
-        );
-        y += galley.size().y + 8.0;
+    if let (Some(note), Some(rect)) = (state.language_note(), measured.note) {
+        let mut job = egui::text::LayoutJob::default();
+        job.append(&note, 0.0, caption.format(tokens.warn));
+        job.wrap.max_width = rect.width();
+        job.wrap.max_rows = 2;
+        job.wrap.break_anywhere = false;
+        job.wrap.overflow_character = Some('…');
+        painter.galley(rect.min, painter.layout_job(job), tokens.warn);
+        a11y::describe(ui, rect, &note);
     }
 
-    // The recommended model, always first.
+    // The one model pill and the one primary action.
     if let Some(row) = state.recommended_model().cloned() {
-        let row_rect = Rect::from_min_size(pos2(x, y), vec2(width, 78.0));
-        paint_model_row(ui, tokens, &row, row_rect, true);
+        let pill_text = format!("{} · {}", row.id, bytes_label(row.size_bytes));
+        let pill_font = type_scale::row_value().font;
+        let pill_width = painter
+            .layout_no_wrap(
+                pill_text.clone(),
+                pill_font.clone(),
+                egui::Color32::PLACEHOLDER,
+            )
+            .size()
+            .x
+            + 28.0;
+        let pill = Rect::from_min_size(
+            measured.pill.min,
+            vec2(
+                pill_width
+                    .min(measured.action.left() - 12.0 - measured.pill.left())
+                    .max(0.0),
+                ACTION_H,
+            ),
+        );
+        painter.rect(
+            pill,
+            CornerRadius::same(tokens.radius.control),
+            tokens.control_fill,
+            Stroke::new(1.0_f32, tokens.hairline),
+            StrokeKind::Inside,
+        );
+        painter.text(
+            pill.center(),
+            Align2::CENTER_CENTER,
+            &pill_text,
+            pill_font,
+            tokens.ink,
+        );
+        a11y::describe(
+            ui,
+            pill,
+            &format!("{} recommended, {}", row.id, row.size_role()),
+        );
+
         let blocked = state.has_space_for(row.size_bytes) == Some(false);
         let download = state
             .download
@@ -122,152 +275,56 @@ pub fn card(
             Some(download) if download.state == DownloadState::Failed => "Try again",
             _ => "Download",
         };
-        let action = Rect::from_min_size(
-            pos2(row_rect.right() - 104.0, row_rect.top() + 12.0),
-            vec2(92.0, 36.0),
-        );
-        if !running {
+        if running {
+            // The job OWNS the download; the banner's only control is Pause.
             let response = a11y::touch(
                 ui,
                 tokens,
-                action,
-                "download-recommended",
-                WidgetType::Button,
-                &format!("{primary_label} {}", row.id),
-                !blocked,
-            );
-            ui.painter().rect(
-                action,
-                CornerRadius::same(tokens.radius.control),
-                if blocked {
-                    tokens.control_fill
-                } else {
-                    tokens.accent
-                },
-                Stroke::new(
-                    1.0_f32,
-                    if blocked {
-                        tokens.hairline
-                    } else {
-                        tokens.accent
-                    },
-                ),
-                StrokeKind::Inside,
-            );
-            ui.painter().text(
-                action.center(),
-                Align2::CENTER_CENTER,
-                primary_label,
-                FontId::proportional(12.5),
-                if blocked {
-                    tokens.ink_faint
-                } else {
-                    tokens.on_accent
-                },
-            );
-            if response.clicked() && !blocked {
-                actions.push(CompactAction::DownloadModel(row.id.clone()));
-            }
-        } else {
-            // The job OWNS the download; the card's only control is Pause.
-            let pause = Rect::from_min_size(
-                pos2(row_rect.right() - 104.0, row_rect.top() + 12.0),
-                vec2(92.0, 36.0),
-            );
-            let response = a11y::touch(
-                ui,
-                tokens,
-                pause,
+                measured.action,
                 "download-pause",
                 WidgetType::Button,
                 "Pause the download",
                 true,
             );
-            ui.painter().rect(
-                pause,
-                CornerRadius::same(tokens.radius.control),
-                tokens.control_fill,
-                Stroke::new(1.0_f32, tokens.hairline),
-                StrokeKind::Inside,
-            );
-            ui.painter().text(
-                pause.center(),
-                Align2::CENTER_CENTER,
+            paint_button(
+                &painter,
+                tokens,
+                response.is_pointer_button_down_on(),
+                measured.action,
                 "Pause",
-                FontId::proportional(12.5),
-                tokens.ink,
+                false,
+                true,
             );
             if response.clicked() {
                 actions.push(CompactAction::CancelDownload);
             }
+        } else {
+            let response = a11y::touch(
+                ui,
+                tokens,
+                measured.action,
+                "download-recommended",
+                WidgetType::Button,
+                &format!("{primary_label} {}", row.id),
+                !blocked,
+            );
+            paint_button(
+                &painter,
+                tokens,
+                response.is_pointer_button_down_on(),
+                measured.action,
+                primary_label,
+                !blocked,
+                !blocked,
+            );
+            if response.clicked() && !blocked {
+                actions.push(CompactAction::DownloadModel(row.id.clone()));
+            }
         }
-        a11y::describe(
-            ui,
-            row_rect,
-            &format!("{} recommended, {}", row.id, row.size_role()),
-        );
-        y = row_rect.bottom() + 8.0;
     }
 
-    // The other offered models, cheapest first, two at most: the card is a
-    // recommendation, not the full manifest (that is Settings' table).
-    let alternatives: Vec<ModelRow> = state
-        .offered_models()
-        .into_iter()
-        .filter(|row| !row.recommended)
-        .filter(|row| !row.installed)
-        .filter(|row| row.id != "tiny")
-        .take(2)
-        .cloned()
-        .collect();
-    for row in alternatives {
-        let row_rect = Rect::from_min_size(pos2(x, y), vec2(width, ROW));
-        paint_model_row(ui, tokens, &row, row_rect, false);
-        let blocked = state.has_space_for(row.size_bytes) == Some(false);
-        let action = Rect::from_min_size(
-            pos2(row_rect.right() - 72.0, row_rect.top() + 11.0),
-            vec2(60.0, 34.0),
-        );
-        let response = a11y::touch(
-            ui,
-            tokens,
-            action,
-            ("download-alternative", row.id.clone()),
-            WidgetType::Button,
-            &format!("Download {}", row.id),
-            !blocked,
-        );
-        ui.painter().rect(
-            action,
-            CornerRadius::same(tokens.radius.control),
-            tokens.control_fill,
-            Stroke::new(1.0_f32, tokens.hairline),
-            StrokeKind::Inside,
-        );
-        ui.painter().text(
-            action.center(),
-            Align2::CENTER_CENTER,
-            "Get",
-            FontId::proportional(12.5),
-            if blocked {
-                tokens.ink_faint
-            } else {
-                tokens.ink
-            },
-        );
-        if response.clicked() && !blocked {
-            actions.push(CompactAction::DownloadModel(row.id.clone()));
-        }
-        y = row_rect.bottom() + 2.0;
-    }
-    let _ = motion;
-    ui.painter().line_segment(
-        [pos2(x, y + 3.0), pos2(x + width, y + 3.0)],
-        Stroke::new(1.0_f32, tokens.hairline),
-    );
-    y += 16.0;
-
-    // The M13D free-space preflight, with the number the shell reported.
+    // The footer: the M13D free-space preflight, with the number the shell
+    // reported — never invented.
     let recommended_size = state
         .recommended_model()
         .map(|row| row.size_bytes)
@@ -294,119 +351,131 @@ pub fn card(
             false,
         ),
     };
-    ui.painter().text(
-        pos2(x, y),
-        Align2::LEFT_CENTER,
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
         &space_line,
-        FontId::proportional(11.5),
-        if space_error {
+        0.0,
+        caption.format(if space_error {
             tokens.record_red_text
         } else {
             tokens.ink_faint
-        },
+        }),
     );
-    a11y::describe(
-        ui,
-        Rect::from_min_size(pos2(x, y - 10.0), vec2(width, 20.0)),
-        &space_line,
+    job.wrap.max_width = measured.footer.width();
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = false;
+    job.wrap.overflow_character = Some('…');
+    painter.galley(
+        measured.footer.min,
+        painter.layout_job(job),
+        tokens.ink_faint,
     );
-    y += 18.0;
+    a11y::describe(ui, measured.footer, &space_line);
 
     // The download's own block: the job's percent, never an estimate.
-    if let Some(download) = state.download.clone() {
+    if let (Some(download), Some(job_rect)) = (state.download.clone(), measured.job) {
         let line = download.line();
-        ui.painter().text(
-            pos2(x, y),
-            Align2::LEFT_CENTER,
+        let mut job = egui::text::LayoutJob::default();
+        job.append(
             &line,
-            FontId::proportional(12.0),
-            match download.state {
+            0.0,
+            caption.format(match download.state {
                 DownloadState::Failed => tokens.record_red_text,
                 _ => tokens.ink_soft,
-            },
+            }),
         );
-        a11y::describe(
-            ui,
-            Rect::from_min_size(pos2(x, y - 10.0), vec2(width, 20.0)),
-            &line,
-        );
-        y += 10.0;
-        let track = Rect::from_min_size(pos2(x, y), vec2(width, 4.0));
-        ui.painter()
-            .rect_filled(track, CornerRadius::same(2), tokens.control_fill);
-        let fraction = if download.state == DownloadState::Done {
-            1.0
-        } else {
-            download.fraction()
-        };
-        if fraction > 0.0 {
-            ui.painter().rect_filled(
-                Rect::from_min_size(track.min, vec2(track.width() * fraction, 4.0)),
-                CornerRadius::same(2),
-                if download.state == DownloadState::Failed {
-                    tokens.record_red
-                } else {
-                    tokens.accent
-                },
-            );
+        job.wrap.max_width = job_rect.width();
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = false;
+        job.wrap.overflow_character = Some('…');
+        painter.galley(job_rect.min, painter.layout_job(job), tokens.ink_soft);
+        a11y::describe(ui, job_rect, &line);
+
+        if let Some(track) = measured.progress {
+            painter.rect_filled(track, CornerRadius::same(2), tokens.control_fill);
+            let fraction = if download.state == DownloadState::Done {
+                1.0
+            } else {
+                download.fraction()
+            };
+            if fraction > 0.0 {
+                painter.rect_filled(
+                    Rect::from_min_size(track.min, vec2(track.width() * fraction, track.height())),
+                    CornerRadius::same(2),
+                    if download.state == DownloadState::Failed {
+                        tokens.record_red
+                    } else {
+                        tokens.accent
+                    },
+                );
+            }
         }
-        if download.state == DownloadState::Failed && !download.message.is_empty() {
-            ui.painter().text(
-                pos2(x, y + 18.0),
-                Align2::LEFT_CENTER,
-                truncate(&download.message, 76),
-                FontId::proportional(11.0),
-                tokens.record_red_text,
+        if let (DownloadState::Failed, Some(message)) = (download.state, measured.message) {
+            let mut job = egui::text::LayoutJob::default();
+            job.append(
+                &download.message,
+                0.0,
+                caption.format(tokens.record_red_text),
             );
+            job.wrap.max_width = message.width();
+            job.wrap.max_rows = 1;
+            job.wrap.break_anywhere = false;
+            job.wrap.overflow_character = Some('…');
+            painter.galley(message.min, painter.layout_job(job), tokens.record_red_text);
         }
     }
+
+    let _ = motion;
     actions
 }
 
-fn paint_model_row(ui: &mut Ui, tokens: &Tokens, row: &ModelRow, rect: Rect, recommended: bool) {
-    ui.painter().rect(
-        rect,
-        CornerRadius::same(tokens.radius.card),
-        if recommended {
-            tokens.accent_tint
+/// The banner's primary/secondary button body: 36 pt, control radius, the
+/// accent fill when enabled (the Record red is the dock's alone).
+fn paint_button(
+    painter: &egui::Painter,
+    tokens: &Tokens,
+    pressed: bool,
+    rect: Rect,
+    label: &str,
+    enabled: bool,
+    primary: bool,
+) {
+    let fill = if !enabled {
+        tokens.control_fill
+    } else if primary {
+        if pressed {
+            tokens.accent_active
         } else {
-            tokens.panel_faint
-        },
+            tokens.accent
+        }
+    } else {
+        tokens.control_fill
+    };
+    painter.rect(
+        rect,
+        CornerRadius::same(tokens.radius.control),
+        fill,
         Stroke::new(
             1.0_f32,
-            if recommended {
-                tokens.accent
+            if primary && enabled {
+                fill
             } else {
                 tokens.hairline
             },
         ),
         StrokeKind::Inside,
     );
-    ui.painter().text(
-        pos2(rect.left() + 12.0, rect.top() + 21.0),
-        Align2::LEFT_CENTER,
-        format!(
-            "{}{}",
-            row.id,
-            if recommended { " · recommended" } else { "" }
-        ),
-        FontId::proportional(16.0),
-        tokens.ink,
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        type_scale::row_title().font,
+        if !enabled {
+            tokens.ink_faint
+        } else if primary {
+            tokens.on_accent
+        } else {
+            tokens.ink
+        },
     );
-    ui.painter().text(
-        pos2(rect.left() + 12.0, rect.top() + 42.0),
-        Align2::LEFT_CENTER,
-        truncate(&format!("{} · {}", row.size_role(), row.note), 46),
-        FontId::proportional(11.5),
-        tokens.ink_soft,
-    );
-}
-
-fn truncate(text: &str, chars: usize) -> String {
-    if text.chars().count() <= chars {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(chars.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }

@@ -6,13 +6,16 @@
 //! reports, so the system bars and the gesture handle never cover a control.
 
 use egui::{
-    pos2, vec2, Align, Align2, Color32, CornerRadius, FontFamily, FontId, Layout, Rect, Response,
+    pos2, vec2, Align, Align2, Color32, Context, CornerRadius, FontId, Layout, Rect, Response,
     Stroke, StrokeKind, Ui, WidgetType,
 };
 
 use crate::deck::controls::{self, Glyph};
-use crate::deck::motion::{self, Motion};
-use crate::deck::theme::{Tokens, SERIF_FAMILY};
+use crate::deck::icons::{self, Icon, IconSize};
+use crate::deck::material::{self, Plane};
+use crate::deck::motion::{self, Motion, PressFrame, PressMotion};
+use crate::deck::theme::{self, Tokens};
+use crate::deck::type_scale::{self, TypeToken};
 
 use super::a11y;
 
@@ -20,12 +23,22 @@ use super::a11y;
 pub const MIN_TOUCH: f32 = 48.0;
 /// The app bar's band height, insets excluded.
 pub const APP_BAR: f32 = 56.0;
-/// The bottom action bar's band height, insets excluded.
+/// The bottom action bar's band height, insets excluded (editor and Settings
+/// still dock a bar; the Library floats a [`DOCK_HEIGHT`] plane instead).
 pub const BOTTOM_BAR: f32 = 68.0;
 /// A list row's designed height.
 pub const ROW: f32 = 64.0;
 /// The content gutter.
 pub const GUTTER: f32 = 16.0;
+
+/// The floating Library dock's height (8 pt padding + 48 pt buttons + 8 pt).
+pub const DOCK_HEIGHT: f32 = 64.0;
+/// The dock's horizontal inset from the screen edge.
+pub const DOCK_INSET: f32 = 16.0;
+/// The dock's gap above the system gesture inset.
+pub const DOCK_GAP: f32 = 12.0;
+/// The dock's internal padding around its two pills.
+pub const DOCK_PADDING: f32 = 8.0;
 
 /// The three bands of a phone screen, in points.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -69,19 +82,62 @@ pub fn bands(screen: Rect, top_inset: f32, bottom_inset: f32, bottom: Option<f32
     }
 }
 
-/// The app bar: optional back chevron, a serif title, and one trailing text
-/// action. Returns whether back was tapped.
+/// The app bar's serif title, at the type scale's **title** token: the house
+/// voice keeps its face, but its size, tracking and line height come from the
+/// scale (22 / −0.4 / 28) rather than a per-screen number.
+pub fn title_token() -> TypeToken {
+    let mut token = type_scale::title();
+    token.font.family = theme::serif_family();
+    token
+}
+
+/// What the app bar's trailing slot shows. The Library uses [`Trailing::Icon`]
+/// with the gear; the other phone screens still pass a text action.
+#[derive(Debug, Clone, Copy)]
+pub enum Trailing<'a> {
+    /// Nothing on the right.
+    Nothing,
+    /// A text action (Settings' and the editor's current form).
+    Text { label: &'a str, enabled: bool },
+    /// A chrome icon with its spoken label in a 44 × 44 pt hit box.
+    Icon {
+        icon: Icon,
+        label: &'a str,
+        enabled: bool,
+    },
+}
+
+/// The app bar: optional back chevron, a serif title at the title token, and
+/// one trailing action. Returns whether back / the trailing action was tapped.
 pub fn app_bar(
     ui: &mut Ui,
     tokens: &Tokens,
-    _motion: &Motion,
+    motion: &Motion,
     rect: Rect,
     title: &str,
     back: bool,
     trailing: Option<(&str, bool)>,
 ) -> (bool, bool) {
+    let trailing = match trailing {
+        Some((label, enabled)) => Trailing::Text { label, enabled },
+        None => Trailing::Nothing,
+    };
+    app_bar_with(ui, tokens, motion, rect, title, back, trailing)
+}
+
+/// [`app_bar`] with an explicit trailing slot — the M20C library passes a gear.
+pub fn app_bar_with(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    rect: Rect,
+    title: &str,
+    back: bool,
+    trailing: Trailing<'_>,
+) -> (bool, bool) {
     let mut back_hit = false;
     let mut trailing_hit = false;
+    let _ = motion;
     let painter = ui.painter().clone();
     painter.rect_filled(rect, CornerRadius::ZERO, tokens.window);
     let center_y = rect.center().y;
@@ -116,54 +172,88 @@ pub fn app_bar(
     } else {
         rect.left() + GUTTER
     };
-    painter.text(
-        pos2(title_left, center_y),
-        Align2::LEFT_CENTER,
-        title,
-        FontId::new(20.0, FontFamily::Name(SERIF_FAMILY.into())),
-        tokens.ink,
-    );
-    if let Some((label, enabled)) = trailing {
-        let width = (ui.painter().layout_no_wrap(
-            label.to_owned(),
-            FontId::proportional(15.0),
-            Color32::PLACEHOLDER,
-        ))
-        .size()
-        .x
-        .max(48.0)
-            + 12.0;
-        let hit = Rect::from_min_size(
-            pos2(rect.right() - width - GUTTER + 12.0, center_y - 24.0),
-            vec2(width, 48.0),
-        );
-        let response = a11y::touch(
-            ui,
-            tokens,
-            hit,
-            ("compact-trailing", title),
-            WidgetType::Button,
+
+    // The trailing control first, so the title knows how much room is left.
+    let mut title_right = rect.right() - GUTTER;
+    match trailing {
+        Trailing::Nothing => {}
+        Trailing::Text { label, enabled } => {
+            let width = (ui
+                .painter()
+                .layout_no_wrap(
+                    label.to_owned(),
+                    FontId::proportional(15.0),
+                    Color32::PLACEHOLDER,
+                )
+                .size()
+                .x)
+                .max(48.0)
+                + 12.0;
+            let hit = Rect::from_min_size(
+                pos2(rect.right() - width - GUTTER + 12.0, center_y - 24.0),
+                vec2(width, 48.0),
+            );
+            title_right = hit.left() - 8.0;
+            let response = a11y::touch(
+                ui,
+                tokens,
+                hit,
+                ("compact-trailing", title),
+                WidgetType::Button,
+                label,
+                enabled,
+            );
+            let color = if !enabled {
+                tokens.ink_faint.gamma_multiply(tokens.disabled_alpha)
+            } else if response.hovered() {
+                tokens.accent
+            } else {
+                tokens.ink
+            };
+            painter.text(
+                hit.center(),
+                Align2::CENTER_CENTER,
+                label,
+                FontId::proportional(15.0),
+                color,
+            );
+            if response.clicked() && enabled {
+                trailing_hit = true;
+            }
+        }
+        Trailing::Icon {
+            icon,
             label,
             enabled,
-        );
-        let color = if !enabled {
-            tokens.ink_faint.gamma_multiply(tokens.disabled_alpha)
-        } else if response.hovered() {
-            tokens.accent
-        } else {
-            tokens.ink
-        };
-        painter.text(
-            hit.center(),
-            Align2::CENTER_CENTER,
-            label,
-            FontId::proportional(15.0),
-            color,
-        );
-        if response.clicked() && enabled {
-            trailing_hit = true;
+        } => {
+            let hit = icons::hit_rect(pos2(rect.right() - GUTTER - icons::HIT / 2.0, center_y));
+            title_right = hit.left() - 8.0;
+            let response = icons::button(
+                ui,
+                tokens,
+                hit,
+                ("compact-gear", title),
+                icon,
+                label,
+                IconSize::Chrome,
+                enabled,
+            );
+            if response.clicked() && enabled {
+                trailing_hit = true;
+            }
         }
     }
+
+    paint_title(
+        ui,
+        tokens,
+        title,
+        Rect::from_min_max(
+            pos2(title_left, rect.top() + 4.0),
+            pos2(title_right.max(title_left + 24.0), rect.bottom() - 4.0),
+        ),
+    );
+
     // The one hairline under the bar.
     painter.line_segment(
         [
@@ -175,8 +265,35 @@ pub fn app_bar(
     (back_hit, trailing_hit)
 }
 
+/// Paints the app-bar title inside `band`, one line, elided with `…` when the
+/// transcript title runs long. Painted through a clip so a title can never
+/// spill over the trailing control.
+fn paint_title(ui: &Ui, tokens: &Tokens, title: &str, band: Rect) {
+    let token = title_token();
+    let mut job = egui::text::LayoutJob::default();
+    job.append(title, 0.0, token.format(tokens.ink));
+    job.wrap.max_width = band.width().max(24.0);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('…');
+    let galley = ui.painter().layout_job(job);
+    let y = band.center().y - galley.size().y / 2.0;
+    ui.painter()
+        .with_clip_rect(band)
+        .galley(pos2(band.left(), y), galley, tokens.ink);
+}
+
 /// A full-width tappable row: title + optional meta, optional selected state.
 /// The body is `ROW` tall; the caller positions it.
+///
+/// The row wears the type scale ([`type_scale::row_title`] /
+/// [`type_scale::caption`]), separates with an inset 1 px hairline, and presses
+/// with the M20A motion (`FAST` in, spring out): the whole painted body scales
+/// to [`motion::PRESS_SCALE`] while the finger is down and the active wash
+/// ramps with it. The hit rect never scales — touch stays 64 pt.
+///
+/// Returns the response and the painted scale (1.0 at rest) so the caller can
+/// keep its own affordances (the play triangle, the chevron) on the same body.
 #[allow(clippy::too_many_arguments)]
 pub fn row(
     ui: &mut Ui,
@@ -187,56 +304,120 @@ pub fn row(
     title: &str,
     meta: &str,
     selected: bool,
-) -> Response {
-    let response = a11y::touch(ui, tokens, rect, id, WidgetType::Button, title, true);
-    let fill = if selected {
-        tokens.accent_tint
-    } else if response.is_pointer_button_down_on() {
-        tokens.surface_active
-    } else if response.hovered() {
-        tokens.surface_hover
-    } else {
-        Color32::TRANSPARENT
-    };
+    divider: bool,
+) -> (Response, f32) {
+    let response = a11y::touch(ui, tokens, rect, &id, WidgetType::Button, title, true);
+    let base = ui.id().with(&id);
+    let press = press_frame(
+        ui.ctx(),
+        base.with("press"),
+        response.is_pointer_button_down_on(),
+        motion.reduce,
+    );
+    let scale = press.scale;
+    let visual = Rect::from_center_size(rect.center(), rect.size() * scale);
+    let radius = CornerRadius::same((f32::from(tokens.radius.row) * scale).round() as u8);
+
     let wash = motion.factor(
         ui.ctx(),
-        ui.id().with(("compact-row-wash", title)),
+        base.with("wash"),
         selected || response.hovered(),
         motion::FAST,
     );
-    ui.painter().rect_filled(
-        rect,
-        CornerRadius::same(tokens.radius.row),
-        fill.gamma_multiply(wash.max(if selected { 1.0 } else { 0.0 })),
-    );
-    let title_galley = ui.painter().layout(
-        title.to_owned(),
-        FontId::proportional(17.0),
-        tokens.ink,
-        (rect.width() - GUTTER * 2.0).max(40.0),
-    );
+    if selected {
+        ui.painter().rect_filled(visual, radius, tokens.accent_tint);
+    } else if wash > 0.0 {
+        ui.painter().rect_filled(
+            visual,
+            radius,
+            tokens.surface_hover.gamma_multiply(wash.clamp(0.0, 1.0)),
+        );
+    }
+    if press.fill > 0.0 {
+        ui.painter().rect_filled(
+            visual,
+            radius,
+            tokens.surface_active.gamma_multiply(press.fill),
+        );
+    }
+
+    let title_token = scaled(&type_scale::row_title(), scale);
+    let mut job = egui::text::LayoutJob::default();
+    job.append(title, 0.0, title_token.format(tokens.ink));
+    job.wrap.max_width = (visual.width() - GUTTER * 2.0 - 96.0).max(40.0);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('…');
     ui.painter().galley(
-        pos2(rect.left() + GUTTER, rect.top() + 14.0),
-        title_galley,
+        pos2(visual.left() + GUTTER * scale, visual.top() + 12.0 * scale),
+        ui.painter().layout_job(job),
         tokens.ink,
     );
     if !meta.is_empty() {
-        ui.painter().text(
-            pos2(rect.left() + GUTTER, rect.bottom() - 16.0),
-            Align2::LEFT_CENTER,
-            meta,
-            FontId::proportional(12.5),
+        let meta_token = scaled(&type_scale::caption(), scale);
+        let mut job = egui::text::LayoutJob::default();
+        job.append(meta, 0.0, meta_token.format(tokens.ink_soft));
+        job.wrap.max_width = (visual.width() - GUTTER * 2.0 - 96.0).max(40.0);
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        job.wrap.overflow_character = Some('…');
+        ui.painter().galley(
+            pos2(visual.left() + GUTTER * scale, visual.top() + 36.0 * scale),
+            ui.painter().layout_job(job),
             tokens.ink_soft,
         );
     }
-    ui.painter().line_segment(
-        [
-            pos2(rect.left() + GUTTER, rect.bottom() - 0.5),
-            pos2(rect.right(), rect.bottom() - 0.5),
-        ],
-        Stroke::new(1.0_f32, tokens.hairline),
-    );
-    response
+    if divider {
+        ui.painter().line_segment(
+            [
+                pos2(rect.left() + GUTTER, rect.bottom() - 0.5),
+                pos2(rect.right() - GUTTER, rect.bottom() - 0.5),
+            ],
+            Stroke::new(1.0_f32, tokens.hairline),
+        );
+    }
+    (response, scale)
+}
+
+/// The row's press state, kept across frames in `ctx.data`: `FAST` down,
+/// [`motion::SPRING_DURATION`] spring back. Reduce Motion keeps the wash and
+/// drops the scale (the plan's "fill swap only").
+#[derive(Clone, Copy)]
+struct RowPress {
+    pressed: bool,
+    motion: PressMotion,
+}
+
+fn press_frame(ctx: &Context, id: egui::Id, pressed: bool, reduce: bool) -> PressFrame {
+    let now = ctx.input(|input| input.time);
+    let mut state = ctx.data_mut(|data| {
+        data.get_temp::<RowPress>(id).unwrap_or(RowPress {
+            pressed: false,
+            motion: PressMotion::new(reduce),
+        })
+    });
+    if state.pressed != pressed {
+        state.pressed = pressed;
+        state.motion.set_pressed(pressed, now);
+    }
+    let frame = state.motion.sample(now);
+    ctx.data_mut(|data| data.insert_temp(id, state));
+    if frame.running {
+        ctx.request_repaint();
+    }
+    frame
+}
+
+/// A type token scaled about its size and line height (the press's 0.97 body).
+fn scaled(token: &TypeToken, scale: f32) -> TypeToken {
+    if (scale - 1.0).abs() < f32::EPSILON {
+        return token.clone();
+    }
+    let mut token = token.clone();
+    token.font.size *= scale;
+    token.line_height *= scale;
+    token.tracking *= scale;
+    token
 }
 
 /// A section label above a card.
@@ -405,7 +586,15 @@ pub fn action_button(
     )
 }
 
-/// A text field sized for touch: 48 tall, panel fill, hairline.
+/// The search field's caption token (the placeholder's face and size).
+pub fn search_hint_token() -> TypeToken {
+    type_scale::caption()
+}
+
+/// A text field sized for touch: 48 tall, a **frosted Card plane** (veil + rim,
+/// no shadow — it sits in the scroll plane), the 18 pt magnifier inline at the
+/// leading edge, and the caption token's placeholder. Entered text uses the
+/// body token so a query reads at speaking size.
 pub fn search_field(
     ui: &mut Ui,
     tokens: &Tokens,
@@ -413,44 +602,62 @@ pub fn search_field(
     text: &mut String,
     hint: &str,
 ) -> bool {
-    ui.painter().rect(
-        rect,
-        CornerRadius::same(tokens.radius.control),
-        tokens.control_fill,
-        Stroke::new(1.0_f32, tokens.hairline),
-        StrokeKind::Inside,
+    material::frosted_panel(ui, tokens, rect, tokens.radius.control, Plane::Card);
+    let icon = Rect::from_center_size(
+        pos2(rect.left() + 14.0 + icons::INLINE / 2.0, rect.center().y),
+        vec2(icons::INLINE, icons::INLINE),
+    );
+    icons::paint(
+        ui.painter(),
+        icon,
+        Icon::Search,
+        IconSize::Inline.points(),
+        tokens.ink_faint,
+    );
+    let field = Rect::from_min_max(
+        pos2(icon.right() + 10.0, rect.top() + 6.0),
+        pos2(rect.right() - 12.0, rect.bottom() - 6.0),
     );
     let mut child = ui.new_child(
         egui::UiBuilder::new()
-            .max_rect(rect.shrink2(vec2(12.0, 0.0)))
+            .max_rect(field)
             .layout(Layout::left_to_right(Align::Center)),
     );
+    child.visuals_mut().text_cursor.stroke = Stroke::new(1.5_f32, tokens.accent);
     let response = child.add(
         egui::TextEdit::singleline(text)
             .hint_text(hint)
+            .hint_text_font(search_hint_token().font)
+            .font(type_scale::body().font)
             .frame(false)
             .desired_width(f32::INFINITY)
-            .margin(vec2(0.0, 12.0)),
+            .margin(vec2(0.0, 0.0)),
     );
     response.changed()
 }
 
 /// The modal sheet scrim + body. Returns the body rect.
 ///
-/// `rise` moves the **body** only: at the start of the present animation the
-/// body sits `rise` points below its resting place (partly past the screen
-/// edge, clipped), so it slides up while the scrim already covers the whole
-/// screen. Translating the scrim too would leave an unscrimmed strip at the
-/// bottom for the length of the animation.
-pub fn sheet(ui: &mut Ui, tokens: &Tokens, rect: Rect, rise: f32) -> Rect {
-    ui.painter()
-        .rect_filled(rect, CornerRadius::ZERO, tokens.scrim);
+/// `slide` is the present progress, 0..=1: 0 is the body fully below the
+/// screen edge, 1 is resting. The plan's sheet motion is `translateY(100% → 0)`
+/// with the scrim already covering the page, so the scrim is painted at the
+/// full screen and only the **body** travels. Reduce Motion passes 1.0 (the
+/// fade is the whole transition).
+///
+/// The body is the [`Plane::Sheet`] material: opaque sheet fill, veil, grain,
+/// the one rim and the one float shadow. Its top corners round; the bottom is
+/// the screen edge.
+pub fn sheet(ui: &mut Ui, tokens: &Tokens, rect: Rect, slide: f32) -> Rect {
+    material::scrim(ui, rect, tokens);
     let height = (rect.height() * 0.46).clamp(240.0, 420.0);
+    let progress = slide.clamp(0.0, 1.0);
     let body = Rect::from_min_max(
-        pos2(rect.left(), rect.bottom() - height + rise),
-        pos2(rect.right(), rect.bottom() + rise),
+        pos2(rect.left(), rect.bottom() - height * progress),
+        pos2(rect.right(), rect.bottom() + height * (1.0 - progress)),
     );
-    ui.painter().rect_filled(
+    material::frosted_panel(
+        ui,
+        tokens,
         body,
         CornerRadius {
             nw: tokens.radius.card,
@@ -458,7 +665,7 @@ pub fn sheet(ui: &mut Ui, tokens: &Tokens, rect: Rect, rise: f32) -> Rect {
             sw: 0,
             se: 0,
         },
-        tokens.sheet,
+        Plane::Sheet,
     );
     // The grabber.
     ui.painter().rect_filled(
@@ -480,4 +687,227 @@ pub fn background(ui: &mut Ui, tokens: &Tokens, rect: Rect) {
         CornerRadius::ZERO,
         tokens.panel_faint,
     );
+}
+
+// ---- M20C: the floating dock ---------------------------------------------
+
+/// The floating dock's rect: [`DOCK_INSET`] in from both edges,
+/// [`DOCK_HEIGHT`] tall, [`DOCK_GAP`] above the gesture inset. It floats OVER
+/// the list; the list's bottom padding has to clear it (see
+/// `library::list_bottom_padding`).
+pub fn dock_rect(screen: Rect, bottom_inset: f32) -> Rect {
+    let width = (screen.width() - DOCK_INSET * 2.0).max(0.0);
+    Rect::from_min_size(
+        pos2(
+            screen.left() + DOCK_INSET,
+            screen.bottom() - bottom_inset - DOCK_GAP - DOCK_HEIGHT,
+        ),
+        vec2(width, DOCK_HEIGHT),
+    )
+}
+
+/// The dock's two pills, left to right: Import at 38 % of the inner width, the
+/// Record primary taking the rest (the plan's 38 / 62 split).
+pub fn dock_action_rects(dock: Rect) -> [Rect; 2] {
+    let inner = dock.shrink(DOCK_PADDING);
+    let gap = 10.0;
+    let usable = (inner.width() - gap).max(0.0);
+    let import = Rect::from_min_size(inner.min, vec2(usable * 0.38, inner.height()));
+    let record = Rect::from_min_max(pos2(import.right() + gap, inner.top()), inner.max);
+    [import, record]
+}
+
+/// The Record pill's fill: the record red, deepened to the text-safe red only
+/// where the ladder's own ink would fall under the 4.5:1 small-text floor on it
+/// (the light ladder's `#E0352B` is 4.46:1 with white; `#C8281E` is 5.56:1).
+/// The dot/fill stays unmistakably the record red either way.
+pub fn record_fill(tokens: &Tokens) -> Color32 {
+    if theme::contrast_ratio(tokens.on_accent, tokens.record_red) >= 4.5 {
+        tokens.record_red
+    } else {
+        tokens.record_red_text
+    }
+}
+
+/// One dock pill: 48 pt tall inside the frosted dock, an optional 20 pt icon,
+/// the type scale's row title, and the M20A press (FAST in, spring out).
+///
+/// `primary` paints the Record fill ([`record_fill`]) with `on_accent` ink;
+/// otherwise the secondary `control_fill` + hairline with `ink`. `spoken` is
+/// the TalkBack name (the visible label stays short).
+#[allow(clippy::too_many_arguments)]
+pub fn dock_button(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    rect: Rect,
+    id: impl std::hash::Hash,
+    label: &str,
+    spoken: &str,
+    icon: Option<Icon>,
+    primary: bool,
+    enabled: bool,
+) -> Response {
+    let response = a11y::touch(ui, tokens, rect, &id, WidgetType::Button, spoken, enabled);
+    let base = ui.id().with(&id);
+    let press = press_frame(
+        ui.ctx(),
+        base.with("press"),
+        enabled && response.is_pointer_button_down_on(),
+        motion.reduce,
+    );
+    let hover = motion.factor(
+        ui.ctx(),
+        base.with("hover"),
+        enabled && response.hovered(),
+        motion::FAST,
+    );
+    let scale = press.scale;
+    let visual = Rect::from_center_size(rect.center(), rect.size() * scale);
+    let radius = CornerRadius::same((f32::from(tokens.radius.control) * scale).round() as u8);
+
+    let (fill, ink) = if !enabled {
+        (tokens.control_fill, tokens.ink_faint)
+    } else if primary {
+        (record_fill(tokens), tokens.on_accent)
+    } else {
+        (
+            motion::lerp_color(tokens.control_fill, tokens.control_fill_hover, hover),
+            tokens.ink,
+        )
+    };
+    ui.painter().rect_filled(visual, radius, fill);
+    if !enabled || !primary {
+        ui.painter().rect_stroke(
+            visual,
+            radius,
+            Stroke::new(1.0_f32, tokens.hairline),
+            StrokeKind::Inside,
+        );
+    }
+    if press.fill > 0.0 && enabled {
+        // The press wash rides the pill's own ink so it reads on both tiers.
+        ui.painter()
+            .rect_filled(visual, radius, ink.gamma_multiply(0.10 * press.fill));
+    }
+
+    let token = scaled(&type_scale::row_title(), scale);
+    let galley =
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), token.font.clone(), Color32::PLACEHOLDER);
+    let icon_size = icons::CHROME * scale;
+    let gap = 6.0 * scale;
+    let total = if icon.is_some() {
+        icon_size + gap + galley.size().x
+    } else {
+        galley.size().x
+    };
+    let start = visual.center().x - total / 2.0;
+    if let Some(icon) = icon {
+        let icon_rect = Rect::from_center_size(
+            pos2(start + icon_size / 2.0, visual.center().y),
+            vec2(icon_size, icon_size),
+        );
+        icons::paint(ui.painter(), icon_rect, icon, icon_size, ink);
+    }
+    let text_left = if icon.is_some() {
+        start + icon_size + gap
+    } else {
+        start
+    };
+    ui.painter().galley(
+        pos2(text_left, visual.center().y - galley.size().y / 2.0),
+        galley,
+        ink,
+    );
+    response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::deck::theme::{self, AppTheme};
+
+    /// The row/button press is the M20A grammar: `FAST` down to the 0.97 body,
+    /// `SPRING_DURATION` back out. The helper is driven directly so the test
+    /// sees the same values the painter uses.
+    #[test]
+    fn the_press_is_fast_in_and_springs_out() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::install(&ctx, AppTheme::Dark, false);
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, vec2(400.0, 200.0));
+        let id = egui::Id::new("press-test");
+        let at = |ctx: &egui::Context, time: f64, pressed: bool| {
+            let mut frame = None;
+            let raw = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(time),
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |_| {
+                frame = Some(press_frame(ctx, id, pressed, false));
+            });
+            frame.expect("one frame")
+        };
+
+        // Frame one arms the state at rest.
+        assert_eq!(at(&ctx, 0.0, true).scale, 1.0);
+        let mid = at(&ctx, f64::from(motion::FAST) / 2.0, true).scale;
+        assert!(
+            mid < 0.995 && mid > motion::PRESS_SCALE,
+            "halfway through FAST the body is between rest and pressed: {mid}"
+        );
+        let down = at(&ctx, f64::from(motion::FAST), true).scale;
+        assert!(
+            (down - motion::PRESS_SCALE).abs() < 0.001,
+            "at the FAST token the body is pressed: {down}"
+        );
+
+        // Release: the spring starts and lands exactly on 1.0.
+        let _ = at(&ctx, f64::from(motion::FAST) + 0.001, false);
+        let rising = at(&ctx, f64::from(motion::FAST) + 0.08, false).scale;
+        assert!(
+            rising > motion::PRESS_SCALE,
+            "the body starts to rise: {rising}"
+        );
+        let settled = at(
+            &ctx,
+            f64::from(motion::FAST + motion::SPRING_DURATION) + 0.01,
+            false,
+        )
+        .scale;
+        assert!(
+            (settled - 1.0).abs() < 1e-4,
+            "the spring settles exactly at rest: {settled}"
+        );
+    }
+
+    /// Reduce Motion keeps the wash but removes the scale (the plan's rule).
+    #[test]
+    fn reduce_motion_drops_the_press_scale() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::install(&ctx, AppTheme::Dark, true);
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, vec2(400.0, 200.0));
+        let id = egui::Id::new("press-reduce");
+        let mut frames = Vec::new();
+        for time in [0.0, 0.03, 0.06] {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(time),
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |_| {
+                frames.push(press_frame(&ctx, id, time > 0.0, true));
+            });
+        }
+        for frame in &frames {
+            assert_eq!(frame.scale, 1.0, "Reduce Motion never scales the body");
+        }
+        assert!(
+            frames.last().unwrap().fill > 0.9,
+            "the wash still swaps under Reduce Motion"
+        );
+    }
 }

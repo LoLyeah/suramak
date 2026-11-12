@@ -11,14 +11,17 @@ tests/ui-compact/run.sh
 
 | shot | screen | what it proves |
 |---|---|---|
-| `shots/launch-library.png` | Library | **the launch surface** (M13g3): app bar, search, rows with play affordance + chevrons, Import/Record bar |
-| `shots/library.png` | Library | the same Library after the model card is gone (a normal launch) |
+| `shots/launch-library.png` | Library | **the launch surface** (M13g3, redrawn in M20C): serif title at the title token, gear, frosted magnifier search, type-scaled rows, floating dock — **no model banner** (a verified model is in use) |
+| `shots/library.png` | Library | the normal launch: the same chrome, three rows, the dock's Import (secondary) + record-red Record |
 | `shots/library-light.png` | Library | the same layout on the light token ladder |
-| `shots/library-empty.png` | Library | the zero-empty-screen hint: share a voice note / Import / Record |
-| `shots/first-run-download.png` | Library | **the first-run release path**: M13D's recommendation, `tiny` absent, free-space line, Download/Get |
+| `shots/library-empty.png` | Library | the empty state: 28 pt waveform, Newsreader 21 pt "No transcripts yet", the two-line prompt |
+| `shots/first-run-download.png` | Library | **the first-run release path**: ONE shrink-wrapped banner — 159 pt, M13D's recommendation, one model pill + Download, free-space caption, `tiny` absent |
 | `shots/download-progress.png` | Library | the job's own percent on the card (the notification's number) + Pause |
 | `shots/download-resume.png` | Library | the `.part` resume offer at the same percent after a relaunch |
-| `shots/onboarding.png` | Library + sheet | the one-time intro: three paths, Start, Skip, on the Deck spring |
+| `shots/onboarding.png` | Library + sheet | the one-time intro: three paths, Start, Skip, on the Sheet plane + full slide |
+| `shots/library-bottom.png` | Library | **M20C dock clearance**: 14 rows scrolled to the end — the last row ends clear above the floating dock (list bottom padding = gap + dock + gesture inset + 16) |
+| `shots/library-model-in-use.png` | Library | **M20C banner absence**: `base` verified on disk → no banner, the list starts at the search field |
+| `shots/library-model-choice.png` | Library | a verified model that is **not** the configured one: Record is disabled and a reason chip sits above the dock |
 | `shots/diagnostics.png` | Settings → Diagnostics | the four check groups + the v2.4 crash banner (Clear / Share log) |
 | `shots/editor.png` | Editor | back, title, meta line, selected segment with **M15.6 word chips**, transport + Export |
 | `shots/settings.png` | Settings | transcription card, M13D model tiers (offered only), appearance chips, device card, Diagnostics, Quit |
@@ -34,7 +37,7 @@ hit-target assertions.
 ## What is asserted (machine)
 
 * every action target is ≥ 48 dp and inside the viewport;
-* the bottom bar clears a 20 pt gesture inset and never overlaps its buttons;
+* the floating dock clears a 20 pt gesture inset, never overlaps its buttons, and the list pads its bottom past the dock + inset (asserted for insets 0/20/54);
 * the three routes are reachable by the push/pop stack and a notification deep
   link lands on Library → Editor;
 * Reduce Motion removes the navigation **travel** and keeps exactly one 120 ms
@@ -46,6 +49,7 @@ hit-target assertions.
   viewport, and the sheet's six formats are the desktop serializers' set;
 * each shot is non-blank and exactly the requested size;
 * the light and dark ladders both render;
+* **M20C:** the app-bar title is the type scale's title token in the serif, the gear is a 44 × 44 pt "Settings" control, and the Record fill clears 4.5:1 with its ink on both ladders;
 * **M19A:** the Settings rows move with the scroll offset (offset 0 is
   pixel-identical to the pre-M19A render), a 10 pt wobble is still a tap, a
   100 pt drag on a row scrolls without toggling it, a cancelled touch never

@@ -24,7 +24,7 @@ use suramak_core::settings::Appearance;
 use suramak_core::store::WordAlignment;
 use suramak_core::transcript::{Segment, Source, Transcript, WordTiming};
 use suramak_ui::deck::compact::{
-    self, a11y, chrome, library, CompactApp, CompactRoute, CompactSettings, CrashBanner,
+    self, a11y, chrome, first_run, library, CompactApp, CompactRoute, CompactSettings, CrashBanner,
     DiagnosticsView, DownloadState, Insets, Sheet,
 };
 use suramak_ui::deck::snapshot;
@@ -403,15 +403,15 @@ fn a_phone_without_a_verified_model_cannot_tap_record() {
     assert!(
         labels
             .iter()
-            .any(|label| label == "Download a model before recording."),
-        "the reason is on screen: {labels:?}"
+            .any(|label| label.contains("Record from the microphone")
+                && label.contains("Download a model before recording")),
+        "the Record control says why it is disabled: {labels:?}"
     );
     assert!(
         labels
             .iter()
-            .any(|label| label.contains("Record from the microphone")
-                && label.contains("Download a model before recording")),
-        "the Record control says why it is disabled: {labels:?}"
+            .any(|label| label == "Get a model for this phone"),
+        "the banner is the visible reason on a model-less phone: {labels:?}"
     );
     assert!(
         !labels
@@ -583,8 +583,16 @@ fn the_launch_surface_is_the_library_and_the_first_run_card_leads() {
         "the card offers the recommendation: {labels:?}"
     );
     assert!(
-        labels.iter().any(|label| label == "Download small"),
-        "small is the next offered model: {labels:?}"
+        !labels.iter().any(|label| label.contains("small")),
+        "the banner is ONE recommendation — the model table lives in Settings: {labels:?}"
+    );
+    assert!(
+        first_run::height(
+            &ctx,
+            &fresh,
+            compact::phone_screen_rect().width() - chrome::GUTTER * 2.0
+        ) < 200.0,
+        "the banner is shrink-wrapped (no dead space)"
     );
     assert_eq!(
         fresh.recommended_model().map(|row| row.id.as_str()),
@@ -737,6 +745,221 @@ fn the_empty_library_offers_the_share_hint() {
 }
 
 #[test]
+fn the_banner_is_absent_when_a_verified_model_is_in_use() {
+    // The launch state with `base` verified: the banner must be gone entirely,
+    // and the list must start where the banner would have been.
+    let mut app = seeded_app();
+    assert!(
+        app.models
+            .iter()
+            .any(|row| row.id == "base" && row.installed),
+        "the fixture has a verified base"
+    );
+    assert!(!app.model_card_needed(), "a verified model means no banner");
+    let shot = render(&mut app, "library-model-in-use");
+    assert!(shot.painted_fraction(egui::Color32::BLACK) > 0.5);
+    let ctx = fresh_context(&app);
+    let (_, _, scale) = compact::phone_viewport();
+    let screen = compact::phone_screen_rect();
+    let _ = snapshot::render(&ctx, screen, scale, |ctx| {
+        let _ = compact::ui(ctx, &mut app);
+    });
+    let labels: Vec<String> = a11y::controls(&ctx)
+        .into_iter()
+        .map(|control| control.label)
+        .collect();
+    assert!(
+        !labels.iter().any(|label| label == first_run::TITLE),
+        "the banner must not exist with a verified model: {labels:?}"
+    );
+    let bands = chrome::bands(screen, app.insets.top, app.insets.bottom, None);
+    let expected_top = bands.content.top() + 12.0 + chrome::MIN_TOUCH + 12.0;
+    let first_row = a11y::controls(&ctx)
+        .into_iter()
+        .find(|control| control.label == "Morning notes")
+        .expect("the first row is a control");
+    assert!(
+        (first_row.rect.top() - expected_top).abs() < 0.5,
+        "the list starts at the search field when no banner is present: {:?} vs {expected_top}",
+        first_row.rect
+    );
+}
+
+#[test]
+fn the_scrolled_library_clears_the_floating_dock() {
+    // Fourteen rows overflow the viewport; the last one must scroll clear of
+    // the floating dock thanks to the list's bottom padding.
+    let mut app = seeded_app();
+    app.set_library(
+        (1..=14)
+            .map(|index| {
+                transcript(
+                    &format!("Note {index:02}"),
+                    "en",
+                    &["A short recording that fills one library row."],
+                    index as i64 * 60_000,
+                )
+            })
+            .collect(),
+    );
+    let mut h = Harness::new(app);
+    h.frame();
+    h.frame();
+    let dock = chrome::dock_rect(h.screen, h.app.insets.bottom);
+
+    // Two full-height swipes take the list to its end; a third lets egui's
+    // scroll animation settle before the shot.
+    for _ in 0..3 {
+        let start = egui::pos2(120.0, 820.0);
+        h.touch(1, egui::TouchPhase::Start, start);
+        for step in 1..=8 {
+            h.touch(
+                1,
+                egui::TouchPhase::Move,
+                start - egui::vec2(0.0, 50.0 * step as f32),
+            );
+        }
+        h.touch(1, egui::TouchPhase::End, start - egui::vec2(0.0, 400.0));
+        for _ in 0..8 {
+            h.frame();
+        }
+    }
+
+    // Park the pointer off the list and let the hover washes settle: the shot
+    // is a rest frame, and a harness that ends mid-scroll leaves egui animating
+    // whichever row the finger passed over.
+    let mut raw = h.raw();
+    raw.events
+        .push(egui::Event::PointerMoved(egui::pos2(12.0, 40.0)));
+    h.run(raw);
+    for _ in 0..8 {
+        h.frame();
+    }
+
+    let first = h.control("Note 01");
+    let last = h.control("Note 14");
+    assert!(
+        first.top()
+            < chrome::bands(h.screen, h.app.insets.top, h.app.insets.bottom, None)
+                .content
+                .top(),
+        "the list really scrolled: first row at {:?}",
+        first
+    );
+    assert!(
+        last.bottom() <= dock.top() - 8.0,
+        "the last row must clear the dock: row bottom {} vs dock top {}",
+        last.bottom(),
+        dock.top()
+    );
+    assert!(
+        last.bottom() > dock.top() - 120.0,
+        "the list scrolled all the way to its padding: row bottom {}",
+        last.bottom()
+    );
+    let shot = h.shot("library-bottom");
+    assert!(shot.painted_fraction(egui::Color32::BLACK) > 0.5);
+}
+
+#[test]
+fn the_library_wears_the_type_scale_and_the_gear_is_settings() {
+    use suramak_ui::deck::type_scale;
+
+    // The app bar's title is the title token's size/tracking/line height in the
+    // house serif — not a per-screen `FontId::new(20.0, ..)`.
+    let title = library::title();
+    let scale_title = type_scale::title();
+    assert_eq!(title.font.family, theme::serif_family());
+    assert_eq!(title.size(), scale_title.size());
+    assert_eq!(title.tracking, scale_title.tracking);
+    assert_eq!(title.line_height, scale_title.line_height);
+    // The search placeholder is the caption role; the rows are row_title/meta.
+    assert_eq!(library::search_hint().size(), type_scale::caption().size());
+    assert_eq!(
+        library::search_hint().font.family,
+        type_scale::caption().font.family
+    );
+    assert_eq!(library::row_title().size(), type_scale::row_title().size());
+    assert_eq!(library::row_meta().size(), type_scale::caption().size());
+
+    // The header action is a 44 × 44 pt control carrying the spoken label
+    // "Settings", inside the app bar band.
+    let mut app = seeded_app();
+    let (_, _, scale) = compact::phone_viewport();
+    let screen = compact::phone_screen_rect();
+    let ctx = fresh_context(&app);
+    let _ = snapshot::render(&ctx, screen, scale, |ctx| {
+        let _ = compact::ui(ctx, &mut app);
+    });
+    let gear = a11y::controls(&ctx)
+        .into_iter()
+        .find(|control| control.label == "Settings")
+        .expect("the gear is announced as Settings");
+    assert!(
+        (gear.rect.width() - 44.0).abs() < 0.5 && (gear.rect.height() - 44.0).abs() < 0.5,
+        "the gear's touch target is 44 × 44: {:?}",
+        gear.rect
+    );
+    let bands = chrome::bands(screen, app.insets.top, app.insets.bottom, None);
+    assert!(
+        bands.app_bar.contains_rect(gear.rect),
+        "the gear sits in the app bar"
+    );
+    assert_eq!(gear.role, egui::WidgetType::Button);
+}
+
+#[test]
+fn a_model_chosen_elsewhere_explains_the_disabled_record() {
+    // `small` is verified but the configured model is `base`: no banner (an
+    // offered model is on disk), yet Record cannot run. The chip above the dock
+    // must say why, and the list must pad past it.
+    let mut app = CompactApp::new(fixture_settings());
+    app.theme = AppTheme::Dark;
+    app.insets = Insets {
+        top: 28.0,
+        bottom: 20.0,
+    };
+    app.seed_device(
+        DeviceProfile::new(6_000_000_000, 2_000_000_000, false, true),
+        &["small".to_string()],
+    );
+    assert!(!app.model_card_needed(), "a verified model is on disk");
+    let reason = app.record_block_reason().expect("base is not verified");
+    assert_eq!(reason, "Choose a model that is on this phone.");
+
+    let (_, _, scale) = compact::phone_viewport();
+    let screen = compact::phone_screen_rect();
+    let ctx = fresh_context(&app);
+    let _ = snapshot::render(&ctx, screen, scale, |ctx| {
+        let _ = compact::ui(ctx, &mut app);
+    });
+    let labels: Vec<String> = a11y::controls(&ctx)
+        .into_iter()
+        .map(|control| control.label)
+        .collect();
+    assert!(
+        labels.iter().any(|label| label == reason),
+        "the reason is on screen above the dock: {labels:?}"
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.contains("Record from the microphone") && label.contains(reason)),
+        "the disabled Record speaks the reason: {labels:?}"
+    );
+    assert!(!labels.iter().any(|label| label == first_run::TITLE));
+    assert!(
+        library::list_bottom_padding(screen, app.insets.bottom, true)
+            > library::list_bottom_padding(screen, app.insets.bottom, false),
+        "the reason chip reserves list clearance"
+    );
+    // The reason state is a shot of its own: a disabled Record with no banner
+    // has to explain itself, and this is where that chip lives.
+    let shot = render(&mut app, "library-model-choice");
+    assert!(shot.painted_fraction(egui::Color32::BLACK) > 0.5);
+}
+
+#[test]
 fn the_diagnostics_card_keeps_the_four_checks_and_the_crash_banner() {
     let mut app = seeded_app();
     app.open_settings(0.0);
@@ -881,9 +1104,11 @@ impl Harness {
     fn run(&mut self, raw: egui::RawInput) -> Vec<compact::CompactAction> {
         let app = &mut self.app;
         let mut actions = Vec::new();
-        let _ = self.ctx.run(raw, |ctx| {
+        let output = self.ctx.run(raw, |ctx| {
             actions = compact::ui(ctx, app);
         });
+        // Keep the frame's texture uploads resident for the offscreen shot.
+        snapshot::note_textures(&self.ctx, &output);
         actions
     }
 
@@ -929,9 +1154,10 @@ impl Harness {
     fn shot(&mut self, name: &str) -> snapshot::Shot {
         let (_, _, scale) = compact::phone_viewport();
         let screen = self.screen;
+        let time = self.time;
         let ctx = self.ctx.clone();
         let app = &mut self.app;
-        let shot = snapshot::render(&ctx, screen, scale, |ctx| {
+        let shot = snapshot::render_at(&ctx, screen, scale, time, |ctx| {
             let _ = compact::ui(ctx, app);
         });
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

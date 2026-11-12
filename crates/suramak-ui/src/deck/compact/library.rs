@@ -1,5 +1,5 @@
-//! The compact Library: search, the job strip, the transcript list, and the
-//! Import/Record bar.
+//! The compact Library: search, the model banner, the transcript list, and the
+//! floating Import/Record dock.
 //!
 //! One screen, one column. The same data the desktop sidebar shows
 //! (`Store::list_transcripts`, newest first as the store returns it), the same
@@ -7,18 +7,30 @@
 //! and 48 dp actions. Tapping a row opens the editor — a push, not a selection
 //! in a side panel.
 //!
+//! **M20C — the redraw.** The app bar carries the serif title at the type
+//! scale's title token and a 44 pt gear (spoken "Settings"); the field is a
+//! frosted Card plane with the magnifier and the caption placeholder; the model
+//! card is ONE shrink-wrapped frosted banner that disappears once a model is
+//! verified; rows wear the type scale, an inset hairline and the M20A press;
+//! the empty state is the waveform + Newsreader line; and the actions float in
+//! a frosted dock over the list, which pads its bottom so the last row can
+//! never hide behind it.
+//!
 //! **M13g2:** inserted rows fade/slide in and a removed row's slot collapses
 //! (`super::motion::ListAnim`); a running job is a static strip between the
 //! search field and the list (it redraws on events, not on a clock); and the
 //! scroll offset is fed to the fling probe after a drag release.
 
 use egui::{
-    pos2, vec2, Align, Align2, Color32, CornerRadius, FontFamily, FontId, Layout, Rect, ScrollArea,
-    Sense, Stroke, StrokeKind, Ui, WidgetType,
+    pos2, vec2, Align, Align2, Color32, CornerRadius, Layout, Rect, ScrollArea, Sense, Stroke,
+    StrokeKind, Ui, WidgetType,
 };
 
+use crate::deck::icons::Icon;
+use crate::deck::material::{self, Plane};
 use crate::deck::motion::{self, Motion};
 use crate::deck::theme::Tokens;
+use crate::deck::type_scale::{self, TypeToken};
 
 use super::a11y;
 use super::chrome::{self, GUTTER, MIN_TOUCH, ROW};
@@ -27,6 +39,12 @@ use super::model::{clock, CompactAction, CompactApp, CompactRoute};
 
 /// The job strip's height (between the search field and the list).
 pub const JOB_STRIP: f32 = 46.0;
+/// The gap under the app bar / search field / banner.
+const SECTION_GAP: f32 = 12.0;
+/// The dock's backdrop fade: how far above the dock the scrim starts.
+const SCRIM_FADE: f32 = 64.0;
+/// The reason chip above the dock (only when the banner is absent).
+const REASON_CHIP: f32 = 26.0;
 
 /// Draws the Library into `screen`. Returns the actions it requested.
 pub fn ui(
@@ -37,21 +55,22 @@ pub fn ui(
     screen: Rect,
 ) -> Vec<CompactAction> {
     let mut actions = Vec::new();
-    let bands = chrome::bands(
-        screen,
-        state.insets.top,
-        state.insets.bottom,
-        Some(chrome::BOTTOM_BAR),
-    );
+    // The Library floats its dock over the list, so the content band runs to
+    // the gesture inset (the dock reserves its own space via list padding).
+    let bands = chrome::bands(screen, state.insets.top, state.insets.bottom, None);
     chrome::background(ui, tokens, screen);
-    let (back, to_settings) = chrome::app_bar(
+    let (back, to_settings) = chrome::app_bar_with(
         ui,
         tokens,
         motion,
         bands.app_bar,
         "Library",
         false,
-        Some(("Settings", true)),
+        chrome::Trailing::Icon {
+            icon: Icon::Gear,
+            label: Icon::Gear.label(),
+            enabled: true,
+        },
     );
     debug_assert!(!back);
     if to_settings {
@@ -60,7 +79,10 @@ pub fn ui(
 
     // --- search ------------------------------------------------------------
     let search_rect = Rect::from_min_size(
-        pos2(bands.content.left() + GUTTER, bands.content.top() + 10.0),
+        pos2(
+            bands.content.left() + GUTTER,
+            bands.content.top() + SECTION_GAP,
+        ),
         vec2(bands.content.width() - GUTTER * 2.0, MIN_TOUCH),
     );
     chrome::search_field(
@@ -71,7 +93,7 @@ pub fn ui(
         "Search transcripts",
     );
     a11y::describe(ui, search_rect, "Search transcripts");
-    let mut list_top = search_rect.bottom() + 6.0;
+    let mut list_top = search_rect.bottom() + SECTION_GAP;
 
     // --- status / error ----------------------------------------------------
     if let Some((text, error)) = state.status.clone() {
@@ -88,19 +110,21 @@ pub fn ui(
             pos2(bands.content.left() + GUTTER, list_top),
             vec2(bands.content.width() - GUTTER * 2.0, 92.0),
         );
-        chrome::card(ui, tokens, rect);
+        let content = material::card(ui, tokens, rect, None);
+        let title = type_scale::row_title();
         ui.painter().text(
-            pos2(rect.left() + 14.0, rect.top() + 20.0),
+            pos2(content.left(), rect.top() + 24.0),
             Align2::LEFT_CENTER,
             "Could not read the library",
-            FontId::proportional(15.0),
+            title.font,
             tokens.ink,
         );
+        let caption = type_scale::caption();
         ui.painter().text(
-            pos2(rect.left() + 14.0, rect.top() + 42.0),
+            pos2(content.left(), rect.top() + 46.0),
             Align2::LEFT_CENTER,
             error,
-            FontId::proportional(12.5),
+            caption.font,
             tokens.ink_soft,
         );
         let retry = Rect::from_min_size(
@@ -116,16 +140,18 @@ pub fn ui(
             "Reload the library",
             true,
         );
-        ui.painter().rect_filled(
+        ui.painter().rect(
             retry,
             CornerRadius::same(tokens.radius.control),
             tokens.control_fill,
+            Stroke::new(1.0_f32, tokens.hairline),
+            StrokeKind::Inside,
         );
         ui.painter().text(
             retry.center(),
             Align2::CENTER_CENTER,
             "Reload",
-            FontId::proportional(13.0),
+            type_scale::row_title().font,
             tokens.ink,
         );
         if response.clicked() {
@@ -134,20 +160,19 @@ pub fn ui(
         list_top = rect.bottom() + 10.0;
     }
 
-    // --- first-run model card ---------------------------------------------
-    // A phone with no installed model must never see an empty library: the
-    // release path lands on M13D's one recommendation for this device and
-    // language, with the free-space line and the job's own percent. The card is
-    // the Library's lead; transcripts (a restored backup) still list below it.
+    // --- first-run model banner -------------------------------------------
+    // A phone with no installed model must never see an empty library. The
+    // banner is the release path's one recommendation; it is absent entirely
+    // once a model is verified on disk.
     if state.model_card_needed() {
-        let available = (bands.content.bottom() - list_top).max(0.0);
-        let height = first_run::height(state).min(available.max(220.0));
+        let width = bands.content.width() - GUTTER * 2.0;
+        let height = first_run::height(ui.ctx(), state, width);
         let rect = Rect::from_min_size(
             pos2(bands.content.left() + GUTTER, list_top),
-            vec2(bands.content.width() - GUTTER * 2.0, height),
+            vec2(width, height),
         );
         actions.extend(first_run::card(ui, tokens, motion, state, rect));
-        list_top = rect.bottom() + 10.0;
+        list_top = rect.bottom() + SECTION_GAP;
     }
 
     // --- job strip ----------------------------------------------------------
@@ -156,17 +181,17 @@ pub fn ui(
             pos2(bands.content.left() + GUTTER, list_top),
             vec2(bands.content.width() - GUTTER * 2.0, JOB_STRIP),
         );
-        chrome::card(ui, tokens, rect);
+        let content = material::card(ui, tokens, rect, None);
         ui.painter().text(
-            pos2(rect.left() + 14.0, rect.top() + 17.0),
+            pos2(content.left(), rect.top() + 18.0),
             Align2::LEFT_CENTER,
             job.line(),
-            FontId::proportional(13.0),
+            type_scale::row_value().font,
             tokens.ink,
         );
         let track = Rect::from_min_size(
-            pos2(rect.left() + 14.0, rect.bottom() - 14.0),
-            vec2(rect.width() - 28.0, 3.0),
+            pos2(content.left(), rect.bottom() - 14.0),
+            vec2(content.width(), 3.0),
         );
         ui.painter()
             .rect_filled(track, CornerRadius::same(2), tokens.control_fill);
@@ -183,18 +208,22 @@ pub fn ui(
     }
 
     // --- list --------------------------------------------------------------
-    // M19B: with no verified model there is nothing to transcribe. The record
-    // button is disabled and the reason rides directly above the bar, so the
-    // list must end above that line.
+    let dock = chrome::dock_rect(screen, state.insets.bottom);
     let record_reason = state.record_block_reason();
-    let note_h = if record_reason.is_some() { 26.0 } else { 0.0 };
+    // The banner already tells a model-less phone why Record is disabled; the
+    // chip is for the other case (a model is installed, the configured one is
+    // not) where the banner is gone and the reason would otherwise be lost.
+    let show_reason = record_reason.is_some() && !state.model_card_needed();
+    let bottom_pad = list_bottom_padding(screen, state.insets.bottom, show_reason);
     let list_rect = Rect::from_min_max(
         pos2(bands.content.left(), list_top),
-        pos2(bands.content.right(), bands.content.bottom() - note_h),
+        pos2(bands.content.right(), bands.content.bottom()),
     );
+
     if state.library_query.trim().is_empty() {
         if state.rows.is_empty() {
-            empty_library(ui, tokens, list_rect);
+            let empty_bottom = dock.top() - if show_reason { REASON_CHIP + 8.0 } else { 0.0 };
+            empty_library(ui, tokens, list_rect, empty_bottom);
         } else {
             let now = ui.input(|input| input.time);
             let keys = state.library_keys();
@@ -236,7 +265,7 @@ pub fn ui(
                             .editor
                             .as_ref()
                             .is_some_and(|editor| editor.transcript.id == row.id);
-                        let response = chrome::row(
+                        let (response, scale) = chrome::row(
                             &mut row_ui,
                             tokens,
                             motion,
@@ -245,7 +274,16 @@ pub fn ui(
                             &row.title,
                             &row.meta(),
                             selected,
+                            index + 1 < state.rows.len(),
                         );
+                        // The press scales the whole painted row about its
+                        // centre; the trailing affordances map with it.
+                        let map = |point: egui::Pos2| {
+                            pos2(
+                                rect.center().x + (point.x - rect.center().x) * scale,
+                                rect.center().y + (point.y - rect.center().y) * scale,
+                            )
+                        };
                         // The play affordance: a 48 dp target at the row's
                         // trailing edge opens the transcript with the transport
                         // running (the compact editor's karaoke surface).
@@ -262,27 +300,30 @@ pub fn ui(
                             &format!("Play {}", row.title),
                             true,
                         );
-                        let triangle = pos2(play.center().x + 1.0, play.center().y);
+                        let triangle = map(pos2(play.center().x + 1.0, play.center().y));
+                        let half_w = 6.5 * scale;
+                        let half_h = 8.0 * scale;
                         row_ui.painter().add(egui::Shape::convex_polygon(
                             vec![
-                                pos2(triangle.x - 5.0, triangle.y - 8.0),
-                                pos2(triangle.x - 5.0, triangle.y + 8.0),
-                                pos2(triangle.x + 8.0, triangle.y),
+                                pos2(triangle.x - half_w, triangle.y - half_h),
+                                pos2(triangle.x - half_w, triangle.y + half_h),
+                                pos2(triangle.x + half_w * 1.2, triangle.y),
                             ],
                             tokens.ink_soft,
                             Stroke::NONE,
                         ));
-                        // The list ends without a dangling rule under its last
-                        // row (chrome::row paints one for row separation).
-                        if index + 1 == state.rows.len() {
-                            row_ui.painter().rect_filled(
-                                Rect::from_min_size(
-                                    pos2(rect.left() + GUTTER, rect.bottom() - 1.0),
-                                    vec2(rect.width() - GUTTER, 1.0),
-                                ),
-                                CornerRadius::ZERO,
-                                tokens.window,
-                            );
+                        // The tap affordance: a right chevron, in the row's
+                        // quiet ink (the row itself is the 64 dp target).
+                        {
+                            let c = map(pos2(rect.right() - GUTTER - 8.0, rect.center().y));
+                            row_ui.painter().add(egui::Shape::line(
+                                vec![
+                                    pos2(c.x - 2.5 * scale, c.y - 5.0 * scale),
+                                    pos2(c.x + 2.5 * scale, c.y),
+                                    pos2(c.x - 2.5 * scale, c.y + 5.0 * scale),
+                                ],
+                                Stroke::new(1.6_f32 * scale, tokens.ink_faint),
+                            ));
                         }
                         if play_response.clicked() {
                             actions.push(CompactAction::PlayTranscript(row.id));
@@ -292,21 +333,10 @@ pub fn ui(
                                 segment: None,
                             });
                         }
-                        // The tap affordance: a right chevron, in the row's
-                        // quiet ink (the row itself is the 64 dp target).
-                        {
-                            let c = pos2(rect.right() - GUTTER - 8.0, rect.center().y);
-                            row_ui.painter().add(egui::Shape::line(
-                                vec![
-                                    pos2(c.x - 2.5, c.y - 5.0),
-                                    pos2(c.x + 2.5, c.y),
-                                    pos2(c.x - 2.5, c.y + 5.0),
-                                ],
-                                Stroke::new(1.6_f32, tokens.ink_faint),
-                            ));
-                        }
                     }
-                    ui.add_space(8.0);
+                    // The dock floats over the list: the last row must be able
+                    // to scroll clear of it (and of the gesture inset).
+                    ui.add_space(bottom_pad);
                 });
             // The fling probe's input side: a release starts the measurement,
             // the following frames accumulate the offset egui's momentum moved.
@@ -359,10 +389,10 @@ pub fn ui(
                         ui.painter()
                             .rect_filled(rect, CornerRadius::same(tokens.radius.row), fill);
                         ui.painter().text(
-                            pos2(rect.left() + GUTTER, rect.top() + 16.0),
+                            pos2(rect.left() + GUTTER, rect.top() + 18.0),
                             Align2::LEFT_CENTER,
                             &hit.title,
-                            FontId::proportional(16.0),
+                            type_scale::row_title().font,
                             tokens.ink,
                         );
                         let time = if hit.segment_idx.is_some() {
@@ -372,130 +402,134 @@ pub fn ui(
                         };
                         if !time.is_empty() {
                             ui.painter().text(
-                                pos2(rect.right() - GUTTER, rect.top() + 16.0),
+                                pos2(rect.right() - GUTTER, rect.top() + 18.0),
                                 Align2::RIGHT_CENTER,
                                 time,
-                                FontId::new(12.0, FontFamily::Monospace),
+                                type_scale::numerals().font,
                                 tokens.ink_soft,
                             );
                         }
-                        ui.painter().text(
-                            pos2(rect.left() + GUTTER, rect.top() + 40.0),
-                            Align2::LEFT_CENTER,
-                            &hit.snippet,
-                            FontId::proportional(13.0),
+                        let snippet = type_scale::caption();
+                        let mut job = egui::text::LayoutJob::default();
+                        job.append(&hit.snippet, 0.0, snippet.format(tokens.ink_soft));
+                        job.wrap.max_width = (rect.width() - GUTTER * 2.0).max(40.0);
+                        job.wrap.max_rows = 1;
+                        job.wrap.break_anywhere = false;
+                        job.wrap.overflow_character = Some('…');
+                        ui.painter().galley(
+                            pos2(rect.left() + GUTTER, rect.top() + 42.0),
+                            ui.painter().layout_job(job),
                             tokens.ink_soft,
                         );
                         ui.painter().line_segment(
                             [
                                 pos2(rect.left() + GUTTER, rect.bottom() - 0.5),
-                                pos2(rect.right(), rect.bottom() - 0.5),
+                                pos2(rect.right() - GUTTER, rect.bottom() - 0.5),
                             ],
                             Stroke::new(1.0_f32, tokens.hairline),
                         );
                     }
+                    ui.add_space(bottom_pad);
                 });
         }
     }
 
-    // --- bottom bar --------------------------------------------------------
-    let bar = bands.bottom_bar;
-    if let Some(reason) = record_reason {
-        let note = Rect::from_min_size(
-            pos2(bar.left() + GUTTER, bar.top() - 24.0),
-            vec2(bar.width() - GUTTER * 2.0, 20.0),
-        );
-        ui.painter().text(
-            pos2(note.left(), note.center().y),
-            Align2::LEFT_CENTER,
-            reason,
-            FontId::proportional(12.0),
-            tokens.warn,
-        );
-        a11y::describe(ui, note, reason);
-    }
-    ui.painter()
-        .rect_filled(bar, CornerRadius::ZERO, tokens.panel);
-    ui.painter().line_segment(
-        [bar.left_top(), pos2(bar.right(), bar.top())],
-        Stroke::new(1.0_f32, tokens.hairline),
+    // --- the floating dock --------------------------------------------------
+    // The scrim fades the list into the dock (no hard rule), then the Dock
+    // plane floats with the one float shadow. Painted last: it is above the
+    // list in both paint and hit-test order.
+    material::dock_scrim(
+        ui,
+        Rect::from_min_max(pos2(screen.left(), dock.top() - SCRIM_FADE), screen.max),
+        tokens,
     );
-    let button_h = 48.0;
-    let width = (bar.width() - GUTTER * 2.0 - 10.0) / 2.0;
-    let y = bar.center().y - button_h / 2.0;
-    let import = Rect::from_min_size(pos2(bar.left() + GUTTER, y), vec2(width, button_h));
-    let record = Rect::from_min_size(pos2(import.right() + 10.0, y), vec2(width, button_h));
-    if chrome::action_button(
+    if show_reason {
+        if let Some(reason) = record_reason {
+            paint_reason_chip(ui, tokens, dock, reason);
+        }
+    }
+    material::frosted_panel(ui, tokens, dock, tokens.radius.card, Plane::Dock);
+    let [import, record] = chrome::dock_action_rects(dock);
+    if chrome::dock_button(
         ui,
         tokens,
         motion,
         import,
         "library-import",
         "Import",
+        "Import audio",
+        Some(Icon::ImportWave),
         false,
+        true,
     )
     .clicked()
     {
         actions.push(CompactAction::Import);
     }
-    a11y::record_button(ui, import, "Import audio", true);
     let record_label = if state.recording { "Stop" } else { "Record" };
-    if record_reason.is_none() {
-        if chrome::action_button(
-            ui,
-            tokens,
-            motion,
-            record,
-            "library-record",
-            record_label,
-            true,
-        )
-        .clicked()
-        {
-            actions.push(if state.recording {
-                CompactAction::StopRecording
-            } else {
-                CompactAction::Record
-            });
-        }
-        a11y::record_button(
-            ui,
-            record,
-            if state.recording {
-                "Stop recording"
-            } else {
-                "Record from the microphone"
-            },
-            true,
-        );
-    } else {
-        // Disabled paint: the same rect and label, in the quiet ink — and a
-        // semantic node that says it cannot be pressed.
-        let reason = record_reason.unwrap_or_default();
-        ui.painter().rect(
-            record,
-            CornerRadius::same(tokens.radius.control),
-            tokens.control_fill.gamma_multiply(0.5),
-            Stroke::new(1.0_f32, tokens.hairline),
-            StrokeKind::Inside,
-        );
-        ui.painter().text(
-            record.center(),
-            Align2::CENTER_CENTER,
-            record_label,
-            FontId::proportional(15.0),
-            tokens.ink_faint,
-        );
-        a11y::record_button(
-            ui,
-            record,
-            &format!("Record from the microphone — {reason}"),
-            false,
-        );
+    let record_spoken = match (record_reason, state.recording) {
+        (Some(reason), _) => format!("Record from the microphone — {reason}"),
+        (None, true) => "Stop recording".to_string(),
+        (None, false) => "Record from the microphone".to_string(),
+    };
+    if chrome::dock_button(
+        ui,
+        tokens,
+        motion,
+        record,
+        "library-record",
+        record_label,
+        &record_spoken,
+        Some(Icon::Mic),
+        true,
+        record_reason.is_none(),
+    )
+    .clicked()
+        && record_reason.is_none()
+    {
+        actions.push(if state.recording {
+            CompactAction::StopRecording
+        } else {
+            CompactAction::Record
+        });
     }
 
     let _ = state.nav.current() == CompactRoute::Library;
     actions
+}
+
+/// The list's bottom padding: enough to scroll the last row clear of the
+/// floating dock, the dock's gap, the gesture inset and a breathing space. The
+/// dock floats OVER the list, so this is the only thing keeping the last
+/// transcript reachable.
+pub fn list_bottom_padding(screen: Rect, bottom_inset: f32, with_reason: bool) -> f32 {
+    let dock = chrome::dock_rect(screen, bottom_inset);
+    let viewport_bottom = screen.bottom() - bottom_inset;
+    (viewport_bottom - dock.top()).max(0.0) + bottom_inset + if with_reason { 24.0 } else { 16.0 }
+}
+
+/// The disabled-Record reason, in a small chip above the dock: frosted enough
+/// to stay legible while rows pass beneath it, too small to read as a card.
+fn paint_reason_chip(ui: &mut Ui, tokens: &Tokens, dock: Rect, reason: &str) {
+    let caption = type_scale::caption();
+    let mut job = egui::text::LayoutJob::default();
+    job.append(reason, 0.0, caption.format(tokens.warn));
+    job.wrap.max_width = (dock.width() - 20.0).max(40.0);
+    job.wrap.max_rows = 1;
+    job.wrap.overflow_character = Some('…');
+    let galley = ui.painter().layout_job(job);
+    let width = (galley.size().x + 20.0).min(dock.width());
+    let chip = Rect::from_min_size(
+        pos2(dock.left(), dock.top() - 8.0 - REASON_CHIP),
+        vec2(width, REASON_CHIP),
+    );
+    material::frosted_panel(ui, tokens, chip, tokens.radius.control, Plane::Card);
+    ui.painter().galley(
+        pos2(chip.left() + 10.0, chip.center().y - galley.size().y / 2.0),
+        galley,
+        tokens.warn,
+    );
+    a11y::describe(ui, chip, reason);
 }
 
 /// Feeds the list's scroll offset to the fling probe. Called by the screen after
@@ -524,7 +558,7 @@ fn paint_note(ui: &mut Ui, tokens: &Tokens, rect: Rect, text: &str, error: bool)
         pos2(rect.left() + 12.0, rect.center().y),
         Align2::LEFT_CENTER,
         text,
-        FontId::proportional(13.0),
+        type_scale::row_value().font,
         if error {
             tokens.record_red_text
         } else {
@@ -533,43 +567,84 @@ fn paint_note(ui: &mut Ui, tokens: &Tokens, rect: Rect, text: &str, error: bool)
     );
 }
 
-fn empty_library(ui: &mut Ui, tokens: &Tokens, rect: Rect) {
-    let center = pos2(rect.center().x, rect.top() + rect.height() * 0.30);
-    ui.painter().text(
-        center,
-        Align2::CENTER_CENTER,
-        "No transcripts yet",
-        FontId::new(
-            19.0,
-            FontFamily::Name(crate::deck::theme::SERIF_FAMILY.into()),
-        ),
+/// The 28 pt waveform mark: seven round-capped bars, tall in the middle, in
+/// `ink_faint`. Drawn from the same 1.75 px pen language as the icon kit.
+fn waveform(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
+    const BARS: [f32; 7] = [0.34, 0.62, 1.0, 0.52, 0.84, 0.44, 0.66];
+    let step = 28.0 / BARS.len() as f32;
+    for (index, amount) in BARS.iter().enumerate() {
+        let x = center.x - 14.0 + step * (index as f32 + 0.5);
+        let height = 28.0 * amount;
+        painter.rect_filled(
+            Rect::from_center_size(pos2(x, center.y), vec2(2.0, height)),
+            CornerRadius::same(1),
+            color,
+        );
+    }
+}
+
+fn empty_library(ui: &mut Ui, tokens: &Tokens, rect: Rect, dock_top: f32) {
+    let display = type_scale::editorial_display();
+    let caption = type_scale::caption();
+    let width = (rect.width() - 48.0).max(120.0);
+    let title = ui.painter().layout(
+        "No transcripts yet".to_owned(),
+        display.font.clone(),
         tokens.ink,
+        width,
     );
-    // The zero-empty-screen hint (M13E's two working entries): share a voice
-    // note into the app, or pick a file. Record is on the bar below; the line
-    // is the only place a first-time user learns the share target exists.
-    let hint = Rect::from_min_size(
-        pos2(rect.left() + GUTTER, center.y + 20.0),
-        vec2(rect.width() - GUTTER * 2.0, 44.0),
-    );
-    ui.painter().text(
-        pos2(hint.center().x, hint.top() + 8.0),
-        Align2::CENTER_CENTER,
+    // The owner-approved copy, kept verbatim: two working entries, one line
+    // each. (The share target is the only place a first-time user learns it
+    // exists; Record is in the dock below.)
+    let lines = [
         "Share a voice note into Suramak, or tap Import to choose a file.",
-        FontId::proportional(13.0),
-        tokens.ink_soft,
-    );
-    ui.painter().text(
-        pos2(hint.center().x, hint.top() + 28.0),
-        Align2::CENTER_CENTER,
         "Record works here too — it keeps going with the screen off.",
-        FontId::proportional(12.0),
+    ];
+    let galleys: Vec<_> = lines
+        .iter()
+        .map(|line| {
+            ui.painter().layout(
+                (*line).to_owned(),
+                caption.font.clone(),
+                tokens.ink_soft,
+                width,
+            )
+        })
+        .collect();
+    let prompt_h: f32 = galleys.iter().map(|galley| galley.size().y + 2.0).sum();
+    let block = 28.0 + 12.0 + title.size().y + 10.0 + prompt_h;
+    let band_bottom = (dock_top - 8.0).max(rect.top() + 80.0);
+    let top = rect.top()
+        + ((band_bottom - rect.top() - block) / 2.0)
+            .max(0.0)
+            .min((band_bottom - block - rect.top()).max(0.0));
+
+    waveform(
+        ui.painter(),
+        pos2(rect.center().x, top + 14.0),
         tokens.ink_faint,
     );
+    ui.painter().galley(
+        pos2(rect.center().x - title.size().x / 2.0, top + 40.0),
+        title,
+        tokens.ink,
+    );
+    let mut y = top + 40.0 + display.line_height + 10.0;
+    for galley in &galleys {
+        ui.painter().galley(
+            pos2(rect.center().x - galley.size().x / 2.0, y),
+            galley.clone(),
+            tokens.ink_soft,
+        );
+        y += galley.size().y + 2.0;
+    }
     a11y::describe(
         ui,
-        hint,
-        "Share a voice note into Suramak, or tap Import to choose a file. Record works here too.",
+        Rect::from_min_size(
+            pos2(rect.left() + 12.0, top),
+            vec2(rect.width() - 24.0, block),
+        ),
+        &format!("No transcripts yet. {}", lines.join(" ")),
     );
 }
 
@@ -579,15 +654,14 @@ fn empty_search(ui: &mut Ui, tokens: &Tokens, rect: Rect, query: &str) {
         center,
         Align2::CENTER_CENTER,
         format!("No matches for “{query}”"),
-        FontId::proportional(15.0),
+        type_scale::body().font,
         tokens.ink_soft,
     );
 }
 
 /// The list's scroll band, exposed for the layout assertions.
 pub fn list_bounds(screen: Rect) -> Rect {
-    let bands = chrome::bands(screen, 0.0, 0.0, Some(chrome::BOTTOM_BAR));
-    bands.content
+    chrome::bands(screen, 0.0, 0.0, None).content
 }
 
 /// Paints a single library row into a standalone frame (the screenshot suite's
@@ -605,36 +679,114 @@ pub fn fling_probe_size() -> egui::Vec2 {
     vec2(360.0, 640.0)
 }
 
-/// The bottom bar's two button rects, for hit-target tests.
+/// The dock's two button rects, for hit-target tests.
 pub fn action_rects(screen: Rect) -> [Rect; 2] {
-    let bands = chrome::bands(screen, 0.0, 0.0, Some(chrome::BOTTOM_BAR));
-    let bar = bands.bottom_bar;
-    let width = (bar.width() - GUTTER * 2.0 - 10.0) / 2.0;
-    let y = bar.center().y - 24.0;
-    [
-        Rect::from_min_size(pos2(bar.left() + GUTTER, y), vec2(width, 48.0)),
-        Rect::from_min_size(
-            pos2(bar.left() + GUTTER + width + 10.0, y),
-            vec2(width, 48.0),
-        ),
-    ]
+    chrome::dock_action_rects(chrome::dock_rect(screen, 12.0))
 }
 
 /// The search field's rect, for layout assertions.
 pub fn search_rect(screen: Rect) -> Rect {
-    let bands = chrome::bands(screen, 0.0, 0.0, Some(chrome::BOTTOM_BAR));
+    let bands = chrome::bands(screen, 0.0, 0.0, None);
     Rect::from_min_size(
-        pos2(bands.content.left() + GUTTER, bands.content.top() + 10.0),
+        pos2(
+            bands.content.left() + GUTTER,
+            bands.content.top() + SECTION_GAP,
+        ),
         vec2(bands.content.width() - GUTTER * 2.0, MIN_TOUCH),
     )
 }
 
-/// A frame-level check that the bottom actions never overlap and both clear
-/// the system gesture inset.
+/// A frame-level check that the dock's actions never overlap, both clear the
+/// system gesture inset, and neither escapes the viewport.
 pub fn bar_is_safe(screen: Rect) -> bool {
-    let [a, b] = action_rects(screen);
-    let bands = chrome::bands(screen, 0.0, 12.0, Some(chrome::BOTTOM_BAR));
+    let dock = chrome::dock_rect(screen, 12.0);
+    let [a, b] = chrome::dock_action_rects(dock);
     !a.intersects(b)
         && a.height() >= MIN_TOUCH
-        && bands.bottom_bar.bottom() <= screen.bottom() - 12.0
+        && b.height() >= MIN_TOUCH
+        && dock.bottom() <= screen.bottom() - 12.0
+        && screen.contains_rect(dock)
+}
+
+/// The Library's type roles, exposed so the suite can assert the scale is
+/// actually applied (the tokens are the plan's, not per-screen numbers).
+pub fn search_hint() -> TypeToken {
+    chrome::search_hint_token()
+}
+
+/// The row's title token (the painted rows use this, possibly press-scaled).
+pub fn row_title() -> TypeToken {
+    type_scale::row_title()
+}
+
+/// The row's meta token.
+pub fn row_meta() -> TypeToken {
+    type_scale::caption()
+}
+
+/// The app bar's serif title token.
+pub fn title() -> TypeToken {
+    chrome::title_token()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::deck::theme::{self, AppTheme};
+
+    fn tokens(theme: AppTheme) -> Tokens {
+        crate::deck::compact::tokens_for(theme)
+    }
+
+    /// The dock's clearance math, on both ladders' geometry: the padding the
+    /// list adds must cover the dock, its gap and the gesture inset, so the
+    /// last row is never hidden behind the floating plane.
+    #[test]
+    fn the_list_clears_the_dock_and_the_gesture_inset() {
+        let screen = crate::deck::compact::phone_screen_rect();
+        for inset in [0.0, 20.0, 54.0] {
+            let dock = chrome::dock_rect(screen, inset);
+            let padding = list_bottom_padding(screen, inset, false);
+            assert!(
+                padding >= dock.height() + inset,
+                "inset {inset}: padding {padding} < dock {} + inset",
+                dock.height()
+            );
+            assert!(padding >= chrome::DOCK_HEIGHT + chrome::DOCK_GAP);
+            // The dock itself sits 12 pt above the gesture area and is
+            // inside the screen.
+            assert!((screen.bottom() - inset - dock.bottom() - chrome::DOCK_GAP).abs() < 0.01);
+            assert!(screen.contains_rect(dock));
+        }
+    }
+
+    /// The dock's two pills are 48 pt targets that never overlap.
+    #[test]
+    fn the_dock_pills_are_touch_targets() {
+        let screen = crate::deck::compact::phone_screen_rect();
+        let [import, record] = action_rects(screen);
+        assert!(import.height() >= MIN_TOUCH && record.height() >= MIN_TOUCH);
+        assert!(!import.intersects(record));
+        assert!(record.width() > import.width(), "Record is the primary");
+        assert!((import.width() / (import.width() + record.width()) - 0.38).abs() < 0.02);
+    }
+
+    /// The Record fill clears the small-text contrast floor with the ladder's
+    /// own ink on both ladders (the light ladder's plain red is 4.46:1).
+    #[test]
+    fn the_record_fill_is_legible_on_both_ladders() {
+        for theme in [AppTheme::Dark, AppTheme::Light] {
+            let tokens = tokens(theme);
+            let fill = chrome::record_fill(&tokens);
+            let ratio = theme::contrast_ratio(tokens.on_accent, fill);
+            assert!(
+                ratio >= 4.5,
+                "{theme:?}: on_accent on the Record fill = {ratio:.2}:1"
+            );
+            assert!(
+                fill == tokens.record_red || fill == tokens.record_red_text,
+                "{theme:?}: the fill must be one of the two record reds"
+            );
+        }
+    }
 }

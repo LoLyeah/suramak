@@ -45,10 +45,20 @@ impl Shot {
     }
 }
 
+#[derive(Clone)]
 struct Texture {
     width: usize,
     height: usize,
     pixels: Vec<Color32>,
+}
+
+/// The rasteriser's texture residency, kept in the `Context` so a texture
+/// uploaded in an earlier frame (the material grain is created once) is still
+/// there when a later frame binds it. A real renderer keeps uploaded textures
+/// resident; without this the offscreen pass fell back to a 1×1 white texture
+/// and painted a solid white panel wherever the grain mesh was drawn.
+fn texture_slot() -> egui::Id {
+    egui::Id::new("suramak-snapshot-textures")
 }
 
 impl Texture {
@@ -87,11 +97,27 @@ impl Texture {
 }
 
 /// Renders one frame of `draw` at `screen` (points) and `scale`.
-pub fn render(ctx: &Context, screen: Rect, scale: f32, mut draw: impl FnMut(&Context)) -> Shot {
+pub fn render(ctx: &Context, screen: Rect, scale: f32, draw: impl FnMut(&Context)) -> Shot {
+    render_at(ctx, screen, scale, 0.0, draw)
+}
+
+/// [`render`] at an explicit input time.
+///
+/// The phone suite's interactive harness has already run frames on this
+/// `Context`; replaying at time 0 would walk egui's animation and input
+/// history backwards (and freeze whatever hover wash was mid-flight). A shot
+/// taken there must carry the harness's current time.
+pub fn render_at(
+    ctx: &Context,
+    screen: Rect,
+    scale: f32,
+    time: f64,
+    mut draw: impl FnMut(&Context),
+) -> Shot {
     let mut raw = RawInput {
         viewport_id: ViewportId::ROOT,
         screen_rect: Some(screen),
-        time: Some(0.0),
+        time: Some(time),
         ..Default::default()
     };
     raw.viewports.insert(
@@ -104,7 +130,9 @@ pub fn render(ctx: &Context, screen: Rect, scale: f32, mut draw: impl FnMut(&Con
     let output = ctx.run(raw, |ctx| draw(ctx));
     let width = (screen.width() * scale).round() as usize;
     let height = (screen.height() * scale).round() as usize;
-    let mut textures: HashMap<TextureId, Texture> = HashMap::new();
+    let mut textures: HashMap<TextureId, Texture> = ctx
+        .data_mut(|data| data.remove_temp::<HashMap<TextureId, Texture>>(texture_slot()))
+        .unwrap_or_default();
     for (id, delta) in &output.textures_delta.set {
         apply_delta(&mut textures, *id, delta);
     }
@@ -143,11 +171,34 @@ pub fn render(ctx: &Context, screen: Rect, scale: f32, mut draw: impl FnMut(&Con
             );
         }
     }
+    store_textures(ctx, textures);
     Shot {
         width,
         height,
         pixels,
     }
+}
+
+/// Returns the resident textures after a render (called by `render`).
+fn store_textures(ctx: &Context, textures: HashMap<TextureId, Texture>) {
+    ctx.data_mut(|data| data.insert_temp(texture_slot(), textures));
+}
+
+/// Records the textures an arbitrary frame uploaded.
+///
+/// The phone suite's interactive harness runs its own `ctx.run` calls (touch,
+/// scroll, multi-frame settling) and the material grain is uploaded on the
+/// first of them. Without noting those deltas the later offscreen pass would
+/// bind a texture this rasteriser never saw and fall back to white. A real
+/// renderer keeps uploads resident across frames; this makes the seam match.
+pub fn note_textures(ctx: &Context, output: &egui::FullOutput) {
+    let mut textures = ctx
+        .data_mut(|data| data.remove_temp::<HashMap<TextureId, Texture>>(texture_slot()))
+        .unwrap_or_default();
+    for (id, delta) in &output.textures_delta.set {
+        apply_delta(&mut textures, *id, delta);
+    }
+    store_textures(ctx, textures);
 }
 
 fn apply_delta(textures: &mut HashMap<TextureId, Texture>, id: TextureId, delta: &ImageDelta) {

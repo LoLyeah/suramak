@@ -122,13 +122,20 @@ pub fn ui(ctx: &egui::Context, state: &mut CompactApp) -> Vec<CompactAction> {
     }
 
     // The sheet layer rides above both screens and absorbs back first
-    // (`CompactApp::back`). Its present/dismiss animation is the fade + rise
-    // pair; under Reduce Motion the rise is zero and only the fade runs.
+    // (`CompactApp::back`). Its present/dismiss animation is the slide + scrim
+    // pair; under Reduce Motion the travel is zero and only the fade runs.
     if let Some(sheet) = state.sheet {
         let fade = state.sheet_anim.value().max(0.001);
-        let rise = state.sheet_anim.rise(state.reduce_motion);
+        // The plan's sheet motion is translateY(100% → 0): the body's slide is
+        // the sheet's own present progress, and Reduce Motion removes the
+        // travel (the fade is the whole transition then).
+        let slide = if state.reduce_motion {
+            1.0
+        } else {
+            state.sheet_anim.value()
+        };
         let mut sheet_ui = layer_ui(&mut ui, screen, fade, 2, state.sheet_anim.is_present());
-        let sheet_rect = chrome::sheet(&mut sheet_ui, &tokens, screen, rise);
+        let sheet_rect = chrome::sheet(&mut sheet_ui, &tokens, screen, slide);
         match sheet {
             Sheet::Export => {
                 actions.extend(editor::export_sheet(
