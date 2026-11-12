@@ -238,7 +238,6 @@ impl CompactShell {
         let mut actions = Vec::new();
         let mut layout_probe = None;
         let mut model_probe = None;
-        let mut voice_note_cancelled = false;
         let drew = host.with_app(|app| {
             app.insets.top = (state.insets.top as f32 / ppp).max(0.0);
             app.insets.bottom = (state.insets.bottom as f32 / ppp).max(0.0);
@@ -267,8 +266,15 @@ impl CompactShell {
             }
             actions = compact::ui(ctx, app);
             // M22B: BACK on the voice-note offer drops the pending share. The
-            // gesture has no action vector, so the flag is the message.
-            voice_note_cancelled = app.take_voice_note_cancel();
+            // gesture has no action vector; the *host reply* carries the
+            // dismissal to the Activity (`voice_note: dismissed`), and the
+            // model's flag is consumed there. It is deliberately NOT turned
+            // into a self-targeted ACTION_VOICE_NOTE_CANCEL intent any more:
+            // MainActivity is singleTask, so that launch restarted the Activity
+            // — pause → focus false → destroy → the process ended mid-share
+            // (CI run 43216992141's logcat shows the START at 12:26:42.552 and
+            // the destroy at 12:26:45.3).
+            let _ = app.take_voice_note_cancel();
             // One line per offer: the emulator smoke's proof that the sheet
             // really painted (egui text is invisible to uiautomator).
             if app.sheet == Some(suramak_ui::deck::compact::Sheet::VoiceNote) {
@@ -320,9 +326,6 @@ impl CompactShell {
         if drew.is_none() {
             draw_starting(ctx);
             return Vec::new();
-        }
-        if voice_note_cancelled {
-            send_intent(ACTION_VOICE_NOTE_CANCEL, &[]);
         }
         self.log_layout_probe(ctx, layout_probe);
         self.log_model_probe(model_probe);
