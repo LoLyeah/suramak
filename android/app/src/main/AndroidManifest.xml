@@ -39,6 +39,11 @@
          The dataSync foreground-service type needs its own permission from
          API 34 — declared here, harmless below. -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- The model download is a JobScheduler job with a connectivity
+         constraint; the platform refuses to schedule one without this normal
+         permission (SecurityException, seen live in the monkey pass). It is
+         not a runtime permission and prompts for nothing. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />

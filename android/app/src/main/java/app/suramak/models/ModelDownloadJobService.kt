@@ -304,7 +304,16 @@ class ModelDownloadJobService : JobService() {
                 .setExtras(extras)
                 .build()
             val scheduler = context.getSystemService(JobScheduler::class.java)
-            return scheduler.schedule(job) == JobScheduler.RESULT_SUCCESS
+            // A refused schedule is a named failure, never a crash: the manifest
+            // once lacked ACCESS_NETWORK_STATE, and the platform answers such a
+            // job with a SecurityException from inside schedule() (the monkey
+            // pass killed the app on it). The caller already reports false.
+            return try {
+                scheduler.schedule(job) == JobScheduler.RESULT_SUCCESS
+            } catch (t: SecurityException) {
+                Log.e(TAG, "the download job was refused by the platform", t)
+                false
+            }
         }
 
         /** Clears the progress notification (used by the cancel broadcast). */
