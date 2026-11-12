@@ -3,6 +3,8 @@
 //! | module | what it is | desktop | phone |
 //! |---|---|---|---|
 //! | [`theme`] | the token ladder (colour, material, spacing, type) | yes | yes |
+//! | [`material`] | the frosted primitives + the SystemGlass/PaintedFrost capability | yes | yes |
+//! | [`icons`] | the painted 1.75 px icon kit (18/20 pt) | yes | yes |
 //! | [`motion`] | duration tokens, easing, springs, Reduce Motion | yes | yes |
 //! | [`controls`] | painted control kit (buttons, rows, toggles, sheets) | new compact screens | yes |
 //! | [`nav`] | push/pop stack, back semantics, transition clock | compact routes | yes |
@@ -17,6 +19,10 @@ pub mod compact;
 pub mod controls;
 // M20A: the bundled OFL faces (embedded statics) + their platform table.
 pub mod fonts;
+// M20B: the painted icon kit (1.75 px round-cap strokes at 18/20 pt).
+pub mod icons;
+// M20B: the material capability + the frosted primitives (veil, rim, grain).
+pub mod material;
 pub mod motion;
 pub mod nav;
 pub mod snapshot;

@@ -1291,3 +1291,492 @@ anggota tim produk dan tim desain pada hari Kamis.";
         "the phone must render the bundled face (stock {stock_width}, bundled {bundled_width})"
     );
 }
+
+// ---- M20B: the material kit goldens ---------------------------------------
+
+/// The kit's specimen geometry, in points, at the phone viewport. One function
+/// so the drawing and the pixel assertions cannot drift apart.
+struct KitRects {
+    card: egui::Rect,
+    sheet: egui::Rect,
+    grouped: egui::Rect,
+    dock: egui::Rect,
+    icon_row: egui::Rect,
+}
+
+fn material_kit_rects(screen: egui::Rect) -> KitRects {
+    let card = egui::Rect::from_min_size(egui::pos2(24.0, 118.0), egui::vec2(200.0, 220.0));
+    let sheet = egui::Rect::from_min_size(egui::pos2(243.0, 118.0), egui::vec2(200.0, 220.0));
+    let grouped = egui::Rect::from_min_size(
+        egui::pos2(24.0, 382.0),
+        egui::vec2(screen.width() - 48.0, 138.0),
+    );
+    let dock = egui::Rect::from_min_size(
+        egui::pos2(16.0, screen.bottom() - 56.0 - 64.0),
+        egui::vec2(screen.width() - 32.0, 64.0),
+    );
+    let icon_row = egui::Rect::from_min_size(
+        egui::pos2(24.0, 596.0),
+        egui::vec2(screen.width() - 48.0, 44.0),
+    );
+    KitRects {
+        card,
+        sheet,
+        grouped,
+        dock,
+        icon_row,
+    }
+}
+
+/// Draws the kit: Card, Sheet and Dock specimens plus the eleven-icon strip, in
+/// the ladder for `theme`, always on the **PaintedFrost** backend (the goldens
+/// are the phone's material even when the host running them is macOS).
+fn material_kit_scene(ctx: &egui::Context, theme: AppTheme) {
+    use suramak_ui::deck::icons::{self, Icon};
+    use suramak_ui::deck::material::{self, MaterialBackend, Plane};
+    use suramak_ui::deck::type_scale;
+
+    let tokens = theme::tokens_for(theme, MaterialBackend::PaintedFrost);
+    let screen = compact::phone_screen_rect();
+    let kit = material_kit_rects(screen);
+    egui::CentralPanel::default()
+        .frame(egui::Frame::NONE.fill(tokens.window))
+        .show(ctx, |ui| {
+            let painter = ui.painter();
+            let display = type_scale::editorial_display().font;
+            let caption = type_scale::caption().font;
+            let row_title = type_scale::row_title().font;
+            let section = type_scale::section_label().font;
+            let body = type_scale::body().font;
+            let meta = |pos, text: &str, color| {
+                painter.text(pos, egui::Align2::LEFT_CENTER, text, caption.clone(), color);
+            };
+            painter.text(
+                egui::pos2(24.0, 46.0),
+                egui::Align2::LEFT_CENTER,
+                "Material",
+                display,
+                tokens.ink,
+            );
+            meta(
+                egui::pos2(24.0, 72.0),
+                "Card · Sheet · Dock — painted frost at phone scale",
+                tokens.ink_soft,
+            );
+
+            // --- the two floating specimens, side by side ------------------
+            for (rect, name) in [(kit.card, "CARD"), (kit.sheet, "SHEET")] {
+                painter.text(
+                    egui::pos2(rect.left(), rect.top() - 12.0),
+                    egui::Align2::LEFT_CENTER,
+                    name,
+                    section.clone(),
+                    tokens.ink_faint,
+                );
+            }
+
+            let card_body = material::card(ui, &tokens, kit.card, Some(66.0));
+            painter.text(
+                egui::pos2(card_body.left(), kit.card.top() + 24.0),
+                egui::Align2::LEFT_CENTER,
+                "Morning notes",
+                row_title.clone(),
+                tokens.ink,
+            );
+            meta(
+                egui::pos2(card_body.left(), kit.card.top() + 46.0),
+                "12 min · English",
+                tokens.ink_soft,
+            );
+            meta(
+                egui::pos2(card_body.left(), kit.card.top() + 90.0),
+                "The quick brown fox jumps",
+                tokens.ink_soft,
+            );
+            meta(
+                egui::pos2(card_body.left(), kit.card.top() + 108.0),
+                "over the lazy dog.",
+                tokens.ink_soft,
+            );
+            meta(
+                egui::pos2(card_body.left(), kit.card.bottom() - 16.0),
+                "Today · 09:14",
+                tokens.ink_faint,
+            );
+
+            // The sheet: top-only radius (the plan's modal anatomy).
+            material::frosted_panel(
+                ui,
+                &tokens,
+                kit.sheet,
+                egui::CornerRadius {
+                    nw: tokens.radius.card,
+                    ne: tokens.radius.card,
+                    sw: 0,
+                    se: 0,
+                },
+                Plane::Sheet,
+            );
+            painter.rect_filled(
+                egui::Rect::from_center_size(
+                    egui::pos2(kit.sheet.center().x, kit.sheet.top() + 10.0),
+                    egui::vec2(36.0, 4.0),
+                ),
+                egui::CornerRadius::same(2),
+                tokens.hairline_strong,
+            );
+            painter.text(
+                egui::pos2(kit.sheet.left() + 16.0, kit.sheet.top() + 38.0),
+                egui::Align2::LEFT_CENTER,
+                "Export transcript",
+                row_title.clone(),
+                tokens.ink,
+            );
+            for (offset, line) in [(70.0, "Plain text (.txt)"), (96.0, "SubRip (.srt)")] {
+                meta(
+                    egui::pos2(kit.sheet.left() + 16.0, kit.sheet.top() + offset),
+                    line,
+                    tokens.ink_soft,
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(kit.sheet.left() + 16.0, kit.sheet.top() + offset + 14.0),
+                        egui::pos2(kit.sheet.right() - 16.0, kit.sheet.top() + offset + 14.0),
+                    ],
+                    egui::Stroke::new(1.0_f32, tokens.hairline),
+                );
+            }
+            meta(
+                egui::pos2(kit.sheet.left() + 16.0, kit.sheet.bottom() - 18.0),
+                "Grain · rim · 12 pt shadow",
+                tokens.ink_faint,
+            );
+
+            // --- the grouped card: title + divider + rows -------------------
+            painter.text(
+                egui::pos2(kit.grouped.left(), kit.grouped.top() - 12.0),
+                egui::Align2::LEFT_CENTER,
+                "CARD · GROUPED",
+                section.clone(),
+                tokens.ink_faint,
+            );
+            let grouped_body = material::card(ui, &tokens, kit.grouped, Some(44.0));
+            painter.text(
+                egui::pos2(grouped_body.left(), kit.grouped.top() + 22.0),
+                egui::Align2::LEFT_CENTER,
+                "Models",
+                egui::FontId::new(15.0, theme::sans_semibold()),
+                tokens.ink,
+            );
+            for (index, (name, value)) in [("Compact", "148 MB"), ("Balanced", "488 MB")]
+                .into_iter()
+                .enumerate()
+            {
+                let y = kit.grouped.top() + 62.0 + index as f32 * 40.0;
+                painter.text(
+                    egui::pos2(grouped_body.left(), y),
+                    egui::Align2::LEFT_CENTER,
+                    name,
+                    row_title.clone(),
+                    tokens.ink,
+                );
+                painter.text(
+                    egui::pos2(grouped_body.right(), y),
+                    egui::Align2::RIGHT_CENTER,
+                    value,
+                    caption.clone(),
+                    tokens.ink_soft,
+                );
+                if index == 0 {
+                    painter.line_segment(
+                        [
+                            egui::pos2(grouped_body.left(), y + 20.0),
+                            egui::pos2(grouped_body.right(), y + 20.0),
+                        ],
+                        egui::Stroke::new(1.0_f32, tokens.hairline),
+                    );
+                }
+            }
+
+            // --- the icon strip: all eleven at 20 pt, one stroke ------------
+            painter.text(
+                egui::pos2(kit.icon_row.left(), kit.icon_row.top() - 12.0),
+                egui::Align2::LEFT_CENTER,
+                "ICONS",
+                section,
+                tokens.ink_faint,
+            );
+            let icons = [
+                Icon::Gear,
+                Icon::Search,
+                Icon::ImportWave,
+                Icon::Mic,
+                Icon::Chevron,
+                Icon::Check,
+                Icon::Download,
+                Icon::Share,
+                Icon::Speaker,
+                Icon::Close,
+                Icon::Trash,
+            ];
+            let stride = (kit.icon_row.width() - 20.0) / (icons.len() - 1) as f32;
+            for (index, icon) in icons.into_iter().enumerate() {
+                let center = egui::pos2(
+                    kit.icon_row.left() + 10.0 + index as f32 * stride,
+                    kit.icon_row.center().y,
+                );
+                icons::paint(
+                    painter,
+                    egui::Rect::from_center_size(center, egui::vec2(24.0, 24.0)),
+                    icon,
+                    icons::IconSize::Chrome.points(),
+                    tokens.ink,
+                );
+            }
+            meta(
+                egui::pos2(kit.icon_row.left(), kit.icon_row.bottom() + 12.0),
+                "1.75 px round caps · 20 pt chrome",
+                tokens.ink_faint,
+            );
+            // One inline (18 pt) sample beside a row title: the second size.
+            let inline_center =
+                egui::pos2(kit.icon_row.left() + 10.0, kit.icon_row.bottom() + 52.0);
+            icons::paint(
+                painter,
+                egui::Rect::from_center_size(inline_center, egui::vec2(24.0, 24.0)),
+                Icon::Mic,
+                icons::IconSize::Inline.points(),
+                tokens.ink_soft,
+            );
+            painter.text(
+                egui::pos2(inline_center.x + 20.0, inline_center.y),
+                egui::Align2::LEFT_CENTER,
+                "Record a note",
+                row_title.clone(),
+                tokens.ink,
+            );
+            meta(
+                egui::pos2(inline_center.x + 132.0, inline_center.y),
+                "18 pt inline",
+                tokens.ink_faint,
+            );
+
+            // --- the dock: scrim + floating bar -----------------------------
+            painter.text(
+                egui::pos2(kit.dock.left(), kit.dock.top() - 14.0),
+                egui::Align2::LEFT_CENTER,
+                "DOCK",
+                type_scale::section_label().font,
+                tokens.ink_faint,
+            );
+            // Two rows of content behind the fade, so the scrim is visible.
+            for (offset, line) in [
+                (0.0, "Rapat tim produk"),
+                (38.0, "Interview — field recording"),
+            ] {
+                painter.text(
+                    egui::pos2(24.0, kit.dock.top() - 104.0 + offset),
+                    egui::Align2::LEFT_CENTER,
+                    line,
+                    body.clone(),
+                    tokens.ink_soft,
+                );
+            }
+            material::dock_scrim(
+                ui,
+                egui::Rect::from_min_max(egui::pos2(0.0, kit.dock.top() - 90.0), screen.max),
+                &tokens,
+            );
+            material::frosted_panel(ui, &tokens, kit.dock, tokens.radius.card, Plane::Dock);
+            let inner = kit.dock.shrink(8.0);
+            let import = egui::Rect::from_min_size(
+                inner.min,
+                egui::vec2(inner.width() * 0.38 - 6.0, inner.height()),
+            );
+            painter.rect(
+                import,
+                egui::CornerRadius::same(10),
+                tokens.control_fill,
+                egui::Stroke::new(1.0_f32, tokens.hairline),
+                egui::StrokeKind::Inside,
+            );
+            let import_width = painter
+                .layout_no_wrap(
+                    "Import".to_owned(),
+                    row_title.clone(),
+                    egui::Color32::PLACEHOLDER,
+                )
+                .size()
+                .x;
+            let import_start = import.center().x - (24.0 + 6.0 + import_width) / 2.0;
+            icons::paint(
+                painter,
+                egui::Rect::from_center_size(
+                    egui::pos2(import_start + 12.0, import.center().y),
+                    egui::vec2(24.0, 24.0),
+                ),
+                Icon::ImportWave,
+                icons::IconSize::Chrome.points(),
+                tokens.ink,
+            );
+            painter.text(
+                egui::pos2(import_start + 30.0, import.center().y),
+                egui::Align2::LEFT_CENTER,
+                "Import",
+                row_title.clone(),
+                tokens.ink,
+            );
+            let record =
+                egui::Rect::from_min_max(egui::pos2(import.right() + 12.0, inner.top()), inner.max);
+            painter.rect_filled(record, egui::CornerRadius::same(10), tokens.record_red);
+            let record_width = painter
+                .layout_no_wrap(
+                    "Record".to_owned(),
+                    row_title.clone(),
+                    egui::Color32::PLACEHOLDER,
+                )
+                .size()
+                .x;
+            let record_start = record.center().x - (24.0 + 6.0 + record_width) / 2.0;
+            icons::paint(
+                painter,
+                egui::Rect::from_center_size(
+                    egui::pos2(record_start + 12.0, record.center().y),
+                    egui::vec2(24.0, 24.0),
+                ),
+                Icon::Mic,
+                icons::IconSize::Chrome.points(),
+                tokens.on_accent,
+            );
+            painter.text(
+                egui::pos2(record_start + 30.0, record.center().y),
+                egui::Align2::LEFT_CENTER,
+                "Record",
+                row_title.clone(),
+                tokens.on_accent,
+            );
+        });
+}
+
+#[test]
+fn material_kit_goldens_show_card_sheet_and_dock_in_both_appearances() {
+    let (_, _, scale) = compact::phone_viewport();
+    let screen = compact::phone_screen_rect();
+    let kit = material_kit_rects(screen);
+    let mut shots = Vec::new();
+    for (theme_value, name) in [
+        (AppTheme::Light, "material-kit-light"),
+        (AppTheme::Dark, "material-kit-dark"),
+    ] {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::install(&ctx, theme_value, false);
+        let shot = snapshot::render(&ctx, screen, scale, |ctx| {
+            material_kit_scene(ctx, theme_value);
+        });
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/ui-compact/shots")
+            .join(format!("{name}.png"));
+        snapshot::write_png(&out, &shot).expect("write shot");
+        eprintln!("shot: {} ({}x{})", out.display(), shot.width, shot.height);
+        assert_eq!(shot.width, 1216);
+        assert_eq!(shot.height, 2640);
+        assert!(
+            shot.painted_fraction(egui::Color32::BLACK) > 0.5,
+            "{name} must not be blank"
+        );
+        shots.push((theme_value, shot));
+    }
+
+    // Screen point -> shot pixel.
+    let pixel = |shot: &snapshot::Shot, x: f32, y: f32| {
+        shot.pixel((x * scale) as usize, (y * scale) as usize)
+    };
+    let luma = |color: egui::Color32| {
+        f32::from(color.r()) * 0.2126
+            + f32::from(color.g()) * 0.7152
+            + f32::from(color.b()) * 0.0722
+    };
+    for (theme_value, shot) in &shots {
+        let tokens = theme::tokens_for(
+            *theme_value,
+            suramak_ui::deck::material::MaterialBackend::PaintedFrost,
+        );
+        let name = format!("{theme_value:?}");
+
+        // The veil falls top -> bottom. On the dark ladder it is measurable
+        // (4.5 % -> 1.2 % white); on the light ladder the card token is
+        // already #fff, so the white veil is honestly a no-op there.
+        let top = pixel(shot, kit.card.right() - 16.0, kit.card.top() + 14.0);
+        let bottom = pixel(shot, kit.card.right() - 16.0, kit.card.bottom() - 10.0);
+        if *theme_value == AppTheme::Dark {
+            assert!(
+                luma(top) > luma(bottom) + 2.0,
+                "{name}: the veil must fall top->bottom ({} vs {})",
+                luma(top),
+                luma(bottom)
+            );
+        } else {
+            assert!(
+                top.r() > 245 && bottom.r() > 245,
+                "{name}: the light card is the white token + white veil"
+            );
+        }
+
+        // The perimeter hairline is real ink on both ladders: scan across the
+        // card's left edge and find a pixel darker than the fill.
+        let y = kit.card.center().y;
+        let mut edge_min = 255.0_f32;
+        let mut interior_max = 0.0_f32;
+        for step in 0..=10 {
+            let x = kit.card.left() - 2.0 + step as f32;
+            let value = luma(pixel(shot, x, y));
+            edge_min = edge_min.min(value);
+        }
+        for step in 0..=26 {
+            let x = kit.card.left() + 14.0 + step as f32;
+            interior_max = interior_max.max(luma(pixel(shot, x, y)));
+        }
+        assert!(
+            edge_min < interior_max - 3.0,
+            "{name}: the hairline rim must read (edge {edge_min} vs fill {interior_max})"
+        );
+
+        // The shadow budget: the sheet (floating) casts one; the card (in the
+        // scroll plane) casts none. Sample just under each.
+        let sheet_below = luma(pixel(shot, kit.sheet.center().x, kit.sheet.bottom() + 6.0));
+        let card_below = luma(pixel(shot, kit.card.center().x, kit.card.bottom() + 8.0));
+        let window_ref = luma(pixel(shot, kit.card.center().x, kit.grouped.top() - 28.0));
+        assert!(
+            sheet_below < window_ref - 0.4,
+            "{name}: the sheet must cast its 12 pt shadow ({sheet_below} vs {window_ref})"
+        );
+        assert!(
+            (card_below - window_ref).abs() <= 1.0,
+            "{name}: the card must not cast a shadow ({card_below} vs {window_ref})"
+        );
+
+        // The dock is a distinct opaque plane above the window.
+        let dock_fill = pixel(shot, kit.dock.center().x, kit.dock.top() + 3.5);
+        let window_fill = pixel(shot, 8.0, kit.dock.top() - 120.0);
+        assert_ne!(
+            dock_fill, window_fill,
+            "{name}: the dock must sit above the window"
+        );
+        assert_eq!(dock_fill.a(), 255, "{name}: the golden is opaque");
+
+        // The icon strip carries real ink (1.75 px strokes, 11 icons).
+        let icon_counts = ((kit.icon_row.top() * scale) as usize
+            ..(kit.icon_row.bottom() * scale) as usize)
+            .flat_map(|py| {
+                ((kit.icon_row.left() * scale) as usize..(kit.icon_row.right() * scale) as usize)
+                    .map(move |px| (px, py))
+            })
+            .filter(|(px, py)| shot.pixel(*px, *py) != tokens.window)
+            .count();
+        assert!(
+            icon_counts > 300,
+            "{name}: expected the eleven icon strokes in the strip, got {icon_counts} px"
+        );
+    }
+}

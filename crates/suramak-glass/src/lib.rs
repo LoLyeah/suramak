@@ -276,6 +276,31 @@ pub fn reduce_motion() -> bool {
     }
 }
 
+/// Whether this platform supplies a **real system material** behind the single
+/// render surface — the capability `suramak-ui`'s `MaterialBackend` needs to
+/// decide between painted frost and transparent passthrough (M20B).
+///
+/// * **macOS** — `true`: the window is non-opaque and `apply` installs
+///   `NSGlassEffectView` (macOS 26+) or the `NSVisualEffectView` fallback, both
+///   AppKit's own optical materials.
+/// * **Windows / Linux / Android** — `false`: there is no single-surface
+///   backdrop blur to pass through; the UI paints its honest in-surface frost.
+///
+/// This is a **platform** capability, not the live window state: whether a
+/// particular window's material was applied is [`GlassHandle::float_glass_available`]
+/// (and `apply`'s `Result`). The UI calls this once at startup, before the
+/// first frame, to pick its token ladder.
+pub fn system_glass_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos::system_glass_available()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 /// Applies the native window material to `window` and returns the handle that
 /// drives the floating record control's glass (M8.5).
 ///
@@ -322,6 +347,13 @@ mod tests {
     fn glass_config_new_carries_the_mode() {
         assert_eq!(GlassConfig::new(GlassMode::Never).mode, GlassMode::Never);
         assert_eq!(GlassConfig::default().mode, GlassMode::Auto);
+    }
+
+    #[test]
+    fn system_glass_is_a_macos_capability() {
+        // The UI's MaterialBackend reads this once at startup: only macOS has
+        // a real single-surface material to pass through (M20B).
+        assert_eq!(system_glass_available(), cfg!(target_os = "macos"));
     }
 
     // ---- M8.5: the floating control's geometry -------------------------------

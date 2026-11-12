@@ -53,6 +53,17 @@ struct Texture {
 
 impl Texture {
     fn sample(&self, uv: Pos2) -> Color32 {
+        // M20B: the material grain tiles with `TextureWrapMode::Repeat`, and
+        // the CPU rasteriser has no sampler state — wrap the UV here (font
+        // atlas UVs stay in 0..=1 and are untouched).
+        let wrap = |value: f32| {
+            if (0.0..=1.0).contains(&value) {
+                value
+            } else {
+                value.rem_euclid(1.0)
+            }
+        };
+        let uv = Pos2::new(wrap(uv.x), wrap(uv.y));
         let x = (uv.x * self.width as f32 - 0.5).clamp(0.0, self.width as f32 - 1.0);
         let y = (uv.y * self.height as f32 - 0.5).clamp(0.0, self.height as f32 - 1.0);
         let x0 = x.floor() as usize;

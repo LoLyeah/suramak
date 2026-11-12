@@ -28,6 +28,8 @@ use egui::{Color32, CornerRadius, Stroke, ThemePreference, Visuals};
 
 use suramak_core::settings::Appearance;
 
+use crate::deck::material::MaterialBackend;
+
 use egui::FontData;
 use egui::{FontDefinitions, FontFamily};
 use std::sync::Arc;
@@ -177,6 +179,25 @@ pub struct Tokens {
     /// M14e: the sheet's backdrop scrim — the page behind a popup is dimmed so
     /// the list reads above it (egui has no blur; a dim is the honest ceiling).
     pub scrim: Color32,
+    // ---- M20B frost material ----------------------------------------------
+    /// The veil gradient's top stop: white at 4.5 % (dark) / 62 % (light),
+    /// painted over [`Tokens::card`]/[`Tokens::sheet`]. Zero under
+    /// [`MaterialBackend::SystemGlass`](crate::deck::material::MaterialBackend).
+    pub frost_veil_top: Color32,
+    /// The veil gradient's bottom stop: white at 1.2 % (dark) / 38 % (light).
+    pub frost_veil_bottom: Color32,
+    /// The 1 px specular arc over the top edge + upper corner tangents:
+    /// white 13 % (dark) / 75 % (light).
+    pub rim_specular: Color32,
+    /// The 1 px perimeter hairline: white 6 % (dark) / black 7 % (light).
+    pub rim_hairline: Color32,
+    /// The 64×64 micro-grain's per-texel alpha: 1.8 % (dark) / 1.2 % (light).
+    /// A scalar, not a colour: the texture is white/black noise at this alpha.
+    pub frost_grain_alpha: f32,
+    /// The dock scrim's top stop: 0 % (the fade starts clear).
+    pub dock_scrim_top: Color32,
+    /// The dock scrim's bottom stop: the opaque window base at 92 %.
+    pub dock_scrim_bottom: Color32,
     // ---- control-state deltas ---------------------------------------------
     /// Secondary control, rest.
     pub control_fill: Color32,
@@ -211,16 +232,33 @@ pub struct Tokens {
     pub stroke: Strokes,
 }
 
+/// A percentage of 255, rounded — the one notation the M20B frost tokens are
+/// authored in (the plan states them as percentages of white/black).
+fn percent(value: f32) -> u8 {
+    (value * 2.55).round() as u8
+}
+
 /// The token ladder for one appearance, on this platform.
+///
+/// The M20B frost layer is capability-gated: on macOS the real AppKit material
+/// sits behind the window, so [`MaterialBackend::detect`] selects `SystemGlass`
+/// and every frost alpha is zeroed ([`tokens_for`]); the painted recipe only
+/// runs where the platform has no system backdrop (Android/Windows/Linux).
 pub fn tokens(theme: AppTheme) -> Tokens {
+    tokens_for(theme, MaterialBackend::detect())
+}
+
+/// The token ladder for an explicit material backend. Pure and portable, so
+/// the tests (and the material-kit goldens) can exercise both capabilities on
+/// one host: `PaintedFrost` keeps the authored alphas, `SystemGlass` zeroes
+/// them so no painted veil sits over the real optical material.
+pub fn tokens_for(theme: AppTheme, backend: MaterialBackend) -> Tokens {
     #[cfg(target_os = "macos")]
-    {
-        macos_ladder(theme)
-    }
+    let mut tokens = macos_ladder(theme);
     #[cfg(not(target_os = "macos"))]
-    {
-        desktop_ladder(theme)
-    }
+    let mut tokens = desktop_ladder(theme);
+    backend.apply(&mut tokens);
+    tokens
 }
 
 /// The macOS ladder: real material behind a transparent surface — translucent
@@ -257,6 +295,19 @@ pub fn macos_ladder(theme: AppTheme) -> Tokens {
             card: Color32::from_white_alpha(150),
             sheet: Color32::from_rgb(0xff, 0xff, 0xff),
             scrim: Color32::from_black_alpha(72),
+            // M20B: the plan's percentages. The macOS ladder authors them too
+            // (the tokens exist per ladder); `SystemGlass` zeroes them at
+            // runtime, so nothing paints over the NSGlassEffectView.
+            frost_veil_top: Color32::from_white_alpha(percent(62.0)),
+            frost_veil_bottom: Color32::from_white_alpha(percent(38.0)),
+            rim_specular: Color32::from_white_alpha(percent(75.0)),
+            rim_hairline: Color32::from_black_alpha(percent(7.0)),
+            frost_grain_alpha: 0.012,
+            dock_scrim_top: Color32::TRANSPARENT,
+            // 92 % of the opaque macOS light base (#f2f2f7): `window` itself is
+            // TRANSPARENT here (the real material shows through), and a scrim
+            // has to be paintable when the backend is forced to PaintedFrost.
+            dock_scrim_bottom: Color32::from_rgba_unmultiplied(0xf2, 0xf2, 0xf7, percent(92.0)),
             card_shadow: Shadow {
                 offset: [0, 8],
                 blur: 20,
@@ -306,6 +357,13 @@ pub fn macos_ladder(theme: AppTheme) -> Tokens {
             card: Color32::from_white_alpha(32),
             sheet: Color32::from_rgb(0x1c, 0x1c, 0x1e),
             scrim: Color32::from_black_alpha(130),
+            frost_veil_top: Color32::from_white_alpha(percent(4.5)),
+            frost_veil_bottom: Color32::from_white_alpha(percent(1.2)),
+            rim_specular: Color32::from_white_alpha(percent(13.0)),
+            rim_hairline: Color32::from_white_alpha(percent(6.0)),
+            frost_grain_alpha: 0.018,
+            dock_scrim_top: Color32::TRANSPARENT,
+            dock_scrim_bottom: Color32::from_rgba_unmultiplied(0x1c, 0x1c, 0x1e, percent(92.0)),
             card_shadow: Shadow {
                 offset: [0, 10],
                 blur: 24,
@@ -369,6 +427,13 @@ pub fn desktop_ladder(theme: AppTheme) -> Tokens {
             card: Color32::from_rgb(0xff, 0xff, 0xff),
             sheet: Color32::from_rgb(0xff, 0xff, 0xff),
             scrim: Color32::from_black_alpha(60),
+            frost_veil_top: Color32::from_white_alpha(percent(62.0)),
+            frost_veil_bottom: Color32::from_white_alpha(percent(38.0)),
+            rim_specular: Color32::from_white_alpha(percent(75.0)),
+            rim_hairline: Color32::from_black_alpha(percent(7.0)),
+            frost_grain_alpha: 0.012,
+            dock_scrim_top: Color32::TRANSPARENT,
+            dock_scrim_bottom: Color32::from_rgba_unmultiplied(0xe9, 0xeb, 0xf0, percent(92.0)),
             card_shadow: Shadow {
                 offset: [0, 8],
                 blur: 20,
@@ -418,6 +483,13 @@ pub fn desktop_ladder(theme: AppTheme) -> Tokens {
             card: Color32::from_rgb(0x1a, 0x24, 0x40),
             sheet: Color32::from_rgb(0x1c, 0x1c, 0x1e),
             scrim: Color32::from_black_alpha(140),
+            frost_veil_top: Color32::from_white_alpha(percent(4.5)),
+            frost_veil_bottom: Color32::from_white_alpha(percent(1.2)),
+            rim_specular: Color32::from_white_alpha(percent(13.0)),
+            rim_hairline: Color32::from_white_alpha(percent(6.0)),
+            frost_grain_alpha: 0.018,
+            dock_scrim_top: Color32::TRANSPARENT,
+            dock_scrim_bottom: Color32::from_rgba_unmultiplied(0x0e, 0x15, 0x26, percent(92.0)),
             card_shadow: Shadow {
                 offset: [0, 10],
                 blur: 24,
@@ -1181,6 +1253,79 @@ mod tests {
                 for left in 0..6 {
                     for right in (left + 1)..6 {
                         assert_ne!(t.speaker[left], t.speaker[right]);
+                    }
+                }
+            }
+        }
+        for line in &measured {
+            println!("{line}");
+        }
+    }
+
+    /// M20B: the frost layer exists on **both** ladders and every ink pair
+    /// stays legible on the veiled fills. The veil is composited over the same
+    /// worst-case backdrop the ladder test uses, at both gradient stops, so the
+    /// 62 % light top stop cannot quietly wash out a caption.
+    #[test]
+    fn the_frost_tokens_exist_per_ladder_and_keep_ink_legible() {
+        type Ladder = (&'static str, fn(AppTheme) -> Tokens);
+        let ladders: [Ladder; 2] = [("macos", macos_ladder), ("desktop", desktop_ladder)];
+        let mut measured: Vec<String> = Vec::new();
+        for (ladder, build) in ladders {
+            for theme in [AppTheme::Light, AppTheme::Dark] {
+                let t = build(theme);
+                // The authored percentages, pinned per appearance (the plan's
+                // numbers; a drift fails here before a golden can hide it).
+                let (veil_top, veil_bottom, specular, hairline, grain) = match theme {
+                    AppTheme::Light => (
+                        percent(62.0),
+                        percent(38.0),
+                        percent(75.0),
+                        percent(7.0),
+                        0.012,
+                    ),
+                    AppTheme::Dark => (
+                        percent(4.5),
+                        percent(1.2),
+                        percent(13.0),
+                        percent(6.0),
+                        0.018,
+                    ),
+                };
+                assert_eq!(t.frost_veil_top.a(), veil_top, "{ladder} {theme:?}");
+                assert_eq!(t.frost_veil_bottom.a(), veil_bottom, "{ladder} {theme:?}");
+                assert_eq!(t.rim_specular.a(), specular, "{ladder} {theme:?}");
+                assert_eq!(t.rim_hairline.a(), hairline, "{ladder} {theme:?}");
+                assert_eq!(t.frost_grain_alpha, grain, "{ladder} {theme:?}");
+                assert_eq!(t.dock_scrim_top, Color32::TRANSPARENT);
+                assert_eq!(t.dock_scrim_bottom.a(), percent(92.0), "{ladder} {theme:?}");
+                assert!(
+                    t.frost_veil_top.a() > t.frost_veil_bottom.a(),
+                    "{ladder} {theme:?}: the veil must fall from top to bottom"
+                );
+
+                let backdrop = match theme {
+                    AppTheme::Light => Color32::WHITE,
+                    AppTheme::Dark => Color32::BLACK,
+                };
+                let window = composite_over(t.window, backdrop);
+                let card = composite_over(t.card, window);
+                let sheet = composite_over(t.sheet, window);
+                for (surface, base) in [("card", card), ("sheet", sheet)] {
+                    for (stop, veil) in [("top", t.frost_veil_top), ("bottom", t.frost_veil_bottom)]
+                    {
+                        let fill = composite_over(veil, base);
+                        for (ink_name, ink) in [("ink", t.ink), ("ink_soft", t.ink_soft)] {
+                            let ratio = contrast_ratio(ink, fill);
+                            measured.push(format!(
+                                "{ladder} {theme:?}: {ink_name} on the veiled {surface} {stop}: {ratio:.2}:1"
+                            ));
+                            assert!(
+                                ratio >= 4.5,
+                                "{ladder} {theme:?}: {ink_name} on the veiled {surface} \
+                                 ({stop}) = {ratio:.2}:1 — under the 4.5:1 small-text floor"
+                            );
+                        }
                     }
                 }
             }

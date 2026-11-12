@@ -394,6 +394,17 @@ impl Handle {
     }
 }
 
+/// macOS always has a real material path: `NSGlassEffectView` where the class
+/// exists at runtime (macOS 26+), `NSVisualEffectView` (`BehindWindow` /
+/// `UnderWindowBackground` / `Active`) below it. Both are system-owned optical
+/// materials, so the capability is the platform, not the class.
+///
+/// The live window's applied state is separate ([`Handle::float_glass_available`]);
+/// this is the pre-window probe the UI uses to pick its material backend.
+pub fn system_glass_available() -> bool {
+    true
+}
+
 /// macOS 26+ (`NSGlassEffectView` present at runtime): the typed wrapper from
 /// objc2-app-kit 0.3.2; otherwise the `NSVisualEffectView` fallback of PLAN §1.
 enum Material {
