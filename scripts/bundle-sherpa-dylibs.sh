@@ -59,6 +59,23 @@ rpaths_of() {
   '
 }
 
+# Pass 0 — recover a missing pristine dylib from sherpa-rs-sys's own download
+# cache. A restored `target/` counts the build script as fresh, so it never
+# re-copies the runtime next to the binaries (CI run 43186421484 failed exactly
+# here: `libsherpa-onnx-c-api.dylib is missing from target/release`). The pin
+# verification in pass 1 still decides whether the recovered bytes are the real
+# thing — this step only decides where to look.
+cache_dir="${SHERPA_CACHE_DIR:-$HOME/Library/Caches/sherpa-rs}"
+while IFS=$'\t' read -r name bytes sha; do
+  case "$name" in ''|'#'*) continue ;; esac
+  [ -f "$SRC_DIR/$name" ] && continue
+  [ -d "$cache_dir" ] || continue
+  found="$(find "$cache_dir" -type f -name "$name" 2>/dev/null | head -n 1)"
+  [ -n "$found" ] || continue
+  cp -f "$found" "$SRC_DIR/$name"
+  echo "sherpa: recovered $name from $found (a restored target/ skipped the build-script copy)"
+done < "$MANIFEST"
+
 # Pass 1 — verify every pin before touching the bundle. A mismatch is a
 # supply-chain failure: stop with the expected/actual pair, never copy.
 while IFS=$'\t' read -r name bytes sha; do
