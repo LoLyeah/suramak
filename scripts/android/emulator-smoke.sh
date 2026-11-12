@@ -828,19 +828,49 @@ sleep 1
 # once the offset has been still for 300 ms; `LAST_SWIPE_MS` is the host clock
 # reading taken just before the final swipe, which the line's own `ts=` must
 # beat.
+# Device clock, not the host's: the line's ts= comes from the emulator's
+# clock and a host/device skew would make every "newer than the swipe" test a
+# coin flip.
+device_ms() { "$ADB" shell date +%s%3N 2>/dev/null | tr -d '\r'; }
+
+# The resting line lands 300 ms after the geometry stops; poll instead of a
+# fixed sleep, and re-swipe when the list had not reached its end yet. A
+# single `tail -1` after a fixed sleep read a MID-SWIPE line once and failed a
+# healthy layout (settled=0 at quit_top=1030 while the list was still moving).
+settled_layout_line() {
+  local since="$1" attempt line ts settled
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    line="$(app_log | grep -F "SURAMAK-LAYOUT" | tail -1 || true)"
+    if [ -n "$line" ]; then
+      ts="$(printf '%s' "$line" | sed -n 's/.* ts=\([0-9]*\).*/\1/p')"
+      settled="$(printf '%s' "$line" | sed -n 's/.* settled=\([0-9]*\).*/\1/p')"
+      if [ "$settled" = "1" ] && [ -n "$ts" ] && [ "$ts" -ge "$since" ]; then
+        printf '%s\n' "$line"
+        return 0
+      fi
+    fi
+    sleep 0.3
+  done
+  return 1
+}
+
 LAST_SWIPE_MS=""
-for _ in 1 2 3 4 5; do
-  LAST_SWIPE_MS="$(now_ms)"
-  "$ADB" shell input swipe \
-    "$((SCREEN_W / 2))" "$((SCREEN_H * 72 / 100))" \
-    "$((SCREEN_W / 2))" "$((SCREEN_H * 28 / 100))" 200
-  sleep 0.4
+LINE=""
+for round in 1 2 3; do
+  for _ in 1 2 3; do
+    LAST_SWIPE_MS="$(device_ms)"
+    "$ADB" shell input swipe \
+      "$((SCREEN_W / 2))" "$((SCREEN_H * 72 / 100))" \
+      "$((SCREEN_W / 2))" "$((SCREEN_H * 28 / 100))" 200
+    sleep 0.3
+  done
+  if LINE="$(settled_layout_line "$((LAST_SWIPE_MS - 1500))")"; then
+    break
+  fi
 done
-# The resting line lands 300 ms after the list stops; 2 s leaves room for a
-# slow software-rendered frame plus the logcat flush.
-sleep 2
+[ -n "$LINE" ] || fail "no settled SURAMAK-LAYOUT line after the swipes — the resting position never landed (see the app log)"
+printf '%s\n' "$LINE" >"$OUT/layout.txt"
 "$ADB" exec-out screencap -p >"$OUT/settings-bottom.png"
-app_log | grep -F "SURAMAK-LAYOUT" | tail -1 >"$OUT/layout.txt" || true
 
 python3 - "$OUT/layout.txt" "$LAST_SWIPE_MS" <<'PY' || fail "the Quit row does not clear the gesture area (see $OUT/layout.txt and $OUT/settings-bottom.png)"
 import re

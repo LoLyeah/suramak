@@ -205,6 +205,13 @@ jobs:
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
+        with:
+          # One-time rebuild after the sherpa link started failing: a restored
+          # target/ whose sherpa-rs-sys build script counts as fresh never
+          # re-runs its download, so OUT_DIR/lib stays empty and the link dies
+          # on onnxruntime.1.17.1. A new key forces the build scripts to run
+          # once with a cache dir that now exists (the step below).
+          key: sherpa-runtime-2
 
       # M16F follow-up: sherpa-rs-sys downloads its prebuilt runtime into
       # ~/Library/Caches/sherpa-rs on first build. rust-cache can restore a
