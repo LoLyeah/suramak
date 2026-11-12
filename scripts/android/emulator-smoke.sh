@@ -706,6 +706,11 @@ tap_and_wait_route() {
 }
 
 enter_settings() {
+  # Clear the log FIRST: the route assertion must read a marker THIS tap
+  # produced. Without it a stale "compact route: Settings" from the previous
+  # visit satisfied route_is while the tap had not landed, and the clearance
+  # phase then measured a Library that was never Settings (run 43287222116).
+  "$ADB" logcat -c 2>/dev/null || true
   # The gear's REAL position, as the shell logged it when it drew the Library
   # (`compact library: settings at X,Y`, device pixels). The dp guesses below
   # stopped being true when the header took the new type scale: run 43223493395
