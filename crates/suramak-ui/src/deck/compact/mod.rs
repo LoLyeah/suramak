@@ -29,6 +29,7 @@ pub mod model;
 pub mod motion;
 pub mod onboarding;
 pub mod settings;
+pub mod speaker_sheets;
 pub mod voice_note;
 
 use egui::{vec2, Rect, Ui, UiBuilder};
@@ -41,7 +42,8 @@ pub use model::{
     CompactApp, CompactEditor, CompactExportFormat, CompactRoute, CompactSetting, CompactSettings,
     CompactSpeakers, CrashBanner, DiagnosticsView, DownloadState, DownloadView, ExportPhase,
     ExportSession, FlingProbe, Insets, JobView, LibraryFacets, LibraryHit, LibraryRow, ModelRow,
-    ModelState, SegmentEdit, Sheet, VoiceNoteView,
+    ModelState, SegmentEdit, Sheet, SpeakerSheetState, TurnScope, TurnStripState, UndoToast,
+    VoiceNoteView, UNDO_TOAST_SECS,
 };
 
 /// Paints one frame of the compact app and returns everything the host must do.
@@ -61,6 +63,13 @@ pub fn ui(ctx: &egui::Context, state: &mut CompactApp) -> Vec<CompactAction> {
     // deadline, not by a permanent frame request.
     state.begin_voice_note(now);
     if let Some(deadline) = state.voice_note_deadline() {
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+            (deadline - now).max(0.0),
+        ));
+    }
+    // M23A: the Undo toast expires on the same mechanism — one scheduled wake
+    // at its deadline, never a permanent frame request.
+    if let Some(deadline) = state.undo_deadline() {
         ctx.request_repaint_after(std::time::Duration::from_secs_f64(
             (deadline - now).max(0.0),
         ));
@@ -150,6 +159,16 @@ pub fn ui(ctx: &egui::Context, state: &mut CompactApp) -> Vec<CompactAction> {
         let mut sheet_ui = layer_ui(&mut ui, screen, fade, 2, state.sheet_anim.is_present());
         let sheet_rect = if sheet == Sheet::VoiceNote {
             chrome::micro_sheet(&mut sheet_ui, &tokens, screen, slide)
+        } else if sheet.is_speaker_sheet() {
+            chrome::sheet_sized(
+                &mut sheet_ui,
+                &tokens,
+                screen,
+                slide,
+                sheet.speaker_height(),
+            )
+        } else if sheet == Sheet::Export {
+            chrome::sheet_sized(&mut sheet_ui, &tokens, screen, slide, 480.0)
         } else {
             chrome::sheet(&mut sheet_ui, &tokens, screen, slide)
         };
@@ -159,6 +178,32 @@ pub fn ui(ctx: &egui::Context, state: &mut CompactApp) -> Vec<CompactAction> {
                     &mut sheet_ui,
                     &tokens,
                     &motion,
+                    state,
+                    sheet_rect,
+                ));
+            }
+            Sheet::Speakers => {
+                actions.extend(speaker_sheets::speakers_sheet(
+                    &mut sheet_ui,
+                    &tokens,
+                    &motion,
+                    state,
+                    sheet_rect,
+                ));
+            }
+            Sheet::Speaker => {
+                actions.extend(speaker_sheets::speaker_sheet(
+                    &mut sheet_ui,
+                    &tokens,
+                    &motion,
+                    state,
+                    sheet_rect,
+                ));
+            }
+            Sheet::TurnStrip => {
+                actions.extend(speaker_sheets::turn_strip(
+                    &mut sheet_ui,
+                    &tokens,
                     state,
                     sheet_rect,
                 ));
@@ -197,6 +242,24 @@ pub fn ui(ctx: &egui::Context, state: &mut CompactApp) -> Vec<CompactAction> {
                 }
             }
         }
+    }
+
+    // M23A: the Undo toast is a snackbar — above the sheet layer, so Undo is
+    // reachable while the Speakers sheet is still open and stays visible as
+    // the sheet slides away.
+    if state.undo_toast.is_some() {
+        let bands = chrome::bands(
+            screen,
+            state.insets.top,
+            state.insets.bottom,
+            Some(chrome::BOTTOM_BAR),
+        );
+        actions.extend(speaker_sheets::undo_toast(
+            &mut ui,
+            &tokens,
+            state,
+            bands.bottom_bar,
+        ));
     }
 
     actions

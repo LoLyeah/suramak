@@ -7,9 +7,11 @@ use std::path::Path;
 use uuid::Uuid;
 
 use crate::diarization::{
-    default_label, merge_speakers, rename, speaker_for_segments, speaker_turn_ranges,
+    assign_range, default_label, manual_run, merge_speakers, next_color_slot, next_speaker_id,
+    remove_speaker as remove_speaker_turns, rename, speaker_for_segments, speaker_turn_ranges,
     split_speaker, validate as validate_diarization, Diarization, DiarizationRun, SegmentSpeaker,
-    Speaker, SpeakerSource, SpeakerTurn, TurnSource, COLOR_SLOTS,
+    Speaker, SpeakerEditKind, SpeakerSnapshot, SpeakerSource, SpeakerState, SpeakerTurn, TimeRange,
+    TurnSource, COLOR_SLOTS, MAX_SPEAKERS,
 };
 use crate::export::ZeroDuration;
 use crate::search::{self, HitKind, SearchHit, SearchOptions, SearchResults};
@@ -142,7 +144,10 @@ pub const WAVEFORM_BARS: usize = 28;
 ///   `segment_fts_map` (its document map), plus `waveforms` (the down-sampled
 ///   RMS bars the library rows draw). Existing tables are untouched; an empty
 ///   index is rebuilt one transcript per transaction on open.
-pub const SCHEMA_VERSION: i64 = 9;
+/// - **v10** — M23A, additive only: `speaker_edits` — the manual-tagging
+///   revision stamp and the revision the last speaker-inclusive export saw.
+///   No speaker, turn, segment or transcript row is touched.
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// SQLite-backed transcript library with WAL mode.
 pub struct Store {
@@ -174,6 +179,14 @@ impl SearchIndexStats {
     pub fn total(&self) -> i64 {
         self.segments + self.titles + self.glossary + self.dictionary
     }
+}
+
+/// The monotonic speaker-edit stamp (M23A): `revision` is bumped by every
+/// speaker verb, `edited_at` records when the bump landed (informational).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeakerEditStamp {
+    pub revision: i64,
+    pub edited_at: String,
 }
 
 /// One hit from [`Store::search_segments`] (M22C).
@@ -581,6 +594,18 @@ impl Store {
                  transcript_id TEXT PRIMARY KEY REFERENCES transcripts(id) ON DELETE CASCADE,
                  bars          BLOB NOT NULL,
                  updated_at    TEXT NOT NULL
+             );
+             -- M23A (schema v10): the manual-tagging stamp. One row per
+             -- transcript keeps a monotonic revision (bumped by every speaker
+             -- verb) and the revision the last speaker-inclusive export saw.
+             -- `edited_at` is informational; `revision` is the comparison the
+             -- honesty note makes, so a clock change can never hide an edit.
+             CREATE TABLE IF NOT EXISTS speaker_edits (
+                 transcript_id     TEXT PRIMARY KEY REFERENCES transcripts(id) ON DELETE CASCADE,
+                 revision          INTEGER NOT NULL DEFAULT 0,
+                 edited_at         TEXT NOT NULL DEFAULT '',
+                 exported_revision INTEGER NOT NULL DEFAULT 0,
+                 exported_at       TEXT
              );",
         )?;
         self.migrate()?;
@@ -669,6 +694,9 @@ impl Store {
         }
         if version < 9 {
             self.upgrade_to_v9()?;
+        }
+        if version < 10 {
+            self.upgrade_to_v10()?;
         }
         Ok(())
     }
@@ -943,6 +971,30 @@ impl Store {
         tx.execute_batch(SEGMENT_FTS_DDL)?;
         tx.execute_batch(SEGMENT_MAP_DDL)?;
         tx.execute_batch(WAVEFORMS_DDL)?;
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ---- M23A: manual speaker tagging ---------------------------------------
+
+    /// v9 → v10, one transaction: the manual-tagging stamp. A fresh database
+    /// already has it from the DDL above, and a re-run is a no-op.
+    fn upgrade_to_v10(&self) -> Result<(), SuramakError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS speaker_edits (
+                 transcript_id     TEXT PRIMARY KEY REFERENCES transcripts(id) ON DELETE CASCADE,
+                 revision          INTEGER NOT NULL DEFAULT 0,
+                 edited_at         TEXT NOT NULL DEFAULT '',
+                 exported_revision INTEGER NOT NULL DEFAULT 0,
+                 exported_at       TEXT
+             );",
+        )?;
         tx.execute(
             "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -3553,8 +3605,16 @@ impl Store {
         &self,
         transcript_id: Uuid,
     ) -> Result<Option<DiarizationRun>, SuramakError> {
-        let run = self
-            .conn
+        Self::read_run(&self.conn, transcript_id)
+    }
+
+    /// The active run on a borrowed connection (the transaction-safe read the
+    /// manual-tagging verbs use).
+    fn read_run(
+        conn: &Connection,
+        transcript_id: Uuid,
+    ) -> Result<Option<DiarizationRun>, SuramakError> {
+        let run = conn
             .query_row(
                 "SELECT run_id, created_at, segmentation_model, segmentation_sha256,
                         embedding_model, embedding_sha256, engine_version,
@@ -3671,51 +3731,399 @@ impl Store {
         Ok(speaker_turn_ranges(&segments, &diarization.turns))
     }
 
+    // ---- M23A: manual tagging (no engine, no voiceprints) -------------------
+
+    /// One transcript's speaker rows and the active run's turns.
+    fn speaker_state_with(
+        conn: &Connection,
+        transcript_id: Uuid,
+    ) -> Result<SpeakerState, SuramakError> {
+        let mut stmt = conn.prepare(
+            "SELECT speaker_id, label, color_slot, source, created_at, updated_at
+             FROM speakers WHERE transcript_id = ?1 ORDER BY speaker_id",
+        )?;
+        let speakers = stmt
+            .query_map(params![transcript_id.to_string()], |row| {
+                Ok(Speaker {
+                    speaker_id: row.get(0)?,
+                    label: row.get(1)?,
+                    color_slot: row.get(2)?,
+                    source: SpeakerSource::parse(&row.get::<_, String>(3)?),
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(SuramakError::Sqlite)?;
+        let turns = match Self::read_run(conn, transcript_id)? {
+            Some(run) => {
+                let mut stmt = conn.prepare(
+                    "SELECT turn_idx, start_ms, end_ms, speaker_id, source
+                     FROM speaker_turns WHERE transcript_id = ?1 AND run_id = ?2
+                     ORDER BY turn_idx",
+                )?;
+                let rows = stmt
+                    .query_map(params![transcript_id.to_string(), run.run_id], |row| {
+                        Ok(SpeakerTurn {
+                            turn_idx: row.get(0)?,
+                            start_ms: row.get(1)?,
+                            end_ms: row.get(2)?,
+                            speaker_id: row.get(3)?,
+                            source: TurnSource::parse(&row.get::<_, String>(4)?),
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(SuramakError::Sqlite)?;
+                rows
+            }
+            None => Vec::new(),
+        };
+        Ok(SpeakerState { speakers, turns })
+    }
+
+    /// The run manual tagging writes through: the existing run, or the honest
+    /// manual anchor [`manual_run`] when the transcript was never diarized.
+    ///
+    /// A manual run carries no model, no embedding and no audio analysis; the
+    /// provenance line says "manual tags". It exists only because the schema
+    /// anchors turns to a run, and it is replaced like any other run.
+    fn ensure_manual_run(
+        conn: &Connection,
+        transcript_id: Uuid,
+    ) -> Result<DiarizationRun, SuramakError> {
+        if let Some(run) = Self::read_run(conn, transcript_id)? {
+            return Ok(run);
+        }
+        let audio_ms: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(end_ms), 0) FROM segments WHERE transcript_id = ?1",
+            params![transcript_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let run = manual_run(transcript_id, audio_ms);
+        conn.execute(
+            "INSERT INTO diarization_runs(transcript_id, run_id, created_at,
+                 segmentation_model, segmentation_sha256, embedding_model,
+                 embedding_sha256, engine_version, num_clusters, threshold,
+                 min_duration_on, min_duration_off, audio_ms, stale)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0)",
+            params![
+                transcript_id.to_string(),
+                run.run_id,
+                run.created_at,
+                run.segmentation_model,
+                run.segmentation_sha256,
+                run.embedding_model,
+                run.embedding_sha256,
+                run.engine_version,
+                run.num_clusters,
+                run.threshold,
+                run.min_duration_on,
+                run.min_duration_off,
+                run.audio_ms,
+            ],
+        )?;
+        Ok(run)
+    }
+
+    /// Bumps the transcript's monotonic speaker revision (one row, upsert).
+    ///
+    /// The revision, not the wall clock, is what the export honesty note
+    /// compares: a clock change (or two edits in one second) can never hide an
+    /// edit, and an export can never claim to be newer than it is.
+    fn bump_speaker_edit(conn: &Connection, transcript_id: Uuid) -> Result<(), SuramakError> {
+        conn.execute(
+            "INSERT INTO speaker_edits(transcript_id, revision, edited_at)
+             VALUES (?1, 1, ?2)
+             ON CONFLICT(transcript_id) DO UPDATE SET
+                 revision = speaker_edits.revision + 1,
+                 edited_at = excluded.edited_at",
+            params![transcript_id.to_string(), Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Writes a complete speaker state for the run, verbatim.
+    ///
+    /// Used by the verbs that renumber ids (merge/remove/undo): deleting and
+    /// reinserting the small row set is exact, avoids the permutation dance
+    /// (a new id may land on another row's old id), and cannot leave a turn
+    /// pointing at a speaker that no longer exists.
+    fn write_speaker_state(
+        conn: &Connection,
+        transcript_id: Uuid,
+        run_id: u32,
+        state: &SpeakerState,
+    ) -> Result<(), SuramakError> {
+        conn.execute(
+            "DELETE FROM speaker_turns WHERE transcript_id = ?1 AND run_id = ?2",
+            params![transcript_id.to_string(), run_id],
+        )?;
+        conn.execute(
+            "DELETE FROM speakers WHERE transcript_id = ?1",
+            params![transcript_id.to_string()],
+        )?;
+        for speaker in &state.speakers {
+            conn.execute(
+                "INSERT INTO speakers(transcript_id, speaker_id, label, color_slot, source,
+                                      created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    transcript_id.to_string(),
+                    speaker.speaker_id,
+                    speaker.label,
+                    speaker.color_slot,
+                    speaker.source.as_str(),
+                    speaker.created_at,
+                    speaker.updated_at,
+                ],
+            )?;
+        }
+        for turn in &state.turns {
+            conn.execute(
+                "INSERT INTO speaker_turns(transcript_id, run_id, turn_idx, start_ms, end_ms,
+                                           speaker_id, source)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    transcript_id.to_string(),
+                    run_id,
+                    turn.turn_idx,
+                    turn.start_ms,
+                    turn.end_ms,
+                    turn.speaker_id,
+                    turn.source.as_str(),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Reads the current state, runs `verb`, writes the result and returns the
+    /// before/after snapshot the Undo log stores.
+    fn apply_speaker_verb(
+        &self,
+        transcript_id: Uuid,
+        kind: SpeakerEditKind,
+        label: Option<String>,
+        verb: impl FnOnce(&mut SpeakerState) -> Result<(), String>,
+    ) -> Result<SpeakerSnapshot, SuramakError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let run = Self::ensure_manual_run(&tx, transcript_id)?;
+        let before = Self::speaker_state_with(&tx, transcript_id)?;
+        let mut after = before.clone();
+        verb(&mut after).map_err(SuramakError::Diarization)?;
+        validate_diarization(&run, &after.speakers, &after.turns)
+            .map_err(SuramakError::Diarization)?;
+        Self::write_speaker_state(&tx, transcript_id, run.run_id, &after)?;
+        Self::bump_speaker_edit(&tx, transcript_id)?;
+        Self::refresh_segment_speakers(&tx, transcript_id)?;
+        tx.commit()?;
+        Ok(SpeakerSnapshot {
+            transcript_id,
+            kind,
+            label,
+            before,
+            after,
+        })
+    }
+
+    /// The next free ordinal, a colour from the first unused slot, and one
+    /// speaker row. Idempotent under a transaction: the insert is
+    /// `INSERT OR IGNORE`, so a retried call can never duplicate a row.
+    pub fn add_speaker(&self, transcript_id: Uuid) -> Result<(u32, SpeakerSnapshot), SuramakError> {
+        // The transcript must exist (and its segments are what the manual run's
+        // audio length is derived from).
+        let _ = self.get_transcript(transcript_id)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let _run = Self::ensure_manual_run(&tx, transcript_id)?;
+        let before = Self::speaker_state_with(&tx, transcript_id)?;
+        if before.speakers.len() >= MAX_SPEAKERS as usize {
+            return Err(SuramakError::Diarization(format!(
+                "at most {MAX_SPEAKERS} speakers"
+            )));
+        }
+        let id = next_speaker_id(&before.speakers);
+        let slot = next_color_slot(&before.speakers);
+        let label = default_label(id);
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT OR IGNORE INTO speakers(transcript_id, speaker_id, label, color_slot, source,
+                                            created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'manual', ?5, ?6)",
+            params![transcript_id.to_string(), id, label, slot, now, now],
+        )?;
+        Self::bump_speaker_edit(&tx, transcript_id)?;
+        let after = Self::speaker_state_with(&tx, transcript_id)?;
+        tx.commit()?;
+        Ok((
+            id,
+            SpeakerSnapshot {
+                transcript_id,
+                kind: SpeakerEditKind::Add,
+                label: Some(label),
+                before,
+                after,
+            },
+        ))
+    }
+
+    /// Reassigns an exact time range to one speaker, splitting the containing
+    /// turn at both boundaries (the phone's "this turn" / "from here down").
+    pub fn assign_speaker(
+        &self,
+        transcript_id: Uuid,
+        speaker_id: u32,
+        range: TimeRange,
+    ) -> Result<SpeakerSnapshot, SuramakError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let run = Self::ensure_manual_run(&tx, transcript_id)?;
+        let before = Self::speaker_state_with(&tx, transcript_id)?;
+        let label = before
+            .speakers
+            .iter()
+            .find(|speaker| speaker.speaker_id == speaker_id)
+            .map(|speaker| speaker.label.clone())
+            .ok_or_else(|| {
+                SuramakError::Diarization(format!("no speaker {speaker_id} on this transcript"))
+            })?;
+        // The store is the authority on the audio span; a range is clipped to
+        // it rather than allowed to invent turns past the recording.
+        let end_ms = if run.audio_ms > 0 {
+            range.end_ms.min(run.audio_ms)
+        } else {
+            range.end_ms
+        };
+        let range = TimeRange::new(range.start_ms.max(0), end_ms);
+        if range.is_empty() {
+            return Err(SuramakError::Diarization(
+                "the range to assign is empty".to_string(),
+            ));
+        }
+        let turns =
+            assign_range(&before.turns, range, speaker_id).map_err(SuramakError::Diarization)?;
+        validate_diarization(&run, &before.speakers, &turns).map_err(SuramakError::Diarization)?;
+        let after = SpeakerState {
+            speakers: before.speakers.clone(),
+            turns,
+        };
+        Self::write_speaker_state(&tx, transcript_id, run.run_id, &after)?;
+        Self::bump_speaker_edit(&tx, transcript_id)?;
+        Self::refresh_segment_speakers(&tx, transcript_id)?;
+        tx.commit()?;
+        Ok(SpeakerSnapshot {
+            transcript_id,
+            kind: SpeakerEditKind::Assign,
+            label: Some(label),
+            before,
+            after,
+        })
+    }
+
+    /// Removes every speaker row and every turn (the run stays as the empty
+    /// anchor a later tag writes through). Whisper segments are untouched: the
+    /// derived badge view returns to unlabelled.
+    pub fn clear_speakers(&self, transcript_id: Uuid) -> Result<SpeakerSnapshot, SuramakError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let before = Self::speaker_state_with(&tx, transcript_id)?;
+        // Turns cascade from the speaker rows (the FK is ON DELETE CASCADE),
+        // so one delete clears both without touching the run's provenance.
+        tx.execute(
+            "DELETE FROM speakers WHERE transcript_id = ?1",
+            params![transcript_id.to_string()],
+        )?;
+        Self::bump_speaker_edit(&tx, transcript_id)?;
+        Self::refresh_segment_speakers(&tx, transcript_id)?;
+        tx.commit()?;
+        Ok(SpeakerSnapshot {
+            transcript_id,
+            kind: SpeakerEditKind::Clear,
+            label: None,
+            before,
+            after: SpeakerState::default(),
+        })
+    }
+
+    /// Writes a recorded [`SpeakerState`] back verbatim — the Undo action.
+    pub fn restore_speaker_state(
+        &self,
+        transcript_id: Uuid,
+        state: &SpeakerState,
+    ) -> Result<(), SuramakError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let run = Self::ensure_manual_run(&tx, transcript_id)?;
+        Self::write_speaker_state(&tx, transcript_id, run.run_id, state)?;
+        Self::bump_speaker_edit(&tx, transcript_id)?;
+        Self::refresh_segment_speakers(&tx, transcript_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The monotonic stamp (`revision` + wall clock) of the last speaker edit.
+    pub fn speakers_edited_at(
+        &self,
+        transcript_id: Uuid,
+    ) -> Result<Option<SpeakerEditStamp>, SuramakError> {
+        let stamp = self
+            .conn
+            .query_row(
+                "SELECT revision, edited_at FROM speaker_edits WHERE transcript_id = ?1",
+                params![transcript_id.to_string()],
+                |row| {
+                    Ok(SpeakerEditStamp {
+                        revision: row.get(0)?,
+                        edited_at: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(stamp)
+    }
+
+    /// Whether a speaker edit landed after the last speaker-inclusive export.
+    /// False before the first edit and after every recorded export.
+    pub fn speakers_edited_since_export(&self, transcript_id: Uuid) -> Result<bool, SuramakError> {
+        let edited: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT revision > exported_revision FROM speaker_edits WHERE transcript_id = ?1",
+                params![transcript_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(edited.unwrap_or(0) != 0)
+    }
+
+    /// Records that a speaker-inclusive export was written: the current
+    /// revision becomes the exported one. Only a verified write calls this —
+    /// the honesty note never claims a file was updated.
+    pub fn record_speaker_export(&self, transcript_id: Uuid) -> Result<(), SuramakError> {
+        self.conn.execute(
+            "UPDATE speaker_edits
+             SET exported_revision = revision, exported_at = ?2
+             WHERE transcript_id = ?1",
+            params![transcript_id.to_string(), Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
     /// Renames one speaker (one row; every turn and export follows because they
-    /// join through `speaker_id`).
+    /// join through `speaker_id`). Returns the applied snapshot for Undo.
     pub fn rename_speaker(
         &self,
         transcript_id: Uuid,
         speaker_id: u32,
         label: &str,
-    ) -> Result<(), SuramakError> {
-        let mut speakers = self.speakers(transcript_id)?;
-        if speakers.is_empty() {
+    ) -> Result<SpeakerSnapshot, SuramakError> {
+        if self.speakers(transcript_id)?.is_empty() {
             return Err(SuramakError::Diarization(
                 "this transcript has no speaker labels".to_string(),
             ));
         }
-        rename(&mut speakers, speaker_id, label).map_err(SuramakError::Diarization)?;
-        let speaker = speakers
-            .iter()
-            .find(|speaker| speaker.speaker_id == speaker_id)
-            .ok_or_else(|| SuramakError::Diarization(format!("no speaker {speaker_id}")))?;
-        self.conn.execute_batch("SAVEPOINT rename_speaker")?;
-        let renamed = (|| -> Result<(), SuramakError> {
-            self.conn.execute(
-                "UPDATE speakers SET label = ?1, source = 'manual', updated_at = ?2
-                 WHERE transcript_id = ?3 AND speaker_id = ?4",
-                params![
-                    speaker.label,
-                    speaker.updated_at,
-                    transcript_id.to_string(),
-                    speaker_id
-                ],
-            )?;
-            Self::refresh_segment_speakers(&self.conn, transcript_id)
-        })();
-        match renamed {
-            Ok(()) => {
-                self.conn.execute_batch("RELEASE rename_speaker")?;
-                Ok(())
-            }
-            Err(err) => {
-                let _ = self
-                    .conn
-                    .execute_batch("ROLLBACK TO rename_speaker; RELEASE rename_speaker");
-                Err(err)
-            }
-        }
+        self.apply_speaker_verb(
+            transcript_id,
+            SpeakerEditKind::Rename,
+            Some(label.trim().to_string()),
+            |state| rename(&mut state.speakers, speaker_id, label),
+        )
     }
 
     /// Sets one speaker's colour slot (0..6; the Deck palette's first N hues).
@@ -3724,28 +4132,23 @@ impl Store {
         transcript_id: Uuid,
         speaker_id: u32,
         slot: u8,
-    ) -> Result<(), SuramakError> {
+    ) -> Result<SpeakerSnapshot, SuramakError> {
         if slot >= COLOR_SLOTS {
             return Err(SuramakError::Diarization(format!(
                 "colour slot {slot} is outside 0..{COLOR_SLOTS}"
             )));
         }
-        let changed = self.conn.execute(
-            "UPDATE speakers SET color_slot = ?1, source = 'manual', updated_at = ?2
-             WHERE transcript_id = ?3 AND speaker_id = ?4",
-            params![
-                slot,
-                Utc::now().to_rfc3339(),
-                transcript_id.to_string(),
-                speaker_id
-            ],
-        )?;
-        if changed == 0 {
-            return Err(SuramakError::Diarization(format!(
-                "no speaker {speaker_id} on this transcript"
-            )));
-        }
-        Ok(())
+        self.apply_speaker_verb(transcript_id, SpeakerEditKind::Color, None, |state| {
+            let speaker = state
+                .speakers
+                .iter_mut()
+                .find(|speaker| speaker.speaker_id == speaker_id)
+                .ok_or_else(|| format!("no speaker {speaker_id} on this transcript"))?;
+            speaker.color_slot = slot;
+            speaker.source = SpeakerSource::Manual;
+            speaker.updated_at = Utc::now().to_rfc3339();
+            Ok(())
+        })
     }
 
     /// Reassigns one turn to another speaker, in one statement, marking it
@@ -3786,119 +4189,110 @@ impl Store {
     }
 
     /// Merges two speakers: moves the turns, deletes the source speaker row and
-    /// renumbers the remaining speakers densely (turns follow).
+    /// renumbers the remaining speakers densely (turns follow). Returns the
+    /// applied snapshot for Undo.
     pub fn merge_speakers(
         &self,
         transcript_id: Uuid,
         from: u32,
         into: u32,
-    ) -> Result<(), SuramakError> {
-        let run = self
-            .diarization_run(transcript_id)?
-            .ok_or_else(|| SuramakError::Diarization("no diarization run".to_string()))?;
-        let before = self.speakers(transcript_id)?;
-        let mut speakers = before.clone();
-        let mut turns = self.speaker_turns(transcript_id)?;
-        merge_speakers(&mut speakers, &mut turns, from, into).map_err(SuramakError::Diarization)?;
-        // The surviving speakers keep their order, so a speaker's new id is its
-        // position among the survivors. Walk from the highest id down: an id
-        // only ever decreases, so a lower row is never in the way.
-        let survivors: Vec<(u32, u32, String)> = before
-            .iter()
-            .filter(|speaker| speaker.speaker_id != from)
-            .enumerate()
-            .map(|(new_id, speaker)| {
-                let label = if speaker.has_default_label() {
-                    default_label(new_id as u32)
-                } else {
-                    speaker.label.clone()
-                };
-                (speaker.speaker_id, new_id as u32, label)
-            })
-            .collect();
-        let tx = self.conn.unchecked_transaction()?;
-        // The renumbering is a permutation: turns must be re-pointed before the
-        // speaker rows change, and a row's id can move onto another row's old
-        // id. Both are only consistent at commit, so the FK checks are deferred
-        // to it (SQLite's documented per-transaction mechanism).
-        tx.execute_batch("PRAGMA defer_foreign_keys = ON")?;
-        for turn in &turns {
-            tx.execute(
-                "UPDATE speaker_turns SET speaker_id = ?1, source = ?2
-                 WHERE transcript_id = ?3 AND run_id = ?4 AND turn_idx = ?5",
-                params![
-                    turn.speaker_id,
-                    turn.source.as_str(),
-                    transcript_id.to_string(),
-                    run.run_id,
-                    turn.turn_idx
-                ],
-            )?;
+    ) -> Result<SpeakerSnapshot, SuramakError> {
+        if self.diarization_run(transcript_id)?.is_none() {
+            return Err(SuramakError::Diarization("no diarization run".to_string()));
         }
-        tx.execute(
-            "DELETE FROM speakers WHERE transcript_id = ?1 AND speaker_id = ?2",
-            params![transcript_id.to_string(), from],
-        )?;
-        for (old_id, new_id, label) in survivors.iter().rev() {
-            tx.execute(
-                "UPDATE speakers SET speaker_id = ?1, label = ?2
-                 WHERE transcript_id = ?3 AND speaker_id = ?4",
-                params![new_id, label, transcript_id.to_string(), old_id],
-            )?;
-        }
-        // M22C: ids and labels both may have moved; the segment index follows.
-        Self::refresh_segment_speakers(&tx, transcript_id)?;
-        tx.commit()?;
-        Ok(())
+        let target = self
+            .speakers(transcript_id)?
+            .into_iter()
+            .find(|speaker| speaker.speaker_id == into)
+            .map(|speaker| speaker.label);
+        self.apply_speaker_verb(transcript_id, SpeakerEditKind::Merge, target, |state| {
+            // Default-labelled survivors are renumbered with their ids, exactly
+            // as the pre-M23A store did; a user's name is never touched.
+            let was_default: Vec<bool> = state
+                .speakers
+                .iter()
+                .filter(|speaker| speaker.speaker_id != from)
+                .map(Speaker::has_default_label)
+                .collect();
+            merge_speakers(&mut state.speakers, &mut state.turns, from, into)?;
+            for (index, speaker) in state.speakers.iter_mut().enumerate() {
+                if was_default.get(index).copied().unwrap_or(false) {
+                    speaker.label = default_label(index as u32);
+                }
+            }
+            Ok(())
+        })
     }
 
-    /// Splits selected turns into a new speaker appended at the end.
+    /// Splits selected turns into a new speaker appended at the end. Returns
+    /// the new speaker's id and the applied snapshot for Undo.
     pub fn split_speaker(
         &self,
         transcript_id: Uuid,
         new_label: &str,
         color_slot: u8,
         turn_idxs: &[u32],
-    ) -> Result<u32, SuramakError> {
-        let run = self
-            .diarization_run(transcript_id)?
-            .ok_or_else(|| SuramakError::Diarization("no diarization run".to_string()))?;
-        let mut speakers = self.speakers(transcript_id)?;
-        let mut turns = self.speaker_turns(transcript_id)?;
-        let id = split_speaker(&mut speakers, &mut turns, new_label, color_slot, turn_idxs)
-            .map_err(SuramakError::Diarization)?;
-        let tx = self.conn.unchecked_transaction()?;
-        let speaker = &speakers[id as usize];
-        tx.execute(
-            "INSERT INTO speakers(transcript_id, speaker_id, label, color_slot, source,
-                                  created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 'manual', ?5, ?6)",
-            params![
-                transcript_id.to_string(),
-                speaker.speaker_id,
-                speaker.label,
-                speaker.color_slot,
-                speaker.created_at,
-                speaker.updated_at
-            ],
-        )?;
-        for turn in &turns {
-            if turn_idxs.contains(&turn.turn_idx) {
-                tx.execute(
-                    "UPDATE speaker_turns SET speaker_id = ?1, source = 'manual'
-                     WHERE transcript_id = ?2 AND run_id = ?3 AND turn_idx = ?4",
-                    params![
-                        turn.speaker_id,
-                        transcript_id.to_string(),
-                        run.run_id,
-                        turn.turn_idx
-                    ],
-                )?;
-            }
+    ) -> Result<(u32, SpeakerSnapshot), SuramakError> {
+        if self.diarization_run(transcript_id)?.is_none() {
+            return Err(SuramakError::Diarization("no diarization run".to_string()));
         }
-        Self::refresh_segment_speakers(&tx, transcript_id)?;
-        tx.commit()?;
-        Ok(id)
+        let mut new_id = 0;
+        let snapshot = self.apply_speaker_verb(
+            transcript_id,
+            SpeakerEditKind::Split,
+            Some(new_label.to_string()),
+            |state| {
+                new_id = split_speaker(
+                    &mut state.speakers,
+                    &mut state.turns,
+                    new_label,
+                    color_slot,
+                    turn_idxs,
+                )?;
+                // The new row is user data from the first frame, exactly like
+                // the pre-M23A store's `source = 'manual'` insert.
+                state.speakers[new_id as usize].source = SpeakerSource::Manual;
+                Ok(())
+            },
+        )?;
+        Ok((new_id, snapshot))
+    }
+
+    /// Removes one speaker's label and every turn it owned; the affected rows
+    /// become unlabelled and the remaining ids renumber densely (the phone's
+    /// "Remove label").
+    pub fn remove_speaker_label(
+        &self,
+        transcript_id: Uuid,
+        speaker_id: u32,
+    ) -> Result<SpeakerSnapshot, SuramakError> {
+        let label = self
+            .speakers(transcript_id)?
+            .into_iter()
+            .find(|speaker| speaker.speaker_id == speaker_id)
+            .map(|speaker| speaker.label);
+        self.apply_speaker_verb(
+            transcript_id,
+            SpeakerEditKind::RemoveLabel,
+            label,
+            |state| {
+                // A default label follows its speaker's new ordinal; a user's
+                // name is never touched (same rule as a merge).
+                let was_default: Vec<bool> = state
+                    .speakers
+                    .iter()
+                    .filter(|speaker| speaker.speaker_id != speaker_id)
+                    .map(Speaker::has_default_label)
+                    .collect();
+                remove_speaker_turns(&mut state.speakers, &mut state.turns, speaker_id)?;
+                for (index, speaker) in state.speakers.iter_mut().enumerate() {
+                    if was_default.get(index).copied().unwrap_or(false) {
+                        speaker.label = default_label(index as u32);
+                    }
+                }
+                Ok(())
+            },
+        )
     }
 
     /// Deletes the run **and** the transcript's speakers in one transaction —
@@ -3916,6 +4310,9 @@ impl Store {
         )?;
         // M22C: with the labels gone, the index's speaker column is cleared.
         Self::refresh_segment_speakers(&tx, transcript_id)?;
+        // M23A: removing labels is an edit like any other; the export note
+        // must be able to say the exported file no longer matches.
+        Self::bump_speaker_edit(&tx, transcript_id)?;
         tx.commit()?;
         Ok(())
     }
@@ -4535,6 +4932,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diarization::{SpeakerHistory, SPEAKER_UNDO_DEPTH};
     use crate::transcript::Source;
 
     fn sample(title: &str) -> Transcript {
@@ -6873,7 +7271,7 @@ mod tests {
         write_fixture(&path, 7);
 
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 9);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(store.list_transcripts().unwrap().len(), 1);
         assert_eq!(
             store
@@ -6886,5 +7284,380 @@ mod tests {
         assert!(store.jobs().unwrap().is_empty());
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- M23A: manual tagging ----------------------------------------------
+
+    /// Six one-second segments, no run: the phone's untagged state.
+    fn manual_fixture(store: &Store) -> Transcript {
+        let mut t = sample("tagging.wav");
+        t.segments = (0..6)
+            .map(|index| Segment {
+                idx: index,
+                start_ms: index as i64 * 1_000,
+                end_ms: index as i64 * 1_000 + 1_000,
+                text: format!("line {index}"),
+            })
+            .collect();
+        store.insert_transcript(&t).unwrap();
+        t
+    }
+
+    /// One engine run with a single turn covering all six segments.
+    fn one_long_turn(store: &Store, t: &Transcript) {
+        let run = DiarizationRun::new(t.id, 0, "seg.onnx", "s", "emb.onnx", "e", 1, 0.5, 6_000);
+        store
+            .replace_diarization_run(
+                t.id,
+                &run,
+                &[Speaker::new(0, "Speaker 1", 0)],
+                &[SpeakerTurn::new(0, 0, 6_000, 0)],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn add_speaker_allocates_the_next_ordinal_and_the_first_unused_colour() {
+        let store = Store::open_in_memory().unwrap();
+        let t = manual_fixture(&store);
+        assert_eq!(store.diarization(t.id).unwrap(), None);
+
+        let (first, snapshot) = store.add_speaker(t.id).unwrap();
+        assert_eq!(first, 0);
+        assert_eq!(snapshot.summary(), "Speaker 1 added");
+        assert!(snapshot.before.is_empty());
+        let run = store.diarization_run(t.id).unwrap().expect("manual anchor");
+        assert!(run.is_manual(), "no engine, no models: an honest anchor");
+        assert_eq!(run.audio_ms, 6_000);
+        assert_eq!(run.provenance_line(1), "manual tags · 1 speaker");
+
+        let (second, _) = store.add_speaker(t.id).unwrap();
+        let (third, _) = store.add_speaker(t.id).unwrap();
+        assert_eq!((second, third), (1, 2));
+        let speakers = store.speakers(t.id).unwrap();
+        assert_eq!(
+            speakers
+                .iter()
+                .map(|speaker| (speaker.label.as_str(), speaker.color_slot))
+                .collect::<Vec<_>>(),
+            vec![("Speaker 1", 0), ("Speaker 2", 1), ("Speaker 3", 2)]
+        );
+        assert!(speakers
+            .iter()
+            .all(|speaker| speaker.source == SpeakerSource::Manual));
+
+        // A free middle slot is claimed, not the next index: rename, then add.
+        store.set_speaker_color(t.id, 1, 5).unwrap();
+        let (_, _) = store.add_speaker(t.id).unwrap();
+        let fourth = store.speakers(t.id).unwrap().pop().unwrap();
+        assert_eq!(fourth.speaker_id, 3);
+        assert_eq!(fourth.color_slot, 1, "slot 1 is the first unused one");
+
+        // The palette cap is refused, not wrapped.
+        store.add_speaker(t.id).unwrap();
+        store.add_speaker(t.id).unwrap();
+        let err = store.add_speaker(t.id).unwrap_err();
+        assert!(err.to_string().contains("at most 6"), "{err}");
+    }
+
+    #[test]
+    fn assign_this_turn_splits_the_containing_turn_at_both_boundaries() {
+        let store = Store::open_in_memory().unwrap();
+        let t = manual_fixture(&store);
+        one_long_turn(&store, &t);
+        let (second, _) = store.add_speaker(t.id).unwrap();
+
+        let snapshot = store
+            .assign_speaker(t.id, second, TimeRange::new(2_000, 3_000))
+            .unwrap();
+        assert_eq!(snapshot.summary(), "Assigned Speaker 2");
+        let turns = store.speaker_turns(t.id).unwrap();
+        assert_eq!(
+            turns
+                .iter()
+                .map(|turn| (turn.start_ms, turn.end_ms, turn.speaker_id, turn.source))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 2_000, 0, TurnSource::Auto),
+                (2_000, 3_000, 1, TurnSource::Manual),
+                (3_000, 6_000, 0, TurnSource::Auto),
+            ],
+            "both boundaries split; the untouched sides keep their speaker"
+        );
+        // Rows are renumbered densely over the complete set.
+        assert!(turns
+            .iter()
+            .enumerate()
+            .all(|(index, turn)| turn.turn_idx == index as u32));
+
+        // The badge projection says exactly one row moved.
+        let projected = store.speaker_for_segments(t.id).unwrap();
+        assert_eq!(
+            projected
+                .iter()
+                .map(|row| row.map(|row| row.primary))
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(0), Some(1), Some(0), Some(0), Some(0)]
+        );
+
+        // The same range assigned again is a no-op in content (idempotent).
+        let before = store.speaker_turns(t.id).unwrap();
+        store
+            .assign_speaker(t.id, second, TimeRange::new(2_000, 3_000))
+            .unwrap();
+        assert_eq!(store.speaker_turns(t.id).unwrap(), before);
+    }
+
+    #[test]
+    fn assign_from_here_down_covers_the_rest_of_the_recording() {
+        let store = Store::open_in_memory().unwrap();
+        let t = manual_fixture(&store);
+        one_long_turn(&store, &t);
+        let (second, _) = store.add_speaker(t.id).unwrap();
+
+        let segment = store.get_transcript(t.id).unwrap().segments[2].clone();
+        let range = TimeRange::from_segment_to_end(&segment, 6_000);
+        store.assign_speaker(t.id, second, range).unwrap();
+        assert_eq!(
+            store
+                .speaker_turns(t.id)
+                .unwrap()
+                .iter()
+                .map(|turn| (turn.start_ms, turn.end_ms, turn.speaker_id))
+                .collect::<Vec<_>>(),
+            vec![(0, 2_000, 0), (2_000, 6_000, 1)]
+        );
+        let projected = store.speaker_for_segments(t.id).unwrap();
+        assert_eq!(
+            projected
+                .iter()
+                .map(|row| row.map(|row| row.primary))
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(0), Some(1), Some(1), Some(1), Some(1)]
+        );
+    }
+
+    #[test]
+    fn assigning_an_unlabelled_run_creates_turns_and_fills_pauses_exactly() {
+        let store = Store::open_in_memory().unwrap();
+        let t = manual_fixture(&store);
+        // Only the first second is labelled; the rest is a gap.
+        let run = DiarizationRun::new(t.id, 0, "seg.onnx", "s", "emb.onnx", "e", 1, 0.5, 6_000);
+        store
+            .replace_diarization_run(
+                t.id,
+                &run,
+                &[Speaker::new(0, "Speaker 1", 0)],
+                &[SpeakerTurn::new(0, 0, 1_000, 0)],
+            )
+            .unwrap();
+        let (second, _) = store.add_speaker(t.id).unwrap();
+
+        // A range that starts and ends in silence still becomes one exact turn.
+        store
+            .assign_speaker(t.id, second, TimeRange::new(3_000, 6_000))
+            .unwrap();
+        assert_eq!(
+            store
+                .speaker_turns(t.id)
+                .unwrap()
+                .iter()
+                .map(|turn| (turn.start_ms, turn.end_ms, turn.speaker_id))
+                .collect::<Vec<_>>(),
+            vec![(0, 1_000, 0), (3_000, 6_000, 1)]
+        );
+        let projected = store.speaker_for_segments(t.id).unwrap();
+        assert_eq!(
+            projected
+                .iter()
+                .map(|row| row.map(|row| row.primary))
+                .collect::<Vec<_>>(),
+            vec![Some(0), None, None, Some(1), Some(1), Some(1)],
+            "the untouched gap stays unlabelled — never a fabricated speaker"
+        );
+
+        // A range spanning the gap and the existing turn fills the pause too.
+        store
+            .assign_speaker(t.id, second, TimeRange::new(500, 3_500))
+            .unwrap();
+        let turns = store.speaker_turns(t.id).unwrap();
+        assert_eq!(
+            turns
+                .iter()
+                .map(|turn| (turn.start_ms, turn.end_ms, turn.speaker_id))
+                .collect::<Vec<_>>(),
+            vec![(0, 500, 0), (500, 6_000, 1)],
+            "the split piece, the silence and the earlier same-speaker turn are one row"
+        );
+        assert!(turns
+            .iter()
+            .all(|turn| { turn.end_ms <= 6_000 && (turn.end_ms > turn.start_ms) }));
+    }
+
+    #[test]
+    fn clear_speakers_restores_the_plain_view_and_leaves_whisper_segments_alone() {
+        let store = Store::open_in_memory().unwrap();
+        let t = manual_fixture(&store);
+        let segments_before = dump_table(&store, "segments");
+        store.add_speaker(t.id).unwrap();
+        let (second, _) = store.add_speaker(t.id).unwrap();
+        store
+            .assign_speaker(t.id, second, TimeRange::new(0, 2_000))
+            .unwrap();
+        assert!(!store.speaker_for_segments(t.id).unwrap().is_empty());
+
+        let snapshot = store.clear_speakers(t.id).unwrap();
+        assert_eq!(snapshot.summary(), "All speakers cleared");
+        let anchored = store.diarization(t.id).unwrap().expect("the run stays");
+        assert!(anchored.speakers.is_empty() && anchored.turns.is_empty());
+        assert!(store.speakers(t.id).unwrap().is_empty());
+        assert!(store.speaker_turns(t.id).unwrap().is_empty());
+        assert!(store
+            .speaker_for_segments(t.id)
+            .unwrap()
+            .iter()
+            .all(Option::is_none));
+        assert_eq!(
+            dump_table(&store, "segments"),
+            segments_before,
+            "clearing labels never touches the transcript text"
+        );
+        // The segment index's speaker column is cleared too.
+        let labelled: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM segment_fts_map WHERE transcript_id = ?1 AND speaker != ''",
+                params![t.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(labelled, 0);
+
+        // The anchor is reused for the next tag, still manual.
+        let (first, _) = store.add_speaker(t.id).unwrap();
+        assert_eq!(first, 0);
+        assert!(store.diarization_run(t.id).unwrap().unwrap().is_manual());
+    }
+
+    #[test]
+    fn the_edit_stamp_is_monotonic_and_an_export_clears_the_honesty_note() {
+        let store = Store::open_in_memory().unwrap();
+        let t = manual_fixture(&store);
+        assert_eq!(store.speakers_edited_at(t.id).unwrap(), None);
+        assert!(!store.speakers_edited_since_export(t.id).unwrap());
+
+        let (first, _) = store.add_speaker(t.id).unwrap();
+        let after_add = store.speakers_edited_at(t.id).unwrap().expect("stamp");
+        assert_eq!(after_add.revision, 1);
+        assert!(!after_add.edited_at.is_empty());
+        assert!(store.speakers_edited_since_export(t.id).unwrap());
+
+        store.record_speaker_export(t.id).unwrap();
+        assert!(!store.speakers_edited_since_export(t.id).unwrap());
+
+        store.rename_speaker(t.id, first, "Budi").unwrap();
+        let after_rename = store.speakers_edited_at(t.id).unwrap().unwrap();
+        assert_eq!(after_rename.revision, 2, "the revision only moves forward");
+        assert!(store.speakers_edited_since_export(t.id).unwrap());
+
+        // Every mutating verb bumps; the counter is never reused or reset.
+        store.record_speaker_export(t.id).unwrap();
+        store.set_speaker_color(t.id, first, 3).unwrap();
+        store
+            .assign_speaker(t.id, first, TimeRange::new(0, 1_000))
+            .unwrap();
+        store.clear_speakers(t.id).unwrap();
+        assert_eq!(store.speakers_edited_at(t.id).unwrap().unwrap().revision, 5);
+    }
+
+    #[test]
+    fn every_verb_returns_an_undo_snapshot_that_restores_the_exact_rows() {
+        let store = Store::open_in_memory().unwrap();
+        let t = manual_fixture(&store);
+        one_long_turn(&store, &t);
+        let mut history = SpeakerHistory::new();
+
+        // Add
+        let before = store.speakers(t.id).unwrap();
+        let (_, snapshot) = store.add_speaker(t.id).unwrap();
+        history.push(snapshot.clone());
+        store.restore_speaker_state(t.id, &snapshot.before).unwrap();
+        assert_eq!(store.speakers(t.id).unwrap(), before);
+        assert_eq!(store.speaker_turns(t.id).unwrap(), snapshot.before.turns);
+        store.restore_speaker_state(t.id, &snapshot.after).unwrap();
+
+        // Rename
+        let snapshot = store.rename_speaker(t.id, 0, "Budi").unwrap();
+        history.push(snapshot.clone());
+        store.restore_speaker_state(t.id, &snapshot.before).unwrap();
+        assert_eq!(store.speakers(t.id).unwrap()[0].label, "Speaker 1");
+        store.restore_speaker_state(t.id, &snapshot.after).unwrap();
+        assert_eq!(store.speakers(t.id).unwrap()[0].label, "Budi");
+
+        // Colour
+        let snapshot = store.set_speaker_color(t.id, 0, 4).unwrap();
+        history.push(snapshot.clone());
+        store.restore_speaker_state(t.id, &snapshot.before).unwrap();
+        assert_eq!(store.speakers(t.id).unwrap()[0].color_slot, 0);
+        store.restore_speaker_state(t.id, &snapshot.after).unwrap();
+
+        // Assign
+        let snapshot = store
+            .assign_speaker(t.id, 1, TimeRange::new(1_000, 2_000))
+            .unwrap();
+        history.push(snapshot.clone());
+        store.restore_speaker_state(t.id, &snapshot.before).unwrap();
+        assert_eq!(store.speaker_turns(t.id).unwrap(), snapshot.before.turns);
+        store.restore_speaker_state(t.id, &snapshot.after).unwrap();
+
+        // Merge (ids renumber, so the snapshot is the only exact record)
+        let (_, snapshot) = store.split_speaker(t.id, "Speaker 3", 2, &[1]).unwrap();
+        history.push(snapshot.clone());
+        let after_split = store.diarization(t.id).unwrap().unwrap();
+        let snapshot = store.merge_speakers(t.id, 2, 0).unwrap();
+        history.push(snapshot.clone());
+        assert_eq!(store.speakers(t.id).unwrap().len(), 2);
+        store.restore_speaker_state(t.id, &snapshot.before).unwrap();
+        assert_eq!(store.diarization(t.id).unwrap().unwrap(), after_split);
+        store.restore_speaker_state(t.id, &snapshot.after).unwrap();
+
+        // Remove label
+        let snapshot = store.remove_speaker_label(t.id, 1).unwrap();
+        history.push(snapshot.clone());
+        let after_clear_one = store.diarization(t.id).unwrap().unwrap();
+        store.restore_speaker_state(t.id, &snapshot.before).unwrap();
+        assert_eq!(store.speakers(t.id).unwrap(), snapshot.before.speakers);
+        assert_eq!(store.speaker_turns(t.id).unwrap(), snapshot.before.turns);
+        assert_eq!(after_clear_one.speakers.len(), 1);
+
+        // Clear
+        let snapshot = store.clear_speakers(t.id).unwrap();
+        history.push(snapshot.clone());
+        store.restore_speaker_state(t.id, &snapshot.before).unwrap();
+        assert_eq!(store.speakers(t.id).unwrap(), snapshot.before.speakers);
+        assert_eq!(store.speaker_turns(t.id).unwrap(), snapshot.before.turns);
+
+        // The log is the same bounded pattern as the segment one.
+        assert_eq!(history.depth(), 8);
+        let undone = history.undo().expect("undo");
+        history.push(undone);
+        assert!(!history.can_redo(), "a push drops the redo branch");
+        assert_eq!(SPEAKER_UNDO_DEPTH, 20);
+    }
+
+    #[test]
+    fn a_manual_run_needs_no_diarization_engine() {
+        let store = Store::open_in_memory().unwrap();
+        let t = manual_fixture(&store);
+        store.add_speaker(t.id).unwrap();
+        let run = store.diarization_run(t.id).unwrap().unwrap();
+        assert!(run.is_manual());
+        assert_eq!(run.num_clusters, 0);
+        assert_eq!(run.threshold, 0.0);
+        assert_eq!(run.segmentation_sha256, "");
+        assert_eq!(run.embedding_sha256, "");
+        // The em-dash-free provenance line the desktop will show, and no model
+        // pretence.
+        assert_eq!(run.provenance_line(2), "manual tags · 2 speakers");
     }
 }

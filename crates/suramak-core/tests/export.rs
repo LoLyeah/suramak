@@ -1,9 +1,12 @@
 use chrono::DateTime;
 use suramak_core::diagnostics::SubtitleLimits;
+use suramak_core::diarization::SpeakerTurn;
 use suramak_core::export::{
     bilingual_advisories, bilingual_cues, to_ass, to_ass_bilingual, to_ass_with, to_json,
-    to_markdown, to_srt, to_srt_bilingual, to_tsv, to_txt, to_vtt, to_vtt_bilingual, AssOptions,
-    ZeroDuration, ASS_ONE_FRAME_MS, BILINGUAL_LINE_BUDGET_CPL,
+    to_markdown, to_markdown_with_speakers, to_srt, to_srt_bilingual,
+    to_srt_bilingual_with_speakers, to_srt_with_speakers, to_tsv, to_txt, to_vtt, to_vtt_bilingual,
+    to_vtt_bilingual_with_speakers, to_vtt_with_speakers, AssOptions, ExportSpeakers, ZeroDuration,
+    ASS_ONE_FRAME_MS, BILINGUAL_LINE_BUDGET_CPL,
 };
 use suramak_core::transcript::{Segment, Source, Transcript};
 use suramak_core::translate::TranslationRecord;
@@ -584,4 +587,156 @@ fn bilingual_exporters_never_drop_a_zero_duration_cue_from_srt_or_vtt() {
     assert!(srt.contains("00:00:01,000 --> 00:00:01,000"));
     let vtt = to_vtt_bilingual(&t, &translations).unwrap();
     assert!(vtt.contains("instant\nseketika"), "{vtt}");
+}
+
+// ---- M23A: speakers in exports -------------------------------------------
+
+/// Two speakers over the fixed transcript: Speaker 1 through 2.4 s,
+/// Speaker 2 for the rest.
+fn two_speakers() -> ExportSpeakers {
+    ExportSpeakers::new(
+        vec![(0, "Speaker 1".to_string()), (1, "Speaker 2".to_string())],
+        vec![
+            SpeakerTurn::new(0, 0, 2_500, 0),
+            SpeakerTurn::new(1, 2_500, 8_500, 1),
+        ],
+    )
+}
+
+#[test]
+fn speakers_prefix_srt_vtt_and_markdown_with_their_labels() {
+    let t = fixed_transcript();
+    let speakers = two_speakers();
+
+    let srt = to_srt_with_speakers(&t, Some(&speakers)).unwrap();
+    assert!(srt.contains("Speaker 1: Hello world."), "{srt}");
+    assert!(srt.contains("Speaker 2: This is a test."), "{srt}");
+    assert!(srt.contains("Speaker 2: Goodbye."), "{srt}");
+    // The cue numbering and timing are the plain path's, untouched.
+    assert!(srt.starts_with("1\n00:00:00,000 --> 00:00:02,400\nSpeaker 1: "));
+
+    let vtt = to_vtt_with_speakers(&t, Some(&speakers)).unwrap();
+    assert!(
+        vtt.contains("<v Speaker 1>Hello world."),
+        "a voice span, not a prefix: {vtt}"
+    );
+    assert!(vtt.contains("<v Speaker 2>This is a test."), "{vtt}");
+    assert!(vtt.contains("<v Speaker 2>Goodbye."), "{vtt}");
+
+    let md = to_markdown_with_speakers(&t, Some(&speakers)).unwrap();
+    assert!(
+        md.contains("[00:00:00.000 → 00:00:02.400] **Speaker 1:** Hello world."),
+        "{md}"
+    );
+    assert!(
+        md.contains("[00:00:02.400 → 00:00:05.000] **Speaker 2:** This is a test."),
+        "{md}"
+    );
+}
+
+#[test]
+fn a_renamed_speaker_exports_the_name_and_vtt_escapes_the_annotation() {
+    let t = fixed_transcript();
+    let renamed = ExportSpeakers::new(
+        vec![(0, "Budi".to_string())],
+        vec![SpeakerTurn::new(0, 0, 8_500, 0)],
+    );
+    assert!(to_srt_with_speakers(&t, Some(&renamed))
+        .unwrap()
+        .contains("Budi: Hello world."));
+    assert!(to_vtt_with_speakers(&t, Some(&renamed))
+        .unwrap()
+        .contains("<v Budi>Hello world."));
+    assert!(to_markdown_with_speakers(&t, Some(&renamed))
+        .unwrap()
+        .contains("**Budi:** Hello world."));
+
+    // A name with VTT's syntactic characters cannot close the annotation early.
+    let awkward = ExportSpeakers::new(
+        vec![(0, "R&D <x>".to_string())],
+        vec![SpeakerTurn::new(0, 0, 8_500, 0)],
+    );
+    let vtt = to_vtt_with_speakers(&t, Some(&awkward)).unwrap();
+    assert!(vtt.contains("<v R&amp;D &lt;x&gt;>Hello world."), "{vtt}");
+}
+
+#[test]
+fn an_unlabelled_row_exports_with_no_prefix_at_all() {
+    let t = fixed_transcript();
+    // Only the first cue is covered; the other two are a gap.
+    let partial = ExportSpeakers::new(
+        vec![(0, "Speaker 1".to_string())],
+        vec![SpeakerTurn::new(0, 0, 2_400, 0)],
+    );
+    let srt = to_srt_with_speakers(&t, Some(&partial)).unwrap();
+    assert!(srt.contains("Speaker 1: Hello world."), "{srt}");
+    assert!(srt.contains("\nThis is a test.\n"), "{srt}");
+    assert!(srt.contains("\nGoodbye.\n"), "{srt}");
+    assert!(!srt.contains("Speaker ?"), "never a fabricated label");
+    let md = to_markdown_with_speakers(&t, Some(&partial)).unwrap();
+    assert!(
+        md.contains("[00:00:02.400 → 00:00:05.000] This is a test."),
+        "{md}"
+    );
+}
+
+#[test]
+fn turning_speakers_off_is_byte_identical_to_todays_exports() {
+    let t = fixed_transcript();
+    let translations = vec![
+        (
+            0,
+            TranslationRecord::new("Halo dunia.", "m", "2026-01-01T00:00:00Z", vec![0]),
+        ),
+        (
+            1,
+            TranslationRecord::new("Ini uji.", "m", "2026-01-01T00:00:00Z", vec![1]),
+        ),
+    ];
+    assert_eq!(to_srt_with_speakers(&t, None).unwrap(), to_srt(&t).unwrap());
+    assert_eq!(to_vtt_with_speakers(&t, None).unwrap(), to_vtt(&t).unwrap());
+    assert_eq!(
+        to_markdown_with_speakers(&t, None).unwrap(),
+        to_markdown(&t).unwrap()
+    );
+    assert_eq!(
+        to_srt_bilingual_with_speakers(&t, &translations, None).unwrap(),
+        to_srt_bilingual(&t, &translations).unwrap()
+    );
+    assert_eq!(
+        to_vtt_bilingual_with_speakers(&t, &translations, None).unwrap(),
+        to_vtt_bilingual(&t, &translations).unwrap()
+    );
+
+    // An empty annotation (a run with no turns) is also the plain bytes, not
+    // an export full of blank prefixes.
+    let empty = ExportSpeakers::default();
+    assert_eq!(
+        to_srt_with_speakers(&t, Some(&empty)).unwrap(),
+        to_srt(&t).unwrap()
+    );
+    assert_eq!(
+        to_vtt_with_speakers(&t, Some(&empty)).unwrap(),
+        to_vtt(&t).unwrap()
+    );
+}
+
+#[test]
+fn bilingual_exports_prefix_only_the_primary_line() {
+    let t = fixed_transcript();
+    let speakers = two_speakers();
+    let translations = vec![(
+        0,
+        TranslationRecord::new("Halo dunia.", "m", "2026-01-01T00:00:00Z", vec![0]),
+    )];
+    let srt = to_srt_bilingual_with_speakers(&t, &translations, Some(&speakers)).unwrap();
+    assert!(
+        srt.contains("Speaker 1: Hello world.\nHalo dunia."),
+        "{srt}"
+    );
+    let vtt = to_vtt_bilingual_with_speakers(&t, &translations, Some(&speakers)).unwrap();
+    assert!(
+        vtt.contains("<v Speaker 1>Hello world.\nHalo dunia."),
+        "{vtt}"
+    );
 }

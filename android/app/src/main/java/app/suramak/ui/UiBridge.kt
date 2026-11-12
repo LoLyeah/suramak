@@ -76,23 +76,34 @@ object UiBridge {
      * `path`, `suggested_name`, `bytes`, `checksum` and `mime`; the platform
      * writes that one file and then calls [exportDone].
      *
-     * `bilingual` adds the stacked translation (SRT/VTT only).
+     * `bilingual` adds the stacked translation (SRT/VTT only); `speakers`
+     * prefixes each line with its speaker (SRT/VTT/Markdown only).
      */
-    fun export(format: String, bilingual: Boolean = false): JSONObject =
+    fun export(
+        format: String,
+        bilingual: Boolean = false,
+        speakers: Boolean = false,
+    ): JSONObject =
         dispatch(
             JSONObject()
                 .put("op", "export")
                 .put("format", format)
-                .put("bilingual", bilingual),
+                .put("bilingual", bilingual)
+                .put("speakers", speakers),
         )
 
     /** The `ACTION_SEND` alternative: the same staged bytes, one file. */
-    fun exportShare(format: String, bilingual: Boolean = false): JSONObject =
+    fun exportShare(
+        format: String,
+        bilingual: Boolean = false,
+        speakers: Boolean = false,
+    ): JSONObject =
         dispatch(
             JSONObject()
                 .put("op", "export_share")
                 .put("format", format)
-                .put("bilingual", bilingual),
+                .put("bilingual", bilingual)
+                .put("speakers", speakers),
         )
 
     /** The picker's stream is closed and verified at [bytes]. */

@@ -37,6 +37,7 @@ object ExportWriter {
         val checksum: String,
         val mime: String,
         val bilingual: Boolean,
+        val speakers: Boolean,
     ) {
         companion object {
             fun from(reply: JSONObject): Staged? {
@@ -52,6 +53,7 @@ object ExportWriter {
                     checksum = reply.optString("checksum"),
                     mime = reply.optString("mime").ifEmpty { "application/octet-stream" },
                     bilingual = reply.optBoolean("bilingual"),
+                    speakers = reply.optBoolean("speakers"),
                 )
             }
         }

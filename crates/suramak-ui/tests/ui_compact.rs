@@ -177,6 +177,245 @@ fn render(app: &mut CompactApp, name: &str) -> snapshot::Shot {
     shot
 }
 
+/// M23A: a two-speaker transcript whose third row is unlabelled (the pill's
+/// state). Speaker ids/turns are the store's own shape.
+fn seed_tagged_speakers(app: &mut CompactApp) -> compact::CompactSpeakers {
+    use suramak_core::diarization::{Speaker, SpeakerTurn};
+    let segments = app.transcripts[0].segments.clone();
+    let speakers = vec![Speaker::new(0, "Speaker 1", 0), Speaker::new(1, "Budi", 1)];
+    let turns = vec![
+        SpeakerTurn::new(0, 0, 4_200, 0),
+        SpeakerTurn::new(1, 4_200, 8_400, 1),
+    ];
+    let view = compact::CompactSpeakers {
+        speakers,
+        turns: turns.clone(),
+        per_segment: suramak_core::diarization::speaker_for_segments(&segments, &turns),
+        stale: false,
+        audio_ms: 12_600,
+        edited_since_export: true,
+    };
+    app.editor.as_mut().expect("editor").speakers = Some(view.clone());
+    view
+}
+
+#[test]
+fn the_speakers_button_reads_tag_speakers_then_the_count() {
+    let mut app = seeded_app();
+    let target = app.transcripts[0].clone();
+    app.open_editor(target, 0.0);
+    assert_eq!(
+        app.speakers_button_label(),
+        "Tag speakers",
+        "an untagged transcript names the action"
+    );
+
+    let view = seed_tagged_speakers(&mut app);
+    assert_eq!(app.speakers_button_label(), "2 speakers");
+    assert_eq!(view.turn_count(0), 1);
+    assert_eq!(view.turn_count(1), 1);
+
+    // One speaker is singular; the numeral is never a bare count.
+    let mut one = view.clone();
+    one.speakers.truncate(1);
+    app.on_speakers_refreshed(Some(one));
+    assert_eq!(app.speakers_button_label(), "1 speaker");
+}
+
+#[test]
+fn the_pill_opens_the_turn_strip_on_the_unlabelled_segment() {
+    let mut app = seeded_app();
+    let target = app.transcripts[0].clone();
+    app.open_editor(target.clone(), 0.0);
+    app.advance(10.0);
+    seed_tagged_speakers(&mut app);
+
+    let mut h = Harness::new(app);
+    h.frame();
+    let pill = h.control("Tag this segment with a speaker");
+    h.touch(1, egui::TouchPhase::Start, pill.center());
+    h.touch(1, egui::TouchPhase::End, pill.center());
+    let strip = h.app.turn_strip.expect("the strip opened");
+    assert_eq!(strip.segment, 2, "the pill names its own row");
+    assert_eq!(strip.scope, compact::TurnScope::ThisTurn);
+
+    // The strip's chips assign; `From here down` flips the range in place.
+    h.frame();
+    h.app.toggle_turn_scope();
+    assert_eq!(
+        h.app.turn_strip.expect("still open").scope,
+        compact::TurnScope::FromHereDown
+    );
+    let action = h.app.request_assign(1, 12.0).expect("assign action");
+    assert_eq!(
+        action,
+        compact::CompactAction::AssignSpeaker {
+            transcript: target.id,
+            speaker_id: 1,
+            segment: 2,
+            from_here_down: true,
+        }
+    );
+}
+
+#[test]
+fn the_speaker_sheet_renames_colours_merges_and_removes() {
+    let mut app = seeded_app();
+    let target = app.transcripts[0].clone();
+    app.open_editor(target.clone(), 0.0);
+    app.advance(10.0);
+    seed_tagged_speakers(&mut app);
+
+    app.open_speaker_sheet(0, 11.0);
+    assert_eq!(app.sheet, Some(Sheet::Speaker));
+    let sheet = app.speaker_sheet.clone().expect("sheet draft");
+    assert_eq!(sheet.rename, "Speaker 1", "the field starts at the label");
+
+    app.speaker_sheet.as_mut().unwrap().rename = "  Ani  ".to_string();
+    let rename = app.request_rename().expect("rename action");
+    match rename {
+        compact::CompactAction::RenameSpeaker { label, .. } => assert_eq!(label, "Ani"),
+        other => panic!("unexpected {other:?}"),
+    }
+    // An empty name is refused before the store is asked.
+    app.speaker_sheet.as_mut().unwrap().rename = "   ".to_string();
+    assert!(app.request_rename().is_none());
+
+    match app.request_speaker_color(4).expect("colour action") {
+        compact::CompactAction::SetSpeakerColor { slot, .. } => assert_eq!(slot, 4),
+        other => panic!("unexpected {other:?}"),
+    }
+
+    app.open_merge_targets();
+    assert!(app.speaker_sheet.as_ref().unwrap().merge_open);
+    match app.request_merge(1).expect("merge action") {
+        compact::CompactAction::MergeSpeakers { from, into, .. } => {
+            assert_eq!((from, into), (0, 1));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    match app.request_remove_label().expect("remove action") {
+        compact::CompactAction::RemoveSpeakerLabel { speaker_id, .. } => {
+            assert_eq!(speaker_id, 0);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn clear_all_arms_on_the_first_tap_and_runs_on_the_second() {
+    let mut app = seeded_app();
+    let target = app.transcripts[0].clone();
+    app.open_editor(target.clone(), 0.0);
+    seed_tagged_speakers(&mut app);
+    app.open_speakers_sheet(10.0);
+    assert_eq!(app.sheet, Some(Sheet::Speakers));
+
+    assert!(
+        app.request_clear_speakers().is_none(),
+        "first tap only arms"
+    );
+    assert!(app.speakers_confirm_clear);
+    match app.request_clear_speakers().expect("second tap clears") {
+        compact::CompactAction::ClearSpeakers { transcript } => {
+            assert_eq!(transcript, target.id);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    assert!(!app.speakers_confirm_clear, "the arm is consumed");
+}
+
+#[test]
+fn a_speaker_edit_shows_a_six_second_undo_toast() {
+    let mut app = seeded_app();
+    let target = app.transcripts[0].clone();
+    app.open_editor(target, 0.0);
+    seed_tagged_speakers(&mut app);
+
+    app.on_speaker_applied("Assigned Budi", 100.0);
+    let toast = app.undo_toast.as_ref().expect("toast");
+    assert_eq!(toast.label, "Assigned Budi");
+    assert!(!toast.is_expired(105.0));
+    assert!(toast.is_expired(106.0));
+    assert_eq!(app.undo_deadline(), Some(106.0));
+    assert!(app.speakers_undo_available);
+
+    // Advance past the deadline: the toast is gone, the surface goes idle.
+    app.advance(107.0);
+    assert!(app.undo_toast.is_none());
+
+    app.on_speaker_applied("Renamed to Ani", 200.0);
+    match app.request_undo_speakers(201.0).expect("undo action") {
+        compact::CompactAction::UndoSpeakers { .. } => {}
+        other => panic!("unexpected {other:?}"),
+    }
+    assert!(app.undo_toast.is_none());
+}
+
+#[test]
+fn the_export_sheet_offers_speakers_and_the_honesty_note() {
+    let mut app = seeded_app();
+    let target = app.transcripts[0].clone();
+    app.open_editor(target.clone(), 0.0);
+    app.advance(10.0);
+    seed_tagged_speakers(&mut app);
+    app.editor.as_mut().expect("editor").format = compact::CompactExportFormat::Srt;
+    app.export_speakers = true;
+    app.open_export_sheet(10.0);
+    app.advance(11.0);
+
+    match app.begin_export(12.0).expect("export action") {
+        compact::CompactAction::Export { speakers, .. } => {
+            assert!(speakers, "the toggle rides the request");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    assert!(app.export_session.as_ref().expect("session").speakers);
+
+    // A machine format has no speaker variant: the request drops the flag.
+    app.editor.as_mut().expect("editor").format = compact::CompactExportFormat::Json;
+    match app
+        .editor
+        .as_ref()
+        .expect("editor")
+        .export_request(false, true)
+    {
+        compact::CompactAction::Export { speakers, .. } => assert!(!speakers),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn the_new_speaker_sheet_and_turn_strip_are_shots() {
+    let mut app = seeded_app();
+    let target = app.transcripts[0].clone();
+    app.open_editor(target.clone(), 0.0);
+    app.advance(10.0);
+    seed_tagged_speakers(&mut app);
+    app.editor.as_mut().expect("editor").select(2);
+    let tagged = render(&mut app, "editor-tag-speakers");
+    assert!(tagged.painted_fraction(egui::Color32::BLACK) > 0.5);
+
+    app.open_speaker_sheet(1, 10.0);
+    app.advance(11.0);
+    assert_eq!(app.sheet, Some(Sheet::Speaker));
+    assert_eq!(app.sheet_anim.value(), 1.0);
+    let sheet = render(&mut app, "editor-speaker-sheet");
+    assert!(sheet.painted_fraction(egui::Color32::BLACK) > 0.5);
+
+    app.sheet = None;
+    app.open_turn_strip(2, 11.0);
+    app.advance(12.0);
+    let strip = render(&mut app, "editor-turn-strip");
+    assert!(strip.painted_fraction(egui::Color32::BLACK) > 0.5);
+
+    app.sheet = None;
+    app.open_speakers_sheet(11.0);
+    app.advance(12.0);
+    let list = render(&mut app, "editor-speakers-sheet");
+    assert!(list.painted_fraction(egui::Color32::BLACK) > 0.5);
+}
+
 #[test]
 fn the_phone_editor_inherits_the_speaker_badges_and_lane() {
     // M16I: the phone draws the same shared Deck components as the desktop —
@@ -200,6 +439,7 @@ fn the_phone_editor_inherits_the_speaker_badges_and_lane() {
         per_segment: projection,
         stale: false,
         audio_ms: 12_000,
+        edited_since_export: false,
     });
     let shot = render(&mut app, "editor-speakers");
     assert!(shot.painted_fraction(egui::Color32::BLACK) > 0.5);
@@ -361,9 +601,11 @@ fn the_export_sheet_and_its_picker_result_are_shots() {
     let target = app.transcripts[0].clone();
     app.open_editor(target, 0.0);
     app.advance(10.0);
+    seed_tagged_speakers(&mut app);
     app.editor.as_mut().expect("editor").format = compact::CompactExportFormat::Srt;
     app.editor.as_mut().expect("editor").has_translation = true;
     app.export_bilingual = true;
+    app.export_speakers = true;
     app.open_export_sheet(10.0);
     app.advance(11.0); // the sheet's present animation settles
     assert_eq!(app.sheet, Some(Sheet::Export));

@@ -302,6 +302,7 @@ class MainActivity : GameActivity() {
 
         private const val EXTRA_FORMAT = "format"
         private const val EXTRA_BILINGUAL = "bilingual"
+        private const val EXTRA_SPEAKERS = "speakers"
         private const val EXTRA_MODEL = "model"
         private const val EXTRA_LANGUAGE = "language"
         private const val EXTRA_SENDER = "app.suramak.extra.SENDER"
@@ -555,10 +556,12 @@ class MainActivity : GameActivity() {
             ACTION_COMPACT_EXPORT -> exportFromCompact(
                 intent.getStringExtra(EXTRA_FORMAT) ?: "md",
                 intent.getBooleanExtra(EXTRA_BILINGUAL, false),
+                intent.getBooleanExtra(EXTRA_SPEAKERS, false),
             )
             ACTION_COMPACT_SHARE -> shareFromCompact(
                 intent.getStringExtra(EXTRA_FORMAT) ?: "md",
                 intent.getBooleanExtra(EXTRA_BILINGUAL, false),
+                intent.getBooleanExtra(EXTRA_SPEAKERS, false),
             )
             ACTION_COMPACT_DOWNLOAD -> {
                 val model = intent.getStringExtra(EXTRA_MODEL)
@@ -1140,8 +1143,8 @@ class MainActivity : GameActivity() {
      * this entry is the seam between them — no screen invents an export.
      */
     @Suppress("unused")
-    fun exportFromCompact(format: String, bilingual: Boolean) {
-        val reply = UiBridge.export(format, bilingual)
+    fun exportFromCompact(format: String, bilingual: Boolean, speakers: Boolean = false) {
+        val reply = UiBridge.export(format, bilingual, speakers)
         if (!reply.optBoolean("ok")) {
             val reason = reply.optString("error", "the export could not be staged")
             logToRust("export: refused — $reason")
@@ -1171,8 +1174,8 @@ class MainActivity : GameActivity() {
      * stays until the next process start so the receiving app can read it.
      */
     @Suppress("unused")
-    fun shareFromCompact(format: String, bilingual: Boolean) {
-        val reply = UiBridge.exportShare(format, bilingual)
+    fun shareFromCompact(format: String, bilingual: Boolean, speakers: Boolean = false) {
+        val reply = UiBridge.exportShare(format, bilingual, speakers)
         if (!reply.optBoolean("ok")) {
             val reason = reply.optString("error", "the export could not be staged")
             logToRust("export: share refused — $reason")

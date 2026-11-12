@@ -2,13 +2,79 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 use crate::diagnostics::{diagnose, SegmentDiagnostics, SubtitleLimits};
+use crate::diarization::{speaker_for_segments, Diarization, SpeakerTurn};
 use crate::time::{fmt_ms, fmt_plain, fmt_srt, fmt_vtt};
-use crate::transcript::{Source, Transcript};
+use crate::transcript::{Segment, Source, Transcript};
 use crate::translate::TranslationRecord;
 use crate::SuramakError;
 
+/// The speaker annotation an export may prefix each line with (M23A).
+///
+/// Built from the store's own rows (labels + time-anchored turns), so an
+/// export says exactly what the editor shows. It is a read-only view: exporting
+/// never writes, renames or rewrites a speaker.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExportSpeakers {
+    /// `speaker_id → label`, in the store's id order (a renamed speaker exports
+    /// the user's name, never the default numeral).
+    pub labels: Vec<(u32, String)>,
+    pub turns: Vec<SpeakerTurn>,
+}
+
+impl ExportSpeakers {
+    pub fn new(labels: Vec<(u32, String)>, turns: Vec<SpeakerTurn>) -> Self {
+        Self { labels, turns }
+    }
+
+    /// The whole view of one stored run.
+    pub fn from_diarization(diarization: &Diarization) -> Self {
+        Self {
+            labels: diarization
+                .speakers
+                .iter()
+                .map(|speaker| (speaker.speaker_id, speaker.label.clone()))
+                .collect(),
+            turns: diarization.turns.clone(),
+        }
+    }
+
+    pub fn label(&self, speaker_id: u32) -> Option<&str> {
+        self.labels
+            .iter()
+            .find(|(id, _)| *id == speaker_id)
+            .map(|(_, label)| label.as_str())
+    }
+
+    /// One label per segment row, using the same overlap projection the editor
+    /// draws. `None` is an unlabelled row (or a gap between turns) and exports
+    /// with no prefix at all — never a fabricated "Speaker ?".
+    pub fn per_segment(&self, segments: &[Segment]) -> Vec<Option<String>> {
+        speaker_for_segments(segments, &self.turns)
+            .into_iter()
+            .map(|row| row.and_then(|row| self.label(row.primary).map(str::to_string)))
+            .collect()
+    }
+}
+
+/// `Speaker 1: ` (SRT), `<v Speaker 1>` (VTT) or `**Speaker 1:** ` (MD).
+fn srt_prefix(label: &str) -> String {
+    format!("{label}: ")
+}
+
 /// Exports a transcript to Markdown.
 pub fn to_markdown(t: &Transcript) -> Result<String, SuramakError> {
+    to_markdown_with_speakers(t, None)
+}
+
+/// Markdown with an optional speaker prefix per line (`**Speaker 1:** …`).
+/// `None` is byte-for-byte [`to_markdown`].
+pub fn to_markdown_with_speakers(
+    t: &Transcript,
+    speakers: Option<&ExportSpeakers>,
+) -> Result<String, SuramakError> {
+    let labels = speakers
+        .map(|speakers| speakers.per_segment(&t.segments))
+        .unwrap_or_default();
     let mut out = String::new();
     writeln!(out, "# {}", t.title).unwrap();
     writeln!(out).unwrap();
@@ -29,12 +95,18 @@ pub fn to_markdown(t: &Transcript) -> Result<String, SuramakError> {
     writeln!(out).unwrap();
     writeln!(out, "## Transcript").unwrap();
     writeln!(out).unwrap();
-    for seg in &t.segments {
+    for (index, seg) in t.segments.iter().enumerate() {
+        let prefix = labels
+            .get(index)
+            .and_then(Option::as_deref)
+            .map(|label| format!("**{label}:** "))
+            .unwrap_or_default();
         writeln!(
             out,
-            "[{} → {}] {}",
+            "[{} → {}] {}{}",
             fmt_ms(seg.start_ms),
             fmt_ms(seg.end_ms),
+            prefix,
             seg.text.trim()
         )
         .unwrap();
@@ -98,11 +170,28 @@ pub fn to_json(t: &Transcript) -> Result<String, SuramakError> {
 
 /// Exports a transcript to SRT subtitle format.
 pub fn to_srt(t: &Transcript) -> Result<String, SuramakError> {
+    to_srt_with_speakers(t, None)
+}
+
+/// SRT with an optional `Speaker 1: ` prefix per cue. `None` is byte-for-byte
+/// [`to_srt`].
+pub fn to_srt_with_speakers(
+    t: &Transcript,
+    speakers: Option<&ExportSpeakers>,
+) -> Result<String, SuramakError> {
+    let labels = speakers
+        .map(|speakers| speakers.per_segment(&t.segments))
+        .unwrap_or_default();
     let mut out = String::new();
-    for seg in &t.segments {
+    for (index, seg) in t.segments.iter().enumerate() {
         writeln!(out, "{}", seg.idx + 1).unwrap();
         writeln!(out, "{} --> {}", fmt_srt(seg.start_ms), fmt_srt(seg.end_ms)).unwrap();
-        writeln!(out, "{}", seg.text.trim()).unwrap();
+        let prefix = labels
+            .get(index)
+            .and_then(Option::as_deref)
+            .map(srt_prefix)
+            .unwrap_or_default();
+        writeln!(out, "{}{}", prefix, seg.text.trim()).unwrap();
         writeln!(out).unwrap();
     }
     Ok(out)
@@ -133,12 +222,30 @@ pub fn to_tsv(t: &Transcript) -> Result<String, SuramakError> {
 
 /// Exports a transcript to WebVTT subtitle format.
 pub fn to_vtt(t: &Transcript) -> Result<String, SuramakError> {
+    to_vtt_with_speakers(t, None)
+}
+
+/// WebVTT with an optional voice span per cue (`<v Speaker 1>…`). `None` is
+/// byte-for-byte [`to_vtt`]. The label is escaped for the annotation slot; a
+/// cue's own text keeps the bytes the plain path writes.
+pub fn to_vtt_with_speakers(
+    t: &Transcript,
+    speakers: Option<&ExportSpeakers>,
+) -> Result<String, SuramakError> {
+    let labels = speakers
+        .map(|speakers| speakers.per_segment(&t.segments))
+        .unwrap_or_default();
     let mut out = String::new();
     writeln!(out, "WEBVTT").unwrap();
     writeln!(out).unwrap();
-    for seg in &t.segments {
+    for (index, seg) in t.segments.iter().enumerate() {
         writeln!(out, "{} --> {}", fmt_vtt(seg.start_ms), fmt_vtt(seg.end_ms)).unwrap();
-        writeln!(out, "{}", seg.text.trim()).unwrap();
+        let prefix = labels
+            .get(index)
+            .and_then(Option::as_deref)
+            .map(|label| format!("<v {}>", escape_vtt_text(label)))
+            .unwrap_or_default();
+        writeln!(out, "{}{}", prefix, seg.text.trim()).unwrap();
         writeln!(out).unwrap();
     }
     Ok(out)
@@ -396,10 +503,27 @@ fn subtitle_lines(text: &str) -> Vec<String> {
 }
 
 /// The payload of one stacked SRT/VTT cue: primary line(s) then translation
-/// line(s), with no blank separator (see [`to_srt_bilingual`]).
-fn stacked_payload(cue: &BilingualCue) -> Vec<String> {
-    let mut lines = subtitle_lines(&cue.primary);
-    lines.extend(subtitle_lines(&cue.translation));
+/// line(s), with no blank separator (see [`to_srt_bilingual`]). An optional
+/// prefix lands on the first primary line only; `vtt` escapes every line for
+/// the cue payload.
+fn stacked_payload_prefixed(cue: &BilingualCue, prefix: Option<&str>, vtt: bool) -> Vec<String> {
+    let escape = |line: String| {
+        if vtt {
+            escape_vtt_text(&line)
+        } else {
+            line
+        }
+    };
+    let mut lines: Vec<String> = subtitle_lines(&cue.primary)
+        .into_iter()
+        .map(escape)
+        .collect();
+    match (prefix, lines.first_mut()) {
+        (Some(prefix), Some(first)) => *first = format!("{prefix}{first}"),
+        (Some(prefix), None) => lines.push(prefix.to_string()),
+        (None, _) => {}
+    }
+    lines.extend(subtitle_lines(&cue.translation).into_iter().map(escape));
     lines
 }
 
@@ -419,16 +543,50 @@ pub fn to_srt_bilingual(
     t: &Transcript,
     translations: &[(u32, TranslationRecord)],
 ) -> Result<String, SuramakError> {
+    to_srt_bilingual_with_speakers(t, translations, None)
+}
+
+/// The stacked bilingual SRT with an optional `Speaker 1: ` prefix on each
+/// cue's **primary** line (the translation stays unprefixed: it is the same
+/// utterance, not a second speaker). `None` is byte-for-byte
+/// [`to_srt_bilingual`].
+pub fn to_srt_bilingual_with_speakers(
+    t: &Transcript,
+    translations: &[(u32, TranslationRecord)],
+    speakers: Option<&ExportSpeakers>,
+) -> Result<String, SuramakError> {
+    let labels = speaker_labels_by_idx(t, speakers);
     let mut out = String::new();
     for cue in bilingual_cues(t, translations) {
         writeln!(out, "{}", cue.idx + 1).unwrap();
         writeln!(out, "{} --> {}", fmt_srt(cue.start_ms), fmt_srt(cue.end_ms)).unwrap();
-        for line in stacked_payload(&cue) {
+        let prefix = labels
+            .get(&cue.idx)
+            .cloned()
+            .flatten()
+            .map(|label| srt_prefix(&label));
+        for line in stacked_payload_prefixed(&cue, prefix.as_deref(), false) {
             writeln!(out, "{line}").unwrap();
         }
         writeln!(out).unwrap();
     }
     Ok(out)
+}
+
+/// `segment idx → speaker label`, for the cue-addressed bilingual paths.
+fn speaker_labels_by_idx(
+    t: &Transcript,
+    speakers: Option<&ExportSpeakers>,
+) -> std::collections::HashMap<u32, Option<String>> {
+    match speakers {
+        Some(speakers) => t
+            .segments
+            .iter()
+            .zip(speakers.per_segment(&t.segments))
+            .map(|(segment, label)| (segment.idx, label))
+            .collect(),
+        None => std::collections::HashMap::new(),
+    }
 }
 
 /// Exports a transcript as a **stacked bilingual WebVTT**: same layout as
@@ -439,13 +597,29 @@ pub fn to_vtt_bilingual(
     t: &Transcript,
     translations: &[(u32, TranslationRecord)],
 ) -> Result<String, SuramakError> {
+    to_vtt_bilingual_with_speakers(t, translations, None)
+}
+
+/// The stacked bilingual WebVTT with an optional `<v Speaker 1>` voice span on
+/// each cue's primary line. `None` is byte-for-byte [`to_vtt_bilingual`].
+pub fn to_vtt_bilingual_with_speakers(
+    t: &Transcript,
+    translations: &[(u32, TranslationRecord)],
+    speakers: Option<&ExportSpeakers>,
+) -> Result<String, SuramakError> {
+    let labels = speaker_labels_by_idx(t, speakers);
     let mut out = String::new();
     writeln!(out, "WEBVTT").unwrap();
     writeln!(out).unwrap();
     for cue in bilingual_cues(t, translations) {
         writeln!(out, "{} --> {}", fmt_vtt(cue.start_ms), fmt_vtt(cue.end_ms)).unwrap();
-        for line in stacked_payload(&cue) {
-            writeln!(out, "{}", escape_vtt_text(&line)).unwrap();
+        let prefix = labels
+            .get(&cue.idx)
+            .cloned()
+            .flatten()
+            .map(|label| format!("<v {}>", escape_vtt_text(&label)));
+        for line in stacked_payload_prefixed(&cue, prefix.as_deref(), true) {
+            writeln!(out, "{line}").unwrap();
         }
         writeln!(out).unwrap();
     }

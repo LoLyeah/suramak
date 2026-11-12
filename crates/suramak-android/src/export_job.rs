@@ -30,7 +30,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use suramak_core::export;
+use suramak_core::export::{self, ExportSpeakers};
 use suramak_core::transcript::Transcript;
 use suramak_core::translate::TranslationRecord;
 use suramak_ui::deck::compact::CompactExportFormat;
@@ -57,6 +57,8 @@ pub struct StagedExport {
     pub checksum: String,
     pub mime: &'static str,
     pub bilingual: bool,
+    /// M23A: whether the bytes carry speaker prefixes.
+    pub speakers: bool,
 }
 
 impl StagedExport {
@@ -113,12 +115,14 @@ impl ExportJobs {
     }
 
     /// Renders and stages one export.
+    #[allow(clippy::too_many_arguments)]
     pub fn stage(
         &self,
         transcript: &Transcript,
         translations: &[(u32, TranslationRecord)],
         format: CompactExportFormat,
         bilingual: bool,
+        speakers: Option<&ExportSpeakers>,
         name: &str,
     ) -> Result<StagedExport, String> {
         // The lock is held across the render and the write: the host serialises
@@ -128,7 +132,7 @@ impl ExportJobs {
         if let Some(current) = live.as_ref() {
             return Err(format!("an export is already in flight ({})", current.name));
         }
-        let text = render(transcript, translations, format, bilingual)?;
+        let text = render(transcript, translations, format, bilingual, speakers)?;
         let job = Uuid::new_v4().to_string();
         let dir = self.root.join(&job);
         fs::create_dir_all(&dir)
@@ -148,6 +152,7 @@ impl ExportJobs {
             checksum: checksum_hex(fnv1a64(text.as_bytes())),
             mime: format.mime(),
             bilingual,
+            speakers: speakers.is_some(),
         };
         *live = Some(staged.clone());
         Ok(staged)
@@ -225,6 +230,7 @@ pub fn render(
     translations: &[(u32, TranslationRecord)],
     format: CompactExportFormat,
     bilingual: bool,
+    speakers: Option<&ExportSpeakers>,
 ) -> Result<String, String> {
     if bilingual {
         if !format.supports_bilingual() {
@@ -237,14 +243,23 @@ pub fn render(
             return Err("this transcript has no translation to include".to_string());
         }
     }
+    // M23A: speakers ride the same serializers. A format without a speaker
+    // variant is refused loudly rather than exporting a silently plain file.
+    if speakers.is_some() && !format.supports_speakers() {
+        return Err(format!("{} has no speaker variant", format.label()));
+    }
     let rendered = match (format, bilingual) {
-        (CompactExportFormat::Md, _) => export::to_markdown(transcript),
+        (CompactExportFormat::Md, _) => export::to_markdown_with_speakers(transcript, speakers),
         (CompactExportFormat::Txt, _) => export::to_txt(transcript),
         (CompactExportFormat::Json, _) => export::to_json(transcript),
-        (CompactExportFormat::Srt, false) => export::to_srt(transcript),
-        (CompactExportFormat::Srt, true) => export::to_srt_bilingual(transcript, translations),
-        (CompactExportFormat::Vtt, false) => export::to_vtt(transcript),
-        (CompactExportFormat::Vtt, true) => export::to_vtt_bilingual(transcript, translations),
+        (CompactExportFormat::Srt, false) => export::to_srt_with_speakers(transcript, speakers),
+        (CompactExportFormat::Srt, true) => {
+            export::to_srt_bilingual_with_speakers(transcript, translations, speakers)
+        }
+        (CompactExportFormat::Vtt, false) => export::to_vtt_with_speakers(transcript, speakers),
+        (CompactExportFormat::Vtt, true) => {
+            export::to_vtt_bilingual_with_speakers(transcript, translations, speakers)
+        }
         (CompactExportFormat::Tsv, _) => export::to_tsv(transcript),
     };
     rendered.map_err(|err| err.to_string())
@@ -330,13 +345,14 @@ mod tests {
         let jobs = ExportJobs::new(&dir);
         let t = transcript();
         for format in CompactExportFormat::ALL {
-            let expected = render(&t, &[], format, false).expect("render");
+            let expected = render(&t, &[], format, false, None).expect("render");
             let staged = jobs
                 .stage(
                     &t,
                     &[],
                     format,
                     false,
+                    None,
                     &format!("note.{}", format.extension()),
                 )
                 .expect("stage");
@@ -363,6 +379,7 @@ mod tests {
                 &translations(),
                 CompactExportFormat::Srt,
                 true,
+                None,
                 "note.srt",
             )
             .expect("stage");
@@ -375,8 +392,8 @@ mod tests {
     #[test]
     fn bilingual_is_refused_for_a_flat_format_or_missing_translation() {
         let t = transcript();
-        assert!(render(&t, &translations(), CompactExportFormat::Md, true).is_err());
-        assert!(render(&t, &[], CompactExportFormat::Srt, true).is_err());
+        assert!(render(&t, &translations(), CompactExportFormat::Md, true, None).is_err());
+        assert!(render(&t, &[], CompactExportFormat::Srt, true, None).is_err());
     }
 
     #[test]
@@ -385,7 +402,7 @@ mod tests {
         let jobs = ExportJobs::new(&dir);
         let t = transcript();
         let staged = jobs
-            .stage(&t, &[], CompactExportFormat::Txt, false, "note.txt")
+            .stage(&t, &[], CompactExportFormat::Txt, false, None, "note.txt")
             .expect("stage");
         let err = jobs
             .finish(&staged.job, staged.bytes - 1)
@@ -397,15 +414,43 @@ mod tests {
     }
 
     #[test]
+    fn a_speaker_staging_carries_the_prefixes_and_flags_it() {
+        let dir = std::env::temp_dir().join(format!("suramak-export-{}", Uuid::new_v4()));
+        let jobs = ExportJobs::new(&dir);
+        let t = transcript();
+        let speakers = ExportSpeakers::new(
+            vec![(0, "Budi".to_string())],
+            vec![suramak_core::diarization::SpeakerTurn::new(0, 0, 4_000, 0)],
+        );
+        let staged = jobs
+            .stage(
+                &t,
+                &[],
+                CompactExportFormat::Srt,
+                false,
+                Some(&speakers),
+                "note.srt",
+            )
+            .expect("stage");
+        let text = fs::read_to_string(&staged.path).expect("read");
+        assert!(text.contains("Budi: Hello world."), "{text}");
+        assert!(staged.speakers);
+        jobs.finish(&staged.job, staged.bytes).expect("finish");
+        // A machine format refuses the request instead of dropping it.
+        assert!(render(&t, &[], CompactExportFormat::Json, false, Some(&speakers)).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_second_export_while_one_is_live_is_refused() {
         let dir = std::env::temp_dir().join(format!("suramak-export-{}", Uuid::new_v4()));
         let jobs = ExportJobs::new(&dir);
         let t = transcript();
         let first = jobs
-            .stage(&t, &[], CompactExportFormat::Txt, false, "note.txt")
+            .stage(&t, &[], CompactExportFormat::Txt, false, None, "note.txt")
             .expect("first");
         let err = jobs
-            .stage(&t, &[], CompactExportFormat::Txt, false, "again.txt")
+            .stage(&t, &[], CompactExportFormat::Txt, false, None, "again.txt")
             .expect_err("single-flight");
         assert!(err.contains("in flight"));
         jobs.cancel(&first.job);

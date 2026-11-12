@@ -24,11 +24,13 @@ use std::time::Instant;
 
 use serde_json::{json, Value};
 use suramak_core::device::DeviceProfile;
+use suramak_core::diarization::{speaker_for_segments, SpeakerHistory, TimeRange};
+use suramak_core::export::ExportSpeakers;
 use suramak_core::settings::{LangMode, Settings};
 use suramak_core::store::Store;
 use suramak_ui::deck::compact::{
     CompactAction, CompactApp, CompactExportFormat, CompactRoute, CompactSetting, CompactSettings,
-    LibraryFacets, LibraryHit, Sheet, VoiceNoteView,
+    CompactSpeakers, LibraryFacets, LibraryHit, Sheet, VoiceNoteView,
 };
 
 use crate::export_job::ExportJobs;
@@ -50,6 +52,10 @@ struct Inner {
     profile: Option<DeviceProfile>,
     /// The export job slot (single-flight; staging under `files/exports`).
     exports: ExportJobs,
+    /// M23A: the undo log for the open transcript's speaker edits, and the
+    /// transcript it belongs to (a switch resets it, like the segment log).
+    speakers: SpeakerHistory,
+    speakers_for: Option<uuid::Uuid>,
 }
 
 impl CompactHost {
@@ -77,6 +83,8 @@ impl CompactHost {
             settings_existed,
             profile: None,
             exports: ExportJobs::new(root),
+            speakers: SpeakerHistory::new(),
+            speakers_for: None,
         };
         inner.reload_library();
         Self {
@@ -130,6 +138,15 @@ impl CompactHost {
             "export_shared" => inner.finish_shared(&value),
             "export_cancel" => inner.cancel_export(&value),
             "export_failed" => inner.fail_export(&value),
+            "add_speaker" => inner.add_speaker(),
+            "assign_speaker" => inner.assign_speaker(&value, false),
+            "new_speaker_assign" => inner.assign_speaker(&value, true),
+            "rename_speaker" => inner.rename_speaker(&value),
+            "set_speaker_color" => inner.set_speaker_color(&value),
+            "merge_speakers" => inner.merge_speakers(&value),
+            "remove_speaker_label" => inner.remove_speaker_label(&value),
+            "clear_speakers" => inner.clear_speakers(),
+            "undo_speakers" => inner.undo_speakers(),
             "quit" => inner.quit(),
             "version" => json!({ "ok": true, "version": env!("CARGO_PKG_VERSION") }).to_string(),
             other => error(&format!("unknown op '{other}'")),
@@ -247,7 +264,16 @@ impl Inner {
             "depth": self.app.nav.depth(),
             "transcript_id": self.app.editor.as_ref().map(|editor| editor.transcript.id.to_string()),
             "title": self.app.editor.as_ref().map(|editor| editor.transcript.title.clone()),
-            "sheet": match self.app.sheet { Some(Sheet::Export) => "export", Some(Sheet::Quit) => "quit", Some(Sheet::Onboarding) => "onboarding", Some(Sheet::VoiceNote) => "voice_note", None => "none" },
+            "sheet": match self.app.sheet {
+                Some(Sheet::Export) => "export",
+                Some(Sheet::Quit) => "quit",
+                Some(Sheet::Onboarding) => "onboarding",
+                Some(Sheet::VoiceNote) => "voice_note",
+                Some(Sheet::Speakers) => "speakers",
+                Some(Sheet::Speaker) => "speaker",
+                Some(Sheet::TurnStrip) => "turn_strip",
+                None => "none",
+            },
             "status": self.app.status.as_ref().map(|(text, error)| json!({"text": text, "error": error})),
             "library_rows": self.app.rows.len(),
             // M22C: the Library field's state and its "in transcripts" section,
@@ -263,6 +289,16 @@ impl Inner {
                 "rank": hit.rank,
             })).collect::<Vec<_>>(),
             "library_waveforms": self.app.rows.iter().filter(|row| !row.waveform.is_empty()).count(),
+            // M23A: the speaker state the Kotlin mirror and the host tests read.
+            "speakers": self.app.speakers_view().map(|view| json!({
+                "count": view.speakers.len(),
+                "labels": view.speakers.iter().map(|speaker| &speaker.label).collect::<Vec<_>>(),
+                "turns": view.turns.len(),
+                "edited_since_export": view.edited_since_export,
+                "undo_available": self.app.speakers_undo_available,
+            })),
+            "speaker_button": self.app.speakers_button_label(),
+            "export_speakers": self.app.export_speakers,
             "first_run_seen": self.app.first_run_seen,
             "recording": self.app.recording,
             "model_id": self.app.settings.model_id,
@@ -312,6 +348,7 @@ impl Inner {
                     .and_then(|store| store.word_alignment(uuid).ok())
                     .unwrap_or_default();
                 self.app.deep_link_words(transcript, words, now);
+                self.arm_speaker_history(uuid);
                 if let Some(editor) = self.app.editor.as_mut() {
                     editor.has_translation = !translations.is_empty();
                     // M22C: the search hit's landing — select the row, park the
@@ -321,6 +358,7 @@ impl Inner {
                         editor.reveal_segment(idx);
                     }
                 }
+                self.refresh_speakers();
                 self.snapshot()
             }
             None => {
@@ -669,6 +707,254 @@ impl Inner {
         }
     }
 
+    // ---- M23A: manual speaker tagging ------------------------------------
+
+    fn current_transcript_id(&self) -> Option<uuid::Uuid> {
+        self.app.editor.as_ref().map(|editor| editor.transcript.id)
+    }
+
+    /// The badge view the phone draws for one transcript: the stored run's
+    /// speakers/turns plus the read-time projection and the export flag.
+    fn speaker_view(&self, store: &Store, id: uuid::Uuid) -> Option<CompactSpeakers> {
+        let diarization = store.diarization(id).ok().flatten()?;
+        let transcript = store.get_transcript(id).ok()?;
+        let per_segment = speaker_for_segments(&transcript.segments, &diarization.turns);
+        Some(CompactSpeakers {
+            speakers: diarization.speakers,
+            turns: diarization.turns,
+            per_segment,
+            stale: diarization.run.stale,
+            audio_ms: diarization.run.audio_ms,
+            edited_since_export: store.speakers_edited_since_export(id).unwrap_or(false),
+        })
+    }
+
+    /// Re-reads the speaker view into the open editor (after every verb, an
+    /// export, or a transcript open). The undo flag follows the same read.
+    fn refresh_speakers(&mut self) {
+        let Some(id) = self.current_transcript_id() else {
+            return;
+        };
+        let view = Store::open(&self.dirs.db_path)
+            .ok()
+            .and_then(|store| self.speaker_view(&store, id));
+        self.app.on_speakers_refreshed(view);
+        self.app.speakers_undo_available = self.speakers.can_undo();
+    }
+
+    /// Starts (or keeps) the undo log for the transcript the editor has open.
+    fn arm_speaker_history(&mut self, id: uuid::Uuid) {
+        if self.speakers_for != Some(id) {
+            self.speakers.clear();
+            self.speakers_for = Some(id);
+        }
+    }
+
+    /// Pushes one applied snapshot, re-reads the view, and shows the toast.
+    /// `keep_sheet` leaves the Speakers/Speaker surface open (Add, colour).
+    fn note_speaker_snapshot(
+        &mut self,
+        id: uuid::Uuid,
+        snapshot: suramak_core::diarization::SpeakerSnapshot,
+        keep_sheet: bool,
+    ) {
+        let now = self.started_now();
+        self.arm_speaker_history(id);
+        let summary = snapshot.summary();
+        self.speakers.push(snapshot);
+        self.refresh_speakers();
+        if keep_sheet {
+            self.app.show_speaker_toast(summary, now);
+        } else {
+            self.app.on_speaker_applied(summary, now);
+        }
+    }
+
+    fn speaker_error(&mut self, err: &str) -> String {
+        self.app.status = Some((err.to_string(), true));
+        self.snapshot_with_error(err)
+    }
+
+    fn add_speaker(&mut self) -> String {
+        let Some(id) = self.current_transcript_id() else {
+            return error("no transcript is open");
+        };
+        let result = Store::open(&self.dirs.db_path).and_then(|store| store.add_speaker(id));
+        match result {
+            Ok((_speaker_id, snapshot)) => {
+                self.note_speaker_snapshot(id, snapshot, true);
+                self.snapshot()
+            }
+            Err(err) => self.speaker_error(&err.to_string()),
+        }
+    }
+
+    /// `assign_speaker` and `new_speaker_assign`: resolve the segment to its
+    /// exact time range, optionally create the speaker first, then assign.
+    fn assign_speaker(&mut self, value: &Value, create: bool) -> String {
+        let Some(id) = self.current_transcript_id() else {
+            return error("no transcript is open");
+        };
+        let segment_idx = value.get("segment").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let from_here_down = value
+            .get("from_here_down")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut speaker_id = value.get("speaker_id").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let store = match Store::open(&self.dirs.db_path) {
+            Ok(store) => store,
+            Err(err) => return self.speaker_error(&err.to_string()),
+        };
+        let transcript = match store.get_transcript(id) {
+            Ok(transcript) => transcript,
+            Err(err) => return self.speaker_error(&err.to_string()),
+        };
+        let Some(segment) = transcript.segments.get(segment_idx as usize) else {
+            return self.speaker_error("that segment is no longer in the transcript");
+        };
+        let range = if from_here_down {
+            let end = transcript
+                .segments
+                .iter()
+                .map(|segment| segment.end_ms)
+                .max()
+                .unwrap_or(segment.end_ms);
+            TimeRange::from_segment_to_end(segment, end)
+        } else {
+            TimeRange::of_segment(segment)
+        };
+        self.arm_speaker_history(id);
+        if create {
+            match store.add_speaker(id) {
+                Ok((new_id, snapshot)) => {
+                    self.speakers.push(snapshot);
+                    speaker_id = new_id;
+                }
+                Err(err) => return self.speaker_error(&err.to_string()),
+            }
+        }
+        match store.assign_speaker(id, speaker_id, range) {
+            Ok(snapshot) => {
+                self.note_speaker_snapshot(id, snapshot, false);
+                self.snapshot()
+            }
+            Err(err) => self.speaker_error(&err.to_string()),
+        }
+    }
+
+    fn rename_speaker(&mut self, value: &Value) -> String {
+        let Some(id) = self.current_transcript_id() else {
+            return error("no transcript is open");
+        };
+        let speaker_id = value.get("speaker_id").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let label = value
+            .get("label")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let result = Store::open(&self.dirs.db_path)
+            .and_then(|store| store.rename_speaker(id, speaker_id, label));
+        match result {
+            Ok(snapshot) => {
+                self.note_speaker_snapshot(id, snapshot, false);
+                self.snapshot()
+            }
+            Err(err) => self.speaker_error(&err.to_string()),
+        }
+    }
+
+    fn set_speaker_color(&mut self, value: &Value) -> String {
+        let Some(id) = self.current_transcript_id() else {
+            return error("no transcript is open");
+        };
+        let speaker_id = value.get("speaker_id").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let slot = value
+            .get("slot")
+            .and_then(Value::as_u64)
+            .and_then(|slot| u8::try_from(slot).ok())
+            .unwrap_or(u8::MAX);
+        let result = Store::open(&self.dirs.db_path)
+            .and_then(|store| store.set_speaker_color(id, speaker_id, slot));
+        match result {
+            Ok(snapshot) => {
+                // Keep the sheet open: trying the six dots is one visit.
+                self.note_speaker_snapshot(id, snapshot, true);
+                self.snapshot()
+            }
+            Err(err) => self.speaker_error(&err.to_string()),
+        }
+    }
+
+    fn merge_speakers(&mut self, value: &Value) -> String {
+        let Some(id) = self.current_transcript_id() else {
+            return error("no transcript is open");
+        };
+        let from = value.get("from").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let into = value.get("into").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let result =
+            Store::open(&self.dirs.db_path).and_then(|store| store.merge_speakers(id, from, into));
+        match result {
+            Ok(snapshot) => {
+                self.note_speaker_snapshot(id, snapshot, false);
+                self.snapshot()
+            }
+            Err(err) => self.speaker_error(&err.to_string()),
+        }
+    }
+
+    fn remove_speaker_label(&mut self, value: &Value) -> String {
+        let Some(id) = self.current_transcript_id() else {
+            return error("no transcript is open");
+        };
+        let speaker_id = value.get("speaker_id").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let result = Store::open(&self.dirs.db_path)
+            .and_then(|store| store.remove_speaker_label(id, speaker_id));
+        match result {
+            Ok(snapshot) => {
+                self.note_speaker_snapshot(id, snapshot, false);
+                self.snapshot()
+            }
+            Err(err) => self.speaker_error(&err.to_string()),
+        }
+    }
+
+    fn clear_speakers(&mut self) -> String {
+        let Some(id) = self.current_transcript_id() else {
+            return error("no transcript is open");
+        };
+        let result = Store::open(&self.dirs.db_path).and_then(|store| store.clear_speakers(id));
+        match result {
+            Ok(snapshot) => {
+                self.note_speaker_snapshot(id, snapshot, false);
+                self.snapshot()
+            }
+            Err(err) => self.speaker_error(&err.to_string()),
+        }
+    }
+
+    /// Undo the newest speaker transaction: write the snapshot's `before`
+    /// rows back verbatim (the segment log's own rule).
+    fn undo_speakers(&mut self) -> String {
+        let Some(id) = self.current_transcript_id() else {
+            return error("no transcript is open");
+        };
+        let Some(snapshot) = self.speakers.undo() else {
+            self.app.status = Some(("Nothing to undo".to_string(), false));
+            return self.snapshot();
+        };
+        let result = Store::open(&self.dirs.db_path)
+            .and_then(|store| store.restore_speaker_state(id, &snapshot.before));
+        match result {
+            Ok(()) => {
+                self.refresh_speakers();
+                let now = self.started_now();
+                self.app.on_speaker_undone(now);
+                self.app.status = Some(("Speaker edit undone".to_string(), false));
+                self.snapshot()
+            }
+            Err(err) => self.speaker_error(&err.to_string()),
+        }
+    }
+
     /// `export` / `export_share`: render through the M15 serializer, stage the
     /// bytes atomically, and hand Kotlin the one file. The bytes exist before
     /// the platform stream is opened; `export_done` verifies the write.
@@ -683,6 +969,10 @@ impl Inner {
         };
         let bilingual = value
             .get("bilingual")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let include_speakers = value
+            .get("speakers")
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let Some(editor) = self.app.editor.as_mut() else {
@@ -707,11 +997,21 @@ impl Inner {
         } else {
             Vec::new()
         };
+        // M23A: the speaker prefixes come from the same stored run the editor
+        // draws. `Include speakers` on a format without a speaker path is a
+        // refusal (the UI does not offer it; a stale action must not lie).
+        let speaker_view = Store::open(&self.dirs.db_path)
+            .ok()
+            .and_then(|store| store.diarization(id).ok().flatten())
+            .map(|diarization| ExportSpeakers::from_diarization(&diarization))
+            .filter(|_| include_speakers)
+            .filter(|_| format.supports_speakers());
         let now = self.started_now();
         // The UI's Export/Share button normally creates the session before the
         // action reaches us; a host-only dispatch (process restart, tests) must
         // create the same state instead of leaving the sheet blank.
         self.app.export_bilingual = bilingual;
+        self.app.export_speakers = include_speakers;
         self.app.open_export_sheet(now);
         let _ = self.app.begin_export(now);
         self.app.on_export_picked();
@@ -720,6 +1020,7 @@ impl Inner {
             &translations,
             format,
             bilingual,
+            speaker_view.as_ref(),
             &suggested_name,
         ) {
             Ok(staged) => json!({
@@ -731,6 +1032,7 @@ impl Inner {
                 "checksum": staged.checksum,
                 "mime": staged.mime,
                 "bilingual": staged.bilingual,
+                "speakers": staged.speakers,
                 "share": share,
                 "screen": "editor",
                 "sheet": "export",
@@ -750,6 +1052,12 @@ impl Inner {
         let bytes = value.get("bytes").and_then(Value::as_u64).unwrap_or(0);
         match self.exports.finish(job, bytes) {
             Ok(staged) => {
+                if staged.speakers {
+                    if let Ok(store) = Store::open(&self.dirs.db_path) {
+                        let _ = store.record_speaker_export(staged.transcript);
+                    }
+                    self.refresh_speakers();
+                }
                 self.app.on_export_written(staged.name, staged.bytes);
                 self.snapshot()
             }
@@ -766,6 +1074,14 @@ impl Inner {
         let job = value.get("job").and_then(Value::as_str).unwrap_or_default();
         match self.exports.release_for_share(job) {
             Ok(staged) => {
+                // The chooser has the file: this is the export the honesty
+                // note compares against from now on.
+                if staged.speakers {
+                    if let Ok(store) = Store::open(&self.dirs.db_path) {
+                        let _ = store.record_speaker_export(staged.transcript);
+                    }
+                    self.refresh_speakers();
+                }
                 self.app.on_export_shared(staged.name);
                 self.snapshot()
             }
@@ -1709,6 +2025,108 @@ mod tests {
         assert_eq!(
             reply["model_id"], "small",
             "a working choice is not replaced by a later download"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn speaker_ops_add_assign_rename_and_undo_through_the_host() {
+        let dir =
+            std::env::temp_dir().join(format!("suramak-compact-host-{}", uuid::Uuid::new_v4()));
+        let (_store, id) = fixture(&dir);
+        let host = CompactHost::new(&dir);
+        let open = |op: &str, extra: Value| -> Value {
+            let mut request = json!({ "op": op, "transcript_id": id.to_string() });
+            if let Value::Object(fields) = extra {
+                for (key, value) in fields {
+                    request[&key] = value;
+                }
+            }
+            serde_json::from_str(&host.dispatch(&request.to_string())).expect("json")
+        };
+        let opened = open("open_transcript", json!({}));
+        assert_eq!(opened["screen"], "editor");
+        assert!(opened["speakers"].is_null(), "an untagged transcript");
+
+        let added = open("add_speaker", json!({}));
+        assert_eq!(added["speakers"]["count"], 1, "{added}");
+        assert_eq!(added["speakers"]["labels"][0], "Speaker 1");
+        assert_eq!(added["speaker_button"], "1 speaker");
+
+        let assigned = open("assign_speaker", json!({ "speaker_id": 0, "segment": 0 }));
+        assert_eq!(assigned["speakers"]["turns"], 1, "{assigned}");
+        assert_eq!(assigned["speakers"]["undo_available"], true);
+        let store = Store::open(&dir.join("suramak.db")).expect("store");
+        assert_eq!(store.speaker_turns(id).unwrap()[0].end_ms, 3_000);
+
+        // The undo writes the pre-assignment rows back (no turns).
+        let undone = open("undo_speakers", json!({}));
+        assert_eq!(undone["speakers"]["turns"], 0, "{undone}");
+
+        let renamed = open(
+            "rename_speaker",
+            json!({ "speaker_id": 0, "label": "Budi" }),
+        );
+        assert_eq!(renamed["speakers"]["labels"][0], "Budi");
+
+        let cleared = open("clear_speakers", json!({}));
+        assert_eq!(cleared["speakers"]["count"], 0, "{cleared}");
+        assert_eq!(cleared["speaker_button"], "Tag speakers");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_speaker_export_records_the_stamp_only_after_the_bytes_verify() {
+        let dir =
+            std::env::temp_dir().join(format!("suramak-compact-host-{}", uuid::Uuid::new_v4()));
+        let (_store, id) = fixture(&dir);
+        let host = CompactHost::new(&dir);
+        let _: Value = serde_json::from_str(&host.dispatch(
+            &json!({ "op": "open_transcript", "transcript_id": id.to_string() }).to_string(),
+        ))
+        .expect("json");
+        let _: Value =
+            serde_json::from_str(&host.dispatch(r#"{"op":"add_speaker"}"#)).expect("json");
+        let _: Value = serde_json::from_str(
+            &host
+                .dispatch(r#"{"op":"assign_speaker","speaker_id":0,"segment":0}"#)
+                .to_string(),
+        )
+        .expect("json");
+        let store = Store::open(&dir.join("suramak.db")).expect("store");
+        assert!(store.speakers_edited_since_export(id).unwrap());
+
+        let staged: Value = serde_json::from_str(
+            &host.dispatch(r#"{"op":"export","format":"srt","speakers":true}"#),
+        )
+        .expect("json");
+        assert_eq!(staged["ok"], true, "{staged}");
+        assert_eq!(staged["speakers"], true);
+        let path = std::path::PathBuf::from(staged["path"].as_str().expect("path"));
+        let text = std::fs::read_to_string(&path).expect("staged bytes");
+        assert!(text.contains("Speaker 1: first line"), "{text}");
+        assert!(
+            store.speakers_edited_since_export(id).unwrap(),
+            "staging alone is not an export"
+        );
+
+        let done: Value = serde_json::from_str(
+            &host
+                .dispatch(
+                    &json!({
+                        "op": "export_done",
+                        "job": staged["job"],
+                        "bytes": staged["bytes"],
+                    })
+                    .to_string(),
+                )
+                .to_string(),
+        )
+        .expect("json");
+        assert_eq!(done["ok"], true, "{done}");
+        assert!(
+            !store.speakers_edited_since_export(id).unwrap(),
+            "the verified write is the export the note compares against"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -31,7 +31,8 @@
 //! dims the badges/lane and offers a re-run — the turns themselves stay valid
 //! in time and are never rewritten by an edit.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
 
 use chrono::Utc;
 use uuid::Uuid;
@@ -112,6 +113,13 @@ impl DiarizationRun {
     /// The one-line provenance the speaker row shows ("pyannote-segmentation-3.0
     /// + CAM++ · 3 speakers · auto"), never in the transcript body.
     pub fn provenance_line(&self, speakers: usize) -> String {
+        if self.is_manual() {
+            return match speakers {
+                0 => "manual tags".to_string(),
+                1 => "manual tags · 1 speaker".to_string(),
+                n => format!("manual tags · {n} speakers"),
+            };
+        }
         let count = if self.num_clusters > 0 {
             format!("c={}", self.num_clusters)
         } else {
@@ -124,6 +132,12 @@ impl DiarizationRun {
             short_model(&self.embedding_model),
             count
         )
+    }
+
+    /// Whether this run is the manual-tagging anchor, not a diarization result
+    /// (M23A): no models, no embeddings, no engine.
+    pub fn is_manual(&self) -> bool {
+        self.segmentation_model == "manual" && self.embedding_model == "manual"
     }
 }
 
@@ -567,6 +581,380 @@ fn renumber(speakers: &mut [Speaker], turns: &mut [SpeakerTurn]) {
         if let Some(next) = mapping.get(&turn.speaker_id) {
             turn.speaker_id = *next;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M23A — manual tagging (no engine, no voiceprints)
+// ---------------------------------------------------------------------------
+
+/// The next ordinal a new speaker takes: one past the highest id ever used.
+///
+/// Deliberately **not** `speakers.len()`: a removed middle speaker leaves a gap
+/// that a dense count would silently reuse, which would give a new voice an old
+/// speaker's number in the export. Ids stay dense from 0 after a merge/remove
+/// ([`renumber`]), so this is also `len` in the normal case.
+pub fn next_speaker_id(speakers: &[Speaker]) -> u32 {
+    speakers
+        .iter()
+        .map(|speaker| speaker.speaker_id + 1)
+        .max()
+        .unwrap_or(0)
+}
+
+/// The next **unused** colour slot (`0..COLOR_SLOTS`).
+///
+/// Colours are bound at creation and never re-indexed: a merge keeps the
+/// target's colour, a split claims the lowest free slot. Only when every slot
+/// is taken does the caller fall back to a stable rotation (`id % slots`).
+pub fn next_color_slot(speakers: &[Speaker]) -> u8 {
+    for slot in 0..COLOR_SLOTS {
+        if !speakers.iter().any(|speaker| speaker.color_slot == slot) {
+            return slot;
+        }
+    }
+    (next_speaker_id(speakers) % u32::from(COLOR_SLOTS)) as u8
+}
+
+/// The run row a transcript gets when its speakers were tagged **by hand**.
+///
+/// The schema anchors turns to a run, so manual tagging needs the same anchor
+/// the engine uses. This is not a diarization result: no model, no embedding,
+/// no audio analysis — only the speaker turns the user assigned. The honest
+/// provenance line says so ([`DiarizationRun::is_manual`]).
+pub fn manual_run(transcript_id: Uuid, audio_ms: i64) -> DiarizationRun {
+    let mut run = DiarizationRun::new(
+        transcript_id,
+        1,
+        "manual",
+        "",
+        "manual",
+        "",
+        0,
+        0.0,
+        audio_ms.max(0),
+    );
+    run.engine_version = "manual tags".to_string();
+    run
+}
+
+/// One contiguous time range a manual assignment covers: `[start_ms, end_ms)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeRange {
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+impl TimeRange {
+    pub fn new(start_ms: i64, end_ms: i64) -> Self {
+        Self { start_ms, end_ms }
+    }
+
+    /// The range from a segment's start to its end ("this turn").
+    pub fn of_segment(segment: &Segment) -> Self {
+        Self::new(segment.start_ms, segment.end_ms)
+    }
+
+    /// `[segment.start, transcript_end)` — the phone's "from here down".
+    pub fn from_segment_to_end(segment: &Segment, transcript_end_ms: i64) -> Self {
+        Self::new(segment.start_ms, transcript_end_ms.max(segment.end_ms))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.end_ms <= self.start_ms
+    }
+
+    pub fn length_ms(&self) -> i64 {
+        (self.end_ms - self.start_ms).max(0)
+    }
+}
+
+/// Reassigns an exact time range to one speaker, splitting the turns that
+/// straddle either boundary.
+///
+/// The result is a complete turn list (contiguous in time order, renumbered
+/// from 0) rather than an in-place patch: a range can start and end inside two
+/// different turns, so the containing turn becomes up to three rows and every
+/// later index moves. Splitting at **both** boundaries is what makes the range
+/// exact — the untouched part before `start` keeps its old speaker, the part
+/// after `end` keeps its old speaker, and only the middle changes.
+pub fn assign_range(
+    turns: &[SpeakerTurn],
+    range: TimeRange,
+    speaker_id: u32,
+) -> Result<Vec<SpeakerTurn>, String> {
+    if range.is_empty() {
+        return Err("the range to assign is empty".to_string());
+    }
+    let mut out: Vec<SpeakerTurn> = Vec::with_capacity(turns.len() + 2);
+    for turn in turns {
+        if turn.end_ms <= range.start_ms || turn.start_ms >= range.end_ms {
+            out.push(turn.clone());
+            continue;
+        }
+        if turn.start_ms < range.start_ms {
+            out.push(SpeakerTurn {
+                turn_idx: 0,
+                start_ms: turn.start_ms,
+                end_ms: range.start_ms,
+                speaker_id: turn.speaker_id,
+                source: turn.source,
+            });
+        }
+        out.push(SpeakerTurn {
+            turn_idx: 0,
+            start_ms: turn.start_ms.max(range.start_ms),
+            end_ms: turn.end_ms.min(range.end_ms),
+            speaker_id,
+            source: TurnSource::Manual,
+        });
+        if turn.end_ms > range.end_ms {
+            out.push(SpeakerTurn {
+                turn_idx: 0,
+                start_ms: range.end_ms,
+                end_ms: turn.end_ms,
+                speaker_id: turn.speaker_id,
+                source: turn.source,
+            });
+        }
+    }
+    // The range itself is the promise: every millisecond of it belongs to the
+    // new speaker, including pauses between two turns. Fill the gaps inside the
+    // range so an unlabelled segment in silence still gets a label.
+    let mut covered: Vec<(i64, i64)> = out
+        .iter()
+        .filter_map(|turn| {
+            let start = turn.start_ms.max(range.start_ms);
+            let end = turn.end_ms.min(range.end_ms);
+            (end > start).then_some((start, end))
+        })
+        .collect();
+    covered.sort_unstable();
+    let mut cursor = range.start_ms;
+    for (start, end) in covered {
+        if start > cursor {
+            out.push(SpeakerTurn {
+                turn_idx: 0,
+                start_ms: cursor,
+                end_ms: start,
+                speaker_id,
+                source: TurnSource::Manual,
+            });
+        }
+        cursor = cursor.max(end);
+    }
+    if cursor < range.end_ms {
+        out.push(SpeakerTurn {
+            turn_idx: 0,
+            start_ms: cursor,
+            end_ms: range.end_ms,
+            speaker_id,
+            source: TurnSource::Manual,
+        });
+    }
+    // Stable by start: overlapping rows keep the order they already had.
+    out.sort_by_key(|turn| (turn.start_ms, turn.end_ms));
+    // Adjacent pieces of this assignment are one utterance: coalesce them so
+    // "fill a pause between two turns" does not leave three 0-length-adjacent
+    // rows where the user sees one range. Only manual rows merge — an auto row
+    // the user never touched keeps its own identity.
+    let mut merged: Vec<SpeakerTurn> = Vec::with_capacity(out.len());
+    for turn in out {
+        if let Some(last) = merged.last_mut() {
+            if last.end_ms == turn.start_ms
+                && last.speaker_id == turn.speaker_id
+                && last.source == TurnSource::Manual
+                && turn.source == TurnSource::Manual
+            {
+                last.end_ms = turn.end_ms;
+                continue;
+            }
+        }
+        merged.push(turn);
+    }
+    for (index, turn) in merged.iter_mut().enumerate() {
+        turn.turn_idx = index as u32;
+    }
+    Ok(merged)
+}
+
+/// Drops one speaker's label and every turn it owned (the phone's
+/// "Remove label" — the rows become unlabelled, the text is untouched).
+pub fn remove_speaker(
+    speakers: &mut Vec<Speaker>,
+    turns: &mut Vec<SpeakerTurn>,
+    speaker_id: u32,
+) -> Result<(), String> {
+    if !speakers
+        .iter()
+        .any(|speaker| speaker.speaker_id == speaker_id)
+    {
+        return Err(format!("no speaker {speaker_id}"));
+    }
+    turns.retain(|turn| turn.speaker_id != speaker_id);
+    speakers.retain(|speaker| speaker.speaker_id != speaker_id);
+    renumber(speakers, turns);
+    Ok(())
+}
+
+/// One transcript's speaker rows, as a value (the undo log's payload).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SpeakerState {
+    pub speakers: Vec<Speaker>,
+    pub turns: Vec<SpeakerTurn>,
+}
+
+impl SpeakerState {
+    pub fn is_empty(&self) -> bool {
+        self.speakers.is_empty() && self.turns.is_empty()
+    }
+}
+
+/// How a speaker transaction entered the log (the toast line and the report).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeakerEditKind {
+    Add,
+    Assign,
+    Rename,
+    Color,
+    Merge,
+    Split,
+    RemoveLabel,
+    Clear,
+}
+
+impl SpeakerEditKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SpeakerEditKind::Add => "add",
+            SpeakerEditKind::Assign => "assign",
+            SpeakerEditKind::Rename => "rename",
+            SpeakerEditKind::Color => "colour",
+            SpeakerEditKind::Merge => "merge",
+            SpeakerEditKind::Split => "split",
+            SpeakerEditKind::RemoveLabel => "remove",
+            SpeakerEditKind::Clear => "clear",
+        }
+    }
+}
+
+impl fmt::Display for SpeakerEditKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One applied speaker transaction: the rows before and after.
+///
+/// The same shape as [`crate::segment_edit::SegmentSnapshot`], for the same
+/// reason: undo writes the real `before` rows back instead of recomputing an
+/// inverse (a merge cannot be inverted from ids alone, and a split has no
+/// record of which side was which).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpeakerSnapshot {
+    pub transcript_id: Uuid,
+    pub kind: SpeakerEditKind,
+    /// The human name the verb acted on (`"Speaker 2"`, `"Budi"`), when one
+    /// applies — the toast reads `Assigned Speaker 2`, never a bare verb.
+    pub label: Option<String>,
+    pub before: SpeakerState,
+    pub after: SpeakerState,
+}
+
+impl SpeakerSnapshot {
+    /// The one-line past-tense summary the Undo toast shows.
+    pub fn summary(&self) -> String {
+        let label = self.label.as_deref();
+        match (self.kind, label) {
+            (SpeakerEditKind::Add, Some(label)) => format!("{label} added"),
+            (SpeakerEditKind::Assign, Some(label)) => format!("Assigned {label}"),
+            (SpeakerEditKind::Rename, Some(label)) => format!("Renamed to {label}"),
+            (SpeakerEditKind::Merge, Some(label)) => format!("Merged into {label}"),
+            (SpeakerEditKind::Split, Some(label)) => format!("{label} split off"),
+            (SpeakerEditKind::RemoveLabel, Some(label)) => format!("{label} removed"),
+            (SpeakerEditKind::Color, _) => "Colour changed".to_string(),
+            (SpeakerEditKind::Clear, _) => "All speakers cleared".to_string(),
+            (SpeakerEditKind::Add, None) => "Speaker added".to_string(),
+            (SpeakerEditKind::Assign, None) => "Speaker assigned".to_string(),
+            (SpeakerEditKind::Rename, None) => "Speaker renamed".to_string(),
+            (SpeakerEditKind::Merge, None) => "Speakers merged".to_string(),
+            (SpeakerEditKind::Split, None) => "Speaker split".to_string(),
+            (SpeakerEditKind::RemoveLabel, None) => "Label removed".to_string(),
+        }
+    }
+}
+
+/// How deep one transcript's speaker undo log goes. The same bound as the
+/// segment log ([`crate::segment_edit::UNDO_DEPTH`]): a session convenience,
+/// not history.
+pub const SPEAKER_UNDO_DEPTH: usize = 20;
+
+/// The bounded, in-memory undo/redo log for one transcript's speakers.
+///
+/// Mirrors [`crate::segment_edit::SegmentHistory`] exactly — push clears the
+/// redo branch, the oldest entry falls off at [`SPEAKER_UNDO_DEPTH`], and a
+/// fresh editor session starts empty. There is one undo model in this app, not
+/// two: this is the same one, over a different row set.
+#[derive(Debug, Clone, Default)]
+pub struct SpeakerHistory {
+    undo: VecDeque<SpeakerSnapshot>,
+    redo: Vec<SpeakerSnapshot>,
+}
+
+impl SpeakerHistory {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records an applied transaction and drops any redo branch.
+    pub fn push(&mut self, snapshot: SpeakerSnapshot) {
+        if self.undo.len() == SPEAKER_UNDO_DEPTH {
+            self.undo.pop_front();
+        }
+        self.undo.push_back(snapshot);
+        self.redo.clear();
+    }
+
+    pub fn next_undo(&self) -> Option<SpeakerSnapshot> {
+        self.undo.back().cloned()
+    }
+
+    pub fn next_redo(&self) -> Option<SpeakerSnapshot> {
+        self.redo.last().cloned()
+    }
+
+    /// Pops the newest undo entry onto the redo stack.
+    pub fn undo(&mut self) -> Option<SpeakerSnapshot> {
+        let entry = self.undo.pop_back()?;
+        self.redo.push(entry.clone());
+        Some(entry)
+    }
+
+    /// Pops the newest redo entry back onto the undo stack.
+    pub fn redo(&mut self) -> Option<SpeakerSnapshot> {
+        let entry = self.redo.pop()?;
+        if self.undo.len() == SPEAKER_UNDO_DEPTH {
+            self.undo.pop_front();
+        }
+        self.undo.push_back(entry.clone());
+        Some(entry)
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+    }
+
+    pub fn depth(&self) -> usize {
+        self.undo.len()
     }
 }
 

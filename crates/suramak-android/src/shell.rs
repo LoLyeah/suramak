@@ -493,23 +493,159 @@ impl CompactShell {
             }
             CompactAction::StopRecording => send_intent(ACTION_STOP_RECORDING, &[]),
             CompactAction::Export {
-                format, bilingual, ..
+                format,
+                bilingual,
+                speakers,
+                ..
             } => send_intent(
                 ACTION_EXPORT,
                 &[
                     ("format", Extra::Str(format.extension())),
                     ("bilingual", Extra::Bool(bilingual)),
+                    ("speakers", Extra::Bool(speakers)),
                 ],
             ),
             CompactAction::ShareExport {
-                format, bilingual, ..
+                format,
+                bilingual,
+                speakers,
+                ..
             } => send_intent(
                 ACTION_SHARE,
                 &[
                     ("format", Extra::Str(format.extension())),
                     ("bilingual", Extra::Bool(bilingual)),
+                    ("speakers", Extra::Bool(speakers)),
                 ],
             ),
+            // M23A: every speaker verb is one store call and one re-read; the
+            // host answers with the same snapshot shape the UI shows.
+            CompactAction::AddSpeaker { transcript } => {
+                let reply = host.dispatch(
+                    &serde_json::json!({
+                        "op": "add_speaker",
+                        "transcript_id": transcript.to_string(),
+                    })
+                    .to_string(),
+                );
+                log_reply("add speaker", &reply);
+            }
+            CompactAction::AssignSpeaker {
+                transcript,
+                speaker_id,
+                segment,
+                from_here_down,
+            } => {
+                let reply = host.dispatch(
+                    &serde_json::json!({
+                        "op": "assign_speaker",
+                        "transcript_id": transcript.to_string(),
+                        "speaker_id": speaker_id,
+                        "segment": segment,
+                        "from_here_down": from_here_down,
+                    })
+                    .to_string(),
+                );
+                log_reply("assign speaker", &reply);
+            }
+            CompactAction::NewSpeakerAssign {
+                transcript,
+                segment,
+                from_here_down,
+            } => {
+                let reply = host.dispatch(
+                    &serde_json::json!({
+                        "op": "new_speaker_assign",
+                        "transcript_id": transcript.to_string(),
+                        "segment": segment,
+                        "from_here_down": from_here_down,
+                    })
+                    .to_string(),
+                );
+                log_reply("new speaker + assign", &reply);
+            }
+            CompactAction::RenameSpeaker {
+                transcript,
+                speaker_id,
+                label,
+            } => {
+                let reply = host.dispatch(
+                    &serde_json::json!({
+                        "op": "rename_speaker",
+                        "transcript_id": transcript.to_string(),
+                        "speaker_id": speaker_id,
+                        "label": label,
+                    })
+                    .to_string(),
+                );
+                log_reply("rename speaker", &reply);
+            }
+            CompactAction::SetSpeakerColor {
+                transcript,
+                speaker_id,
+                slot,
+            } => {
+                let reply = host.dispatch(
+                    &serde_json::json!({
+                        "op": "set_speaker_color",
+                        "transcript_id": transcript.to_string(),
+                        "speaker_id": speaker_id,
+                        "slot": slot,
+                    })
+                    .to_string(),
+                );
+                log_reply("speaker colour", &reply);
+            }
+            CompactAction::MergeSpeakers {
+                transcript,
+                from,
+                into,
+            } => {
+                let reply = host.dispatch(
+                    &serde_json::json!({
+                        "op": "merge_speakers",
+                        "transcript_id": transcript.to_string(),
+                        "from": from,
+                        "into": into,
+                    })
+                    .to_string(),
+                );
+                log_reply("merge speakers", &reply);
+            }
+            CompactAction::RemoveSpeakerLabel {
+                transcript,
+                speaker_id,
+            } => {
+                let reply = host.dispatch(
+                    &serde_json::json!({
+                        "op": "remove_speaker_label",
+                        "transcript_id": transcript.to_string(),
+                        "speaker_id": speaker_id,
+                    })
+                    .to_string(),
+                );
+                log_reply("remove speaker label", &reply);
+            }
+            CompactAction::ClearSpeakers { transcript } => {
+                let reply = host.dispatch(
+                    &serde_json::json!({
+                        "op": "clear_speakers",
+                        "transcript_id": transcript.to_string(),
+                    })
+                    .to_string(),
+                );
+                log_reply("clear speakers", &reply);
+            }
+            CompactAction::UndoSpeakers { transcript } => {
+                let reply = host.dispatch(
+                    &serde_json::json!({
+                        "op": "undo_speakers",
+                        "transcript_id": transcript.to_string(),
+                    })
+                    .to_string(),
+                );
+                log_reply("undo speaker edit", &reply);
+            }
             CompactAction::OnboardingSeen { skipped } => {
                 let reply = host.dispatch(
                     &serde_json::json!({

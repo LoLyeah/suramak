@@ -853,8 +853,15 @@ pub fn search_field(
 /// the one rim and the one float shadow. Its top corners round; the bottom is
 /// the screen edge.
 pub fn sheet(ui: &mut Ui, tokens: &Tokens, rect: Rect, slide: f32) -> Rect {
-    material::scrim(ui, rect, tokens);
     let height = (rect.height() * 0.46).clamp(240.0, 420.0);
+    sheet_sized(ui, tokens, rect, slide, height)
+}
+
+/// The same Sheet plane at an explicit height (M23A: the speaker surfaces and
+/// the taller export sheet). Never taller than the screen.
+pub fn sheet_sized(ui: &mut Ui, tokens: &Tokens, rect: Rect, slide: f32, height: f32) -> Rect {
+    material::scrim(ui, rect, tokens);
+    let height = height.clamp(160.0, rect.height());
     let progress = slide.clamp(0.0, 1.0);
     let body = Rect::from_min_max(
         pos2(rect.left(), rect.bottom() - height * progress),

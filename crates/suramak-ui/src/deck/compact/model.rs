@@ -198,6 +198,12 @@ impl CompactExportFormat {
     pub fn supports_bilingual(self) -> bool {
         matches!(self, Self::Srt | Self::Vtt)
     }
+
+    /// Whether this format has a speaker-aware variant (M23A): SRT, VTT and
+    /// Markdown prefix a line; txt/json/tsv are machine rows and stay plain.
+    pub fn supports_speakers(self) -> bool {
+        matches!(self, Self::Srt | Self::Vtt | Self::Md)
+    }
 }
 
 /// The export sheet's phase — the "picker result path" is a modelled state, not
@@ -221,6 +227,8 @@ pub struct ExportSession {
     pub transcript: Uuid,
     pub format: CompactExportFormat,
     pub bilingual: bool,
+    /// M23A: whether the speaker prefixes were included in this write.
+    pub speakers: bool,
     pub phase: ExportPhase,
     /// The suggested file name (also the staged file's name).
     pub name: String,
@@ -241,6 +249,7 @@ impl ExportSession {
             transcript,
             format,
             bilingual,
+            speakers: false,
             phase: ExportPhase::Choosing,
             name,
             bytes: None,
@@ -722,6 +731,8 @@ pub enum CompactAction {
         transcript: Uuid,
         format: CompactExportFormat,
         bilingual: bool,
+        /// M23A: prefix each line with its speaker (`Include speakers`).
+        speakers: bool,
         suggested_name: String,
     },
     /// The one-file `ACTION_SEND` alternative: stage the same bytes and hand
@@ -730,6 +741,7 @@ pub enum CompactAction {
         transcript: Uuid,
         format: CompactExportFormat,
         bilingual: bool,
+        speakers: bool,
         suggested_name: String,
     },
     /// The library's Import button (SAF / share).
@@ -762,6 +774,56 @@ pub enum CompactAction {
     ClearCrash,
     /// Diagnostics: hand the crash log to another app (the v2.1 share route).
     ShareCrashLog,
+    /// M23A: add the next speaker (ordinal + first unused colour).
+    AddSpeaker {
+        transcript: Uuid,
+    },
+    /// M23A: assign one segment's range (or from it to the end) to a speaker.
+    AssignSpeaker {
+        transcript: Uuid,
+        speaker_id: u32,
+        segment: u32,
+        from_here_down: bool,
+    },
+    /// M23A: `+ New` in the turn strip — add a speaker and assign the range
+    /// to it in one host transaction pair (two undo entries, both undoable).
+    NewSpeakerAssign {
+        transcript: Uuid,
+        segment: u32,
+        from_here_down: bool,
+    },
+    /// M23A: rename one speaker (the store owns uniqueness and the 60-char cap).
+    RenameSpeaker {
+        transcript: Uuid,
+        speaker_id: u32,
+        label: String,
+    },
+    /// M23A: one palette slot (0..6).
+    SetSpeakerColor {
+        transcript: Uuid,
+        speaker_id: u32,
+        slot: u8,
+    },
+    /// M23A: merge the source speaker into the target (the target's colour and
+    /// name survive).
+    MergeSpeakers {
+        transcript: Uuid,
+        from: u32,
+        into: u32,
+    },
+    /// M23A: remove one speaker's label and turns (the rows go unlabelled).
+    RemoveSpeakerLabel {
+        transcript: Uuid,
+        speaker_id: u32,
+    },
+    /// M23A: remove every speaker (confirmed in the Speakers sheet).
+    ClearSpeakers {
+        transcript: Uuid,
+    },
+    /// M23A: undo the newest speaker transaction (the host's SpeakerHistory).
+    UndoSpeakers {
+        transcript: Uuid,
+    },
     /// M22B: start the shared voice note with this language (`auto` allowed).
     VoiceNoteAccept {
         language: String,
@@ -783,6 +845,95 @@ pub enum Sheet {
     Onboarding,
     /// M22B: the 1.2 s voice-note offer a share opens.
     VoiceNote,
+    /// M23A: the speaker list (bottom-bar `Tag speakers` / `N speakers`).
+    Speakers,
+    /// M23A: one speaker's properties (rename, colour, merge, remove).
+    Speaker,
+    /// M23A: the per-segment turn strip (assign this turn / from here down).
+    TurnStrip,
+}
+
+impl Sheet {
+    /// Whether this sheet is one of M23A's speaker surfaces.
+    pub fn is_speaker_sheet(self) -> bool {
+        matches!(self, Sheet::Speakers | Sheet::Speaker | Sheet::TurnStrip)
+    }
+
+    /// The height the speaker surfaces ask the sheet plane for.
+    pub fn speaker_height(self) -> f32 {
+        match self {
+            Sheet::TurnStrip => 260.0,
+            _ => 430.0,
+        }
+    }
+}
+
+/// M23A: the turn strip's scope — one segment, or the rest of the recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TurnScope {
+    /// Only the tapped segment's time range.
+    #[default]
+    ThisTurn,
+    /// From the tapped segment's start to the end of the transcript.
+    FromHereDown,
+}
+
+impl TurnScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            TurnScope::ThisTurn => "This turn",
+            TurnScope::FromHereDown => "From here down",
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            TurnScope::ThisTurn => TurnScope::FromHereDown,
+            TurnScope::FromHereDown => TurnScope::ThisTurn,
+        }
+    }
+}
+
+/// M23A: the turn strip's target and scope (the segment it was opened on).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TurnStripState {
+    pub segment: u32,
+    pub scope: TurnScope,
+}
+
+/// M23A: the Speaker sheet's drafts. The rename field is a draft until Save;
+/// `merge_open` swaps the body to the "merge into…" target list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpeakerSheetState {
+    pub speaker_id: u32,
+    pub rename: String,
+    pub merge_open: bool,
+}
+
+/// M23A: the 6 s Undo toast after a speaker edit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UndoToast {
+    pub label: String,
+    pub opened_at: f64,
+}
+
+/// How long the Undo toast stays on screen (the plan's 6 s).
+pub const UNDO_TOAST_SECS: f64 = 6.0;
+
+impl UndoToast {
+    pub fn is_expired(&self, now: f64) -> bool {
+        now - self.opened_at >= UNDO_TOAST_SECS
+    }
+
+    /// 0 → 1 opacity over the last 400 ms, so the toast leaves rather than
+    /// vanishing mid-read (Reduce Motion keeps its state, as everywhere).
+    pub fn alpha(&self, now: f64, reduce_motion: bool) -> f32 {
+        if reduce_motion {
+            return 1.0;
+        }
+        let remaining = UNDO_TOAST_SECS - (now - self.opened_at);
+        (remaining / 0.4).clamp(0.0, 1.0) as f32
+    }
 }
 
 /// M22B: the state the voice-note micro-sheet draws. The host builds it from
@@ -815,6 +966,9 @@ pub struct CompactSpeakers {
     pub per_segment: Vec<Option<suramak_core::diarization::SegmentSpeaker>>,
     pub stale: bool,
     pub audio_ms: i64,
+    /// M23A: whether a speaker edit landed after the last speaker-inclusive
+    /// export (the export sheet's honesty note).
+    pub edited_since_export: bool,
 }
 
 impl CompactSpeakers {
@@ -836,6 +990,33 @@ impl CompactSpeakers {
 
     pub fn row(&self, idx: u32) -> Option<suramak_core::diarization::SegmentSpeaker> {
         self.per_segment.get(idx as usize).copied().flatten()
+    }
+
+    /// How many turns a speaker owns in the active run (the Speaker sheet's
+    /// subtitle and the list row's count).
+    pub fn turn_count(&self, speaker_id: u32) -> usize {
+        self.turns
+            .iter()
+            .filter(|turn| turn.speaker_id == speaker_id)
+            .count()
+    }
+
+    /// The speaker's label for the badge/pill (the sheet reads through
+    /// [`Self::label`] too; this is the borrow-friendly form).
+    pub fn speaker(&self, speaker_id: u32) -> Option<&suramak_core::diarization::Speaker> {
+        self.speakers
+            .iter()
+            .find(|speaker| speaker.speaker_id == speaker_id)
+    }
+
+    /// The bottom bar's label: `Tag speakers` when nothing is labelled yet,
+    /// else the count. Never a nounless number.
+    pub fn button_label(&self) -> String {
+        match self.speakers.len() {
+            0 => "Tag speakers".to_string(),
+            1 => "1 speaker".to_string(),
+            n => format!("{n} speakers"),
+        }
     }
 }
 
@@ -1081,23 +1262,36 @@ impl CompactEditor {
         }
     }
 
-    /// The export request for the current transcript. `bilingual` adds the
-    /// stacked translation (SRT/VTT only; the sheet gates the switch).
-    pub fn export_request(&self, bilingual: bool) -> CompactAction {
+    /// The export request the host stages. `bilingual` is gated on the
+    /// format; `speakers` on a labelled transcript and a speaker-capable
+    /// format (txt/json/tsv stay machine rows).
+    pub fn export_request(&self, bilingual: bool, speakers: bool) -> CompactAction {
         CompactAction::Export {
             transcript: self.transcript.id,
             format: self.format,
             bilingual: bilingual && self.format.supports_bilingual(),
+            speakers: speakers
+                && self.format.supports_speakers()
+                && self
+                    .speakers
+                    .as_ref()
+                    .is_some_and(|view| !view.speakers.is_empty()),
             suggested_name: self.suggested_name(),
         }
     }
 
     /// The one-file share request (same bytes, `ACTION_SEND`).
-    pub fn share_request(&self, bilingual: bool) -> CompactAction {
+    pub fn share_request(&self, bilingual: bool, speakers: bool) -> CompactAction {
         CompactAction::ShareExport {
             transcript: self.transcript.id,
             format: self.format,
             bilingual: bilingual && self.format.supports_bilingual(),
+            speakers: speakers
+                && self.format.supports_speakers()
+                && self
+                    .speakers
+                    .as_ref()
+                    .is_some_and(|view| !view.speakers.is_empty()),
             suggested_name: self.suggested_name(),
         }
     }
@@ -1190,6 +1384,19 @@ pub struct CompactApp {
     pub export_session: Option<ExportSession>,
     /// The sheet's "include the translation" switch.
     pub export_bilingual: bool,
+    /// M23A: the sheet's "include speakers" switch.
+    pub export_speakers: bool,
+    /// M23A: the Speaker sheet's draft (open while `Sheet::Speaker` is).
+    pub speaker_sheet: Option<SpeakerSheetState>,
+    /// M23A: the turn strip's target/scope (open while `Sheet::TurnStrip`).
+    pub turn_strip: Option<TurnStripState>,
+    /// M23A: the 6 s Undo toast after a speaker edit.
+    pub undo_toast: Option<UndoToast>,
+    /// M23A: `Clear all speakers` is destructive; the first tap only arms it.
+    pub speakers_confirm_clear: bool,
+    /// M23A: whether the host has a speaker snapshot to undo (the turn strip's
+    /// and the toast's Undo state; the host owns the log).
+    pub speakers_undo_available: bool,
     /// M22B: the voice-note offer being drawn (or about to be).
     pub voice_note: Option<VoiceNoteView>,
     /// M22B: an offer that arrived before the next frame could timestamp it.
@@ -1285,6 +1492,12 @@ impl CompactApp {
             onboarding_seen_pending: false,
             export_session: None,
             export_bilingual: false,
+            export_speakers: false,
+            speaker_sheet: None,
+            turn_strip: None,
+            undo_toast: None,
+            speakers_confirm_clear: false,
+            speakers_undo_available: false,
             voice_note: None,
             voice_note_armed: None,
             voice_note_cancel_pending: false,
@@ -1862,6 +2075,16 @@ impl CompactApp {
             self.sheet = None;
             self.export_session = None;
             self.voice_note = None;
+            self.speaker_sheet = None;
+            self.turn_strip = None;
+            self.speakers_confirm_clear = false;
+        }
+        if self
+            .undo_toast
+            .as_ref()
+            .is_some_and(|toast| toast.is_expired(now))
+        {
+            self.undo_toast = None;
         }
         // The editor's data outlives a pop until the transition has played: the
         // outgoing screen is painted while it slides away.
@@ -1987,31 +2210,14 @@ impl CompactApp {
     /// Returns the action the host must run, or `None` when no editor is open.
     pub fn begin_export(&mut self, now: f64) -> Option<CompactAction> {
         let editor = self.editor.as_ref()?;
-        let action = editor.export_request(self.export_bilingual);
-        let (transcript, format) = match &action {
+        let action = editor.export_request(self.export_bilingual, self.export_speakers);
+        let (transcript, format, speakers) = match &action {
             CompactAction::Export {
-                transcript, format, ..
-            } => (*transcript, *format),
-            _ => return None,
-        };
-        self.export_session = Some(ExportSession::new(
-            transcript,
-            format,
-            self.export_bilingual,
-            editor.suggested_name(),
-        ));
-        self.sheet_anim.begin(true, now);
-        Some(action)
-    }
-
-    /// The sheet's Share button: the same bytes, one file, `ACTION_SEND`.
-    pub fn share_export(&mut self, now: f64) -> Option<CompactAction> {
-        let editor = self.editor.as_ref()?;
-        let action = editor.share_request(self.export_bilingual);
-        let (transcript, format) = match &action {
-            CompactAction::ShareExport {
-                transcript, format, ..
-            } => (*transcript, *format),
+                transcript,
+                format,
+                speakers,
+                ..
+            } => (*transcript, *format, *speakers),
             _ => return None,
         };
         let mut session = ExportSession::new(
@@ -2020,6 +2226,32 @@ impl CompactApp {
             self.export_bilingual,
             editor.suggested_name(),
         );
+        session.speakers = speakers;
+        self.export_session = Some(session);
+        self.sheet_anim.begin(true, now);
+        Some(action)
+    }
+
+    /// The sheet's Share button: the same bytes, one file, `ACTION_SEND`.
+    pub fn share_export(&mut self, now: f64) -> Option<CompactAction> {
+        let editor = self.editor.as_ref()?;
+        let action = editor.share_request(self.export_bilingual, self.export_speakers);
+        let (transcript, format, speakers) = match &action {
+            CompactAction::ShareExport {
+                transcript,
+                format,
+                speakers,
+                ..
+            } => (*transcript, *format, *speakers),
+            _ => return None,
+        };
+        let mut session = ExportSession::new(
+            transcript,
+            format,
+            self.export_bilingual,
+            editor.suggested_name(),
+        );
+        session.speakers = speakers;
         session.phase = ExportPhase::Writing;
         self.export_session = Some(session);
         self.sheet_anim.begin(true, now);
@@ -2074,6 +2306,227 @@ impl CompactApp {
     /// Closes the export sheet (Done, or a tap outside).
     pub fn close_export_sheet(&mut self, now: f64) {
         self.sheet_anim.begin(false, now);
+    }
+
+    // ---- M23A: the speaker surfaces --------------------------------------
+
+    /// The open transcript's speaker view, when the host seeded one.
+    pub fn speakers_view(&self) -> Option<&CompactSpeakers> {
+        self.editor
+            .as_ref()
+            .and_then(|editor| editor.speakers.as_ref())
+    }
+
+    /// The bottom bar's label: `Tag speakers` or `N speakers`.
+    pub fn speakers_button_label(&self) -> String {
+        self.speakers_view()
+            .map(CompactSpeakers::button_label)
+            .unwrap_or_else(|| "Tag speakers".to_string())
+    }
+
+    /// Opens the Speakers sheet (the bottom bar's button). No editor guard:
+    /// the editor calls this while it holds the frame's `CompactEditor` (the
+    /// app field is temporarily taken), and it only opens from that screen.
+    pub fn open_speakers_sheet(&mut self, now: f64) {
+        self.speakers_confirm_clear = false;
+        self.sheet = Some(Sheet::Speakers);
+        self.sheet_anim.begin(true, now);
+    }
+
+    /// Opens one speaker's sheet (tapping the turn header). The rename field
+    /// starts at the current label — a rename is an edit, not a blank box.
+    pub fn open_speaker_sheet(&mut self, speaker_id: u32, now: f64) {
+        let label = self
+            .speakers_view()
+            .map(|view| view.label(speaker_id))
+            .unwrap_or_else(|| suramak_core::diarization::default_label(speaker_id));
+        self.open_speaker_sheet_named(speaker_id, label, now);
+    }
+
+    /// The same sheet with the label the editor already has in hand (the app's
+    /// editor field is taken while a screen draws, so the row passes its own).
+    pub fn open_speaker_sheet_named(&mut self, speaker_id: u32, label: String, now: f64) {
+        self.speaker_sheet = Some(SpeakerSheetState {
+            speaker_id,
+            rename: label,
+            merge_open: false,
+        });
+        self.sheet = Some(Sheet::Speaker);
+        self.sheet_anim.begin(true, now);
+    }
+
+    /// Opens the turn strip for a segment (tapping `[+ Speaker]`, a badge, or
+    /// a segment's speaker affordance). No editor guard: the caller is the
+    /// editor drawing the frame (see [`Self::open_speakers_sheet`]).
+    pub fn open_turn_strip(&mut self, segment: u32, now: f64) {
+        self.turn_strip = Some(TurnStripState {
+            segment,
+            scope: TurnScope::ThisTurn,
+        });
+        self.sheet = Some(Sheet::TurnStrip);
+        self.sheet_anim.begin(true, now);
+    }
+
+    /// Flips `This turn | From here down` in place (the strip stays open).
+    pub fn toggle_turn_scope(&mut self) {
+        if let Some(strip) = self.turn_strip.as_mut() {
+            strip.scope = strip.scope.toggled();
+        }
+    }
+
+    /// The transcript the speaker surfaces act on.
+    fn speaker_transcript(&self) -> Option<Uuid> {
+        self.editor.as_ref().map(|editor| editor.transcript.id)
+    }
+
+    /// `Add speaker` — the host writes the row, then calls
+    /// [`Self::on_speaker_applied`] with the summary (`Speaker 2 added`).
+    pub fn request_add_speaker(&mut self) -> Option<CompactAction> {
+        Some(CompactAction::AddSpeaker {
+            transcript: self.speaker_transcript()?,
+        })
+    }
+
+    /// `+ New` inside the turn strip: the host adds the next speaker and
+    /// immediately assigns the strip's range to it.
+    pub fn request_new_speaker(&mut self) -> Option<CompactAction> {
+        let strip = self.turn_strip?;
+        let transcript = self.speaker_transcript()?;
+        Some(CompactAction::NewSpeakerAssign {
+            transcript,
+            segment: strip.segment,
+            from_here_down: strip.scope == TurnScope::FromHereDown,
+        })
+    }
+
+    /// Assigns the strip's range to a speaker and closes the strip; the host
+    /// answers with a summary for the Undo toast.
+    pub fn request_assign(&mut self, speaker_id: u32, now: f64) -> Option<CompactAction> {
+        let strip = self.turn_strip?;
+        let transcript = self.speaker_transcript()?;
+        self.sheet_anim.begin(false, now);
+        Some(CompactAction::AssignSpeaker {
+            transcript,
+            speaker_id,
+            segment: strip.segment,
+            from_here_down: strip.scope == TurnScope::FromHereDown,
+        })
+    }
+
+    /// The Speaker sheet's Save: a rename (trimmed; empty is refused in the UI
+    /// and again by the store).
+    pub fn request_rename(&mut self) -> Option<CompactAction> {
+        let sheet = self.speaker_sheet.clone()?;
+        let label = sheet.rename.trim();
+        if label.is_empty() {
+            return None;
+        }
+        Some(CompactAction::RenameSpeaker {
+            transcript: self.speaker_transcript()?,
+            speaker_id: sheet.speaker_id,
+            label: label.to_string(),
+        })
+    }
+
+    /// A colour dot: the store's `set_speaker_color`.
+    pub fn request_speaker_color(&mut self, slot: u8) -> Option<CompactAction> {
+        let sheet = self.speaker_sheet.as_ref()?;
+        Some(CompactAction::SetSpeakerColor {
+            transcript: self.speaker_transcript()?,
+            speaker_id: sheet.speaker_id,
+            slot,
+        })
+    }
+
+    /// `Merge into…` reveals the target list; the second tap merges.
+    pub fn open_merge_targets(&mut self) {
+        if let Some(sheet) = self.speaker_sheet.as_mut() {
+            sheet.merge_open = true;
+        }
+    }
+
+    pub fn request_merge(&mut self, into: u32) -> Option<CompactAction> {
+        let sheet = self.speaker_sheet.as_ref()?;
+        Some(CompactAction::MergeSpeakers {
+            transcript: self.speaker_transcript()?,
+            from: sheet.speaker_id,
+            into,
+        })
+    }
+
+    /// `Remove label` — reverts the speaker's turns to unlabelled.
+    pub fn request_remove_label(&mut self) -> Option<CompactAction> {
+        let sheet = self.speaker_sheet.as_ref()?;
+        Some(CompactAction::RemoveSpeakerLabel {
+            transcript: self.speaker_transcript()?,
+            speaker_id: sheet.speaker_id,
+        })
+    }
+
+    /// `Clear all speakers`: the first tap arms the confirmation, the second
+    /// emits the action. Returns `None` on the arming tap.
+    pub fn request_clear_speakers(&mut self) -> Option<CompactAction> {
+        if !self.speakers_confirm_clear {
+            self.speakers_confirm_clear = true;
+            return None;
+        }
+        self.speakers_confirm_clear = false;
+        Some(CompactAction::ClearSpeakers {
+            transcript: self.speaker_transcript()?,
+        })
+    }
+
+    /// The Undo toast's action (and the turn strip's Undo when one is open).
+    pub fn request_undo_speakers(&mut self, now: f64) -> Option<CompactAction> {
+        let transcript = self.speaker_transcript()?;
+        self.undo_toast = None;
+        self.sheet_anim.begin(false, now);
+        Some(CompactAction::UndoSpeakers { transcript })
+    }
+
+    /// Shows the 6 s Undo toast without closing the sheet (Add speaker and
+    /// the colour dots keep their surface open; a colour is worth trying).
+    pub fn show_speaker_toast(&mut self, summary: impl Into<String>, now: f64) {
+        self.undo_toast = Some(UndoToast {
+            label: summary.into(),
+            opened_at: now,
+        });
+        self.speakers_undo_available = true;
+    }
+
+    /// The host applied one speaker verb: close the speaker surfaces and show
+    /// the 6 s Undo toast with the verb's own summary.
+    pub fn on_speaker_applied(&mut self, summary: impl Into<String>, now: f64) {
+        self.show_speaker_toast(summary, now);
+        self.speaker_sheet = None;
+        self.turn_strip = None;
+        self.speakers_confirm_clear = false;
+        self.sheet_anim.begin(false, now);
+    }
+
+    /// The host undid the newest speaker transaction. The sheet dismisses with
+    /// its own animation (advance clears it when the slide lands).
+    pub fn on_speaker_undone(&mut self, now: f64) {
+        self.undo_toast = None;
+        self.speakers_undo_available = false;
+        self.speaker_sheet = None;
+        self.turn_strip = None;
+        self.sheet_anim.begin(false, now);
+    }
+
+    /// The host re-read the speaker view (after any verb or on open). `None`
+    /// is the plain, never-tagged view.
+    pub fn on_speakers_refreshed(&mut self, view: Option<CompactSpeakers>) {
+        if let Some(editor) = self.editor.as_mut() {
+            editor.speakers = view;
+        }
+    }
+
+    /// The frame deadline that clears the toast, if one is showing.
+    pub fn undo_deadline(&self) -> Option<f64> {
+        self.undo_toast
+            .as_ref()
+            .map(|toast| toast.opened_at + UNDO_TOAST_SECS)
     }
 
     /// The keys the library list is painted with (stable per transcript id).
@@ -2465,7 +2918,7 @@ mod tests {
         app.open_editor(transcript("Rapat: 12/03", &["halo"]), 0.0);
         let editor = app.editor.as_mut().expect("editor");
         editor.format = CompactExportFormat::Srt;
-        match editor.export_request(false) {
+        match editor.export_request(false, false) {
             CompactAction::Export {
                 format,
                 suggested_name,
@@ -2482,7 +2935,7 @@ mod tests {
         }
         // The sheet gates translation to the stacked formats.
         editor.format = CompactExportFormat::Md;
-        match editor.export_request(true) {
+        match editor.export_request(true, false) {
             CompactAction::Export { bilingual, .. } => assert!(!bilingual),
             other => panic!("unexpected {other:?}"),
         }
@@ -2855,6 +3308,7 @@ mod tests {
             format,
             bilingual,
             suggested_name,
+            ..
         } = action
         else {
             panic!("expected an Export action");

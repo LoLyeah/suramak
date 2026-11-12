@@ -42,6 +42,9 @@ const BODY_GAP: f32 = 4.0;
 const WORD_STRIP: f32 = 40.0;
 /// The inline editor's fixed body height (field + Save/Cancel).
 const EDIT_HEIGHT: f32 = 160.0;
+/// M23A: the phone's per-turn rail width. The desktop lane is 8 px; the phone's
+/// rail is the slimmer mark beside the row (the plan's 4 px).
+const PHONE_RAIL_W: f32 = 4.0;
 
 pub fn ui(
     ui: &mut Ui,
@@ -371,6 +374,27 @@ pub fn ui(
                 );
             }
 
+            // M23A: the 4 px turn rail down the row's leading edge. It is the
+            // phone's mark for "these lines belong to this speaker" — the
+            // desktop keeps its 8 px lane above the list.
+            if let (Some(view), Some(row)) = (&speaker_view, speaker_row) {
+                let top = if show_name {
+                    rect.top() + 6.0
+                } else {
+                    rect.top()
+                };
+                let rail = Rect::from_min_max(
+                    pos2(rect.left() + 2.0, top),
+                    pos2(rect.left() + 2.0 + PHONE_RAIL_W, rect.bottom()),
+                );
+                ui.painter().rect_filled(
+                    rail,
+                    CornerRadius::same(2),
+                    speakers::color(tokens, view.color_slot(row.primary))
+                        .gamma_multiply(if view.stale { 0.55 } else { 0.9 }),
+                );
+            }
+
             let header_center = rect.top() + SEGMENT_TOP + SEGMENT_HEADER / 2.0;
             // Speaker badge (M16I): the shared 3 px bar + chip, in the row's
             // leading gutter. Tapping it selects the segment.
@@ -393,7 +417,10 @@ pub fn ui(
                     },
                 );
                 if badge_response.clicked() {
-                    editor.select(segment.idx);
+                    // M23A: the badge is the segment's speaker mark — tapping
+                    // it opens the turn strip for this line's range. The name
+                    // beside it opens the speaker's own sheet.
+                    state.open_turn_strip(segment.idx, now);
                 }
             }
 
@@ -456,6 +483,62 @@ pub fn ui(
                 );
                 if pencil.right() < name_right {
                     icons::paint(ui.painter(), pencil, Icon::Pencil, 12.0, tokens.ink_faint);
+                }
+                // The whole name (with its pencil) is the Speaker sheet's
+                // target: rename, colour, merge, remove. It is a second tap
+                // zone inside the row, not a second visual control.
+                let name_rect = Rect::from_min_size(
+                    pos2(name_x, header_center - 10.0),
+                    vec2((name_galley.size().x + 18.0).min(name_right - name_x), 20.0),
+                );
+                let name_response = a11y::touch(
+                    ui,
+                    tokens,
+                    name_rect,
+                    ("speaker-name", primary.expect("named turn")),
+                    WidgetType::Button,
+                    &format!("{name} — rename, colour, merge or remove"),
+                    true,
+                );
+                if name_response.clicked() {
+                    state.open_speaker_sheet_named(primary.expect("named turn"), name.clone(), now);
+                }
+            }
+
+            // M23A: a labelled transcript's unlabelled rows carry the muted
+            // `+ Speaker` pill in the header band. One tap opens the turn strip
+            // for exactly this segment; a plain (never tagged) transcript keeps
+            // today's clean row — the bottom bar's `Tag speakers` is its door.
+            if speaker_view.is_some() && speaker_row.is_none() {
+                let pill = Rect::from_min_size(
+                    pos2(text_left + time_width + 10.0, header_center - 10.0),
+                    vec2(78.0, 20.0),
+                );
+                let response = a11y::touch(
+                    ui,
+                    tokens,
+                    pill,
+                    ("segment-pill", segment.idx),
+                    WidgetType::Button,
+                    "Tag this segment with a speaker",
+                    true,
+                );
+                ui.painter().rect(
+                    pill,
+                    CornerRadius::same(10),
+                    tokens.control_fill,
+                    Stroke::new(1.0_f32, tokens.hairline),
+                    StrokeKind::Inside,
+                );
+                ui.painter().text(
+                    pill.center(),
+                    Align2::CENTER_CENTER,
+                    "+ Speaker",
+                    type_scale::caption().font,
+                    tokens.ink_soft,
+                );
+                if response.clicked() {
+                    state.open_turn_strip(segment.idx, now);
                 }
             }
 
@@ -691,7 +774,7 @@ pub fn ui(
     }
     let time_rect = Rect::from_min_size(
         pos2(bar.left() + GUTTER + 64.0, bar.center().y - 10.0),
-        vec2(112.0, 20.0),
+        vec2(96.0, 20.0),
     );
     a11y::describe(
         ui,
@@ -709,8 +792,35 @@ pub fn ui(
         &type_scale::numerals().font,
         tokens.ink_soft,
     );
+    // M23A: the Speakers button. It reads `Tag speakers` until the transcript
+    // has a label, then the count; both are the plan's literal labels, and the
+    // sheet behind it is the only door to Add/Clear.
+    let speakers_btn = Rect::from_min_size(
+        pos2(bar.left() + GUTTER + 166.0, bar.center().y - 22.0),
+        vec2(92.0, 44.0),
+    );
+    let speakers_label = editor
+        .speakers
+        .as_ref()
+        .map(super::model::CompactSpeakers::button_label)
+        .unwrap_or_else(|| "Tag speakers".to_string());
+    if chrome::action_button(
+        ui,
+        tokens,
+        motion,
+        speakers_btn,
+        "editor-speakers",
+        &speakers_label,
+        false,
+    )
+    .clicked()
+    {
+        state.open_speakers_sheet(now);
+    }
+    a11y::record_button(ui, speakers_btn, &speakers_label, true);
+
     let search_btn = Rect::from_center_size(
-        pos2(bar.right() - GUTTER - 104.0, bar.center().y),
+        pos2(bar.right() - GUTTER - 128.0, bar.center().y),
         vec2(72.0, 48.0),
     );
     if a11y::touch(
@@ -904,6 +1014,14 @@ pub fn export_sheet(
     // borrow of it.
     let current_format = editor.format;
     let has_translation = editor.has_translation;
+    let has_speakers = editor
+        .speakers
+        .as_ref()
+        .is_some_and(|view| !view.speakers.is_empty());
+    let speakers_edited = editor
+        .speakers
+        .as_ref()
+        .is_some_and(|view| view.edited_since_export);
 
     if let Some(session) = state.export_session.clone() {
         export_result(ui, tokens, motion, state, body, &session, now, &mut actions);
@@ -985,6 +1103,7 @@ pub fn export_sheet(
 
     // The bilingual switch: only rendered for the stacked formats and only when
     // the transcript actually has a translation to stack.
+    let mut next_toggle_y = 176.0;
     if current_format.supports_bilingual() {
         let toggle_rect = Rect::from_min_size(
             pos2(body.left() + GUTTER, body.top() + 176.0),
@@ -1035,18 +1154,89 @@ pub fn export_sheet(
         if response.clicked() && has_translation {
             state.export_bilingual = !state.export_bilingual;
         }
+        next_toggle_y = 224.0;
+    }
+
+    // M23A: `Include speakers`. Offered for SRT/VTT/Markdown only; a format
+    // with no speaker variant says why instead of showing a dead switch.
+    let speakers_toggle = Rect::from_min_size(
+        pos2(body.left() + GUTTER, body.top() + next_toggle_y),
+        vec2(body.width() - GUTTER * 2.0, 40.0),
+    );
+    let speakers_offered = current_format.supports_speakers();
+    let speakers_enabled = speakers_offered && has_speakers;
+    let response = a11y::touch(
+        ui,
+        tokens,
+        speakers_toggle,
+        "export-speakers",
+        WidgetType::Checkbox,
+        "Include speakers",
+        speakers_enabled,
+    );
+    let box_rect = Rect::from_min_size(
+        pos2(
+            speakers_toggle.left() + 2.0,
+            speakers_toggle.center().y - 10.0,
+        ),
+        vec2(20.0, 20.0),
+    );
+    ui.painter().rect(
+        box_rect,
+        CornerRadius::same(5),
+        if state.export_speakers && speakers_enabled {
+            tokens.accent
+        } else {
+            Color32::TRANSPARENT
+        },
+        Stroke::new(1.0_f32, tokens.hairline_strong),
+        StrokeKind::Inside,
+    );
+    if state.export_speakers && speakers_enabled {
+        icons::paint(ui.painter(), box_rect, Icon::Check, 13.0, tokens.on_accent);
+    }
+    let speakers_note = if !speakers_offered {
+        format!("{} has no speaker variant", current_format.label())
+    } else if !has_speakers {
+        "No speakers tagged".to_string()
+    } else {
+        "Include speakers".to_string()
+    };
+    ui.painter().text(
+        pos2(box_rect.right() + 10.0, speakers_toggle.center().y),
+        Align2::LEFT_CENTER,
+        &speakers_note,
+        type_scale::caption().font,
+        if speakers_enabled {
+            tokens.ink
+        } else {
+            tokens.ink_faint
+        },
+    );
+    if response.clicked() && speakers_enabled {
+        state.export_speakers = !state.export_speakers;
+    }
+    if speakers_edited && speakers_enabled {
+        // The honesty note: an exported file is a snapshot, never rewritten.
+        ui.painter().text(
+            pos2(body.left() + GUTTER, body.top() + next_toggle_y + 50.0),
+            Align2::LEFT_CENTER,
+            "Speakers edited since last export — export again to update",
+            type_scale::caption().font,
+            tokens.warn,
+        );
     }
 
     // Two ways out, both disclosed.
     ui.painter().text(
-        pos2(body.left() + GUTTER, body.top() + 232.0),
+        pos2(body.left() + GUTTER, body.top() + 300.0),
         Align2::LEFT_CENTER,
         "Picker: the system file chooser writes to the frame you pick.",
         type_scale::caption().font,
         tokens.ink_soft,
     );
     ui.painter().text(
-        pos2(body.left() + GUTTER, body.top() + 250.0),
+        pos2(body.left() + GUTTER, body.top() + 318.0),
         Align2::LEFT_CENTER,
         "Share: hands this one file to another app (ACTION_SEND).",
         type_scale::caption().font,
