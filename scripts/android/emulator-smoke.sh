@@ -630,137 +630,6 @@ print(f"   model:    header={headers[-1].strip()}")
 print(f"   model:    no row says 'In use'; row states seen: {', '.join(states)}")
 PY
 
-# --- M22B: share → micro-sheet → voice-note notification ---------------------
-#
-# The step is gated on a verified speech model: a fresh `-wipe-data` emulator
-# has none, and downloading one here would put a network dependency in the
-# launch gate. Set SURAMAK_SMOKE_MODEL=/path/to/ggml-tiny.bin to push one; CI
-# leaves it unset and the step asserts the sheet + the honest skip instead.
-echo "== M22B: share a voice note → micro-sheet → notification =="
-VOICE_DIR="/sdcard/Android/data/$PACKAGE/files"
-VOICE_FIXTURE="$VOICE_DIR/smoke-voice-note.wav"
-VOICE_LONG="$VOICE_DIR/smoke-voice-note-long.wav"
-mkdir -p "$OUT"
-"$ADB" push "$REPO_ROOT/fixtures/audio/en.wav" "$VOICE_FIXTURE" >/dev/null
-# A 90 s loop of the same sentence: long enough to observe the progress
-# notification and cancel it on a fast emulator.
-python3 - "$REPO_ROOT/fixtures/audio/en.wav" "$OUT/smoke-voice-note-long.wav" <<'PY'
-import sys, wave
-source, dest = sys.argv[1], sys.argv[2]
-with wave.open(source, "rb") as src:
-    params = src.getparams()
-    frames = src.readframes(src.getnframes())
-with wave.open(dest, "wb") as out:
-    out.setparams(params)
-    for _ in range(10):
-        out.writeframes(frames)
-PY
-"$ADB" push "$OUT/smoke-voice-note-long.wav" "$VOICE_LONG" >/dev/null
-
-MODEL_FILE="$VOICE_DIR/models/ggml-tiny.bin"
-MODEL_PRESENT="$("$ADB" shell "[ -f '$MODEL_FILE' ] && echo yes || echo no" | tr -d '\r')"
-if [ "$MODEL_PRESENT" != "yes" ] && [ -n "${SURAMAK_SMOKE_MODEL:-}" ] && [ -f "${SURAMAK_SMOKE_MODEL:-}" ]; then
-  "$ADB" shell mkdir -p "$VOICE_DIR/models" >/dev/null 2>&1 || true
-  "$ADB" push "$SURAMAK_SMOKE_MODEL" "$MODEL_FILE" >/dev/null
-  MODEL_PRESENT="yes"
-fi
-
-share_voice_note() {
-  local file="$1" language="$2" tag="$3"
-  "$ADB" shell am start \
-    -a android.intent.action.SEND -t audio/wav \
-    --eu android.intent.extra.STREAM "file://$VOICE_DIR/$file" \
-    --es language "$language" \
-    -n "$ACTIVITY" >"$OUT/voice-note-$tag-share.txt" 2>&1 \
-    || fail "am start (voice note $tag) failed"
-}
-
-# The sheet paints for every share, model or not. The shell's own marker is the
-# witness: egui text is invisible to uiautomator.
-if [ "$MODEL_PRESENT" != "yes" ]; then
-  "$ADB" logcat -c 2>/dev/null || true
-  share_voice_note "smoke-voice-note.wav" "en" "ready"
-  wait_for_log "voice note sheet: shown" \
-    || fail "the share did not open the voice-note micro-sheet (no 'voice note sheet: shown' marker)"
-  echo "   sheet:    shown for an audio share"
-  echo "M22B-SKIP: no speech model at $MODEL_FILE — the micro-sheet was asserted; the"
-  echo "           notification step needs a model (set SURAMAK_SMOKE_MODEL to a"
-  echo "           ggml-tiny.bin to run it). This is a gate, not a pass for the notification."
-  # BACK is *attempted*, never required. On this emulator the key stops being
-  # delivered to the app while the share opened with FLAG_ACTIVITY_NEW_TASK and
-  # an IME window is in front (three presses produced zero events in
-  # 43216992141/43219365426: no dispatchKeyEvent, no OnBackInvoked log, while
-  # the same key reaches the app at the library root). The dismissal contract
-  # itself is proven in Rust — compact_host's
-  # `back_on_the_share_sheet_tells_the_activity_the_share_was_refused` asserts
-  # the reply carries `voice_note: dismissed` — so this step reports what the
-  # emulator did instead of pretending a key it never saw proves the product.
-  "$ADB" shell input keyevent 4
-  sleep 1
-  if app_log | grep -q "voice note: the offer was dismissed"; then
-    echo "   sheet:    dismissed by BACK; nothing was scheduled"
-  else
-    echo "   sheet:    NOTE — this emulator did not deliver BACK to the app"
-    echo "             (no key event logged; the reply-level dismissal is unit-tested)"
-  fi
-  # Leave a live app behind: the steps after this one drive the Library, and a
-  # force-stopped process makes every tap dead (run 43221792050 failed exactly
-  # there). Relaunch and wait for the real surface marker, not a sleep.
-  "$ADB" shell am force-stop "$PACKAGE" 2>/dev/null || true
-  "$ADB" logcat -c 2>/dev/null || true
-  "$ADB" shell am start -W -n "$ACTIVITY" >"$OUT/am-start-after-share.txt" 2>&1 || true
-  wait_for_library_ready || fail "the app did not come back after the share step (no library marker)"
-else
-  # Run 1 — cancel while it is transcribing. The key is the service's own log
-  # line, never a guess; Cancel is the same broadcast the notification uses.
-  "$ADB" logcat -c 2>/dev/null || true
-  share_voice_note "smoke-voice-note-long.wav" "en" "cancel"
-  wait_for_log "voice note sheet: shown" \
-    || fail "the share did not open the voice-note micro-sheet"
-  echo "   sheet:    shown for an audio share"
-  KEY=""
-  DEADLINE=$((SECONDS + 120))
-  while [ "$SECONDS" -lt "$DEADLINE" ]; do
-    captured="$(timeout 15 "$ADB" logcat -d -s SuramakTranscribe:I 2>/dev/null || true)"
-    KEY="$(printf '%s\n' "$captured" | sed -nE 's/.*voice-note job key=([^ ]+) percent=([0-9]+).*/\1/p' | tail -1)"
-    [ -n "$KEY" ] && break
-    sleep 1
-  done
-  [ -n "$KEY" ] || fail "the progress notification never logged its job key — the cancel step cannot name the job"
-  "$ADB" shell dumpsys notification --noredact >"$OUT/voice-note-progress.txt" 2>&1 || true
-  grep -q "Transcribing…" "$OUT/voice-note-progress.txt" \
-    || fail "no 'Transcribing…' voice-note notification while the job ran"
-  "$ADB" shell am broadcast -a app.suramak.transcribe.CANCEL \
-    -n "$PACKAGE/.transcribe.CancelTranscriptionReceiver" \
-    --es app.suramak.transcribe.KEY "$KEY" >"$OUT/voice-note-cancel.txt" 2>&1 \
-    || fail "the Cancel broadcast was refused"
-  CANCEL_DEADLINE=$((SECONDS + 30))
-  while [ "$SECONDS" -lt "$CANCEL_DEADLINE" ]; do
-    "$ADB" shell dumpsys notification --noredact >"$OUT/voice-note-cancelled.txt" 2>&1 || true
-    if grep -q "Transcription cancelled" "$OUT/voice-note-cancelled.txt"; then break; fi
-    sleep 1
-  done
-  grep -q "Transcription cancelled" "$OUT/voice-note-cancelled.txt" \
-    || fail "the voice-note job did not report Cancelled after the notification's Cancel"
-  echo "   cancel:   job $KEY cancelled from the notification"
-
-  # Run 2 — the finished transcript. The 9 s fixture says the fox sentence;
-  # its first segment must appear in the notification body.
-  share_voice_note "smoke-voice-note.wav" "en" "ready"
-  READY_DEADLINE=$((SECONDS + 180))
-  while [ "$SECONDS" -lt "$READY_DEADLINE" ]; do
-    "$ADB" shell dumpsys notification --noredact >"$OUT/voice-note-ready.txt" 2>&1 || true
-    if grep -q "Transcript ready" "$OUT/voice-note-ready.txt"; then break; fi
-    sleep 2
-  done
-  grep -q "Transcript ready" "$OUT/voice-note-ready.txt" \
-    || fail "the finished voice note never posted a 'Transcript ready' notification"
-  grep -q "quick brown fox" "$OUT/voice-note-ready.txt" \
-    || fail "the notification does not carry the first segment's words ('quick brown fox')"
-  echo "   finish:   'Transcript ready' notification carries the transcript"
-  echo "   cancel:   the notification's Cancel path was exercised on run 1"
-fi
-
 # --- M19A: the Settings list scrolls, taps land after a swipe, and the DEVICE
 # --- card clears the gesture pill --------------------------------------------
 #
@@ -1130,6 +999,138 @@ else
 fi
 
 echo
-echo "SMOKE-OK: install → launch → compact Library painted → Settings swipes and taps → monkey survived"
+
+# --- M22B: share → micro-sheet → voice-note notification ---------------------
+#
+# The step is gated on a verified speech model: a fresh `-wipe-data` emulator
+# has none, and downloading one here would put a network dependency in the
+# launch gate. Set SURAMAK_SMOKE_MODEL=/path/to/ggml-tiny.bin to push one; CI
+# leaves it unset and the step asserts the sheet + the honest skip instead.
+echo "== M22B: share a voice note → micro-sheet → notification =="
+VOICE_DIR="/sdcard/Android/data/$PACKAGE/files"
+VOICE_FIXTURE="$VOICE_DIR/smoke-voice-note.wav"
+VOICE_LONG="$VOICE_DIR/smoke-voice-note-long.wav"
+mkdir -p "$OUT"
+"$ADB" push "$REPO_ROOT/fixtures/audio/en.wav" "$VOICE_FIXTURE" >/dev/null
+# A 90 s loop of the same sentence: long enough to observe the progress
+# notification and cancel it on a fast emulator.
+python3 - "$REPO_ROOT/fixtures/audio/en.wav" "$OUT/smoke-voice-note-long.wav" <<'PY'
+import sys, wave
+source, dest = sys.argv[1], sys.argv[2]
+with wave.open(source, "rb") as src:
+    params = src.getparams()
+    frames = src.readframes(src.getnframes())
+with wave.open(dest, "wb") as out:
+    out.setparams(params)
+    for _ in range(10):
+        out.writeframes(frames)
+PY
+"$ADB" push "$OUT/smoke-voice-note-long.wav" "$VOICE_LONG" >/dev/null
+
+MODEL_FILE="$VOICE_DIR/models/ggml-tiny.bin"
+MODEL_PRESENT="$("$ADB" shell "[ -f '$MODEL_FILE' ] && echo yes || echo no" | tr -d '\r')"
+if [ "$MODEL_PRESENT" != "yes" ] && [ -n "${SURAMAK_SMOKE_MODEL:-}" ] && [ -f "${SURAMAK_SMOKE_MODEL:-}" ]; then
+  "$ADB" shell mkdir -p "$VOICE_DIR/models" >/dev/null 2>&1 || true
+  "$ADB" push "$SURAMAK_SMOKE_MODEL" "$MODEL_FILE" >/dev/null
+  MODEL_PRESENT="yes"
+fi
+
+share_voice_note() {
+  local file="$1" language="$2" tag="$3"
+  "$ADB" shell am start \
+    -a android.intent.action.SEND -t audio/wav \
+    --eu android.intent.extra.STREAM "file://$VOICE_DIR/$file" \
+    --es language "$language" \
+    -n "$ACTIVITY" >"$OUT/voice-note-$tag-share.txt" 2>&1 \
+    || fail "am start (voice note $tag) failed"
+}
+
+# The sheet paints for every share, model or not. The shell's own marker is the
+# witness: egui text is invisible to uiautomator.
+if [ "$MODEL_PRESENT" != "yes" ]; then
+  "$ADB" logcat -c 2>/dev/null || true
+  share_voice_note "smoke-voice-note.wav" "en" "ready"
+  wait_for_log "voice note sheet: shown" \
+    || fail "the share did not open the voice-note micro-sheet (no 'voice note sheet: shown' marker)"
+  echo "   sheet:    shown for an audio share"
+  echo "M22B-SKIP: no speech model at $MODEL_FILE — the micro-sheet was asserted; the"
+  echo "           notification step needs a model (set SURAMAK_SMOKE_MODEL to a"
+  echo "           ggml-tiny.bin to run it). This is a gate, not a pass for the notification."
+  # BACK is *attempted*, never required. On this emulator the key stops being
+  # delivered to the app while the share opened with FLAG_ACTIVITY_NEW_TASK and
+  # an IME window is in front (three presses produced zero events in
+  # 43216992141/43219365426: no dispatchKeyEvent, no OnBackInvoked log, while
+  # the same key reaches the app at the library root). The dismissal contract
+  # itself is proven in Rust — compact_host's
+  # `back_on_the_share_sheet_tells_the_activity_the_share_was_refused` asserts
+  # the reply carries `voice_note: dismissed` — so this step reports what the
+  # emulator did instead of pretending a key it never saw proves the product.
+  "$ADB" shell input keyevent 4
+  sleep 1
+  if app_log | grep -q "voice note: the offer was dismissed"; then
+    echo "   sheet:    dismissed by BACK; nothing was scheduled"
+  else
+    echo "   sheet:    NOTE — this emulator did not deliver BACK to the app"
+    echo "             (no key event logged; the reply-level dismissal is unit-tested)"
+  fi
+  # Leave a live app behind: the steps after this one drive the Library, and a
+  # force-stopped process makes every tap dead (run 43221792050 failed exactly
+  # there). Relaunch and wait for the real surface marker, not a sleep.
+  "$ADB" shell am force-stop "$PACKAGE" 2>/dev/null || true
+  "$ADB" logcat -c 2>/dev/null || true
+  "$ADB" shell am start -W -n "$ACTIVITY" >"$OUT/am-start-after-share.txt" 2>&1 || true
+  wait_for_library_ready || fail "the app did not come back after the share step (no library marker)"
+else
+  # Run 1 — cancel while it is transcribing. The key is the service's own log
+  # line, never a guess; Cancel is the same broadcast the notification uses.
+  "$ADB" logcat -c 2>/dev/null || true
+  share_voice_note "smoke-voice-note-long.wav" "en" "cancel"
+  wait_for_log "voice note sheet: shown" \
+    || fail "the share did not open the voice-note micro-sheet"
+  echo "   sheet:    shown for an audio share"
+  KEY=""
+  DEADLINE=$((SECONDS + 120))
+  while [ "$SECONDS" -lt "$DEADLINE" ]; do
+    captured="$(timeout 15 "$ADB" logcat -d -s SuramakTranscribe:I 2>/dev/null || true)"
+    KEY="$(printf '%s\n' "$captured" | sed -nE 's/.*voice-note job key=([^ ]+) percent=([0-9]+).*/\1/p' | tail -1)"
+    [ -n "$KEY" ] && break
+    sleep 1
+  done
+  [ -n "$KEY" ] || fail "the progress notification never logged its job key — the cancel step cannot name the job"
+  "$ADB" shell dumpsys notification --noredact >"$OUT/voice-note-progress.txt" 2>&1 || true
+  grep -q "Transcribing…" "$OUT/voice-note-progress.txt" \
+    || fail "no 'Transcribing…' voice-note notification while the job ran"
+  "$ADB" shell am broadcast -a app.suramak.transcribe.CANCEL \
+    -n "$PACKAGE/.transcribe.CancelTranscriptionReceiver" \
+    --es app.suramak.transcribe.KEY "$KEY" >"$OUT/voice-note-cancel.txt" 2>&1 \
+    || fail "the Cancel broadcast was refused"
+  CANCEL_DEADLINE=$((SECONDS + 30))
+  while [ "$SECONDS" -lt "$CANCEL_DEADLINE" ]; do
+    "$ADB" shell dumpsys notification --noredact >"$OUT/voice-note-cancelled.txt" 2>&1 || true
+    if grep -q "Transcription cancelled" "$OUT/voice-note-cancelled.txt"; then break; fi
+    sleep 1
+  done
+  grep -q "Transcription cancelled" "$OUT/voice-note-cancelled.txt" \
+    || fail "the voice-note job did not report Cancelled after the notification's Cancel"
+  echo "   cancel:   job $KEY cancelled from the notification"
+
+  # Run 2 — the finished transcript. The 9 s fixture says the fox sentence;
+  # its first segment must appear in the notification body.
+  share_voice_note "smoke-voice-note.wav" "en" "ready"
+  READY_DEADLINE=$((SECONDS + 180))
+  while [ "$SECONDS" -lt "$READY_DEADLINE" ]; do
+    "$ADB" shell dumpsys notification --noredact >"$OUT/voice-note-ready.txt" 2>&1 || true
+    if grep -q "Transcript ready" "$OUT/voice-note-ready.txt"; then break; fi
+    sleep 2
+  done
+  grep -q "Transcript ready" "$OUT/voice-note-ready.txt" \
+    || fail "the finished voice note never posted a 'Transcript ready' notification"
+  grep -q "quick brown fox" "$OUT/voice-note-ready.txt" \
+    || fail "the notification does not carry the first segment's words ('quick brown fox')"
+  echo "   finish:   'Transcript ready' notification carries the transcript"
+  echo "   cancel:   the notification's Cancel path was exercised on run 1"
+fi
+
+echo "SMOKE-OK: install → launch → compact Library painted → Settings swipes and taps → monkey survived → voice-note share sheet"
 echo "artifacts: $OUT (library.png, launch-onboarding.png, settings-before.png, settings-after-swipe.png,"
 echo "           settings-bottom.png, settings-swipe-diff.json, input-log.txt, layout.txt, model-log.txt, logcat-full.txt)"
