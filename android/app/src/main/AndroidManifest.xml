@@ -187,6 +187,12 @@
             android:name="app.suramak.transcribe.CancelTranscriptionReceiver"
             android:exported="false" />
 
+        <!-- M22B: the voice-note notification's Copy / Next page / Retry
+             actions. A broadcast so they work with no Activity alive. -->
+        <receiver
+            android:name="app.suramak.transcribe.VoiceNoteActionReceiver"
+            android:exported="false" />
+
         <!-- M13F: the microphone foreground service. `microphone` is the only
              valid type for a service that records from the mic; it requires
              RECORD_AUDIO to be granted and (from API 34) the

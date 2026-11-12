@@ -60,6 +60,10 @@ pub struct Job {
     /// Not serialized (it is a large transient buffer, not job identity).
     #[serde(skip)]
     pub samples: Option<Vec<f32>>,
+    /// M22A: the durable identity and the committed prefix/resume boundary.
+    /// `None` when the queue runs without a journal (today's behavior).
+    #[serde(skip)]
+    pub durable: Option<crate::queue::journal::DurableJob>,
 }
 
 /// Events emitted by the worker.
@@ -70,6 +74,11 @@ pub enum WorkerEvent {
     /// M16.1: the pipeline entered a stage (decode → transcribe). Lets the
     /// queue's per-item state stop saying `decoding` when it is not decoding.
     Stage { job_id: u64, stage: JobStage },
+    /// M22A: segments the engine finalized **while it is still running**, in
+    /// `idx` order. The queue driver appends them to its checkpoint writer and
+    /// commits the prefix when the policy says so. Emitted once per segment
+    /// (a few per minute), never for the final list — that rides `Finished`.
+    Checkpoint { job_id: u64, segments: Vec<Segment> },
     /// The final segment list for the job (emitted once, just before `Finished`).
     Segments { job_id: u64, segments: Vec<Segment> },
     /// The completed transcript plus the engine that actually ran.
@@ -167,6 +176,23 @@ fn speech_transcriber_degradation(err: &AsrError, fallback: EngineId) -> String 
     )
 }
 
+/// Builds the pipeline's checkpoint stream for one job (M22A).
+///
+/// `None` (no durable job) leaves the pipeline exactly as it was: a full run from
+/// sample zero, no mid-run events.
+fn checkpoint_run<'a>(
+    durable: Option<&'a crate::queue::journal::DurableJob>,
+    on_segment: &'a mut dyn FnMut(Segment),
+) -> Option<pipeline::CheckpointRun<'a>> {
+    let durable = durable?;
+    Some(pipeline::CheckpointRun {
+        committed: &durable.committed,
+        from_ms: durable.resume.map(|resume| resume.from_ms).unwrap_or(0),
+        next_idx: durable.resume.map(|resume| resume.next_idx).unwrap_or(0),
+        on_segment,
+    })
+}
+
 fn run_worker(jobs: Receiver<Job>, events: Sender<WorkerEvent>) {
     // Route whisper.cpp/GGML C-level logs into whisper-rs's hooks. With neither the
     // `log_backend` nor `tracing_backend` feature enabled this silences the C-level
@@ -188,6 +214,18 @@ fn run_worker(jobs: Receiver<Job>, events: Sender<WorkerEvent>) {
         };
         // M16.1: a decoded-ahead buffer, when the queue prefetched this item.
         let mut samples = job.samples.take();
+        // M22A: the durable identity (and the committed prefix on a resume).
+        let durable = job.durable.take();
+        // M22A: every segment the engine finalizes mid-run is forwarded to the
+        // driver's checkpoint writer. Cheap (one small message per segment); the
+        // policy that decides when to write lives with the store owner.
+        let checkpoint_events = events.clone();
+        let mut on_segment = move |segment: Segment| {
+            let _ = checkpoint_events.send(WorkerEvent::Checkpoint {
+                job_id,
+                segments: vec![segment],
+            });
+        };
 
         // M9e (P2-2): the first cooperative check point — a cancel that landed
         // before this job started (the token can be set while the job sits in
@@ -247,6 +285,7 @@ fn run_worker(jobs: Receiver<Job>, events: Sender<WorkerEvent>) {
                             &fallback_plan,
                             None, // the fast-engine attempt consumed the buffer
                             &job.cancel,
+                            checkpoint_run(durable.as_ref(), &mut on_segment),
                             &mut on_stage,
                             &mut on_progress,
                         )
@@ -293,12 +332,23 @@ fn run_worker(jobs: Receiver<Job>, events: Sender<WorkerEvent>) {
                     &plan,
                     samples.take(),
                     &job.cancel,
+                    checkpoint_run(durable.as_ref(), &mut on_segment),
                     &mut on_stage,
                     &mut on_progress,
                 ),
                 Err(err) => Err(err),
             }
         };
+
+        // M22A: a durable job keeps its transcript identity across the crash —
+        // the resumed run writes the same row the interrupted one started.
+        let result = result.map(|mut outcome| {
+            if let Some(durable) = durable.as_ref() {
+                outcome.transcript.id = durable.transcript_id;
+                outcome.transcript.created_at = durable.created_at;
+            }
+            outcome
+        });
 
         match result {
             // M9e contract, re-checked at the emission point (the dequeue-time
@@ -366,6 +416,7 @@ mod tests {
             fast_engine: false,
             cancel,
             samples: None,
+            durable: None,
         }
     }
 

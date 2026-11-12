@@ -142,6 +142,19 @@ class MainActivity : GameActivity() {
     private var recoveryShown = false
 
     /**
+     * M22B — the share the micro-sheet is offering. The job is scheduled only
+     * when the sheet says Transcribe (or its 1.2 s auto-dismiss fires); a
+     * dismissed sheet drops these URIs and starts nothing.
+     */
+    private data class PendingVoiceNote(
+        val uris: List<Uri>,
+        val language: String,
+        val sender: String?,
+    )
+
+    private var pendingVoiceNote: PendingVoiceNote? = null
+
+    /**
      * M13g2 — the export the picker is currently placing. Set before the
      * `ACTION_CREATE_DOCUMENT` chooser opens; consumed by its result.
      */
@@ -280,10 +293,18 @@ class MainActivity : GameActivity() {
         const val ACTION_COMPACT_FINISH = "app.suramak.action.COMPACT_FINISH"
         const val ACTION_COMPACT_SHARE_CRASH = "app.suramak.action.COMPACT_SHARE_CRASH"
 
+        /** M22B — the micro-sheet's two answers, from the compact shell. */
+        const val ACTION_VOICE_NOTE_ACCEPT = "app.suramak.action.VOICE_NOTE_ACCEPT"
+        const val ACTION_VOICE_NOTE_CANCEL = "app.suramak.action.VOICE_NOTE_CANCEL"
+
+        /** M22B — the notification's Share-quote-card action. */
+        const val ACTION_VOICE_NOTE_QUOTE = "app.suramak.transcribe.SHARE_QUOTE"
+
         private const val EXTRA_FORMAT = "format"
         private const val EXTRA_BILINGUAL = "bilingual"
         private const val EXTRA_MODEL = "model"
         private const val EXTRA_LANGUAGE = "language"
+        private const val EXTRA_SENDER = "app.suramak.extra.SENDER"
 
         /** M13e — the POST_NOTIFICATIONS request code. */
         private const val REQUEST_NOTIFICATIONS = 4301
@@ -511,6 +532,10 @@ class MainActivity : GameActivity() {
                 if (uris.isEmpty()) {
                     Toast.makeText(this, getString(R.string.transcribe_share_empty), Toast.LENGTH_LONG)
                         .show()
+                } else if (uris.any { ImportSource.isAudio(this, it) }) {
+                    // M22B: audio is the voice-note flow — a 1.2 s frosted
+                    // offer, then the FGS. Video keeps the direct import.
+                    offerVoiceNote(intent, uris)
                 } else {
                     enqueueImport(uris)
                 }
@@ -551,6 +576,85 @@ class MainActivity : GameActivity() {
             ACTION_COMPACT_QUIT -> quitApp()
             ACTION_COMPACT_FINISH -> finishAndRemoveTask()
             ACTION_COMPACT_SHARE_CRASH -> shareCrashLog()
+            ACTION_VOICE_NOTE_ACCEPT -> acceptVoiceNote(
+                intent.getStringExtra(EXTRA_LANGUAGE).orEmpty(),
+            )
+            ACTION_VOICE_NOTE_CANCEL -> {
+                pendingVoiceNote = null
+                logToRust("voice note: the offer was dismissed; nothing was scheduled")
+            }
+            ACTION_VOICE_NOTE_QUOTE -> shareQuoteCard(
+                intent.getStringExtra(Notify.EXTRA_TRANSCRIPT_ID).orEmpty(),
+                intent.getIntExtra(Notify.EXTRA_PAGE, 0),
+                intent.getStringExtra(Notify.EXTRA_SENDER),
+            )
+        }
+    }
+
+    /**
+     * M22B — arms the micro-sheet for an audio share. The Activity keeps the
+     * URIs; the sheet's answer (or its 1.2 s auto-dismiss) is what schedules
+     * the job, so a dismissed share leaves the library untouched.
+     */
+    private fun offerVoiceNote(intent: Intent, uris: List<Uri>) {
+        val name = ImportSource.displayName(this, uris.first())
+        val mime = ImportSource.mimeOf(this, uris.first())
+        // Only facts the intent carries: our Open-Transcribe sender extra, or
+        // the sharing app's own title extra when it is not just the file name.
+        // Never a contact lookup, never the media filename.
+        val explicitSender = intent.getStringExtra(EXTRA_SENDER)?.trim()?.takeIf { it.isNotEmpty() }
+        val titleExtra = intent.getStringExtra(Intent.EXTRA_TITLE)?.trim()?.takeIf { it.isNotEmpty() }
+        val sender = explicitSender ?: titleExtra?.takeIf {
+            it != name && it != name.substringBeforeLast('.')
+        }
+        val explicit = intent.getStringExtra(EXTRA_LANGUAGE)?.trim().orEmpty()
+        val model = ModelChoice.forJob(this, explicit.ifEmpty { "auto" })
+        val reply = UiBridge.voiceNoteOffer(name, mime, sender, model ?: "", explicit)
+        if (!reply.optBoolean("ok", false)) {
+            logToRust("voice note: the offer host refused — ${reply.optString("error")}")
+            // The sheet is the preference, not a new dependency: fall back to
+            // the M13E import so a share still transcribes.
+            enqueueImport(uris)
+            return
+        }
+        pendingVoiceNote = PendingVoiceNote(
+            uris = uris,
+            language = explicit.ifEmpty { "auto" },
+            sender = sender,
+        )
+        logToRust(
+            "voice note: offer armed title=\"$name\" auto=${reply.optBoolean("auto")} " +
+                "language=${reply.optString("language").ifEmpty { "auto" }} " +
+                "model=${model ?: "none"} sender=${if (sender == null) "none" else "provided"}",
+        )
+    }
+
+    /**
+     * The sheet's answer. The language is the pill's tag or `auto`; the job is
+     * the existing FGS import with `kind = voice_note`, so the queue remains
+     * the one transcription path.
+     */
+    private fun acceptVoiceNote(language: String) {
+        val pending = pendingVoiceNote
+        pendingVoiceNote = null
+        if (pending == null) {
+            logToRust("voice note: an accept arrived with no pending share — ignored")
+            return
+        }
+        val chosen = language.ifEmpty { pending.language }
+        val scheduled = TranscriptionJobService.enqueue(
+            this,
+            pending.uris,
+            chosen,
+            TranscriptionJobService.KIND_VOICE_NOTE,
+            pending.sender,
+        )
+        if (scheduled) {
+            logToRust("voice note: queued ${pending.uris.size} file(s) as $chosen (voice_note)")
+        } else {
+            Toast.makeText(this, getString(R.string.transcribe_schedule_failed), Toast.LENGTH_LONG)
+                .show()
+            logToRust("voice note: the platform refused to schedule the job")
         }
     }
 
@@ -989,6 +1093,16 @@ class MainActivity : GameActivity() {
             val reply = UiBridge.back()
             if (reply.optBoolean("ok")) {
                 if (reply.optBoolean("finish")) {
+                    if (voiceNoteKeepAlive()) {
+                        // M22B: a live voice-note job keeps the process; send
+                        // the task behind so the user lands back in the chat
+                        // while the FGS finishes the transcript.
+                        logToRust(
+                            "back ($source): voice note still transcribing — moving the task behind",
+                        )
+                        moveTaskToBack(true)
+                        return
+                    }
                     logToRust("back ($source): compact root — finishing the Activity")
                     finishAndRemoveTask()
                     return
@@ -1078,6 +1192,80 @@ class MainActivity : GameActivity() {
             UiBridge.exportCancel(staged.job)
             logToRust("export: the share chooser did not open (${t.javaClass.simpleName})")
         }
+    }
+
+    /**
+     * M22B — the notification's **Share quote card** action.
+     *
+     * Rust renders the page into a PNG with the Deck's own tokens and stages
+     * one file; this method hands that file to the share chooser through the
+     * app's FileProvider. No new UI, no picker — the card is ready to send back
+     * into the chat.
+     */
+    private fun shareQuoteCard(transcriptId: String, page: Int, sender: String?) {
+        if (transcriptId.isEmpty()) {
+            logToRust("quote card: the action carried no transcript id")
+            return
+        }
+        // The card render is a CPU raster of a 1080 px PNG; keep it off the UI
+        // thread so the notification tap never janks the Activity.
+        Thread({
+            val reply = UiBridge.quoteCard(transcriptId, page, sender)
+            runOnUiThread { finishQuoteCard(reply) }
+        }, "suramak-quote-card").start()
+    }
+
+    private fun finishQuoteCard(reply: org.json.JSONObject) {
+        if (!reply.optBoolean("ok", false)) {
+            val reason = reply.optString("error", "the quote card could not be rendered")
+            logToRust("quote card: refused — $reason")
+            Toast.makeText(this, reason, Toast.LENGTH_LONG).show()
+            return
+        }
+        val path = reply.optString("path")
+        val name = reply.optString("name")
+        try {
+            val uri = FileProvider.getUriForFile(
+                this,
+                "$packageName.fileprovider",
+                java.io.File(path),
+            )
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = "image/png"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_SUBJECT, name)
+                clipData = ClipData.newRawUri(name, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(
+                Intent.createChooser(send, "Share quote card")
+                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
+            )
+            logToRust(
+                "quote card: shared $name (${reply.optLong("bytes")} bytes, page " +
+                    "${reply.optInt("page") + 1} of ${reply.optInt("page_count")})",
+            )
+        } catch (t: Throwable) {
+            logToRust("quote card: the chooser did not open (${t.javaClass.simpleName})")
+            Toast.makeText(this, "No share target for the quote card", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    /**
+     * M22B — whether a voice-note job is still running. At the Library root
+     * BACK becomes `moveTaskToBack` instead of `finishAndRemoveTask`: the
+     * Activity stays behind with the FGS and the queue alive, which is exactly
+     * "the user returns to the chat and the transcript arrives in the
+     * notification". A process exit would kill the in-process queue (the M13I
+     * finish-path contract), so this is the line that keeps the headless run
+     * headless rather than merely backgrounded.
+     */
+    private fun voiceNoteKeepAlive(): Boolean = try {
+        val status = TranscribeBridge.status()
+        status.optBoolean("running", false) &&
+            status.optString("current_kind") == TranscriptionJobService.KIND_VOICE_NOTE
+    } catch (t: Throwable) {
+        false
     }
 
     // v2.3 removed postRecreate() from here. If a future milestone ever needs an

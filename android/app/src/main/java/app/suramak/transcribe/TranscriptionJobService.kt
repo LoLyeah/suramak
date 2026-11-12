@@ -71,6 +71,12 @@ class TranscriptionJobService : JobService() {
      * completion notification of the first. */
     private var doneBaseline = 0
 
+    /** M22B: this run came from a share intent's voice note. */
+    private var voiceNote = false
+
+    /** M22B: the sender the intent provided (null when it did not). */
+    private var voiceNoteSender: String? = null
+
     /** `jobFinished` exactly once per `onStartJob` that returned true. */
     private val finishLock = Any()
     private var finished = false
@@ -92,6 +98,8 @@ class TranscriptionJobService : JobService() {
         val uris = sharedUris(params)
         val mode = params.extras.getString(KEY_MODE) ?: MODE_IMPORT
         val resume = mode == MODE_RESUME
+        voiceNote = params.extras.getString(KEY_KIND) == KIND_VOICE_NOTE
+        voiceNoteSender = params.extras.getString(KEY_SENDER)?.takeIf { it.isNotEmpty() }
 
         if (!resume && uris.isEmpty()) {
             // Nothing to import and nothing to resume: a replaced job's echo.
@@ -147,7 +155,15 @@ class TranscriptionJobService : JobService() {
         val name = ImportSource.displayName(this, uri)
         val mime = ImportSource.mimeOf(this, uri)
         val declared = ImportSource.sizeOf(this, uri)
-        val begun = TranscribeBridge.beginImport(name, mime, declared, model, language)
+        val begun = TranscribeBridge.beginImport(
+            name,
+            mime,
+            declared,
+            model,
+            language,
+            kind = if (voiceNote) KIND_VOICE_NOTE else "import",
+            sender = voiceNoteSender,
+        )
         if (!begun.optBoolean("ok", false)) {
             Log.w(TAG, "import refused: ${begun.optString("refused")}")
             Notify.show(
@@ -216,17 +232,40 @@ class TranscriptionJobService : JobService() {
                 lastPercent = percent
                 lastWaiting = waiting
                 lastKey = key
-                Notify.show(
-                    this,
-                    notificationId,
-                    Notify.progress(
+                val title = status.optString("current_title")
+                    .ifEmpty { getString(R.string.transcribe_unnamed) }
+                val isVoiceNote = voiceNote || status.optString("current_kind") == KIND_VOICE_NOTE
+                // The smoke (and a support log) needs the job key the Cancel
+                // action would target; it is the host's own key, not a guess.
+                if (isVoiceNote && key != null) {
+                    Log.i(TAG, "voice-note job key=$key percent=$percent")
+                }
+                if (isVoiceNote) {
+                    Notify.show(
                         this,
-                        getString(R.string.transcribe_progress_title, status.optString("current_title")),
-                        percent,
-                        waiting,
-                        key,
-                    ),
-                )
+                        notificationId,
+                        Notify.voiceNoteProgress(
+                            this,
+                            notificationId,
+                            title,
+                            TranscribeBridge.progressText(percent).optString("text"),
+                            percent,
+                            key,
+                        ),
+                    )
+                } else {
+                    Notify.show(
+                        this,
+                        notificationId,
+                        Notify.progress(
+                            this,
+                            getString(R.string.transcribe_progress_title, title),
+                            percent,
+                            waiting,
+                            key,
+                        ),
+                    )
+                }
             }
             if (!running && waiting == 0) {
                 return true
@@ -247,28 +286,76 @@ class TranscriptionJobService : JobService() {
         val last = status.optJSONObject("last")
         val done = status.optInt("done", 0)
         val failed = status.optInt("failed", 0)
+        val lastKind = last?.optString("kind").orEmpty()
+        // A finished voice note gets its own id: `notificationId` is the
+        // foreground notification, and `stopForeground(REMOVE)` below would
+        // take a notification posted on that same id with it.
+        val readyId = notificationId + 10_000
         if (last != null && done > doneBaseline) {
-            Notify.show(
-                this,
-                Notify.STATUS_ID,
-                Notify.completed(
+            if (lastKind == KIND_VOICE_NOTE) {
+                val id = last.optString("transcript_id")
+                val sender = last.optString("sender").ifEmpty { voiceNoteSender }
+                val content = TranscribeBridge.voiceNote(id, 0, sender)
+                if (content.optBoolean("ok", false)) {
+                    Notify.show(
+                        this,
+                        readyId,
+                        Notify.voiceNoteReady(this, readyId, id, content, copied = false),
+                    )
+                } else {
+                    // The row is saved; only its notification model failed.
+                    // Say exactly that instead of pretending the job failed.
+                    Notify.show(
+                        this,
+                        Notify.STATUS_ID,
+                        Notify.status(
+                            this,
+                            getString(R.string.transcribe_done_title),
+                            content.optString("error")
+                                .ifEmpty { getString(R.string.transcribe_done_body, last.optString("title"), last.optInt("segments", 0)) },
+                        ),
+                    )
+                }
+            } else {
+                Notify.show(
                     this,
-                    last.optString("title"),
-                    last.optInt("segments", 0),
-                    last.optString("transcript_id"),
-                ),
-            )
+                    Notify.STATUS_ID,
+                    Notify.completed(
+                        this,
+                        last.optString("title"),
+                        last.optInt("segments", 0),
+                        last.optString("transcript_id"),
+                    ),
+                )
+            }
         } else if (failed > 0 || lastError.isNotEmpty()) {
             val message = status.optString("message").ifEmpty { lastError }
-            Notify.show(
-                this,
-                Notify.STATUS_ID,
-                Notify.status(
+            val failure = status.optJSONObject("last_failed")
+            if (failure != null && failure.optString("kind") == KIND_VOICE_NOTE) {
+                Notify.show(
                     this,
-                    getString(R.string.transcribe_failed_title),
-                    message.ifEmpty { getString(R.string.transcribe_failed_body) },
-                ),
-            )
+                    readyId,
+                    Notify.voiceNoteFailed(
+                        this,
+                        readyId,
+                        getString(R.string.transcribe_failed_title),
+                        failure.optString("reason").ifEmpty { message }
+                            .ifEmpty { getString(R.string.transcribe_failed_body) },
+                        failure.optString("key"),
+                        failure.optString("sender").ifEmpty { voiceNoteSender },
+                    ),
+                )
+            } else {
+                Notify.show(
+                    this,
+                    Notify.STATUS_ID,
+                    Notify.status(
+                        this,
+                        getString(R.string.transcribe_failed_title),
+                        message.ifEmpty { getString(R.string.transcribe_failed_body) },
+                    ),
+                )
+            }
         } else if (status.optInt("cancelled", 0) > 0) {
             Notify.show(
                 this,
@@ -364,7 +451,18 @@ class TranscriptionJobService : JobService() {
     // --- foreground + wake lock ---------------------------------------------
 
     private fun promoteToForeground(title: String, percent: Int, waiting: Int, key: String?) {
-        val notification = Notify.progress(this, title, percent, waiting, key)
+        val notification = if (voiceNote) {
+            Notify.voiceNoteProgress(
+                this,
+                notificationId,
+                getString(R.string.transcribe_unnamed),
+                TranscribeBridge.progressText(percent).optString("text"),
+                percent,
+                key,
+            )
+        } else {
+            Notify.progress(this, title, percent, waiting, key)
+        }
         val api = Build.VERSION.SDK_INT
         try {
             if (api >= 34) {
@@ -425,8 +523,12 @@ class TranscriptionJobService : JobService() {
         private const val KEY_URIS = "uris"
         private const val KEY_LANGUAGE = "language"
         private const val KEY_MODE = "mode"
+        private const val KEY_KIND = "kind"
+        private const val KEY_SENDER = "sender"
         private const val MODE_IMPORT = "import"
         private const val MODE_RESUME = "resume"
+        /** M22B: this job came from a share intent's voice note. */
+        const val KIND_VOICE_NOTE = "voice_note"
         private const val COPY_CHUNK = 64 * 1024
         private const val PROGRESS_STEP = 256 * 1024L
         private const val POLL_MS = 300L
@@ -440,7 +542,13 @@ class TranscriptionJobService : JobService() {
          * reboot without the grant. The service copies immediately, which is
          * what makes that safe.
          */
-        fun enqueue(context: Context, uris: List<Uri>, language: String = "auto"): Boolean {
+        fun enqueue(
+            context: Context,
+            uris: List<Uri>,
+            language: String = "auto",
+            kind: String = "import",
+            sender: String? = null,
+        ): Boolean {
             if (uris.isEmpty()) return false
             val transient = Bundle().apply {
                 putParcelableArrayList(KEY_URIS, ArrayList(uris))
@@ -448,6 +556,8 @@ class TranscriptionJobService : JobService() {
             val extras = PersistableBundle().apply {
                 putString(KEY_MODE, MODE_IMPORT)
                 putString(KEY_LANGUAGE, language)
+                putString(KEY_KIND, kind)
+                putString(KEY_SENDER, sender)
             }
             val builder = JobInfo.Builder(
                 NEXT_JOB_ID.getAndIncrement(),

@@ -776,7 +776,10 @@ fn decode_window(
             // teardown, so a window that is mid-inference aborts between chunks
             // instead of outliving the quit grace.
             cancel,
+            0,
+            0,
             |_| {},
+            &mut |_| {},
         )?;
         Ok(outcome.segments)
     })();

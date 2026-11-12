@@ -572,6 +572,67 @@ struct ProgressContext<'a> {
     on_progress: &'a mut dyn FnMut(u8),
 }
 
+/// User-data payload for the whisper.cpp new-segment callback (M22A).
+///
+/// The callback runs synchronously on the decoding thread inside `full()`, so a
+/// stack local of [`transcribe`] is alive for every invocation. It only reads
+/// the finalized segment out of the state and forwards it; it never touches the
+/// context, never allocates a store and never unwinds.
+struct SegmentContext<'a> {
+    on_segment: &'a mut dyn FnMut(Segment),
+    /// Absolute time of the first sample in the buffer (0 for a fresh run).
+    offset_ms: i64,
+    /// Index the first produced segment carries (0 for a fresh run).
+    next_idx: u32,
+}
+
+/// C trampoline for `FullParams::set_new_segment_callback` (M22A).
+///
+/// whisper.cpp calls it after each segment is finalized, with `n_new` new
+/// segments since the previous call. Reading the segment here is what lets a
+/// long transcription checkpoint before `full()` returns — the difference
+/// between losing a lecture on an OS kill and losing at most ~5 s of it.
+///
+/// # Safety
+///
+/// `user_data` must point to a live [`SegmentContext`] for the whole duration of
+/// the `full()` call, and `state` must be the state that callback belongs to
+/// (whisper.cpp's contract). Both hold for the stack locals of [`transcribe`].
+unsafe extern "C" fn segment_trampoline(
+    _ctx: *mut whisper_context,
+    state: *mut whisper_state,
+    n_new: std::ffi::c_int,
+    user_data: *mut c_void,
+) {
+    if user_data.is_null() || state.is_null() || n_new <= 0 {
+        return;
+    }
+    let segment_ctx = &mut *(user_data as *mut SegmentContext<'_>);
+    let count = whisper_rs::whisper_rs_sys::whisper_full_n_segments_from_state(state);
+    let first = (count - n_new).max(0);
+    for index in first..count {
+        let text =
+            whisper_rs::whisper_rs_sys::whisper_full_get_segment_text_from_state(state, index);
+        if text.is_null() {
+            continue;
+        }
+        // Lossy, exactly like the batch read below: whisper.cpp can emit
+        // non-UTF-8 token bytes for some languages, and a transcript that keeps
+        // going is better than one that fails at the end.
+        let text = CStr::from_ptr(text).to_string_lossy().trim().to_string();
+        let start_ms =
+            whisper_rs::whisper_rs_sys::whisper_full_get_segment_t0_from_state(state, index) * 10;
+        let end_ms =
+            whisper_rs::whisper_rs_sys::whisper_full_get_segment_t1_from_state(state, index) * 10;
+        (segment_ctx.on_segment)(Segment {
+            idx: segment_ctx.next_idx + index as u32,
+            start_ms: segment_ctx.offset_ms + start_ms,
+            end_ms: segment_ctx.offset_ms + end_ms,
+            text,
+        });
+    }
+}
+
 /// C trampoline for `FullParams::set_progress_callback`.
 ///
 /// # Safety
@@ -639,7 +700,16 @@ pub fn transcribe(
     n_threads: i32,
     plan: &EngineDecision,
     cancel: &CancelToken,
+    // M22A resume: the absolute time of `samples[0]` in the original file (0 for
+    // a fresh run). Every produced timestamp is offset by it.
+    from_ms: i64,
+    // M22A resume: the index the first produced segment carries (0 for fresh).
+    next_idx: u32,
     mut on_progress: impl FnMut(u8),
+    // Called for every segment the engine finalizes, **while it runs** (M22A).
+    // The callback must be cheap and must not unwind (it runs inside whisper's
+    // decoding loop); the checkpoint writer only appends to a batch.
+    on_segment: &mut dyn FnMut(Segment),
 ) -> Result<TranscribeOutcome, AsrError> {
     let mut warnings = Vec::new();
     if let Some(warning) = &plan.warning {
@@ -674,6 +744,21 @@ pub fn transcribe(
         params.set_progress_callback(Some(progress_trampoline));
         params.set_progress_callback_user_data(
             &mut progress_ctx as *mut ProgressContext<'_> as *mut c_void,
+        );
+    }
+
+    // M22A: the checkpoint stream. whisper.cpp invokes this after each segment
+    // is finalized, so a caller can commit text before `full()` returns. Both
+    // pointers are stack locals of this frame, alive for the whole call.
+    let mut segment_ctx = SegmentContext {
+        on_segment,
+        offset_ms: from_ms,
+        next_idx,
+    };
+    unsafe {
+        params.set_new_segment_callback(Some(segment_trampoline));
+        params.set_new_segment_callback_user_data(
+            &mut segment_ctx as *mut SegmentContext<'_> as *mut c_void,
         );
     }
 
@@ -718,18 +803,30 @@ pub fn transcribe(
                 .trim()
                 .to_string(),
         };
-        let start_ms = seg.start_timestamp() * 10;
-        let end_ms = seg.end_timestamp() * 10;
+        let start_ms = from_ms + seg.start_timestamp() * 10;
+        let end_ms = from_ms + seg.end_timestamp() * 10;
         // M15.6: the same run's token spans, mapped onto whole words. Reading
         // them changes nothing about the inference — `token_timestamps` was
-        // already on (params above), so whisper.cpp computed them anyway.
-        let spans = segment_token_spans(ctx, &seg);
+        // already on (params above), so whisper.cpp computed them anyway. A
+        // resumed run reads spans relative to the slice, so they are shifted
+        // into absolute time here (a negative span means "unknown" and stays
+        // unknown rather than becoming a plausible-looking time).
+        let idx = next_idx + i as u32;
+        let mut spans = segment_token_spans(ctx, &seg);
+        for span in &mut spans {
+            if span.start_ms >= 0 {
+                span.start_ms += from_ms;
+            }
+            if span.end_ms >= 0 {
+                span.end_ms += from_ms;
+            }
+        }
         words.extend(words::words_for_segment(
-            i as u32, &text, start_ms, end_ms, &spans,
+            idx, &text, start_ms, end_ms, &spans,
         ));
         segments.push(Segment {
-            idx: i as u32,
-            // Centiseconds → milliseconds.
+            idx,
+            // Centiseconds → milliseconds (plus the resume offset).
             start_ms,
             end_ms,
             text,

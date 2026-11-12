@@ -80,4 +80,16 @@ object ImportSource {
     /** The mime type, with the manifest's family as a fallback. */
     fun mimeOf(context: Context, uri: Uri): String =
         context.contentResolver.getType(uri) ?: "audio/*"
+
+    /**
+     * M22B — whether this share is audio (the voice-note flow) rather than
+     * video (the direct import). The manifest accepts both; only audio gets the
+     * micro-sheet, because a voice note is the thing a chat hands over.
+     */
+    fun isAudio(context: Context, uri: Uri): Boolean {
+        val base = mimeOf(context, uri).split(';').first().trim().lowercase()
+        return base.startsWith("audio/") ||
+            base == "application/ogg" ||
+            base == "application/x-ogg"
+    }
 }

@@ -1957,6 +1957,9 @@ impl Runtime {
             // M16.1: the UI's queue has no decode-ahead pool (the bridge's one
             // job at a time is the stricter bound); the worker decodes.
             samples: None,
+            // M22A: the desktop runtime has no journal on this path (the queue
+            // driver owns durability); the job is a plain in-memory run.
+            durable: None,
         };
         if let Err(err) = self.bridge.submit(job) {
             return state.job_failed(err);
@@ -2493,6 +2496,7 @@ mod tests {
             fast_engine: false,
             cancel: CancelToken::new(),
             samples: None,
+            durable: None,
         }
     }
 

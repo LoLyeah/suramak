@@ -28,7 +28,7 @@ use suramak_core::settings::{LangMode, Settings};
 use suramak_core::store::Store;
 use suramak_ui::deck::compact::{
     CompactAction, CompactApp, CompactExportFormat, CompactRoute, CompactSetting, CompactSettings,
-    Sheet,
+    Sheet, VoiceNoteView,
 };
 
 use crate::export_job::ExportJobs;
@@ -57,6 +57,9 @@ impl CompactHost {
     pub fn new(root: &Path) -> Self {
         let dirs = HostDirs::under(root);
         let settings_path = root.join("settings.toml");
+        // A quote card is a one-shot share artifact (like the export staging):
+        // a card from a previous process can no longer be handed to a chooser.
+        crate::voice_note::prune_quote_cards(root);
         let settings_existed = settings_path.is_file();
         let settings = Settings::load(&settings_path).unwrap_or_default();
         let compact = compact_settings(&settings);
@@ -109,6 +112,7 @@ impl CompactHost {
                     .unwrap_or_default();
                 inner.open_transcript(id)
             }
+            "voice_note_offer" => inner.voice_note_offer(&value),
             "back" => inner.back(),
             "save_segment" => inner.save_segment(&value),
             "setting" => inner.setting(&value),
@@ -174,7 +178,7 @@ impl Inner {
             "depth": self.app.nav.depth(),
             "transcript_id": self.app.editor.as_ref().map(|editor| editor.transcript.id.to_string()),
             "title": self.app.editor.as_ref().map(|editor| editor.transcript.title.clone()),
-            "sheet": match self.app.sheet { Some(Sheet::Export) => "export", Some(Sheet::Quit) => "quit", Some(Sheet::Onboarding) => "onboarding", None => "none" },
+            "sheet": match self.app.sheet { Some(Sheet::Export) => "export", Some(Sheet::Quit) => "quit", Some(Sheet::Onboarding) => "onboarding", Some(Sheet::VoiceNote) => "voice_note", None => "none" },
             "status": self.app.status.as_ref().map(|(text, error)| json!({"text": text, "error": error})),
             "library_rows": self.app.rows.len(),
             "first_run_seen": self.app.first_run_seen,
@@ -236,6 +240,48 @@ impl Inner {
                 self.snapshot()
             }
         }
+    }
+
+    /// M22B: builds the voice-note offer and arms the micro-sheet. The reply is
+    /// the host's own plan (`auto`, the pill) so the Activity logs exactly what
+    /// the sheet will do.
+    fn voice_note_offer(&mut self, value: &Value) -> String {
+        let title = value
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .unwrap_or("Voice note")
+            .to_string();
+        let sender =
+            crate::voice_note::sender_from_intent(value.get("sender").and_then(Value::as_str));
+        let explicit = value.get("language").and_then(Value::as_str);
+        let model = value
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string);
+        let configured = self.app.settings.language.clone();
+        let plan = crate::voice_note::offer_plan(explicit, &configured, model.as_deref());
+        self.app.offer_voice_note(VoiceNoteView {
+            title: title.clone(),
+            sender: sender.clone(),
+            pill: plan.language,
+            model_ok: model.is_some(),
+            auto_start: plan.auto_start,
+            reason: plan.reason.clone(),
+            opened_at: 0.0,
+        });
+        json!({
+            "ok": true,
+            "title": title,
+            "sender": sender,
+            "auto": plan.auto_start,
+            "language": plan.language.map(|pill| pill.tag()),
+            "reason": plan.reason,
+        })
+        .to_string()
     }
 
     fn back(&mut self) -> String {
@@ -818,6 +864,41 @@ mod tests {
         assert_eq!(reply["depth"], 2);
         assert_eq!(reply["title"], "Field notes");
         assert_eq!(reply["transcript_id"], id.to_string());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_voice_note_offer_arms_the_micro_sheet_with_the_pill_and_auto_rule() {
+        let dir =
+            std::env::temp_dir().join(format!("suramak-compact-host-{}", uuid::Uuid::new_v4()));
+        fixture(&dir);
+        let host = CompactHost::new(&dir);
+        let reply: Value = serde_json::from_str(
+            &host.dispatch(
+                &json!({
+                    "op": "voice_note_offer",
+                    "title": "Ptt 2026-11-12.opus",
+                    "sender": "Rina",
+                    "model": "tiny",
+                    "language": "id",
+                })
+                .to_string(),
+            ),
+        )
+        .expect("json");
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["auto"], true, "id + a verified model auto-starts");
+        assert_eq!(reply["language"], "id");
+        assert_eq!(reply["sender"], "Rina");
+
+        // The offer is armed, not yet drawn: begin_voice_note opens the sheet
+        // and stamps the 1.2 s clock (the frame loop calls this with egui time).
+        host.with_app(|app| {
+            app.begin_voice_note(12.5);
+            assert!(app.voice_note_deadline().is_some());
+        });
+        let route: Value = serde_json::from_str(&host.dispatch(r#"{"op":"route"}"#)).expect("json");
+        assert_eq!(route["sheet"], "voice_note");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

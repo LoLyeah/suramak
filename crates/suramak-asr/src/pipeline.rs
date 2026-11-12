@@ -124,6 +124,18 @@ fn transcript_for(
     )
 }
 
+/// M22A: the checkpoint stream handed to a pipeline run.
+///
+/// `committed` is the durable prefix a resumed job continues after; `from_ms`
+/// is the audio boundary it ends at; `on_segment` receives every segment the
+/// engine finalizes while it runs (the worker turns those into checkpoints).
+pub struct CheckpointRun<'a> {
+    pub committed: &'a [Segment],
+    pub from_ms: i64,
+    pub next_idx: u32,
+    pub on_segment: &'a mut dyn FnMut(Segment),
+}
+
 /// Runs the full whisper pipeline on an audio file and returns a library-ready
 /// transcript.
 ///
@@ -134,6 +146,11 @@ fn transcript_for(
 /// stage boundary and, inside whisper, between decoding chunks (the engine's
 /// abort callback — see [`whisper::transcribe`]). A cancellation returns
 /// [`AsrError::Cancelled`] and no partial transcript ever leaves this function.
+///
+/// `checkpoint` (M22A) makes the run resumable: the engine is fed only the
+/// window after `from_ms`, every new segment is streamed to `on_segment`, and
+/// the returned transcript is `committed` followed by the new tail — the same
+/// text an uninterrupted run would have produced, with absolute timestamps.
 #[allow(clippy::too_many_arguments)]
 pub fn transcribe_file(
     ctx: &WhisperContext,
@@ -145,31 +162,74 @@ pub fn transcribe_file(
     plan: &crate::engine::EngineDecision,
     prepared: Option<Vec<f32>>,
     cancel: &CancelToken,
+    checkpoint: Option<CheckpointRun<'_>>,
     mut on_stage: impl FnMut(JobStage),
-    on_progress: impl FnMut(u8),
+    mut on_progress: impl FnMut(u8),
 ) -> Result<PipelineOutcome, AsrError> {
     on_stage(JobStage::Decoding);
     let samples = prepare_samples(input, prepared, cancel)?;
     on_stage(JobStage::Transcribing);
+
+    let mut noop = |_: Segment| {};
+    let (committed, from_ms, next_idx, stream): (Vec<Segment>, i64, u32, &mut dyn FnMut(Segment)) =
+        match checkpoint {
+            Some(run) => (
+                run.committed.to_vec(),
+                run.from_ms.max(0),
+                run.next_idx,
+                run.on_segment,
+            ),
+            None => (Vec::new(), 0, 0, &mut noop),
+        };
+    let model_id = model_id_from_path(model_path);
+
+    // Everything is already committed (the crash landed after the last segment):
+    // there is no tail to feed the engine, and loading it would be pure waste.
+    // 16 samples/ms at 16 kHz; saturate so a corrupt 32-bit bound cannot wrap.
+    let start_sample = usize::try_from(from_ms.max(0))
+        .unwrap_or(usize::MAX)
+        .saturating_mul(16);
+    if from_ms > 0 && start_sample >= samples.len() {
+        on_progress(100);
+        return Ok(PipelineOutcome {
+            transcript: transcript_for(input, model_id, lang, committed),
+            words: Vec::new(),
+            engine_used: plan.engine,
+            warnings: plan.warning.iter().cloned().collect(),
+        });
+    }
+    let tail: &[f32] = samples.get(start_sample..).unwrap_or(&[]);
+
+    // A prompt is a start-of-file hint. Repeating it on a mid-file resume invites
+    // the model to re-emit committed words, which is exactly the duplication the
+    // checkpoint contract forbids.
+    let prompt = if from_ms > 0 { None } else { initial_prompt };
     let outcome = whisper::transcribe(
         ctx,
         model_path,
-        &samples,
+        tail,
         lang,
-        initial_prompt,
+        prompt,
         n_threads,
         plan,
         cancel,
+        from_ms,
+        next_idx,
         on_progress,
+        stream,
     )?;
     stage_check(cancel)?;
+    let mut segments = committed;
+    segments.extend(outcome.segments);
+    debug_assert!(
+        segments
+            .iter()
+            .enumerate()
+            .all(|(i, seg)| seg.idx as usize == i),
+        "a resumed transcript must have a contiguous idx sequence"
+    );
     Ok(PipelineOutcome {
-        transcript: transcript_for(
-            input,
-            model_id_from_path(model_path),
-            lang,
-            outcome.segments,
-        ),
+        transcript: transcript_for(input, model_id, lang, segments),
         words: outcome.words,
         engine_used: outcome.engine_used,
         warnings: outcome.warnings,

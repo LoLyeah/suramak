@@ -29,6 +29,7 @@ pub mod model;
 pub mod motion;
 pub mod onboarding;
 pub mod settings;
+pub mod voice_note;
 
 use egui::{vec2, Rect, Ui, UiBuilder};
 
@@ -40,7 +41,7 @@ pub use model::{
     CompactApp, CompactEditor, CompactExportFormat, CompactRoute, CompactSetting, CompactSettings,
     CompactSpeakers, CrashBanner, DiagnosticsView, DownloadState, DownloadView, ExportPhase,
     ExportSession, FlingProbe, Insets, JobView, LibraryHit, LibraryRow, ModelRow, ModelState,
-    SegmentEdit, Sheet,
+    SegmentEdit, Sheet, VoiceNoteView,
 };
 
 /// Paints one frame of the compact app and returns everything the host must do.
@@ -55,12 +56,24 @@ pub fn ui(ctx: &egui::Context, state: &mut CompactApp) -> Vec<CompactAction> {
     if animating {
         ctx.request_repaint();
     }
+    // M22B: an armed share offer opens on this frame, and its 1.2 s window is
+    // the only idle reason to wake the surface — scheduled exactly once at the
+    // deadline, not by a permanent frame request.
+    state.begin_voice_note(now);
+    if let Some(deadline) = state.voice_note_deadline() {
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+            (deadline - now).max(0.0),
+        ));
+    }
+    let mut actions = Vec::new();
+    if let Some(action) = state.take_voice_note_auto(now) {
+        actions.push(action);
+    }
     a11y::begin_frame(ctx);
     let tokens = theme::tokens(state.theme);
     let motion = Motion::new(state.reduce_motion);
     let screen = ctx.content_rect();
 
-    let mut actions = Vec::new();
     let mut ui = Ui::new(
         ctx.clone(),
         egui::Id::new("suramak-compact-root"),
@@ -135,7 +148,11 @@ pub fn ui(ctx: &egui::Context, state: &mut CompactApp) -> Vec<CompactAction> {
             state.sheet_anim.value()
         };
         let mut sheet_ui = layer_ui(&mut ui, screen, fade, 2, state.sheet_anim.is_present());
-        let sheet_rect = chrome::sheet(&mut sheet_ui, &tokens, screen, slide);
+        let sheet_rect = if sheet == Sheet::VoiceNote {
+            chrome::micro_sheet(&mut sheet_ui, &tokens, screen, slide)
+        } else {
+            chrome::sheet(&mut sheet_ui, &tokens, screen, slide)
+        };
         match sheet {
             Sheet::Export => {
                 actions.extend(editor::export_sheet(
@@ -161,6 +178,22 @@ pub fn ui(ctx: &egui::Context, state: &mut CompactApp) -> Vec<CompactAction> {
                         actions.push(state.finish_onboarding(now, true));
                     }
                     onboarding::OnboardingChoice::None => {}
+                }
+            }
+            Sheet::VoiceNote => {
+                let choice = state.voice_note.as_mut().and_then(|view| {
+                    voice_note::sheet(&mut sheet_ui, &tokens, &motion, view, now, sheet_rect)
+                });
+                match choice {
+                    Some(voice_note::VoiceNoteChoice::Accept) => {
+                        let pill = state.voice_note.as_ref().and_then(|view| view.pill);
+                        actions.push(state.accept_voice_note(pill, now));
+                    }
+                    Some(voice_note::VoiceNoteChoice::Dismiss) => {
+                        state.dismiss_voice_note(now);
+                        actions.push(CompactAction::VoiceNoteDismiss);
+                    }
+                    None => {}
                 }
             }
         }

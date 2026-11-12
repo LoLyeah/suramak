@@ -25,6 +25,8 @@ pub mod icons;
 pub mod material;
 pub mod motion;
 pub mod nav;
+// M22B: the quote card the voice-note notification shares (pure raster).
+pub mod quote_card;
 pub mod snapshot;
 // M16I: the shared speaker badge + 8 px lane (desktop and phone draw the same).
 pub mod speakers;

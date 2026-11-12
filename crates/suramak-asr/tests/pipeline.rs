@@ -30,11 +30,12 @@ use std::path::{Path, PathBuf};
 
 use suramak_asr::engine::{EngineAvailability, EngineId};
 use suramak_asr::live::{LiveConfig, LiveSession};
-use suramak_asr::pipeline::{model_id_from_path, parse_lang, transcribe_file};
+use suramak_asr::pipeline::{model_id_from_path, parse_lang, transcribe_file, CheckpointRun};
 use suramak_asr::whisper::{self, ContextCache};
 use suramak_asr::worker::{Job, Worker, WorkerEvent};
 use suramak_asr::{resolve_for, AsrError, CancelToken};
 use suramak_core::settings::{EngineSetting, LangMode};
+use suramak_core::transcript::Segment;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -201,6 +202,7 @@ fn worker_reports_missing_model_as_error_event() {
             fast_engine: false,
             cancel: CancelToken::new(),
             samples: None,
+            durable: None,
         })
         .expect("submit job");
 
@@ -249,6 +251,7 @@ fn e2e_en_fixture_contains_fox() {
         &plan,
         None,
         &CancelToken::new(),
+        None,
         |_| {},
         |_| {},
     )
@@ -299,6 +302,7 @@ fn e2e_id_fixture_has_non_empty_segment() {
         &plan,
         None,
         &CancelToken::new(),
+        None,
         |_| {},
         |_| {},
     )
@@ -353,6 +357,7 @@ fn e2e_video_fixture_matches_the_source_mp3_words() {
             &plan,
             None,
             &CancelToken::new(),
+            None,
             |_| {},
             |_| {},
         )
@@ -443,6 +448,7 @@ fn e2e_opus_fixtures_transcribe_the_fox_sentence() {
             &plan,
             None,
             &CancelToken::new(),
+            None,
             |_| {},
             |_| {},
         )
@@ -498,6 +504,7 @@ fn e2e_live_partials_then_the_final_pass_replaces_them() {
         &plan,
         None,
         &CancelToken::new(),
+        None,
         |_| {},
         |_| {},
     )
@@ -528,7 +535,10 @@ fn e2e_live_partials_then_the_final_pass_replaces_them() {
                 whisper::default_threads(),
                 &plan,
                 &CancelToken::new(),
+                0,
+                0,
                 |_| {},
+                &mut |_| {},
             )
             .expect("live window decode");
             eprintln!(
@@ -575,6 +585,7 @@ fn e2e_live_partials_then_the_final_pass_replaces_them() {
         &plan,
         None,
         &CancelToken::new(),
+        None,
         |_| {},
         |_| {},
     )
@@ -674,6 +685,7 @@ fn e2e_coreml_encoder_engaged_macos() {
         &plan,
         None,
         &CancelToken::new(),
+        None,
         |_| {},
         |_| {},
     )
@@ -722,6 +734,7 @@ fn e2e_cancel_mid_run_stops_cleanly_and_the_engine_stays_healthy() {
         &plan,
         None,
         &token,
+        None,
         |_| {},
         move |_pct| cancel_from_progress.cancel(),
     );
@@ -746,6 +759,7 @@ fn e2e_cancel_mid_run_stops_cleanly_and_the_engine_stays_healthy() {
         &plan,
         None,
         &CancelToken::new(),
+        None,
         |_| {},
         |_| {},
     )
@@ -754,5 +768,104 @@ fn e2e_cancel_mid_run_stops_cleanly_and_the_engine_stays_healthy() {
         words(&outcome.transcript).contains("fox"),
         "unexpected transcript after a cancelled run: {}",
         words(&outcome.transcript)
+    );
+}
+
+/// M22A: the mid-run segment stream is exactly the final list, and a resumed
+/// run continues after a committed segment without duplicating it or skipping
+/// an index. The suffix text itself is the model's (a real ASR's tail is not
+/// byte-reproducible after a mid-file restart); the *bookkeeping* — prefix,
+/// indices, absolute times — is what this pins.
+#[test]
+#[ignore]
+fn e2e_checkpoint_stream_and_resume_match_the_full_run() {
+    let Some(model) = tiny_model_or_skip() else {
+        return;
+    };
+    let _serial = e2e_serial();
+    let mut cache = ContextCache::new();
+    let ctx = cache
+        .get_or_load(&model, false)
+        .expect("load the tiny model");
+    let plan = resolve_for(&model, EngineSetting::Cpu, false, Some("en"));
+    let lang = LangMode::Fixed("en".to_string());
+    let wav = fixture("en.wav");
+    let cancel = CancelToken::new();
+
+    let mut streamed = Vec::new();
+    let full = transcribe_file(
+        ctx,
+        &wav,
+        &model,
+        &lang,
+        None,
+        whisper::default_threads(),
+        &plan,
+        None,
+        &cancel,
+        Some(CheckpointRun {
+            committed: &[],
+            from_ms: 0,
+            next_idx: 0,
+            on_segment: &mut |segment| streamed.push(segment),
+        }),
+        |_| {},
+        |_| {},
+    )
+    .expect("full run");
+    assert!(!streamed.is_empty(), "the engine streamed no segments");
+    assert_eq!(
+        streamed, full.transcript.segments,
+        "the checkpoint stream must be byte-identical to the final list"
+    );
+
+    // Resume after the first committed segment.
+    let committed: Vec<Segment> = full.transcript.segments[..1].to_vec();
+    let from_ms = committed[0].end_ms;
+    let mut resumed_stream = Vec::new();
+    let resumed = transcribe_file(
+        ctx,
+        &wav,
+        &model,
+        &lang,
+        None,
+        whisper::default_threads(),
+        &plan,
+        None,
+        &cancel,
+        Some(CheckpointRun {
+            committed: &committed,
+            from_ms,
+            next_idx: 1,
+            on_segment: &mut |segment| resumed_stream.push(segment),
+        }),
+        |_| {},
+        |_| {},
+    )
+    .expect("resumed run");
+    assert_eq!(
+        &resumed.transcript.segments[..1],
+        &committed[..],
+        "the committed prefix must survive the resume untouched"
+    );
+    for (index, segment) in resumed.transcript.segments.iter().enumerate() {
+        assert_eq!(segment.idx as usize, index, "indices must stay contiguous");
+    }
+    assert!(
+        resumed.transcript.segments[1].start_ms >= from_ms,
+        "the resumed text must start at or after the committed boundary"
+    );
+    // The mid-run stream of the resumed run is the tail with the committed
+    // index/clock offset applied — exactly what a checkpoint would write.
+    assert_eq!(
+        resumed_stream,
+        resumed.transcript.segments[1..],
+        "the resumed stream must carry the offset indices and absolute times"
+    );
+    assert_eq!(resumed_stream.first().unwrap().idx, 1);
+    eprintln!(
+        "full: {} segments; resumed from {from_ms} ms: {} segments",
+        full.transcript.segments.len(),
+        resumed.transcript.segments.len()
     );
 }

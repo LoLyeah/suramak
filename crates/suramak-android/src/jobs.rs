@@ -257,6 +257,14 @@ pub struct JobRecord {
     pub title: String,
     /// The name the sharing app reported (kept for `Source::File`).
     pub source_name: String,
+    /// M22B: `import`, `recording` or `voice_note`. An absent value (a journal
+    /// written before M22B) behaves exactly like `import`.
+    #[serde(default)]
+    pub kind: String,
+    /// M22B: the sender the share intent provided. Never derived; the
+    /// notification shows it only when it is here.
+    #[serde(default)]
+    pub sender: Option<String>,
     pub media_path: PathBuf,
     pub model: String,
     /// `"auto"` or a language code.
@@ -285,10 +293,13 @@ pub struct JobRecord {
 }
 
 impl JobRecord {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         key: String,
         title: String,
         source_name: String,
+        kind: &str,
+        sender: Option<String>,
         media_path: PathBuf,
         model: String,
         language: String,
@@ -298,6 +309,12 @@ impl JobRecord {
             key,
             title,
             source_name,
+            kind: if kind.trim().is_empty() {
+                "import".to_string()
+            } else {
+                kind.to_string()
+            },
+            sender,
             media_path,
             model,
             language,
@@ -322,6 +339,22 @@ pub struct Completed {
     pub transcript_id: String,
     pub title: String,
     pub segments: usize,
+    /// M22B: `import`, `recording` or `voice_note` — the notification shape is
+    /// chosen from this, so a resumed journal keeps its voice-note surface.
+    pub kind: String,
+    /// M22B: the sender the share intent provided, never a guess.
+    pub sender: Option<String>,
+}
+
+/// M22B: the newest failed job, so the failure notification can name the
+/// queue's reason and offer Retry against the job that still owns its copy.
+#[derive(Debug, Clone, Serialize)]
+pub struct Failed {
+    pub key: String,
+    pub title: String,
+    pub reason: String,
+    pub kind: String,
+    pub sender: Option<String>,
 }
 
 /// A snapshot for the service's notification poll and the Activity's prompt.
@@ -331,6 +364,8 @@ pub struct Status {
     pub current_key: Option<String>,
     pub current_title: String,
     pub current_phase: String,
+    /// M22B: the current job's kind (`import` when absent, for an old journal).
+    pub current_kind: String,
     pub percent: u8,
     pub waiting: usize,
     pub paused: usize,
@@ -340,6 +375,7 @@ pub struct Status {
     pub total: usize,
     pub message: String,
     pub last: Option<Completed>,
+    pub last_failed: Option<Failed>,
 }
 
 impl Status {
@@ -407,6 +443,7 @@ struct InnerState {
     total: usize,
     message: String,
     last: Option<Completed>,
+    last_failed: Option<Failed>,
 }
 
 impl InnerState {
@@ -419,6 +456,7 @@ impl InnerState {
             total: 0,
             message: String::new(),
             last: None,
+            last_failed: None,
         }
     }
 
@@ -452,14 +490,23 @@ impl InnerState {
             return;
         }
         let mut excess = terminal - KEEP;
+        let mut removed_media = Vec::new();
         self.jobs.retain(|job| {
             if job.phase.is_terminal() && excess > 0 {
                 excess -= 1;
+                // A failed job keeps its copy so Retry can re-run it; once its
+                // record is pruned nothing can name that copy again.
+                if job.phase == Phase::Failed {
+                    removed_media.push(job.media_path.clone());
+                }
                 false
             } else {
                 true
             }
         });
+        for media in removed_media {
+            let _ = fs::remove_file(media);
+        }
     }
 
     fn status(&self) -> Status {
@@ -486,6 +533,9 @@ impl InnerState {
                 .map(|job| job.phase.as_str())
                 .unwrap_or("idle")
                 .to_string(),
+            current_kind: current
+                .map(|job| job.kind.clone())
+                .unwrap_or_else(|| "import".to_string()),
             percent: current.map(|job| job.percent).unwrap_or(0),
             waiting,
             paused,
@@ -495,6 +545,7 @@ impl InnerState {
             total: self.total,
             message: self.message.clone(),
             last: self.last.clone(),
+            last_failed: self.last_failed.clone(),
         }
     }
 }
@@ -578,6 +629,10 @@ fn load_journal(path: &Path) -> Vec<JobRecord> {
             // not a run this process owns.
             if job.phase.is_live() {
                 job.phase = Phase::Paused;
+            }
+            if job.kind.trim().is_empty() {
+                // A journal written before M22B knows only imports.
+                job.kind = "import".to_string();
             }
             job.queue_id = None;
             job
@@ -675,6 +730,23 @@ impl<B: InferenceBackend + Send + 'static, P: Prefetcher + Send + 'static> JobHo
         model_id: &str,
         language: &str,
     ) -> Result<(String, PathBuf), String> {
+        self.begin_import_kind(name, mime, bytes_total, model_id, language, "import", None)
+    }
+
+    /// M22B: the same import with the job's kind and the intent's sender. The
+    /// voice-note path passes `kind = "voice_note"`; every other caller keeps
+    /// [`JobHost::begin_import`] and its default.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_import_kind(
+        &self,
+        name: &str,
+        mime: &str,
+        bytes_total: u64,
+        model_id: &str,
+        language: &str,
+        kind: &str,
+        sender: Option<&str>,
+    ) -> Result<(String, PathBuf), String> {
         if !is_supported_mime(mime) {
             return Err(format!(
                 "'{mime}' is not an audio or video type this build imports"
@@ -698,6 +770,8 @@ impl<B: InferenceBackend + Send + 'static, P: Prefetcher + Send + 'static> JobHo
             key.clone(),
             title_for(name),
             name.to_string(),
+            kind,
+            sender.map(str::to_string),
             media_path.clone(),
             model_id.to_string(),
             language.to_string(),
@@ -868,6 +942,8 @@ impl<B: InferenceBackend + Send + 'static, P: Prefetcher + Send + 'static> JobHo
             key.to_string(),
             title.to_string(),
             source_name.to_string(),
+            "recording",
+            None,
             media_path.to_path_buf(),
             model_id.to_string(),
             language.to_string(),
@@ -998,6 +1074,34 @@ impl<B: InferenceBackend + Send + 'static, P: Prefetcher + Send + 'static> JobHo
         Ok(())
     }
 
+    /// M22B: retry a failed job on the copy it still owns. The media is kept
+    /// on failure precisely for this; a job whose copy is gone says so instead
+    /// of pretending to retry.
+    pub fn retry(&self, key: &str) -> Result<(), String> {
+        {
+            let mut state = self.shared.state.lock().expect("job state lock");
+            let Some(job) = state.job_mut(key) else {
+                return Err(format!("unknown job '{key}'"));
+            };
+            if job.phase != Phase::Failed {
+                return Err(format!("job '{key}' is not failed"));
+            }
+            if !job.copy_complete || !job.media_path.is_file() {
+                return Err("the failed job's copy is no longer on the device".to_string());
+            }
+            job.phase = Phase::Queued;
+            job.percent = 0;
+            job.last_journal_pct = 0;
+            job.message.clear();
+            state.last_failed = None;
+            self.shared.persist(&state);
+        }
+        if !self.send(Command::Accept(key.to_string())) {
+            return Err("the job thread is gone".to_string());
+        }
+        Ok(())
+    }
+
     /// Recovery: discard a journaled job and its copy.
     pub fn discard(&self, key: &str) {
         let mut state = self.shared.state.lock().expect("job state lock");
@@ -1052,6 +1156,75 @@ impl<B: InferenceBackend + Send + 'static, P: Prefetcher + Send + 'static> JobHo
         store.get_transcript(uuid).ok()
     }
 
+    /// M22B: the paged transcript notification for a stored row. The sender
+    /// comes from the job that produced it; `fallback_sender` is the value a
+    /// notification action carried (the intent's own name, never invented).
+    pub fn transcript_notification(
+        &self,
+        id: &str,
+        page: usize,
+        fallback_sender: Option<&str>,
+    ) -> Result<crate::voice_note::TranscriptNotification, String> {
+        let uuid = uuid_parse(id).ok_or_else(|| format!("'{id}' is not a transcript id"))?;
+        let store = Store::open(&self.shared.dirs.db_path)
+            .map_err(|err| format!("the library could not be opened: {err}"))?;
+        let transcript = store
+            .get_transcript(uuid)
+            .map_err(|err| format!("the transcript could not be read: {err}"))?;
+        let diarization = store.diarization(uuid).ok().flatten();
+        let sender = {
+            let state = self.shared.state.lock().expect("job state lock");
+            state
+                .jobs
+                .iter()
+                .find(|job| job.transcript_id.as_deref() == Some(id))
+                .and_then(|job| job.sender.clone())
+                .or_else(|| crate::voice_note::sender_from_intent(fallback_sender))
+        };
+        Ok(crate::voice_note::build_transcript_notification(
+            &transcript,
+            diarization.as_ref(),
+            sender.as_deref(),
+            page,
+        ))
+    }
+
+    /// M22B: renders the page the notification is showing into a staged PNG.
+    pub fn stage_quote_card(
+        &self,
+        id: &str,
+        page: usize,
+        fallback_sender: Option<&str>,
+    ) -> Result<crate::voice_note::StagedQuote, String> {
+        let uuid = uuid_parse(id).ok_or_else(|| format!("'{id}' is not a transcript id"))?;
+        let store = Store::open(&self.shared.dirs.db_path)
+            .map_err(|err| format!("the library could not be opened: {err}"))?;
+        let transcript = store
+            .get_transcript(uuid)
+            .map_err(|err| format!("the transcript could not be read: {err}"))?;
+        let diarization = store.diarization(uuid).ok().flatten();
+        let sender = {
+            let state = self.shared.state.lock().expect("job state lock");
+            state
+                .jobs
+                .iter()
+                .find(|job| job.transcript_id.as_deref() == Some(id))
+                .and_then(|job| job.sender.clone())
+                .or_else(|| crate::voice_note::sender_from_intent(fallback_sender))
+        };
+        crate::voice_note::stage_quote_card(
+            self.shared
+                .dirs
+                .media_dir
+                .parent()
+                .unwrap_or(Path::new(".")),
+            &transcript,
+            diarization.as_ref(),
+            sender.as_deref(),
+            page,
+        )
+    }
+
     // -- JNI-facing protocol ----------------------------------------------
 
     /// Runs one JSON command; never panics on bad input, always replies with an
@@ -1064,12 +1237,14 @@ impl<B: InferenceBackend + Send + 'static, P: Prefetcher + Send + 'static> JobHo
         let text = |name: &str| value.get(name).and_then(Value::as_str).unwrap_or_default();
         let number = |name: &str| value.get(name).and_then(Value::as_u64).unwrap_or(0);
         match op {
-            "begin_import" => match self.begin_import(
+            "begin_import" => match self.begin_import_kind(
                 text("name"),
                 text("mime"),
                 number("bytes_total"),
                 text("model"),
                 text("language"),
+                text("kind"),
+                value.get("sender").and_then(Value::as_str),
             ) {
                 Ok((key, path)) => json!({
                     "ok": true,
@@ -1112,6 +1287,39 @@ impl<B: InferenceBackend + Send + 'static, P: Prefetcher + Send + 'static> JobHo
                 Ok(()) => json!({ "ok": true }).to_string(),
                 Err(reason) => json!({ "ok": false, "error": reason }).to_string(),
             },
+            "retry" => match self.retry(text("key")) {
+                Ok(()) => json!({ "ok": true }).to_string(),
+                Err(reason) => json!({ "ok": false, "error": reason }).to_string(),
+            },
+            "voice_note" => {
+                let id = text("transcript_id");
+                let page = number("page") as usize;
+                match self.transcript_notification(id, page, Some(text("sender"))) {
+                    Ok(notification) => {
+                        let mut reply =
+                            serde_json::to_value(&notification).unwrap_or_else(|_| json!({}));
+                        reply["ok"] = json!(true);
+                        reply.to_string()
+                    }
+                    Err(reason) => json!({ "ok": false, "error": reason }).to_string(),
+                }
+            }
+            "quote_card" => {
+                let id = text("transcript_id");
+                let page = number("page") as usize;
+                match self.stage_quote_card(id, page, Some(text("sender"))) {
+                    Ok(staged) => {
+                        let mut reply = serde_json::to_value(&staged).unwrap_or_else(|_| json!({}));
+                        reply["ok"] = json!(true);
+                        reply.to_string()
+                    }
+                    Err(reason) => json!({ "ok": false, "error": reason }).to_string(),
+                }
+            }
+            "progress_text" => {
+                let percent = number("percent").min(100) as u8;
+                json!({ "ok": true, "text": crate::voice_note::progress_text(percent) }).to_string()
+            }
             "discard" => {
                 self.discard(text("key"));
                 json!({ "ok": true }).to_string()
@@ -1419,15 +1627,30 @@ fn stop_running<B: InferenceBackend + Send + 'static, P: Prefetcher + Send + 'st
 
 fn fail(shared: &Arc<Shared>, key: &str, reason: &str) {
     let mut state = shared.state.lock().expect("job state lock");
-    if let Some(job) = state.job_mut(key) {
+    let Some((job_key, title, kind, sender)) = state.job_mut(key).and_then(|job| {
         if job.phase.is_terminal() {
-            return;
+            return None;
         }
         job.phase = Phase::Failed;
         job.message = reason.to_string();
-        state.failed += 1;
-        state.message = reason.to_string();
-    }
+        Some((
+            job.key.clone(),
+            job.title.clone(),
+            job.kind.clone(),
+            job.sender.clone(),
+        ))
+    }) else {
+        return;
+    };
+    state.failed += 1;
+    state.message = reason.to_string();
+    state.last_failed = Some(Failed {
+        key: job_key,
+        title,
+        reason: reason.to_string(),
+        kind,
+        sender,
+    });
     shared.persist(&state);
 }
 
@@ -1452,6 +1675,10 @@ fn apply_event(shared: &Arc<Shared>, store: &mut Option<Store>, event: QueueEven
             }
             shared.persist(&state);
         }
+        // M22A: the driver-level journal continued this job at a committed
+        // boundary. This host keeps its own job journal for resume; the event
+        // is informational here.
+        QueueEvent::Resumed { .. } => {}
         QueueEvent::Progress { id, pct, .. } => {
             let mut state = shared.state.lock().expect("job state lock");
             let mut persist = false;
@@ -1477,17 +1704,30 @@ fn apply_event(shared: &Arc<Shared>, store: &mut Option<Store>, event: QueueEven
         }
         QueueEvent::Failed { id, reason, .. } => {
             let mut state = shared.state.lock().expect("job state lock");
-            if let Some(job) = state.by_queue_mut(id) {
+            let Some((key, title, kind, sender)) = state.by_queue_mut(id).map(|job| {
                 job.phase = Phase::Failed;
                 job.message = reason.clone();
-                let media = job.media_path.clone();
-                drop(state);
-                let _ = fs::remove_file(media);
-                let mut state = shared.state.lock().expect("job state lock");
-                state.failed += 1;
-                state.message = reason;
-                shared.persist(&state);
-            }
+                // M22B: the copy stays. Retry re-queues this same job, so a
+                // failure must not delete the only bytes it could retry with.
+                (
+                    job.key.clone(),
+                    job.title.clone(),
+                    job.kind.clone(),
+                    job.sender.clone(),
+                )
+            }) else {
+                return;
+            };
+            state.last_failed = Some(Failed {
+                key,
+                title,
+                reason: reason.clone(),
+                kind,
+                sender,
+            });
+            state.failed += 1;
+            state.message = reason;
+            shared.persist(&state);
         }
         QueueEvent::Cancelled { id, .. } => {
             let mut state = shared.state.lock().expect("job state lock");
@@ -1517,7 +1757,7 @@ fn finish(
     mut transcript: Transcript,
     words: &[suramak_core::transcript::WordTiming],
 ) {
-    let (key, title, source_name, media, model) = {
+    let (key, title, source_name, media, model, kind, sender) = {
         let state = shared.state.lock().expect("job state lock");
         let Some(job) = state.by_queue(id) else {
             return;
@@ -1528,6 +1768,8 @@ fn finish(
             job.source_name.clone(),
             job.media_path.clone(),
             job.model.clone(),
+            job.kind.clone(),
+            job.sender.clone(),
         )
     };
     // The worker's transcript is named after the copied file (`<key>.opus`).
@@ -1571,7 +1813,10 @@ fn finish(
                 transcript_id: transcript.id.to_string(),
                 title,
                 segments,
+                kind,
+                sender,
             });
+            state.last_failed = None;
             shared.persist(&state);
         }
         Err(err) => fail(
@@ -1681,6 +1926,8 @@ mod tests {
             "k1".into(),
             "Voice note".into(),
             "Ptt.opus".into(),
+            "import",
+            None,
             PathBuf::from("/tmp/k1.opus"),
             "tiny".into(),
             "auto".into(),

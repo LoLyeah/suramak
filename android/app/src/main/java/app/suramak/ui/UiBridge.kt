@@ -116,6 +116,42 @@ object UiBridge {
     fun exportCancel(job: String): JSONObject =
         dispatch(JSONObject().put("op", "export_cancel").put("job", job))
 
+    /**
+     * M22B — stages the page the notification is showing as a PNG quote card.
+     * The reply carries `path`, `name`, `bytes`, `checksum`, `mime`, `page`
+     * and `page_count`; the Activity hands that one file to `ACTION_SEND`.
+     */
+    fun quoteCard(transcriptId: String, page: Int, sender: String?): JSONObject {
+        val request = JSONObject()
+            .put("op", "quote_card")
+            .put("transcript_id", transcriptId)
+            .put("page", page)
+        if (sender != null) request.put("sender", sender)
+        return dispatch(request)
+    }
+
+    /**
+     * M22B — arms the voice-note micro-sheet. `model` is empty when no speech
+     * model is verified; `language` is the intent's explicit tag (or empty).
+     * The reply: `{ok, auto, language, title, sender, reason}`.
+     */
+    fun voiceNoteOffer(
+        title: String,
+        mime: String,
+        sender: String?,
+        model: String,
+        language: String,
+    ): JSONObject {
+        val request = JSONObject()
+            .put("op", "voice_note_offer")
+            .put("title", title)
+            .put("mime", mime)
+            .put("model", model)
+            .put("language", language)
+        if (sender != null) request.put("sender", sender)
+        return dispatch(request)
+    }
+
     /** The ordered plan (capture → jobs → services → exit); Kotlin executes it. */
     fun quit(): JSONObject = dispatch(JSONObject().put("op", "quit"))
 

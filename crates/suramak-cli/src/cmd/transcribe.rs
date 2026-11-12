@@ -37,7 +37,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, ValueEnum};
 use suramak_asr::engine::resolve_for;
 use suramak_asr::queue::driver::{
-    FileDecoder, JobOptions, QueueDriver, QueueEvent, ThreadedPrefetch,
+    FileDecoder, JobOptions, QueueDriver, QueueEvent, ResumeOutcome, ThreadedPrefetch,
 };
 use suramak_asr::worker::Worker;
 use suramak_core::paths;
@@ -196,7 +196,27 @@ fn file_label(input: &Path) -> String {
         .unwrap_or_else(|| input.display().to_string())
 }
 
+/// `m:ss` (or `h:mm:ss`) for a millisecond position — the resume line's
+/// human-readable boundary.
+fn mmss(ms: i64) -> String {
+    let total_seconds = (ms.max(0) / 1000) as u64;
+    let (hours, minutes, seconds) = (
+        total_seconds / 3600,
+        (total_seconds % 3600) / 60,
+        total_seconds % 60,
+    );
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
 /// One finished file's export/save step.
+///
+/// `db` is only true when the transcript still has to be inserted here — with
+/// the M22A journal the driver already wrote it (segments, words and the `done`
+/// row in one transaction), so a second insert would collide on the id.
 fn finish_file(
     transcript: &Transcript,
     words: &[suramak_core::transcript::WordTiming],
@@ -236,9 +256,9 @@ pub fn run(args: TranscribeArgs) -> Result<()> {
             bail!("input file not found: {}", input.display());
         }
     }
-    let total = args.input.len();
-    let cancel = cancel_positions(&args.cancel, total)?;
-    if !cancel.is_empty() && total == 1 {
+    let arg_total = args.input.len();
+    let cancel = cancel_positions(&args.cancel, arg_total)?;
+    if !cancel.is_empty() && arg_total == 1 {
         eprintln!(
             "note: --cancel with a single input has nothing to continue with; the file is still cancelled"
         );
@@ -278,13 +298,6 @@ pub fn run(args: TranscribeArgs) -> Result<()> {
         engine.as_str(),
         plan.engine.as_str()
     );
-    if total > 1 {
-        eprintln!(
-            "queue: {total} files, one at a time (up to 2 decoding ahead, capped at {} MiB decoded)",
-            suramak_asr::MAX_PREFETCH_BYTES / (1024 * 1024)
-        );
-    }
-
     let options = JobOptions {
         model_path,
         lang,
@@ -292,12 +305,59 @@ pub fn run(args: TranscribeArgs) -> Result<()> {
         engine,
         fast_engine,
     };
+    // M22A: `--db` also turns the queue durable. The driver owns the library
+    // connection for the run: job rows, checkpoints and the final write all go
+    // through it (one writer), and a relaunch resumes a crashed batch instead of
+    // starting it from zero.
     let mut driver = QueueDriver::new(
         Worker::spawn(),
         ThreadedPrefetch::new(Box::new(FileDecoder)),
         options,
     );
+    let journal_on = args.db;
+    if journal_on {
+        driver = driver.with_journal(Store::open(&paths::db_path()?)?);
+    }
+
+    // Every journal row a previous process left mid-job is resumed (or named
+    // failed when its source/model is gone) before the new arguments are queued.
+    let pending = driver.resume_pending();
+    for resume in &pending {
+        match &resume.outcome {
+            ResumeOutcome::Resumed { .. } => {
+                // The driver's own `Resumed` event prints this when the job
+                // actually starts (and says what it is doing then).
+            }
+            ResumeOutcome::Fresh => {
+                eprintln!("resumed: {} — from the start", file_label(&resume.path))
+            }
+            ResumeOutcome::Unavailable { reason } => {
+                eprintln!(
+                    "resume unavailable: {} — {reason}",
+                    file_label(&resume.path)
+                )
+            }
+            ResumeOutcome::Skipped { reason } => {
+                eprintln!("left pending: {} — {reason}", file_label(&resume.path))
+            }
+        }
+    }
     driver.enqueue_all(args.input.clone());
+
+    let inputs: Vec<PathBuf> = driver
+        .queue()
+        .items()
+        .iter()
+        .map(|item| item.input.clone())
+        .collect();
+    let total = inputs.len();
+    let stems = output_stems(&inputs);
+    if total > 1 {
+        eprintln!(
+            "queue: {total} files, one at a time (up to 2 decoding ahead, capped at {} MiB decoded)",
+            suramak_asr::MAX_PREFETCH_BYTES / (1024 * 1024)
+        );
+    }
 
     // Waiting positions are removed before the batch starts (deterministic:
     // they can never reach the engine). Position 1 is the file that runs first,
@@ -311,7 +371,6 @@ pub fn run(args: TranscribeArgs) -> Result<()> {
         driver.cancel_seq(1);
     }
 
-    let stems = output_stems(&args.input);
     let mut done = 0usize;
     let mut failed = 0usize;
     let mut cancelled = 0usize;
@@ -335,6 +394,20 @@ pub fn run(args: TranscribeArgs) -> Result<()> {
                     eprint!("\r[{seq}/{total}] transcribing… {pct:>3}%   ");
                 }
                 QueueEvent::Stage { .. } => {}
+                QueueEvent::Resumed {
+                    seq,
+                    input,
+                    from_ms,
+                    next_idx,
+                    ..
+                } => {
+                    eprintln!(
+                        "resumed: {} — continuing from {} (segment {next_idx})",
+                        file_label(&input),
+                        mmss(from_ms)
+                    );
+                    let _ = seq;
+                }
                 QueueEvent::Finished {
                     seq,
                     input,
@@ -350,15 +423,28 @@ pub fn run(args: TranscribeArgs) -> Result<()> {
                         engine.as_str(),
                         " ".repeat(20)
                     );
-                    let stem = &stems[seq - 1];
-                    if let Err(err) =
-                        finish_file(&transcript, &words, stem, &formats, &args.out_dir, args.db)
-                    {
+                    let stem = stems
+                        .get(seq - 1)
+                        .cloned()
+                        .unwrap_or_else(|| "transcript".to_string());
+                    // With the journal the driver already saved this transcript
+                    // (and its words) in the job's final transaction.
+                    if let Err(err) = finish_file(
+                        &transcript,
+                        &words,
+                        &stem,
+                        &formats,
+                        &args.out_dir,
+                        args.db && !journal_on,
+                    ) {
                         // An export failure does not invalidate the transcript
                         // or stop the batch; it is reported per file.
                         eprintln!("\r[{seq}/{total}] failed to write output: {err}");
                         failed += 1;
                         continue;
+                    }
+                    if journal_on {
+                        println!("saved to library: id {}", transcript.id);
                     }
                     done += 1;
                 }

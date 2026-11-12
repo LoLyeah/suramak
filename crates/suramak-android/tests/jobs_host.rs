@@ -756,3 +756,133 @@ fn status_reports_the_current_file_and_the_queue_count() {
     assert_eq!(status.total, 1);
     assert_eq!(status.notification_numbers(), (0, 0));
 }
+
+/// M22B — a voice-note job carries its kind and the intent's sender into the
+/// library shape, and the notification model reads them back through the same
+/// store the compact UI uses.
+#[test]
+fn a_voice_note_notification_is_built_from_the_stored_row() {
+    let dirs = dirs("voice-note-notification");
+    let (backend, _steps, _control) = FakeBackend::new(true);
+    let host = JobHost::with_prefetcher(
+        backend,
+        ThreadedPrefetch::new(Box::new(FileDecoder)),
+        dirs.clone(),
+    );
+    let source = fixtures().join("speech-en.opus");
+    let size = std::fs::metadata(&source).unwrap().len();
+    let (key, dest) = host
+        .begin_import_kind(
+            "Ptt 2026-11-12 at 09.14.opus",
+            "audio/ogg",
+            size,
+            "tiny",
+            "en",
+            "voice_note",
+            Some("Rina"),
+        )
+        .expect("accepted");
+    std::fs::copy(&source, &dest).unwrap();
+    host.import_done(&key).unwrap();
+    wait_until("the voice-note job to finish", || host.status().done == 1);
+
+    let finished = host.status().last.expect("a completed job");
+    assert_eq!(finished.kind, "voice_note");
+    assert_eq!(finished.sender.as_deref(), Some("Rina"));
+
+    let model = host
+        .transcript_notification(&finished.transcript_id, 0, None)
+        .expect("the notification model");
+    assert_eq!(
+        model.subtext.as_deref(),
+        Some("Rina"),
+        "the intent's sender"
+    );
+    assert_eq!(model.title, "Transcript ready · 7 words");
+    assert_eq!(model.page, 0);
+    assert_eq!(model.page_count, 1);
+    assert_eq!(model.text, "selamat pagi, this is the fake engine");
+    assert_eq!(model.copy_text, model.text);
+    assert!(model
+        .actions
+        .contains(&suramak_android::voice_note::Action::Copy));
+    assert!(model
+        .actions
+        .contains(&suramak_android::voice_note::Action::ShareQuote));
+    assert!(!model
+        .actions
+        .contains(&suramak_android::voice_note::Action::NextPage));
+
+    // The quote card the action shares is a real staged PNG.
+    let staged = host
+        .stage_quote_card(&finished.transcript_id, 0, None)
+        .expect("a quote card");
+    assert_eq!(staged.mime, "image/png");
+    assert!(std::path::Path::new(&staged.path).is_file());
+    assert!(staged.bytes > 1_000);
+    let _ = std::fs::remove_dir_all(dirs.db_path.parent().unwrap());
+}
+
+/// A backend that always fails at the engine boundary — the decode is real
+/// (a valid fixture), so Retry re-runs a genuinely decodable job.
+#[derive(Default)]
+struct FailingBackend {
+    submitted: Option<u64>,
+}
+
+impl InferenceBackend for FailingBackend {
+    fn submit(&mut self, job: Job) -> Result<(), String> {
+        self.submitted = Some(job.id);
+        Ok(())
+    }
+
+    fn try_recv(&mut self) -> Option<WorkerEvent> {
+        self.submitted.take().map(|id| WorkerEvent::Error {
+            job_id: id,
+            message: "the fake engine refused the audio".to_string(),
+        })
+    }
+}
+
+/// M22B — a failure keeps the copy so Retry can honestly re-run the same job,
+/// and the failure record names the queue's reason and the sender.
+#[test]
+fn a_failed_voice_note_keeps_its_copy_and_can_be_retried() {
+    let dirs = dirs("voice-note-retry");
+    let host = JobHost::with_prefetcher(
+        FailingBackend::default(),
+        ThreadedPrefetch::new(Box::new(FileDecoder)),
+        dirs.clone(),
+    );
+    let source = fixtures().join("speech-en.opus");
+    let size = std::fs::metadata(&source).unwrap().len();
+    let (key, dest) = host
+        .begin_import_kind(
+            "refused.opus",
+            "audio/ogg",
+            size,
+            "tiny",
+            "auto",
+            "voice_note",
+            Some("Rina"),
+        )
+        .expect("accepted");
+    std::fs::copy(&source, &dest).unwrap();
+    host.import_done(&key).unwrap();
+    wait_until("the engine to fail", || host.status().failed == 1);
+
+    let status = host.status();
+    let failure = status.last_failed.expect("a named failure");
+    assert_eq!(failure.key, key);
+    assert_eq!(failure.kind, "voice_note");
+    assert_eq!(failure.sender.as_deref(), Some("Rina"));
+    assert!(!failure.reason.is_empty(), "the queue's own reason");
+    assert!(dest.exists(), "Retry needs the copy the failure kept");
+
+    host.retry(&key).expect("retry accepted");
+    wait_until("the retried job to fail again", || {
+        host.status().failed == 2
+    });
+    assert!(dest.exists(), "the retried job still owns its copy");
+    let _ = std::fs::remove_dir_all(dirs.db_path.parent().unwrap());
+}

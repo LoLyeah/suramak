@@ -259,6 +259,7 @@ fn e2e_parakeet_transcribes_the_english_fixture() {
             &plan,
             None,
             &CancelToken::new(),
+            None,
             |_| {},
             |_| {},
         )

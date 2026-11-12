@@ -1,5 +1,7 @@
-use chrono::Utc;
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use chrono::{DateTime, Utc};
+use rusqlite::{
+    params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 use uuid::Uuid;
@@ -88,7 +90,12 @@ const SEARCH_DOCS_DDL: &str = "CREATE TABLE IF NOT EXISTS search_docs (
 ///   decision). Turns are time-anchored; segment ranges are a read-time
 ///   projection. No segment or transcript row is rewritten, and a library that
 ///   never diarizes simply has no rows here (the plain editor view).
-pub const SCHEMA_VERSION: i64 = 7;
+/// - **v8** — M22A, additive only: `jobs` — the durable job journal. One row per
+///   accepted file with its status and the checkpoint it last durably committed
+///   (`last_committed_segment` / `last_committed_ms`). The transcript text keeps
+///   living in `segments`; the journal only says how much of it is committed, so
+///   a resume continues at that boundary. No existing table is rebuilt.
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// SQLite-backed transcript library with WAL mode.
 pub struct Store {
@@ -131,6 +138,103 @@ pub struct WordWriteStats {
     /// Segment groups dropped because the segment was gone or its text did not
     /// match the words.
     pub skipped_segments: usize,
+}
+
+/// The lifecycle of one durable job (M22A).
+///
+/// Mirrors the queue's per-item state machine. `decoding` and `transcribing` are
+/// the only non-terminal states a fresh launch may resume; `queued` means the
+/// job was accepted but has committed nothing yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobStatus {
+    Queued,
+    Decoding,
+    Transcribing,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+impl JobStatus {
+    /// The exact `jobs.status` text.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JobStatus::Queued => "queued",
+            JobStatus::Decoding => "decoding",
+            JobStatus::Transcribing => "transcribing",
+            JobStatus::Done => "done",
+            JobStatus::Failed => "failed",
+            JobStatus::Cancelled => "cancelled",
+        }
+    }
+
+    /// Parses a stored status. An unknown string is not guessed at.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "queued" => Some(JobStatus::Queued),
+            "decoding" => Some(JobStatus::Decoding),
+            "transcribing" => Some(JobStatus::Transcribing),
+            "done" => Some(JobStatus::Done),
+            "failed" => Some(JobStatus::Failed),
+            "cancelled" => Some(JobStatus::Cancelled),
+            _ => None,
+        }
+    }
+
+    /// Whether the job will never change again.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            JobStatus::Done | JobStatus::Failed | JobStatus::Cancelled
+        )
+    }
+}
+
+/// The prefix `jobs.failure` puts in front of a resume refusal, so the card,
+/// the CLI and the report all say the same thing: the job cannot be resumed
+/// because its inputs are gone.
+pub const RESUME_UNAVAILABLE_PREFIX: &str = "resume_unavailable:";
+
+/// One row of the durable job journal.
+///
+/// `last_committed_segment` is the **number** of segments durably committed to
+/// `transcript_id` (so the next segment's `idx` is exactly that number), and
+/// `last_committed_ms` is the `end_ms` of the last one (0 when none). Storing
+/// the count rather than the last index removes the empty/one-segment
+/// off-by-one that a resume would otherwise have to guess at.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobRecord {
+    pub id: Uuid,
+    /// The source path the job was accepted with.
+    pub path: String,
+    /// The model path the job ran with.
+    pub model: String,
+    pub status: JobStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    /// The transcript row the committed prefix lives in, once one exists.
+    pub transcript_id: Option<Uuid>,
+    pub last_committed_segment: u32,
+    pub last_committed_ms: i64,
+    /// Whether this row continued an interrupted job (the resume marker).
+    pub resumed: bool,
+    /// The named failure, when `status` is `failed`.
+    pub failure: Option<String>,
+}
+
+impl JobRecord {
+    /// Whether a fresh launch may continue this job at its checkpoint.
+    pub fn is_resumable(&self) -> bool {
+        matches!(self.status, JobStatus::Decoding | JobStatus::Transcribing)
+    }
+
+    /// The resume refusal, when this row carries one.
+    pub fn resume_unavailable_reason(&self) -> Option<&str> {
+        self.failure
+            .as_deref()
+            .and_then(|failure| failure.strip_prefix(RESUME_UNAVAILABLE_PREFIX))
+            .map(str::trim)
+    }
 }
 
 /// A transcript's usable word timing (M15.6).
@@ -347,9 +451,32 @@ impl Store {
                  CHECK (end_ms > start_ms)
              );
              CREATE INDEX IF NOT EXISTS speaker_turns_span
-                 ON speaker_turns(transcript_id, run_id, start_ms, end_ms);",
+                 ON speaker_turns(transcript_id, run_id, start_ms, end_ms);
+             -- M22A (schema v8): the durable job journal. `path` and `model` are
+             -- the exact strings the job ran with (a resume validates both are
+             -- still there); `transcript_id` is the row the committed prefix
+             -- lives in (NULL until the first checkpoint); `resumed` marks a row
+             -- that continued an interrupted job. The journal is deliberately
+             -- separate from `transcripts`: a job may exist before its first
+             -- checkpoint, and a cancelled job keeps both.
+             CREATE TABLE IF NOT EXISTS jobs (
+                 id                     TEXT PRIMARY KEY,
+                 path                   TEXT NOT NULL,
+                 model                  TEXT NOT NULL,
+                 status                 TEXT NOT NULL,
+                 created_at             TEXT NOT NULL,
+                 updated_at             TEXT NOT NULL,
+                 transcript_id          TEXT,
+                 last_committed_segment INTEGER NOT NULL DEFAULT 0,
+                 last_committed_ms      INTEGER NOT NULL DEFAULT 0,
+                 resumed                INTEGER NOT NULL DEFAULT 0,
+                 failure                TEXT
+             );
+             CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
+             CREATE INDEX IF NOT EXISTS jobs_path ON jobs(path);",
         )?;
         self.migrate()?;
+        self.recover_job_checkpoints()?;
         self.ensure_search_index()
     }
 
@@ -427,6 +554,9 @@ impl Store {
         }
         if version < 7 {
             self.upgrade_to_v7()?;
+        }
+        if version < 8 {
+            self.upgrade_to_v8()?;
         }
         Ok(())
     }
@@ -653,6 +783,515 @@ impl Store {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![SCHEMA_VERSION.to_string()],
         )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ---- M22A: the durable job journal -------------------------------------
+
+    /// v7 → v8, one transaction, additive only: the `jobs` table (M22A). A
+    /// fresh database already has it from the DDL above, and a re-run is a
+    /// no-op; an older library simply starts with no rows.
+    fn upgrade_to_v8(&self) -> Result<(), SuramakError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS jobs (
+                 id                     TEXT PRIMARY KEY,
+                 path                   TEXT NOT NULL,
+                 model                  TEXT NOT NULL,
+                 status                 TEXT NOT NULL,
+                 created_at             TEXT NOT NULL,
+                 updated_at             TEXT NOT NULL,
+                 transcript_id          TEXT,
+                 last_committed_segment INTEGER NOT NULL DEFAULT 0,
+                 last_committed_ms      INTEGER NOT NULL DEFAULT 0,
+                 resumed                INTEGER NOT NULL DEFAULT 0,
+                 failure                TEXT
+             );
+             CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
+             CREATE INDEX IF NOT EXISTS jobs_path ON jobs(path);",
+        )?;
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Inserts (or replaces) one journal row. `created_at` is preserved on an
+    /// existing row: the job's birthday does not move when it is updated.
+    pub fn insert_job(&self, job: &JobRecord) -> Result<(), SuramakError> {
+        self.conn.execute(
+            "INSERT INTO jobs(id, path, model, status, created_at, updated_at,
+                              transcript_id, last_committed_segment, last_committed_ms,
+                              resumed, failure)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(id) DO UPDATE SET
+                 path                   = excluded.path,
+                 model                  = excluded.model,
+                 status                 = excluded.status,
+                 updated_at             = excluded.updated_at,
+                 transcript_id          = excluded.transcript_id,
+                 last_committed_segment = excluded.last_committed_segment,
+                 last_committed_ms      = excluded.last_committed_ms,
+                 resumed                = excluded.resumed,
+                 failure                = excluded.failure",
+            params![
+                job.id.to_string(),
+                job.path,
+                job.model,
+                job.status.as_str(),
+                job.created_at.to_rfc3339(),
+                job.updated_at.to_rfc3339(),
+                job.transcript_id.map(|id| id.to_string()),
+                job.last_committed_segment,
+                job.last_committed_ms,
+                i64::from(job.resumed),
+                job.failure,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRecord> {
+        let id: String = row.get(0)?;
+        let status: String = row.get(3)?;
+        let created_at: String = row.get(4)?;
+        let updated_at: String = row.get(5)?;
+        let transcript_id: Option<String> = row.get(6)?;
+        let failure: Option<String> = row.get(10)?;
+        Ok(JobRecord {
+            id: Uuid::parse_str(&id)
+                .map_err(|_| rusqlite::Error::InvalidColumnName("jobs.id".into()))?,
+            path: row.get(1)?,
+            model: row.get(2)?,
+            status: JobStatus::parse(&status)
+                .ok_or_else(|| rusqlite::Error::InvalidColumnName("jobs.status".into()))?,
+            created_at: created_at
+                .parse()
+                .map_err(|_| rusqlite::Error::InvalidColumnName("jobs.created_at".into()))?,
+            updated_at: updated_at
+                .parse()
+                .map_err(|_| rusqlite::Error::InvalidColumnName("jobs.updated_at".into()))?,
+            transcript_id: transcript_id
+                .map(|id| {
+                    Uuid::parse_str(&id).map_err(|_| {
+                        rusqlite::Error::InvalidColumnName("jobs.transcript_id".into())
+                    })
+                })
+                .transpose()?,
+            last_committed_segment: row.get(7)?,
+            last_committed_ms: row.get(8)?,
+            resumed: row.get::<_, i64>(9)? != 0,
+            failure,
+        })
+    }
+
+    const JOB_COLUMNS: &'static str = "id, path, model, status, created_at, updated_at,
+         transcript_id, last_committed_segment, last_committed_ms, resumed, failure";
+
+    /// One journal row.
+    pub fn job(&self, id: Uuid) -> Result<Option<JobRecord>, SuramakError> {
+        let sql = format!("SELECT {} FROM jobs WHERE id = ?1", Self::JOB_COLUMNS);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params![id.to_string()])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::job_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Every journal row, oldest first.
+    pub fn jobs(&self) -> Result<Vec<JobRecord>, SuramakError> {
+        let sql = format!(
+            "SELECT {} FROM jobs ORDER BY created_at, id",
+            Self::JOB_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], Self::job_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(SuramakError::Sqlite)
+    }
+
+    /// Jobs a launch may continue: interrupted mid-decode or mid-transcription,
+    /// oldest first (the order they were accepted in).
+    pub fn resumable_jobs(&self) -> Result<Vec<JobRecord>, SuramakError> {
+        let sql = format!(
+            "SELECT {} FROM jobs WHERE status IN ('decoding', 'transcribing')
+             ORDER BY created_at, id",
+            Self::JOB_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], Self::job_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(SuramakError::Sqlite)
+    }
+
+    /// The newest **unfinished** job for this exact source path and model
+    /// (`queued`, `decoding` or `transcribing`).
+    ///
+    /// `queued` is included so a relaunch binds a still-waiting item to the row
+    /// the dead process created instead of leaving it behind and creating a
+    /// twin; the resume path itself only continues `decoding`/`transcribing`
+    /// (a queued row has committed nothing, so it simply runs from zero).
+    pub fn pending_job_for(
+        &self,
+        path: &str,
+        model: &str,
+    ) -> Result<Option<JobRecord>, SuramakError> {
+        let sql = format!(
+            "SELECT {} FROM jobs
+             WHERE path = ?1 AND model = ?2
+               AND status IN ('queued', 'decoding', 'transcribing')
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+            Self::JOB_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params![path, model])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::job_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The newest resumable job for this exact source path and model, if any.
+    /// A different model is a different job: the committed text was produced by
+    /// the model the row names, and a resume must not splice two models.
+    pub fn resumable_job_for(
+        &self,
+        path: &str,
+        model: &str,
+    ) -> Result<Option<JobRecord>, SuramakError> {
+        let sql = format!(
+            "SELECT {} FROM jobs
+             WHERE path = ?1 AND model = ?2 AND status IN ('decoding', 'transcribing')
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+            Self::JOB_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params![path, model])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::job_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Sets a job's status (and its named failure, which `None` clears).
+    pub fn set_job_status(
+        &self,
+        id: Uuid,
+        status: JobStatus,
+        failure: Option<&str>,
+    ) -> Result<(), SuramakError> {
+        self.conn.execute(
+            "UPDATE jobs SET status = ?1, failure = ?2, updated_at = ?3 WHERE id = ?4",
+            params![
+                status.as_str(),
+                failure,
+                Utc::now().to_rfc3339(),
+                id.to_string()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Records the resume marker on a row (the store half of "resumed"; the log
+    /// line is the caller's).
+    pub fn mark_job_resumed(&self, id: Uuid) -> Result<(), SuramakError> {
+        self.conn.execute(
+            "UPDATE jobs SET resumed = 1, updated_at = ?1 WHERE id = ?2",
+            params![Utc::now().to_rfc3339(), id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Fails a job whose inputs are gone with the named
+    /// `resume_unavailable: …` reason. Never a silent drop: the row stays.
+    pub fn fail_job_unavailable(&self, id: Uuid, reason: &str) -> Result<(), SuramakError> {
+        self.set_job_status(
+            id,
+            JobStatus::Failed,
+            Some(&format!("{RESUME_UNAVAILABLE_PREFIX} {reason}")),
+        )
+    }
+
+    /// A transcript header written inside the caller's transaction. An existing
+    /// row keeps its `created_at`; its metadata follows the current job (the
+    /// title/model never change under a resume, but a first checkpoint is also
+    /// how a cancelled job's row stays readable).
+    fn write_transcript_header(&self, transcript: &Transcript) -> Result<(), SuramakError> {
+        let source_json = serde_json::to_string(&transcript.source)?;
+        self.conn.execute(
+            "INSERT INTO transcripts(id, title, created_at, updated_at, source_json,
+                                     model, language, audio_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+                 title       = excluded.title,
+                 updated_at  = excluded.updated_at,
+                 source_json = excluded.source_json,
+                 model       = excluded.model,
+                 language    = excluded.language,
+                 audio_path  = excluded.audio_path",
+            params![
+                transcript.id.to_string(),
+                transcript.title,
+                transcript.created_at.to_rfc3339(),
+                Utc::now().to_rfc3339(),
+                source_json,
+                transcript.model,
+                transcript.language,
+                transcript
+                    .audio_path
+                    .as_ref()
+                    .and_then(|path| path.to_str())
+                    .map(str::to_string),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The journal half of a checkpoint, inside the caller's transaction.
+    fn write_job_checkpoint(
+        conn: &Connection,
+        job_id: Uuid,
+        transcript_id: Uuid,
+        segments: u32,
+        last_ms: i64,
+    ) -> Result<(), SuramakError> {
+        let changed = conn.execute(
+            "UPDATE jobs SET status = 'transcribing', transcript_id = ?1,
+                 last_committed_segment = ?2, last_committed_ms = ?3, updated_at = ?4
+             WHERE id = ?5",
+            params![
+                transcript_id.to_string(),
+                segments,
+                last_ms,
+                Utc::now().to_rfc3339(),
+                job_id.to_string()
+            ],
+        )?;
+        if changed == 0 {
+            return Err(SuramakError::Schema(format!(
+                "job {job_id} is not in the journal"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Commits the segment prefix and the journal in **one transaction** — the
+    /// heartbeat of M22A.
+    ///
+    /// Statement order is deliberate: the segments land first, the journal
+    /// count second, and both become durable at `COMMIT`. A crash can therefore
+    /// never acknowledge a checkpoint whose text is not in the same committed
+    /// state. The recovery pass ([`Store::recover_job_checkpoints`]) additionally
+    /// reconciles the two if a torn write ever reaches the file (the simulated
+    /// crash test), so a transcript can never *read* as longer than its journal.
+    ///
+    /// `count` must never move backwards; a stale checkpoint is refused rather
+    /// than allowed to delete committed text.
+    pub fn commit_job_checkpoint(
+        &self,
+        job_id: Uuid,
+        transcript: &Transcript,
+    ) -> Result<(), SuramakError> {
+        let count = transcript.segments.len() as u32;
+        let last_ms = transcript
+            .segments
+            .last()
+            .map(|seg| seg.end_ms)
+            .unwrap_or(0);
+        let tx = self.conn.unchecked_transaction()?;
+        let stored: Option<i64> = tx
+            .query_row(
+                "SELECT last_committed_segment FROM jobs WHERE id = ?1",
+                params![job_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(stored) = stored else {
+            return Err(SuramakError::Schema(format!(
+                "job {job_id} is not in the journal"
+            )));
+        };
+        if i64::from(count) < stored {
+            return Err(SuramakError::Schema(format!(
+                "checkpoint for job {job_id} would move backwards ({count} < {stored})"
+            )));
+        }
+        self.write_transcript_header(transcript)?;
+        self.write_segments(transcript.id, &transcript.segments)?;
+        Self::write_job_checkpoint(&tx, job_id, transcript.id, count, last_ms)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The **segments-only** half of a checkpoint, committed by itself.
+    ///
+    /// Only the crash-simulation test calls this: it recreates the torn write
+    /// the recovery pass is designed to repair. Production checkpoints use
+    /// [`Store::commit_job_checkpoint`], where the two halves share a
+    /// transaction.
+    #[cfg(test)]
+    fn commit_checkpoint_segments_only(&self, transcript: &Transcript) -> Result<(), SuramakError> {
+        let tx = self.conn.unchecked_transaction()?;
+        self.write_transcript_header(transcript)?;
+        self.write_segments(transcript.id, &transcript.segments)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The **journal-only** half of a checkpoint, committed by itself (the
+    /// reverse torn write; test-only, see above).
+    #[cfg(test)]
+    fn commit_checkpoint_journal_only(
+        &self,
+        job_id: Uuid,
+        transcript_id: Uuid,
+        count: u32,
+        last_ms: i64,
+    ) -> Result<(), SuramakError> {
+        let tx = self.conn.unchecked_transaction()?;
+        Self::write_job_checkpoint(&tx, job_id, transcript_id, count, last_ms)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Finishes a job: the complete segment set, its word timing, and the
+    /// `done` journal row — one transaction. The full set also repairs any
+    /// prefix a torn checkpoint left behind (rows past the end are deleted).
+    pub fn finish_job(
+        &self,
+        job_id: Uuid,
+        transcript: &Transcript,
+        words: &[WordTiming],
+    ) -> Result<(), SuramakError> {
+        let count = transcript.segments.len() as u32;
+        let last_ms = transcript
+            .segments
+            .last()
+            .map(|seg| seg.end_ms)
+            .unwrap_or(0);
+        let tx = self.conn.unchecked_transaction()?;
+        self.write_transcript_header(transcript)?;
+        self.write_segments(transcript.id, &transcript.segments)?;
+        tx.execute(
+            "DELETE FROM word_timings WHERE transcript_id = ?1",
+            params![transcript.id.to_string()],
+        )?;
+        Self::write_word_rows(&tx, transcript.id, words)?;
+        tx.execute(
+            "UPDATE jobs SET status = 'done', transcript_id = ?1,
+                 last_committed_segment = ?2, last_committed_ms = ?3,
+                 updated_at = ?4, failure = NULL
+             WHERE id = ?5",
+            params![
+                transcript.id.to_string(),
+                count,
+                last_ms,
+                Utc::now().to_rfc3339(),
+                job_id.to_string()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The committed segment prefix of a transcript, in `idx` order.
+    pub fn committed_segments(
+        &self,
+        transcript_id: Uuid,
+        count: u32,
+    ) -> Result<Vec<Segment>, SuramakError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT idx, start_ms, end_ms, text FROM segments
+             WHERE transcript_id = ?1 AND idx < ?2 ORDER BY idx",
+        )?;
+        let rows = stmt.query_map(params![transcript_id.to_string(), count], |row| {
+            Ok(Segment {
+                idx: row.get(0)?,
+                start_ms: row.get(1)?,
+                end_ms: row.get(2)?,
+                text: row.get(3)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(SuramakError::Sqlite)
+    }
+
+    /// Reconciles every resumable job's transcript with its journal at open.
+    ///
+    /// The checkpoint contract says the two are committed together, and they
+    /// are. This pass is the second line of defence for the case the contract
+    /// cannot cover — a torn write from a process that died between two
+    /// statements (the simulated crash) or a hand-edited file:
+    ///
+    /// * **transcript longer than the journal** (the dangerous direction): the
+    ///   unacknowledged tail is deleted, so the transcript can never claim more
+    ///   text than the journal admits and a resume can never duplicate it;
+    /// * **journal longer than the transcript**: the journal count is rewound
+    ///   to the contiguous prefix that actually exists, so a resume re-feeds
+    ///   that audio instead of skipping it (no missing text).
+    ///
+    /// A job with no transcript row is left alone — there is nothing committed.
+    fn recover_job_checkpoints(&self) -> Result<(), SuramakError> {
+        if self.resumable_jobs()?.is_empty() {
+            return Ok(());
+        }
+        // One IMMEDIATE transaction: the journal row and the segment rows are
+        // compared in a single snapshot. Without this, another process writing a
+        // checkpoint between the two reads could look like a torn write (and be
+        // "repaired" into discarding a batch it had just committed).
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        for job in self.resumable_jobs()? {
+            let Some(transcript_id) = job.transcript_id else {
+                continue;
+            };
+            let rows = self.load_segments(transcript_id)?;
+            // The longest prefix that is really there (idx 0..n-1, no gaps).
+            let mut prefix = 0usize;
+            for (expected, segment) in rows.iter().enumerate() {
+                if segment.idx as usize != expected {
+                    break;
+                }
+                prefix = expected + 1;
+            }
+            let journal = job.last_committed_segment as usize;
+            if prefix == journal {
+                continue;
+            }
+            if prefix > journal {
+                let kept: Vec<Segment> = rows.into_iter().take(journal).collect();
+                self.write_segments(transcript_id, &kept)?;
+                tracing::warn!(
+                    job = %job.id,
+                    kept = journal,
+                    discarded = prefix - journal,
+                    "checkpoint recovery: discarded segments past the journal"
+                );
+            } else {
+                let last_ms = rows.last().map(|segment| segment.end_ms).unwrap_or(0);
+                tx.execute(
+                    "UPDATE jobs SET last_committed_segment = ?1, last_committed_ms = ?2,
+                         updated_at = ?3
+                     WHERE id = ?4",
+                    params![
+                        prefix as u32,
+                        last_ms,
+                        Utc::now().to_rfc3339(),
+                        job.id.to_string()
+                    ],
+                )?;
+                tracing::warn!(
+                    job = %job.id,
+                    rewound_to = prefix,
+                    journal_said = journal,
+                    "checkpoint recovery: rewound the journal to the committed text"
+                );
+            }
+        }
         tx.commit()?;
         Ok(())
     }
@@ -4869,7 +5508,7 @@ mod tests {
     /// The M15-A discipline, for v6→v7: every populated fixture upgrades in
     /// place and every existing row reads back exactly as it did.
     #[test]
-    fn every_populated_fixture_upgrades_to_v7_losing_nothing() {
+    fn every_populated_fixture_upgrades_to_the_current_schema_losing_nothing() {
         fn dump(conn: &Connection, table: &str) -> Vec<String> {
             let sql = format!("SELECT * FROM {table} ORDER BY 1, 2");
             let mut stmt = conn.prepare(&sql).unwrap();
@@ -4934,7 +5573,11 @@ mod tests {
             };
 
             let store = Store::open(&path).expect("upgrade");
-            assert_eq!(store.schema_version().unwrap(), 7, "v{version} reaches v7");
+            assert_eq!(
+                store.schema_version().unwrap(),
+                SCHEMA_VERSION,
+                "v{version} reaches the current schema"
+            );
             assert_eq!(dump_table(&store, "transcripts").len(), 1);
             assert_eq!(dump_table(&store, "segments").len(), 3);
             assert_eq!(
@@ -4973,7 +5616,7 @@ mod tests {
             drop(store);
             // A second open is a no-op at the same version.
             let again = Store::open(&path).expect("reopen");
-            assert_eq!(again.schema_version().unwrap(), 7);
+            assert_eq!(again.schema_version().unwrap(), SCHEMA_VERSION);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5021,7 +5664,7 @@ mod tests {
                 let Some(version) = version.and_then(|raw| raw.parse::<i64>().ok()) else {
                     continue;
                 };
-                if transcripts == 0 || version >= 7 {
+                if transcripts == 0 || version >= SCHEMA_VERSION {
                     continue;
                 }
                 let copy = std::env::temp_dir().join(format!(
@@ -5052,7 +5695,12 @@ mod tests {
                     rows.collect::<Result<Vec<_>, _>>().unwrap()
                 };
                 let store = Store::open(&copy).expect("upgrade fixture");
-                assert_eq!(store.schema_version().unwrap(), 7, "{}", path.display());
+                assert_eq!(
+                    store.schema_version().unwrap(),
+                    SCHEMA_VERSION,
+                    "{}",
+                    path.display()
+                );
                 let after = {
                     let mut stmt = store
                         .conn
@@ -5163,6 +5811,334 @@ mod tests {
             Err(err) => err,
         };
         assert!(matches!(err, SuramakError::Schema(_)), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- M22A: the durable job journal ------------------------------------
+
+    fn journal_job(path: &str) -> JobRecord {
+        let now = Utc::now();
+        JobRecord {
+            id: Uuid::new_v4(),
+            path: path.to_string(),
+            model: "/models/ggml-tiny.bin".to_string(),
+            status: JobStatus::Queued,
+            created_at: now,
+            updated_at: now,
+            transcript_id: None,
+            last_committed_segment: 0,
+            last_committed_ms: 0,
+            resumed: false,
+            failure: None,
+        }
+    }
+
+    fn journal_transcript(count: u32) -> Transcript {
+        Transcript::new(
+            "lecture.wav".to_string(),
+            crate::transcript::Source::File {
+                name: "lecture.wav".to_string(),
+            },
+            "tiny".to_string(),
+            Some("en".to_string()),
+            Some(std::path::PathBuf::from("/audio/lecture.wav")),
+            (0..count)
+                .map(|idx| Segment {
+                    idx,
+                    start_ms: i64::from(idx) * 1_000,
+                    end_ms: (i64::from(idx) + 1) * 1_000,
+                    text: format!("segment {idx}"),
+                })
+                .collect(),
+        )
+    }
+
+    /// The same transcript row with a longer committed prefix — what a torn
+    /// segment write would leave behind.
+    fn journal_transcript_with(id: Uuid, count: u32) -> Transcript {
+        let mut transcript = journal_transcript(count);
+        transcript.id = id;
+        transcript
+    }
+
+    fn scratch_store(tag: &str) -> (std::path::PathBuf, Store) {
+        let dir =
+            std::env::temp_dir().join(format!("suramak-journal-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("library.db");
+        let store = Store::open(&path).unwrap();
+        (dir, store)
+    }
+
+    /// The journal row survives the round-trip and the status gates the resume
+    /// list: only decoding/transcribing are resumable, terminal rows are not.
+    #[test]
+    fn the_job_journal_round_trips_and_only_live_rows_are_resumable() {
+        let store = Store::open_in_memory().unwrap();
+        let job = journal_job("/audio/lecture.wav");
+        store.insert_job(&job).unwrap();
+
+        let read = store.job(job.id).unwrap().unwrap();
+        assert_eq!(read.status, JobStatus::Queued);
+        assert_eq!(read.path, "/audio/lecture.wav");
+        assert_eq!(read.model, "/models/ggml-tiny.bin");
+        assert!(!read.is_resumable());
+        assert_eq!(read.last_committed_segment, 0);
+        // A queued row is bindable by a relaunch (it has committed nothing, so
+        // it starts from zero under the same identity).
+        let pending = store
+            .pending_job_for("/audio/lecture.wav", "/models/ggml-tiny.bin")
+            .unwrap()
+            .expect("the queued row is pending");
+        assert_eq!(pending.id, job.id);
+
+        store
+            .set_job_status(job.id, JobStatus::Decoding, None)
+            .unwrap();
+        assert!(store
+            .resumable_jobs()
+            .unwrap()
+            .iter()
+            .any(|row| row.id == job.id));
+        store.mark_job_resumed(job.id).unwrap();
+        assert!(store.job(job.id).unwrap().unwrap().resumed);
+
+        store.set_job_status(job.id, JobStatus::Done, None).unwrap();
+        assert!(store.resumable_jobs().unwrap().is_empty());
+        assert_eq!(store.jobs().unwrap().len(), 1);
+        // A different model is a different job.
+        assert!(store
+            .resumable_job_for("/audio/lecture.wav", "/models/ggml-base.bin")
+            .unwrap()
+            .is_none());
+    }
+
+    /// A checkpoint writes the prefix and the journal count together; the row
+    /// flips to `transcribing` and names its transcript.
+    #[test]
+    fn a_checkpoint_commits_the_segment_prefix_and_the_journal_count() {
+        let store = Store::open_in_memory().unwrap();
+        let job = journal_job("/audio/lecture.wav");
+        store.insert_job(&job).unwrap();
+        let transcript = journal_transcript(5);
+
+        store.commit_job_checkpoint(job.id, &transcript).unwrap();
+
+        let row = store.job(job.id).unwrap().unwrap();
+        assert_eq!(row.status, JobStatus::Transcribing);
+        assert_eq!(row.transcript_id, Some(transcript.id));
+        assert_eq!(row.last_committed_segment, 5);
+        assert_eq!(row.last_committed_ms, 5_000);
+        let stored = store.get_transcript(transcript.id).unwrap();
+        assert_eq!(stored.segments.len(), 5);
+        assert_eq!(stored.segments[4].text, "segment 4");
+    }
+
+    /// A stale checkpoint may not delete text that is already committed: the
+    /// journal count is monotonic.
+    #[test]
+    fn a_checkpoint_never_moves_the_journal_backwards() {
+        let store = Store::open_in_memory().unwrap();
+        let job = journal_job("/audio/lecture.wav");
+        store.insert_job(&job).unwrap();
+        store
+            .commit_job_checkpoint(job.id, &journal_transcript(9))
+            .unwrap();
+
+        let err = store
+            .commit_job_checkpoint(job.id, &journal_transcript(5))
+            .expect_err("a stale checkpoint must be refused");
+        assert!(matches!(err, SuramakError::Schema(_)), "{err}");
+        assert_eq!(
+            store.job(job.id).unwrap().unwrap().last_committed_segment,
+            9
+        );
+        assert_eq!(
+            store
+                .get_transcript(store.job(job.id).unwrap().unwrap().transcript_id.unwrap())
+                .unwrap()
+                .segments
+                .len(),
+            9
+        );
+    }
+
+    /// The crash-between-writes case, dangerous direction: the segment write
+    /// reached the file but the journal update did not. On the next open the
+    /// transcript must never claim more than the journal — the unacknowledged
+    /// tail is discarded, so a resume cannot duplicate it.
+    #[test]
+    fn a_transcript_written_past_the_journal_is_discarded_on_open() {
+        let (dir, store) = scratch_store("torn-transcript");
+        let job = journal_job("/audio/lecture.wav");
+        store.insert_job(&job).unwrap();
+        let five = journal_transcript(5);
+        store.commit_job_checkpoint(job.id, &five).unwrap();
+
+        // The torn write: nine segments on disk, journal still at five.
+        store
+            .commit_checkpoint_segments_only(&journal_transcript_with(five.id, 9))
+            .unwrap();
+        assert_eq!(store.get_transcript(five.id).unwrap().segments.len(), 9);
+        drop(store);
+
+        let store = Store::open(&dir.join("library.db")).unwrap();
+        let row = store.job(job.id).unwrap().unwrap();
+        assert_eq!(row.last_committed_segment, 5);
+        assert_eq!(
+            store.get_transcript(five.id).unwrap().segments.len(),
+            5,
+            "the transcript must never claim more than the journal after recovery"
+        );
+        assert_eq!(
+            store
+                .get_transcript(five.id)
+                .unwrap()
+                .segments
+                .last()
+                .unwrap()
+                .idx,
+            4
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other torn direction: the journal landed but the segments did not.
+    /// Recovery rewinds the count to the text that exists, so the resume
+    /// re-feeds that audio instead of skipping it (no missing text).
+    #[test]
+    fn a_journal_ahead_of_the_transcript_is_rewound_on_open() {
+        let (dir, store) = scratch_store("torn-journal");
+        let job = journal_job("/audio/lecture.wav");
+        store.insert_job(&job).unwrap();
+        let five = journal_transcript(5);
+        store.commit_job_checkpoint(job.id, &five).unwrap();
+        store
+            .commit_checkpoint_journal_only(job.id, five.id, 9, 9_000)
+            .unwrap();
+        assert_eq!(
+            store.job(job.id).unwrap().unwrap().last_committed_segment,
+            9
+        );
+        drop(store);
+
+        let store = Store::open(&dir.join("library.db")).unwrap();
+        let row = store.job(job.id).unwrap().unwrap();
+        assert_eq!(row.last_committed_segment, 5);
+        assert_eq!(row.last_committed_ms, 5_000);
+        assert_eq!(store.get_transcript(five.id).unwrap().segments.len(), 5);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cancelled job keeps its real partial segments and is not resumed.
+    #[test]
+    fn cancelling_keeps_the_partial_segments_and_closes_the_job() {
+        let (dir, store) = scratch_store("cancel");
+        let job = journal_job("/audio/lecture.wav");
+        store.insert_job(&job).unwrap();
+        let three = journal_transcript(3);
+        store.commit_job_checkpoint(job.id, &three).unwrap();
+        store
+            .set_job_status(job.id, JobStatus::Cancelled, None)
+            .unwrap();
+        drop(store);
+
+        let store = Store::open(&dir.join("library.db")).unwrap();
+        let row = store.job(job.id).unwrap().unwrap();
+        assert_eq!(row.status, JobStatus::Cancelled);
+        assert_eq!(row.last_committed_segment, 3);
+        assert_eq!(store.get_transcript(three.id).unwrap().segments.len(), 3);
+        assert!(store.resumable_jobs().unwrap().is_empty());
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `fail_job_unavailable` names the refusal; the row is never dropped.
+    #[test]
+    fn an_unavailable_resume_is_a_named_failure_not_a_dropped_row() {
+        let store = Store::open_in_memory().unwrap();
+        let job = journal_job("/audio/gone.wav");
+        store.insert_job(&job).unwrap();
+        store
+            .fail_job_unavailable(job.id, "the source file is gone: /audio/gone.wav")
+            .unwrap();
+
+        let row = store.job(job.id).unwrap().unwrap();
+        assert_eq!(row.status, JobStatus::Failed);
+        assert_eq!(
+            row.failure.as_deref(),
+            Some("resume_unavailable: the source file is gone: /audio/gone.wav")
+        );
+        assert_eq!(
+            row.resume_unavailable_reason(),
+            Some("the source file is gone: /audio/gone.wav")
+        );
+        assert!(store.resumable_jobs().unwrap().is_empty());
+    }
+
+    /// Finishing writes the complete set, its word timing and `done` in one
+    /// transaction.
+    #[test]
+    fn finishing_a_job_writes_the_full_transcript_words_and_done() {
+        let store = Store::open_in_memory().unwrap();
+        let job = journal_job("/audio/lecture.wav");
+        store.insert_job(&job).unwrap();
+        store
+            .commit_job_checkpoint(job.id, &journal_transcript(2))
+            .unwrap();
+        let full = journal_transcript(4);
+        let words = vec![
+            WordTiming {
+                segment_idx: 3,
+                word_idx: 0,
+                start_ms: 3_000,
+                end_ms: 3_200,
+                text: "segment".to_string(),
+            },
+            WordTiming {
+                segment_idx: 3,
+                word_idx: 1,
+                start_ms: 3_200,
+                end_ms: 3_400,
+                text: "3".to_string(),
+            },
+        ];
+        store.finish_job(job.id, &full, &words).unwrap();
+
+        let row = store.job(job.id).unwrap().unwrap();
+        assert_eq!(row.status, JobStatus::Done);
+        assert_eq!(row.last_committed_segment, 4);
+        assert_eq!(row.failure, None);
+        assert_eq!(store.get_transcript(full.id).unwrap().segments.len(), 4);
+        let alignment = store.word_alignment(full.id).unwrap();
+        assert_eq!(alignment.current_segments(), 1);
+    }
+
+    /// A v7 library gains the journal table and keeps every transcript row.
+    #[test]
+    fn a_v7_library_upgrades_to_the_job_journal() {
+        let dir = std::env::temp_dir().join(format!("suramak-v8-upgrade-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v7.db");
+        write_fixture(&path, 7);
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 8);
+        assert_eq!(store.list_transcripts().unwrap().len(), 1);
+        assert_eq!(
+            store
+                .get_transcript(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap())
+                .unwrap()
+                .segments
+                .len(),
+            3
+        );
+        assert!(store.jobs().unwrap().is_empty());
+        drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

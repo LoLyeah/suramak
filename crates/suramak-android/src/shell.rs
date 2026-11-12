@@ -52,6 +52,8 @@ const ACTION_DOWNLOAD: &str = "app.suramak.action.COMPACT_DOWNLOAD";
 const ACTION_QUIT: &str = "app.suramak.action.COMPACT_QUIT";
 const ACTION_FINISH: &str = "app.suramak.action.COMPACT_FINISH";
 const ACTION_SHARE_CRASH: &str = "app.suramak.action.COMPACT_SHARE_CRASH";
+const ACTION_VOICE_NOTE_ACCEPT: &str = "app.suramak.action.VOICE_NOTE_ACCEPT";
+const ACTION_VOICE_NOTE_CANCEL: &str = "app.suramak.action.VOICE_NOTE_CANCEL";
 
 /// One intent extra (only the shapes the compact verbs need).
 enum Extra<'a> {
@@ -94,6 +96,9 @@ pub struct CompactShell {
     last_model_header: Option<String>,
     last_model_can_record: Option<bool>,
     last_model_rows: std::collections::BTreeMap<String, String>,
+    /// M22B: whether the voice-note sheet's "shown" line was logged for the
+    /// current offer (the emulator smoke's witness that the sheet painted).
+    logged_voice_note_sheet: bool,
 }
 
 impl Default for CompactShell {
@@ -122,6 +127,7 @@ impl CompactShell {
             last_model_header: None,
             last_model_can_record: None,
             last_model_rows: std::collections::BTreeMap::new(),
+            logged_voice_note_sheet: false,
         }
     }
 
@@ -232,6 +238,7 @@ impl CompactShell {
         let mut actions = Vec::new();
         let mut layout_probe = None;
         let mut model_probe = None;
+        let mut voice_note_cancelled = false;
         let drew = host.with_app(|app| {
             app.insets.top = (state.insets.top as f32 / ppp).max(0.0);
             app.insets.bottom = (state.insets.bottom as f32 / ppp).max(0.0);
@@ -259,6 +266,19 @@ impl CompactShell {
                 app.status = Some((status, true));
             }
             actions = compact::ui(ctx, app);
+            // M22B: BACK on the voice-note offer drops the pending share. The
+            // gesture has no action vector, so the flag is the message.
+            voice_note_cancelled = app.take_voice_note_cancel();
+            // One line per offer: the emulator smoke's proof that the sheet
+            // really painted (egui text is invisible to uiautomator).
+            if app.sheet == Some(suramak_ui::deck::compact::Sheet::VoiceNote) {
+                if !self.logged_voice_note_sheet {
+                    self.logged_voice_note_sheet = true;
+                    log::info!("voice note sheet: shown");
+                }
+            } else {
+                self.logged_voice_note_sheet = false;
+            }
             // M19A: one logcat line per navigation change is the smoke's proof
             // that a tap landed (`compact route: Settings`), and the Settings
             // probe below is its bottom-clearance evidence.
@@ -300,6 +320,9 @@ impl CompactShell {
         if drew.is_none() {
             draw_starting(ctx);
             return Vec::new();
+        }
+        if voice_note_cancelled {
+            send_intent(ACTION_VOICE_NOTE_CANCEL, &[]);
         }
         self.log_layout_probe(ctx, layout_probe);
         self.log_model_probe(model_probe);
@@ -499,6 +522,17 @@ impl CompactShell {
                 Err(err) => log::warn!("crash clear failed: {err}"),
             },
             CompactAction::ShareCrashLog => send_intent(ACTION_SHARE_CRASH, &[]),
+            CompactAction::VoiceNoteAccept { language } => {
+                log::info!("voice note: accepted ({language})");
+                send_intent(
+                    ACTION_VOICE_NOTE_ACCEPT,
+                    &[("language", Extra::Str(&language))],
+                );
+            }
+            CompactAction::VoiceNoteDismiss => {
+                log::info!("voice note: dismissed from the sheet");
+                send_intent(ACTION_VOICE_NOTE_CANCEL, &[]);
+            }
             CompactAction::Quit => send_intent(ACTION_QUIT, &[]),
             CompactAction::Finish => send_intent(ACTION_FINISH, &[]),
             CompactAction::Playback { playing } => {

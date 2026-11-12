@@ -731,6 +731,12 @@ pub enum CompactAction {
     ClearCrash,
     /// Diagnostics: hand the crash log to another app (the v2.1 share route).
     ShareCrashLog,
+    /// M22B: start the shared voice note with this language (`auto` allowed).
+    VoiceNoteAccept {
+        language: String,
+    },
+    /// M22B: the offer was dismissed without starting anything.
+    VoiceNoteDismiss,
     /// Quit: the host runs capture → jobs → services → exit.
     Quit,
     /// Back at the root: the host finishes the Activity.
@@ -744,6 +750,28 @@ pub enum Sheet {
     Quit,
     /// M13g3: the one-time intro (three paths, skippable).
     Onboarding,
+    /// M22B: the 1.2 s voice-note offer a share opens.
+    VoiceNote,
+}
+
+/// M22B: the state the voice-note micro-sheet draws. The host builds it from
+/// the share intent; the UI owns only the clock and the press.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VoiceNoteView {
+    /// The shared file's display name (or "Voice note" when it had none).
+    pub title: String,
+    /// The sender from the intent's own title extra — never derived.
+    pub sender: Option<String>,
+    /// The preselected pill; `None` means Auto (and no auto-start).
+    pub pill: Option<super::voice_note::Pill>,
+    /// Whether a verified model is installed (`Transcribe` is enabled).
+    pub model_ok: bool,
+    /// Whether the sheet may start the job and dismiss itself.
+    pub auto_start: bool,
+    /// The honest line under the pill when it cannot start by itself.
+    pub reason: String,
+    /// The egui clock reading when the sheet first drew (the 1.2 s origin).
+    pub opened_at: f64,
 }
 
 /// M16I: what the compact editor needs from one diarization run — the shared
@@ -1111,6 +1139,12 @@ pub struct CompactApp {
     pub export_session: Option<ExportSession>,
     /// The sheet's "include the translation" switch.
     pub export_bilingual: bool,
+    /// M22B: the voice-note offer being drawn (or about to be).
+    pub voice_note: Option<VoiceNoteView>,
+    /// M22B: an offer that arrived before the next frame could timestamp it.
+    voice_note_armed: Option<VoiceNoteView>,
+    /// M22B: the offer was dismissed by BACK; the shell tells the Activity.
+    voice_note_cancel_pending: bool,
     /// The sheet's present/dismiss animation.
     pub sheet_anim: SheetAnim,
     /// The library's insert/delete animation.
@@ -1199,6 +1233,9 @@ impl CompactApp {
             onboarding_seen_pending: false,
             export_session: None,
             export_bilingual: false,
+            voice_note: None,
+            voice_note_armed: None,
+            voice_note_cancel_pending: false,
             sheet_anim: SheetAnim::closed(),
             list_anim: ListAnim::new(),
             job: None,
@@ -1421,6 +1458,86 @@ impl CompactApp {
         true
     }
 
+    // ---- M22B: the voice-note offer ---------------------------------------
+
+    /// Arms the offer. The first frame after this call stamps `opened_at`, so
+    /// the 1.2 s window is measured on the same clock that animates it.
+    pub fn offer_voice_note(&mut self, view: VoiceNoteView) {
+        self.voice_note = None;
+        self.voice_note_armed = Some(view);
+    }
+
+    /// Called once per frame by [`super::ui`]: turns an armed offer into the
+    /// open sheet. The intro yields to a share (the share is the user's act;
+    /// the intro returns next launch because `first_run_seen` is untouched).
+    pub fn begin_voice_note(&mut self, now: f64) {
+        let Some(mut view) = self.voice_note_armed.take() else {
+            return;
+        };
+        view.opened_at = now;
+        self.voice_note = Some(view);
+        self.sheet = Some(Sheet::VoiceNote);
+        self.sheet_anim.begin_spring(true, now);
+    }
+
+    /// When the auto-dismiss fires, if it is armed.
+    pub fn voice_note_deadline(&self) -> Option<f64> {
+        let view = self.voice_note.as_ref()?;
+        view.auto_start
+            .then_some(view.opened_at + super::voice_note::AUTO_DISMISS_SECONDS)
+    }
+
+    /// The auto-dismiss: starts the job and closes the sheet in one step. Only
+    /// armed when the language was unambiguous and a model is verified.
+    pub fn take_voice_note_auto(&mut self, now: f64) -> Option<CompactAction> {
+        let deadline = self.voice_note_deadline()?;
+        if now < deadline {
+            return None;
+        }
+        let language = self
+            .voice_note
+            .as_ref()
+            .and_then(|view| view.pill)
+            .map(|pill| pill.tag())
+            .unwrap_or("auto")
+            .to_string();
+        if let Some(view) = self.voice_note.as_mut() {
+            // The deadline has fired; never schedule it again while the exit
+            // animation plays (a zero-duration repaint would busy-loop).
+            view.auto_start = false;
+        }
+        self.dismiss_voice_note(now);
+        Some(CompactAction::VoiceNoteAccept { language })
+    }
+
+    /// Transcribe was tapped. `pill` is the sheet's current choice (or `None`
+    /// for Auto); the sheet closes and the host schedules the job.
+    pub fn accept_voice_note(
+        &mut self,
+        pill: Option<super::voice_note::Pill>,
+        now: f64,
+    ) -> CompactAction {
+        if let Some(view) = self.voice_note.as_mut() {
+            view.pill = pill;
+            view.auto_start = false;
+        }
+        self.dismiss_voice_note(now);
+        CompactAction::VoiceNoteAccept {
+            language: pill.map(|pill| pill.tag()).unwrap_or("auto").to_string(),
+        }
+    }
+
+    /// Closes the offer (Start, Cancel, a tap outside, or BACK).
+    pub fn dismiss_voice_note(&mut self, now: f64) {
+        self.sheet_anim.begin(false, now);
+    }
+
+    /// BACK dismissed the offer: the shell tells the Activity to drop the
+    /// pending share (no job was scheduled).
+    pub fn take_voice_note_cancel(&mut self) -> bool {
+        std::mem::take(&mut self.voice_note_cancel_pending)
+    }
+
     /// Start/Skip on the intro: dismiss it (spring back down) and ask the host
     /// to persist `first_run_seen = true`. Returns the host action.
     pub fn finish_onboarding(&mut self, now: f64, skipped: bool) -> CompactAction {
@@ -1604,6 +1721,11 @@ impl CompactApp {
                 self.first_run_seen = true;
                 self.onboarding_seen_pending = true;
             }
+            if self.sheet == Some(Sheet::VoiceNote) {
+                // A dismissed share starts nothing; the Activity drops the
+                // pending URI so a later stale tap cannot revive it.
+                self.voice_note_cancel_pending = true;
+            }
             self.sheet_anim.begin(false, now);
             self.status = None;
             return BackOutcome::Dismissed;
@@ -1632,6 +1754,7 @@ impl CompactApp {
         if self.sheet.is_some() && !self.sheet_anim.is_present() && self.sheet_anim.is_done() {
             self.sheet = None;
             self.export_session = None;
+            self.voice_note = None;
         }
         // The editor's data outlives a pop until the transition has played: the
         // outgoing screen is painted while it slides away.

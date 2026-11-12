@@ -494,7 +494,10 @@ fn transcribe(
         whisper::default_threads(),
         &plan,
         &cancel,
+        0,
+        0,
         |_| {},
+        &mut |_| {},
     )
     .expect("transcribe")
     .segments

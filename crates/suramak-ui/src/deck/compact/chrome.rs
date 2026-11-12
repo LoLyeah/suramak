@@ -740,6 +740,37 @@ pub fn sheet(ui: &mut Ui, tokens: &Tokens, rect: Rect, slide: f32) -> Rect {
     body
 }
 
+/// The M22B micro-sheet: the same Sheet material and scrim as [`sheet`], with
+/// the voice-note sheet's fixed height. A glance, not a page — the body is
+/// [`super::voice_note::MICRO_SHEET_HEIGHT`] tall and the drag handle stays.
+pub fn micro_sheet(ui: &mut Ui, tokens: &Tokens, rect: Rect, slide: f32) -> Rect {
+    material::scrim(ui, rect, tokens);
+    let height = super::voice_note::MICRO_SHEET_HEIGHT.min(rect.height());
+    let progress = slide.clamp(0.0, 1.0);
+    let body = Rect::from_min_max(
+        pos2(rect.left(), rect.bottom() - height * progress),
+        pos2(rect.right(), rect.bottom() + height * (1.0 - progress)),
+    );
+    material::frosted_panel(
+        ui,
+        tokens,
+        body,
+        CornerRadius {
+            nw: tokens.radius.card,
+            ne: tokens.radius.card,
+            sw: 0,
+            se: 0,
+        },
+        Plane::Sheet,
+    );
+    ui.painter().rect_filled(
+        Rect::from_center_size(pos2(body.center().x, body.top() + 10.0), vec2(36.0, 4.0)),
+        CornerRadius::same(2),
+        tokens.hairline_strong,
+    );
+    body
+}
+
 /// A screen's static background.
 pub fn background(ui: &mut Ui, tokens: &Tokens, rect: Rect) {
     ui.painter()
@@ -799,6 +830,8 @@ pub fn record_fill(tokens: &Tokens) -> Color32 {
 /// `primary` paints the Record fill ([`record_fill`]) with `on_accent` ink;
 /// otherwise the secondary `control_fill` + hairline with `ink`. `spoken` is
 /// the TalkBack name (the visible label stays short).
+// The dock pill is one call site with a fixed geometry; a parameter struct
+// would only move the same ten fields, exactly like the other chrome builders.
 #[allow(clippy::too_many_arguments)]
 pub fn dock_button(
     ui: &mut Ui,
@@ -811,6 +844,45 @@ pub fn dock_button(
     icon: Option<Icon>,
     primary: bool,
     enabled: bool,
+) -> Response {
+    filled_button(
+        ui, tokens, motion, rect, id, label, spoken, icon, primary, enabled, false,
+    )
+}
+
+/// M22B — a primary action in the app's accent, not the Record red. The
+/// voice-note sheet's one action is "Transcribe"; the record red belongs to the
+/// mic and would read as a second Record button.
+#[allow(clippy::too_many_arguments)]
+pub fn accent_button(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    rect: Rect,
+    id: impl std::hash::Hash,
+    label: &str,
+    spoken: &str,
+    icon: Option<Icon>,
+    enabled: bool,
+) -> Response {
+    filled_button(
+        ui, tokens, motion, rect, id, label, spoken, icon, true, enabled, true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn filled_button(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    rect: Rect,
+    id: impl std::hash::Hash,
+    label: &str,
+    spoken: &str,
+    icon: Option<Icon>,
+    primary: bool,
+    enabled: bool,
+    accent: bool,
 ) -> Response {
     let response = a11y::touch(ui, tokens, rect, &id, WidgetType::Button, spoken, enabled);
     let base = ui.id().with(&id);
@@ -832,6 +904,8 @@ pub fn dock_button(
 
     let (fill, ink) = if !enabled {
         (tokens.control_fill, tokens.ink_faint)
+    } else if accent {
+        (tokens.accent, tokens.on_accent)
     } else if primary {
         (record_fill(tokens), tokens.on_accent)
     } else {
@@ -841,7 +915,7 @@ pub fn dock_button(
         )
     };
     ui.painter().rect_filled(visual, radius, fill);
-    if !enabled || !primary {
+    if !enabled || !(primary || accent) {
         ui.painter().rect_stroke(
             visual,
             radius,

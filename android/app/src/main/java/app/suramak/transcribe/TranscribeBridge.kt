@@ -35,15 +35,20 @@ object TranscribeBridge {
         bytesTotal: Long,
         model: String,
         language: String,
-    ): JSONObject = dispatch(
-        JSONObject()
+        kind: String = "import",
+        sender: String? = null,
+    ): JSONObject {
+        val request = JSONObject()
             .put("op", "begin_import")
             .put("name", name)
             .put("mime", mime)
             .put("bytes_total", bytesTotal)
             .put("model", model)
-            .put("language", language),
-    )
+            .put("language", language)
+            .put("kind", kind)
+        if (sender != null) request.put("sender", sender)
+        return dispatch(request)
+    }
 
     /** One bounded progress report (the service calls this every 256 KiB). */
     fun progress(key: String, bytes: Long): JSONObject =
@@ -77,6 +82,26 @@ object TranscribeBridge {
     /** The completion notification's landing: the library row, when it exists. */
     fun openTranscript(id: String): JSONObject =
         dispatch(JSONObject().put("op", "open").put("transcript_id", id))
+
+    /**
+     * M22B — the paged transcript notification model. `page` is normalised by
+     * the host; `sender` is the intent's name (or null), never a guess.
+     */
+    fun voiceNote(id: String, page: Int, sender: String?): JSONObject {
+        val request = JSONObject()
+            .put("op", "voice_note")
+            .put("transcript_id", id)
+            .put("page", page)
+        if (sender != null) request.put("sender", sender)
+        return dispatch(request)
+    }
+
+    /** M22B — retry the failed job that still owns its copied audio. */
+    fun retry(key: String): JSONObject = dispatch(JSONObject().put("op", "retry").put("key", key))
+
+    /** M22B — the live notification's one honest sentence. */
+    fun progressText(percent: Int): JSONObject =
+        dispatch(JSONObject().put("op", "progress_text").put("percent", percent))
 
     /**
      * The foreground-service type for an API level, selected in Rust (the rule

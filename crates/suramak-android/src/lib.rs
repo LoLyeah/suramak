@@ -30,6 +30,8 @@ pub mod mic;
 pub mod model_host;
 #[cfg(target_os = "android")]
 pub mod shell;
+// M22B: the voice-note offer and the paged transcript notification (pure).
+pub mod voice_note;
 
 /// android-activity's entry point (M13g3).
 ///

@@ -38,6 +38,7 @@
 //! inference slot, bounded decode-ahead — used by the CLI.
 
 pub mod driver;
+pub mod journal;
 
 use std::collections::HashSet;
 use std::path::PathBuf;

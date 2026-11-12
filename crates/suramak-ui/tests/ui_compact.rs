@@ -24,8 +24,8 @@ use suramak_core::settings::Appearance;
 use suramak_core::store::WordAlignment;
 use suramak_core::transcript::{Segment, Source, Transcript, WordTiming};
 use suramak_ui::deck::compact::{
-    self, a11y, chrome, first_run, library, CompactApp, CompactRoute, CompactSettings, CrashBanner,
-    DiagnosticsView, DownloadState, Insets, Sheet,
+    self, a11y, chrome, first_run, library, CompactAction, CompactApp, CompactRoute,
+    CompactSettings, CrashBanner, DiagnosticsView, DownloadState, Insets, Sheet, VoiceNoteView,
 };
 use suramak_ui::deck::snapshot;
 use suramak_ui::deck::theme::{self, AppTheme};
@@ -2219,4 +2219,141 @@ fn material_kit_goldens_show_card_sheet_and_dock_in_both_appearances() {
             "{name}: expected the eleven icon strokes in the strip, got {icon_counts} px"
         );
     }
+}
+
+/// M22B — the share offer is a glance: unambiguous language + verified model
+/// auto-starts at 1.2 s; an unpicked pill waits for the tap instead.
+#[test]
+fn the_voice_note_sheet_auto_dismisses_at_the_slow_token() {
+    let mut app = seeded_app();
+    app.offer_voice_note(VoiceNoteView {
+        title: "Ptt 2026-11-12.opus".to_string(),
+        sender: Some("Rina".to_string()),
+        pill: Some(compact::voice_note::Pill::En),
+        model_ok: true,
+        auto_start: true,
+        reason: String::new(),
+        opened_at: 0.0,
+    });
+    let ctx = fresh_context(&app);
+    let screen = compact::phone_screen_rect();
+    let run = |app: &mut CompactApp, time: f64| -> Vec<CompactAction> {
+        let raw = egui::RawInput {
+            screen_rect: Some(screen),
+            time: Some(time),
+            ..Default::default()
+        };
+        let mut actions = Vec::new();
+        let _ = ctx.run(raw, |ctx| {
+            actions = compact::ui(ctx, app);
+        });
+        actions
+    };
+    // The first frame stamps opened_at = 10.0 and paints the sheet.
+    let first = run(&mut app, 10.0);
+    assert!(first.is_empty(), "no action before the window elapses");
+    assert_eq!(app.sheet, Some(Sheet::VoiceNote));
+    // A frame inside the window is still the offer.
+    let inside = run(&mut app, 11.0);
+    assert!(
+        !inside
+            .iter()
+            .any(|action| matches!(action, CompactAction::VoiceNoteAccept { .. })),
+        "the sheet must survive the first second"
+    );
+    // 1.2 s after the first draw the job starts and the sheet closes.
+    let due = run(&mut app, 11.25);
+    assert!(
+        due.iter().any(|action| matches!(
+            action,
+            CompactAction::VoiceNoteAccept { language } if language == "en"
+        )),
+        "the auto-dismiss must accept the pill's language: {due:?}"
+    );
+    assert!(!app.sheet_anim.is_present());
+}
+
+#[test]
+fn an_unpicked_language_waits_for_the_tap() {
+    let mut app = seeded_app();
+    app.offer_voice_note(VoiceNoteView {
+        title: "Voice note".to_string(),
+        sender: None,
+        pill: None,
+        model_ok: true,
+        auto_start: false,
+        reason: "Pick a language, or transcribe with auto-detect.".to_string(),
+        opened_at: 0.0,
+    });
+    let ctx = fresh_context(&app);
+    let screen = compact::phone_screen_rect();
+    let raw = egui::RawInput {
+        screen_rect: Some(screen),
+        time: Some(5.0),
+        ..Default::default()
+    };
+    let mut actions = Vec::new();
+    let _ = ctx.run(raw, |ctx| {
+        actions = compact::ui(ctx, &mut app);
+    });
+    assert_eq!(app.sheet, Some(Sheet::VoiceNote));
+    assert!(app.voice_note_deadline().is_none());
+    assert!(actions.is_empty());
+    // Two seconds later it is still waiting: this is a tap, not a timer.
+    let raw = egui::RawInput {
+        screen_rect: Some(screen),
+        time: Some(7.0),
+        ..Default::default()
+    };
+    let mut actions = Vec::new();
+    let _ = ctx.run(raw, |ctx| {
+        actions = compact::ui(ctx, &mut app);
+    });
+    assert!(actions.is_empty());
+    assert_eq!(app.sheet, Some(Sheet::VoiceNote));
+}
+
+/// M22B — the micro-sheet is the Sheet plane, not a dialog: it paints over the
+/// Library at the designed height, and its shot is committed with the rest.
+#[test]
+fn the_voice_note_sheet_is_a_frosted_micro_sheet() {
+    let mut app = seeded_app();
+    app.offer_voice_note(VoiceNoteView {
+        title: "Ptt 2026-11-12 at 09.14.opus".to_string(),
+        sender: Some("Rina".to_string()),
+        pill: Some(compact::voice_note::Pill::En),
+        model_ok: true,
+        auto_start: true,
+        reason: String::new(),
+        opened_at: 0.0,
+    });
+    let (_, _, scale) = compact::phone_viewport();
+    let screen = compact::phone_screen_rect();
+    let ctx = fresh_context(&app);
+    // Frame 1 opens the sheet at slide 0 (below the edge); the spring needs
+    // time, so the shot is taken at 0.6 s — still inside the 1.2 s window.
+    let _ = snapshot::render_at(&ctx, screen, scale, 0.0, |ctx| {
+        let _ = compact::ui(ctx, &mut app);
+    });
+    app.advance(0.6);
+    let shot = snapshot::render_at(&ctx, screen, scale, 0.6, |ctx| {
+        let _ = compact::ui(ctx, &mut app);
+    });
+    let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/ui-compact/shots/voice-note-sheet.png");
+    snapshot::write_png(&out, &shot).expect("write shot");
+    assert_eq!(app.sheet, Some(Sheet::VoiceNote));
+    let painted = shot.painted_fraction(egui::Color32::BLACK);
+    assert!(
+        painted > 0.5,
+        "the sheet shot must not be blank (painted {painted})"
+    );
+    // The sheet covers the bottom 236 pt of the 1015 pt viewport: the body is
+    // a real plane, materially different from the window above it.
+    let sheet_px = shot.pixel(
+        (shot.width / 2) as usize,
+        ((1015.4 - 120.0) * scale) as usize,
+    );
+    let window_px = shot.pixel((shot.width / 2) as usize, (40.0 * scale) as usize);
+    assert_ne!(sheet_px, window_px, "the sheet must sit above the page");
 }

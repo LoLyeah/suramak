@@ -2459,6 +2459,9 @@ impl AppState {
             // The segment list arrives just before `Finished`; the editor opens
             // from the full transcript, so this event carries no extra state.
             WorkerEvent::Segments { .. } => Vec::new(),
+            // M22A: mid-run checkpoints feed the durable queue driver's journal.
+            // The desktop queue is in-memory, so there is nothing to write here.
+            WorkerEvent::Checkpoint { .. } => Vec::new(),
             WorkerEvent::Finished {
                 transcript,
                 words,

@@ -24,6 +24,10 @@ pub mod transcript;
 pub mod translate;
 
 pub use error::SuramakError;
+// M22A: the journal stores absolute timestamps; the same re-export rule as the
+// id below — a caller of the store speaks in core's types, not a second
+// dependency edge.
+pub use chrono::{DateTime, Utc};
 // M16I: the id type the store, effects and the diarization lane all name — one
 // re-export of the crate the workspace already pins, so a caller never needs a
 // second `uuid` declaration to speak about a transcript id.

@@ -43,6 +43,14 @@ object Notify {
     const val ACTION_OPEN_RECORDING = "app.suramak.mic.OPEN"
     const val EXTRA_KEY = "app.suramak.transcribe.KEY"
     const val EXTRA_TRANSCRIPT_ID = "app.suramak.transcribe.TRANSCRIPT_ID"
+    /** M22B: the page the voice-note notification is showing (0-based). */
+    const val ACTION_COPY = "app.suramak.transcribe.COPY"
+    const val ACTION_NEXT_PAGE = "app.suramak.transcribe.NEXT_PAGE"
+    const val ACTION_RETRY = "app.suramak.transcribe.RETRY"
+    const val ACTION_SHARE_QUOTE = "app.suramak.transcribe.SHARE_QUOTE"
+    const val EXTRA_PAGE = "app.suramak.transcribe.PAGE"
+    const val EXTRA_SENDER = "app.suramak.transcribe.SENDER"
+    const val EXTRA_NOTIFICATION_ID = "app.suramak.transcribe.NOTIFICATION_ID"
 
     fun ensureChannels(context: Context) {
         val manager = context.getSystemService(NotificationManager::class.java)
@@ -248,6 +256,220 @@ object Notify {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 
+    /**
+     * M22B — the live voice-note notification. The body is the queue's own
+     * percent sentence (`Transcribing… 62%`), never partial text: whisper is
+     * not a streaming engine, so the notification says only what is true.
+     *
+     * Cancel stays available for the whole run and targets the job key the
+     * host reports.
+     */
+    fun voiceNoteProgress(
+        context: Context,
+        notificationId: Int,
+        title: String,
+        text: String,
+        percent: Int,
+        key: String?,
+    ): Notification {
+        val builder = Notification.Builder(context, CHANNEL_PROGRESS)
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setProgress(100, percent.coerceIn(0, 100), false)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setCategory(Notification.CATEGORY_PROGRESS)
+        if (key != null) {
+            val cancel = PendingIntent.getBroadcast(
+                context,
+                notificationId,
+                Intent(context, CancelTranscriptionReceiver::class.java)
+                    .setAction(ACTION_CANCEL)
+                    .putExtra(EXTRA_KEY, key),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            builder.addAction(
+                Notification.Action.Builder(
+                    Icon.createWithResource(context, android.R.drawable.ic_menu_close_clear_cancel),
+                    "Cancel",
+                    cancel,
+                ).build(),
+            )
+        }
+        return builder.build()
+    }
+
+    /**
+     * M22B — the finished transcript. BigText is the paging surface: the body
+     * is exactly one page from the Rust model, the summary names the page, and
+     * Copy always carries the whole cleaned transcript (the model's
+     * `copy_text`, not the page).
+     */
+    fun voiceNoteReady(
+        context: Context,
+        notificationId: Int,
+        transcriptId: String,
+        content: org.json.JSONObject,
+        copied: Boolean,
+    ): Notification {
+        val page = content.optInt("page", 0)
+        val pageCount = content.optInt("page_count", 1).coerceAtLeast(1)
+        val text = content.optString("text")
+        val sender = content.optString("subtext").ifEmpty { null }
+        val title = content.optString("title").ifEmpty { "Transcript ready" }
+        val summary = if (copied) {
+            "Copied · Page ${page + 1} of $pageCount"
+        } else {
+            "Page ${page + 1} of $pageCount"
+        }
+        val builder = Notification.Builder(context, CHANNEL_DONE)
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setContentTitle(title)
+            .setContentText(text.lineSequence().firstOrNull()?.take(160) ?: "")
+            .setSubText(sender)
+            .setNumber(page + 1)
+            .setStyle(
+                Notification.BigTextStyle()
+                    .bigText(text)
+                    .setSummaryText(summary),
+            )
+            .setContentIntent(openTranscript(context, transcriptId))
+            .setAutoCancel(true)
+            .setOnlyAlertOnce(true)
+
+        builder.addAction(
+            action(
+                context,
+                android.R.drawable.ic_menu_save,
+                "Copy",
+                broadcast(context, ACTION_COPY, 1, transcriptId, page, sender, notificationId),
+            ),
+        )
+        if (pageCount > 1) {
+            builder.addAction(
+                action(
+                    context,
+                    android.R.drawable.ic_media_next,
+                    "Next page",
+                    broadcast(context, ACTION_NEXT_PAGE, 2, transcriptId, page, sender, notificationId),
+                ),
+            )
+        }
+        builder.addAction(
+            action(
+                context,
+                android.R.drawable.ic_menu_edit,
+                "Open editor",
+                openTranscript(context, transcriptId),
+            ),
+        )
+        builder.addAction(
+            action(
+                context,
+                android.R.drawable.ic_menu_share,
+                "Share quote card",
+                PendingIntent.getActivity(
+                    context,
+                    notificationId * 16 + 4,
+                    Intent(context, MainActivity::class.java)
+                        .setAction(ACTION_SHARE_QUOTE)
+                        .putExtra(EXTRA_TRANSCRIPT_ID, transcriptId)
+                        .putExtra(EXTRA_PAGE, page)
+                        .putExtra(EXTRA_SENDER, sender)
+                        .addFlags(
+                            Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP,
+                        ),
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                ),
+            ),
+        )
+        return builder.build()
+    }
+
+    /**
+     * M22B — the named failure. The body is the queue's reason (the host
+     * passes it verbatim); Retry re-queues the job whose copy was kept.
+     */
+    fun voiceNoteFailed(
+        context: Context,
+        notificationId: Int,
+        title: String,
+        reason: String,
+        key: String,
+        sender: String?,
+    ): Notification {
+        val builder = Notification.Builder(context, CHANNEL_DONE)
+            .setSmallIcon(android.R.drawable.stat_notify_error)
+            .setContentTitle(title)
+            .setContentText(reason)
+            .setStyle(Notification.BigTextStyle().bigText(reason))
+            .setAutoCancel(true)
+            .setOnlyAlertOnce(true)
+        val retry = Intent(context, VoiceNoteActionReceiver::class.java)
+            .setAction(ACTION_RETRY)
+            .putExtra(EXTRA_KEY, key)
+            .putExtra(EXTRA_SENDER, sender)
+            .putExtra(EXTRA_NOTIFICATION_ID, notificationId)
+        builder.addAction(
+            action(
+                context,
+                android.R.drawable.ic_menu_revert,
+                "Retry",
+                PendingIntent.getBroadcast(
+                    context,
+                    notificationId * 16 + 5,
+                    retry,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                ),
+            ),
+        )
+        return builder.build()
+    }
+
+    private fun action(
+        context: Context,
+        icon: Int,
+        label: String,
+        intent: PendingIntent,
+    ): Notification.Action = Notification.Action.Builder(
+        Icon.createWithResource(context, icon),
+        label,
+        intent,
+    ).build()
+
+    private fun broadcast(
+        context: Context,
+        action: String,
+        offset: Int,
+        transcriptId: String,
+        page: Int,
+        sender: String?,
+        notificationId: Int,
+    ): PendingIntent = PendingIntent.getBroadcast(
+        context,
+        notificationId * 16 + offset,
+        Intent(context, VoiceNoteActionReceiver::class.java)
+            .setAction(action)
+            .putExtra(EXTRA_TRANSCRIPT_ID, transcriptId)
+            .putExtra(EXTRA_PAGE, page)
+            .putExtra(EXTRA_SENDER, sender)
+            .putExtra(EXTRA_NOTIFICATION_ID, notificationId),
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    )
+
+    /** The one landing path a transcript notification uses. */
+    fun openTranscript(context: Context, transcriptId: String): PendingIntent =
+        PendingIntent.getActivity(
+            context,
+            transcriptId.hashCode(),
+            Intent(context, MainActivity::class.java)
+                .setAction(ACTION_OPEN_TRANSCRIPT)
+                .putExtra(EXTRA_TRANSCRIPT_ID, transcriptId)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+
     fun show(context: Context, id: Int, notification: Notification) {
         context.getSystemService(NotificationManager::class.java).notify(id, notification)
     }
@@ -259,8 +481,8 @@ object Notify {
     /** Removes every notification this app owns (Quit's last visible act). */
     fun clearAll(context: Context) {
         val manager = context.getSystemService(NotificationManager::class.java)
-        manager.cancel(PROGRESS_ID)
-        manager.cancel(STATUS_ID)
-        manager.cancel(RECORDING_ID)
+        // The voice-note transcript notifications live on per-run ids, so the
+        // three fixed ids are not enough; cancelAll covers every one.
+        manager.cancelAll()
     }
 }
