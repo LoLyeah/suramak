@@ -471,10 +471,24 @@ if ! wait_for_process_exit; then
   if ! wait_for_process_exit; then
     timeout 30 "$ADB" logcat -d >"$OUT/logcat-back-failed.txt" 2>/dev/null || true
     "$ADB" shell dumpsys activity exit-info "$PACKAGE" >"$OUT/exit-info-back.txt" 2>&1 || true
-    fail "the app process was still alive ${FINISH_TIMEOUT}s after BACK — the finish path did not end the process (the state that leaves a dead EventLoop for the next launch)"
+    # Distinguish "the app ignored BACK" from "this emulator never delivered
+    # it". The log carries an entry line for every back that reaches the app;
+    # two instrumented runs (43216992141, 43284749383) showed zero such lines
+    # while the same key works at other moments — the platform's input
+    # injection drops it after a share/relaunch on this image. If the app never
+    # saw a back, finish through the app's OWN finish action (the same
+    # Activity.finish → process-exit path) and say so; the relaunch assertions
+    # below still prove the contract this gate exists for.
+    if grep -qE "back: arrived|back \(|compact dismissed|compact popped" "$OUT/logcat-back-failed.txt" 2>/dev/null; then
+      fail "the app saw BACK but the process was still alive ${FINISH_TIMEOUT}s later — the finish path did not end the process (the state that leaves a dead EventLoop for the next launch)"
+    fi
+    echo "   finish:   no BACK reached the app on this emulator — using its own finish action"
+    "$ADB" shell am start -a app.suramak.action.COMPACT_FINISH -n "$ACTIVITY" >/dev/null 2>&1 || true
+    wait_for_process_exit || fail "the finish path did not end the process even through ACTION_COMPACT_FINISH"
+    echo "   finish:   process exited via ACTION_COMPACT_FINISH (BACK was never delivered)"
   fi
 fi
-echo "   finish:   process exited after BACK (clean finish path)"
+echo "   finish:   process exited (clean finish path)"
 
 "$ADB" shell am start -W -n "$ACTIVITY" >"$OUT/am-start-library.txt" 2>&1 || true
 
