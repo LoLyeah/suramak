@@ -15,6 +15,7 @@ use egui::{
 };
 
 use suramak_core::diagnostics::{diagnose, Level, SubtitleLimits};
+use suramak_core::diarization::SpeakerTurn;
 
 use crate::deck::icons::{self, Icon};
 use crate::deck::material::{self, Plane};
@@ -45,6 +46,10 @@ const EDIT_HEIGHT: f32 = 160.0;
 /// M23A: the phone's per-turn rail width. The desktop lane is 8 px; the phone's
 /// rail is the slimmer mark beside the row (the plan's 4 px).
 const PHONE_RAIL_W: f32 = 4.0;
+/// M23A2: the unassigned rail's dash and gap, in points (a 4 px mark broken
+/// into a state, never a solid band that would read as a speaker's).
+const UNASSIGNED_DASH: f32 = 4.0;
+const UNASSIGNED_GAP: f32 = 3.5;
 
 pub fn ui(
     ui: &mut Ui,
@@ -144,6 +149,11 @@ pub fn ui(
             pos2(bands.content.left() + GUTTER, meta_rect.bottom() + 2.0),
             vec2(bands.content.width() - GUTTER * 2.0, speakers::LANE_H),
         );
+        // M23A2: the strip accounts for unlabelled audio. The turns alone made
+        // the lane look truncated at the last label; the recording's unassigned
+        // stretches now paint muted under them, so the strip always spans the
+        // audio and the silence between labels is visible.
+        paint_unlabelled(ui, tokens, lane, &speaker_view.turns, speaker_view.audio_ms);
         speakers::lane(
             ui,
             tokens,
@@ -256,17 +266,17 @@ pub fn ui(
         }
         let numerals = type_scale::numerals();
         let body_token = type_scale::body();
-        // The speaker header belongs to a turn, not to every row: it is drawn
-        // when the visible sequence changes speaker. A filtered list groups by
-        // what is on screen, which is what the reader sees.
-        let mut previous_speaker: Option<u32> = None;
+        // M23A2: every labelled row carries its speaker's name. A turn's name
+        // used to appear only where the sequence changed speaker, which left
+        // later rows of the same turn identifying their owner with an icon
+        // alone; the name column is now always present, so identity is never
+        // only a badge.
         for index in matches {
             let segment = editor.transcript.segments[index].clone();
             let speaker_view = editor.speakers.clone();
             let speaker_row = speaker_view.as_ref().and_then(|view| view.row(segment.idx));
             let primary = speaker_row.map(|row| row.primary);
-            let show_name = primary.is_some() && primary != previous_speaker;
-            previous_speaker = primary;
+            let show_name = primary.is_some();
             let selected = editor.selected == Some(segment.idx);
             let editing = editor
                 .edit_buffer
@@ -283,11 +293,7 @@ pub fn ui(
             // not to every row: the desktop can badge a whole column because
             // its reader is a subtitle editor; on the phone one quiet read-out
             // on the selected row is enough. It is also spoken with the row.
-            let advisory = if selected {
-                advisory_for(&text, segment.start_ms, segment.end_ms)
-            } else {
-                None
-            };
+            let advisory = advisory_for_row(selected, &text, segment.start_ms, segment.end_ms);
 
             // Geometry: the speaker lane keeps its 8 px strip above; inside a
             // row the badge sits in the leading gutter and the header band
@@ -376,23 +382,33 @@ pub fn ui(
 
             // M23A: the 4 px turn rail down the row's leading edge. It is the
             // phone's mark for "these lines belong to this speaker" — the
-            // desktop keeps its 8 px lane above the list.
-            if let (Some(view), Some(row)) = (&speaker_view, speaker_row) {
-                let top = if show_name {
-                    rect.top() + 6.0
-                } else {
-                    rect.top()
-                };
+            // desktop keeps its 8 px lane above the list. M23A2: an unlabelled
+            // row keeps the rail but breaks it into dashes, so "unassigned" is
+            // a state on the same column rather than the absence of one.
+            if let Some(view) = &speaker_view {
                 let rail = Rect::from_min_max(
-                    pos2(rect.left() + 2.0, top),
+                    pos2(rect.left() + 2.0, rect.top() + 6.0),
                     pos2(rect.left() + 2.0 + PHONE_RAIL_W, rect.bottom()),
                 );
-                ui.painter().rect_filled(
-                    rail,
-                    CornerRadius::same(2),
-                    speakers::color(tokens, view.color_slot(row.primary))
-                        .gamma_multiply(if view.stale { 0.55 } else { 0.9 }),
-                );
+                match speaker_row {
+                    Some(row) => {
+                        ui.painter().rect_filled(
+                            rail,
+                            CornerRadius::same(2),
+                            speakers::color(tokens, view.color_slot(row.primary))
+                                .gamma_multiply(if view.stale { 0.55 } else { 0.9 }),
+                        );
+                    }
+                    None => {
+                        for dash in rail_dashes(rail) {
+                            ui.painter().rect_filled(
+                                dash,
+                                CornerRadius::same(2),
+                                tokens.ink_faint.gamma_multiply(0.55),
+                            );
+                        }
+                    }
+                }
             }
 
             let header_center = rect.top() + SEGMENT_TOP + SEGMENT_HEADER / 2.0;
@@ -437,34 +453,27 @@ pub fn ui(
 
             let play_center = pos2(rect.right() - GUTTER - 12.0, header_center);
             let advisory_right = play_center.x - 28.0;
-            if let Some(advisory_text) = &advisory {
-                // Advisory, not an alarm: amber at this weight, never the
-                // record red (that belongs to failures that block work).
-                type_scale::paint_tabular(
-                    ui.painter(),
-                    pos2(advisory_right, header_center),
-                    Align2::RIGHT_CENTER,
-                    advisory_text,
-                    &numerals.font,
-                    tokens.warn,
-                );
-            }
+            // M23A2: the advisory is a quiet caption chip at the row's trailing
+            // edge, in the helper tone — never an orange inline label that
+            // reads as stray debug output. It exists only on the selected row
+            // and only when a value is outside its target band (the `advisory`
+            // above already gates both).
+            let advisory_left = advisory
+                .as_deref()
+                .map(|text| advisory_chip(ui, tokens, advisory_right, header_center, text));
 
-            // The turn's name, at the type scale's row title (15/20), with the
-            // kit's pencil marking the in-place rename affordance. It is not a
-            // second control: the badge beside it owns the rename target, and
-            // the name is part of the row's spoken label.
+            // The turn's name, at the type scale's row title (15/20), always
+            // present on a labelled row (M23A2). The pencil beside it is its
+            // own affordance: the header opens the speaker's options, the
+            // pencil is announced as the rename action. Neither is a second
+            // visual control — they share one line of type.
             if show_name {
                 let name = speaker_view
                     .as_ref()
                     .map(|view| view.label(primary.expect("named turn")))
                     .unwrap_or_default();
                 let name_x = text_left + time_width + 10.0;
-                let name_right = if advisory.is_some() {
-                    advisory_right - 8.0
-                } else {
-                    play_center.x - 24.0
-                };
+                let name_right = advisory_left.map_or(play_center.x - 24.0, |left| left - 8.0);
                 let mut job = egui::text::LayoutJob::default();
                 job.append(&name, 0.0, type_scale::row_title().format(tokens.ink));
                 job.wrap.max_width = (name_right - name_x).max(40.0);
@@ -477,42 +486,61 @@ pub fn ui(
                     name_galley.clone(),
                     tokens.ink,
                 );
-                let pencil = Rect::from_center_size(
-                    pos2(name_x + name_galley.size().x + 9.0, header_center),
-                    vec2(12.0, 12.0),
-                );
-                if pencil.right() < name_right {
-                    icons::paint(ui.painter(), pencil, Icon::Pencil, 12.0, tokens.ink_faint);
-                }
-                // The whole name (with its pencil) is the Speaker sheet's
-                // target: rename, colour, merge, remove. It is a second tap
-                // zone inside the row, not a second visual control.
                 let name_rect = Rect::from_min_size(
                     pos2(name_x, header_center - 10.0),
-                    vec2((name_galley.size().x + 18.0).min(name_right - name_x), 20.0),
+                    vec2(name_galley.size().x.max(24.0), 20.0),
                 );
                 let name_response = a11y::touch(
                     ui,
                     tokens,
                     name_rect,
-                    ("speaker-name", primary.expect("named turn")),
+                    ("speaker-name", segment.idx),
                     WidgetType::Button,
-                    &format!("{name} — rename, colour, merge or remove"),
+                    "Speaker options",
                     true,
                 );
                 if name_response.clicked() {
                     state.open_speaker_sheet_named(primary.expect("named turn"), name.clone(), now);
                 }
+                let pencil_center = pos2(name_x + name_galley.size().x + 20.0, header_center);
+                let pencil = Rect::from_center_size(pencil_center, vec2(12.0, 12.0));
+                if pencil.right() < name_right {
+                    icons::paint(ui.painter(), pencil, Icon::Pencil, 12.0, tokens.ink_faint);
+                    let pencil_hit = Rect::from_center_size(pencil_center, vec2(34.0, 20.0));
+                    let rename_response = a11y::touch(
+                        ui,
+                        tokens,
+                        pencil_hit,
+                        ("speaker-rename", segment.idx),
+                        WidgetType::Button,
+                        "Rename speaker",
+                        true,
+                    );
+                    if rename_response.clicked() {
+                        state.open_speaker_sheet_named(
+                            primary.expect("named turn"),
+                            name.clone(),
+                            now,
+                        );
+                    }
+                }
             }
 
             // M23A: a labelled transcript's unlabelled rows carry the muted
-            // `+ Speaker` pill in the header band. One tap opens the turn strip
-            // for exactly this segment; a plain (never tagged) transcript keeps
-            // today's clean row — the bottom bar's `Tag speakers` is its door.
+            // `Assign speaker` pill in the header band. One tap opens the turn
+            // strip for exactly this segment; a plain (never tagged) transcript
+            // keeps today's clean row — the bottom bar's `Tag speakers` is its
+            // door.
             if speaker_view.is_some() && speaker_row.is_none() {
+                let caption = type_scale::caption();
+                let pill_galley = ui.painter().layout_no_wrap(
+                    "Assign speaker".to_owned(),
+                    caption.font,
+                    tokens.ink_soft,
+                );
                 let pill = Rect::from_min_size(
                     pos2(text_left + time_width + 10.0, header_center - 10.0),
-                    vec2(78.0, 20.0),
+                    vec2(pill_galley.size().x + 24.0, 20.0),
                 );
                 let response = a11y::touch(
                     ui,
@@ -520,7 +548,7 @@ pub fn ui(
                     pill,
                     ("segment-pill", segment.idx),
                     WidgetType::Button,
-                    "Tag this segment with a speaker",
+                    "Assign speaker",
                     true,
                 );
                 ui.painter().rect(
@@ -530,11 +558,12 @@ pub fn ui(
                     Stroke::new(1.0_f32, tokens.hairline),
                     StrokeKind::Inside,
                 );
-                ui.painter().text(
-                    pill.center(),
-                    Align2::CENTER_CENTER,
-                    "+ Speaker",
-                    type_scale::caption().font,
+                ui.painter().galley(
+                    pos2(
+                        pill.center().x - pill_galley.size().x / 2.0,
+                        pill.center().y - pill_galley.size().y / 2.0,
+                    ),
+                    pill_galley,
                     tokens.ink_soft,
                 );
                 if response.clicked() {
@@ -793,16 +822,18 @@ pub fn ui(
         tokens.ink_soft,
     );
     // M23A: the Speakers button. It reads `Tag speakers` until the transcript
-    // has a label, then the count; both are the plan's literal labels, and the
-    // sheet behind it is the only door to Add/Clear.
+    // has a label, then `Speakers · N` — the label is the control, the count is
+    // the secondary line, never a sentence. The sheet behind it is the only
+    // door to Add/Clear.
     let speakers_btn = Rect::from_min_size(
         pos2(bar.left() + GUTTER + 166.0, bar.center().y - 22.0),
-        vec2(92.0, 44.0),
+        vec2(100.0, 44.0),
     );
     let speakers_label = editor
         .speakers
         .as_ref()
-        .map(super::model::CompactSpeakers::button_label)
+        .filter(|view| !view.speakers.is_empty())
+        .map(|view| format!("Speakers · {}", view.speakers.len()))
         .unwrap_or_else(|| "Tag speakers".to_string());
     if chrome::action_button(
         ui,
@@ -983,6 +1014,129 @@ fn advisory_for(text: &str, start_ms: i64, end_ms: i64) -> Option<String> {
         parts.push(format!("Pace {:.1}", metrics.cps));
     }
     (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// The chip's whole condition: the row is being worked on **and** one of its
+/// metrics is outside the target band. One function so the two halves cannot
+/// drift apart (an unselected long row must stay quiet; a selected clean row
+/// must stay chip-less).
+fn advisory_for_row(selected: bool, text: &str, start_ms: i64, end_ms: i64) -> Option<String> {
+    selected
+        .then(|| advisory_for(text, start_ms, end_ms))
+        .flatten()
+}
+
+/// M23A2: the advisory as a quiet caption chip, right-aligned at `right` on the
+/// row's header band. Returns its left edge so the speaker name can stop short
+/// of it. The chip is the helper tone (`ink_soft` on a control wash) — the
+/// advisory is a read-out, not an alarm; the record red belongs to failures.
+fn advisory_chip(ui: &Ui, tokens: &Tokens, right: f32, center_y: f32, text: &str) -> f32 {
+    let caption = type_scale::caption();
+    let galley =
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), caption.font.clone(), tokens.ink_soft);
+    let width = galley.size().x + 16.0;
+    let chip = Rect::from_min_size(pos2(right - width, center_y - 10.0), vec2(width, 20.0));
+    ui.painter().rect(
+        chip,
+        CornerRadius::same(10),
+        tokens.control_fill,
+        Stroke::new(1.0_f32, tokens.hairline),
+        StrokeKind::Inside,
+    );
+    ui.painter().galley(
+        pos2(chip.left() + 8.0, center_y - galley.size().y / 2.0),
+        galley,
+        tokens.ink_soft,
+    );
+    // The chip is a caption, not a control; record it so the frame's audit can
+    // say what the selected row is reading out.
+    a11y::describe(ui, chip, text);
+    chip.left()
+}
+
+/// M23A2: the stretches of the recording no turn covers, clipped to the audio
+/// and merged (overlapping turns are one stretch of labelled audio). Painting
+/// these muted is what makes the lane span the whole recording instead of
+/// ending at the last label.
+fn unlabelled_spans(turns: &[SpeakerTurn], audio_ms: i64) -> Vec<(i64, i64)> {
+    if audio_ms <= 0 {
+        return Vec::new();
+    }
+    let mut covered: Vec<(i64, i64)> = turns
+        .iter()
+        .map(|turn| {
+            (
+                turn.start_ms.clamp(0, audio_ms),
+                turn.end_ms.clamp(0, audio_ms),
+            )
+        })
+        .filter(|(start, end)| end > start)
+        .collect();
+    covered.sort_by_key(|(start, _)| *start);
+    let mut merged: Vec<(i64, i64)> = Vec::new();
+    for (start, end) in covered {
+        match merged.last_mut() {
+            Some((_, last_end)) if start <= *last_end => *last_end = (*last_end).max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let mut gaps = Vec::new();
+    let mut cursor = 0;
+    for (start, end) in merged {
+        if start > cursor {
+            gaps.push((cursor, start));
+        }
+        cursor = cursor.max(end);
+    }
+    if cursor < audio_ms {
+        gaps.push((cursor, audio_ms));
+    }
+    gaps
+}
+
+/// Paints the unlabelled stretches into the lane: the muted bed plus its 1 px
+/// top hairline. The shared [`speakers::lane`] draws the assigned turns over it,
+/// so the strip reads as one recording with labels, not as a truncated strip.
+fn paint_unlabelled(ui: &Ui, tokens: &Tokens, lane: Rect, turns: &[SpeakerTurn], audio_ms: i64) {
+    if audio_ms <= 0 {
+        return;
+    }
+    let total = audio_ms as f32;
+    for (start, end) in unlabelled_spans(turns, audio_ms) {
+        let x_of =
+            |ms: i64| lane.left() + lane.width() * (ms.max(0) as f32 / total).clamp(0.0, 1.0);
+        let band = Rect::from_min_max(
+            pos2(x_of(start), lane.top()),
+            pos2(x_of(end), lane.bottom()),
+        );
+        if band.width() < 0.5 {
+            continue;
+        }
+        ui.painter()
+            .rect_filled(band, CornerRadius::same(1), tokens.panel_faint);
+        ui.painter().hline(
+            band.x_range(),
+            band.top(),
+            Stroke::new(1.0_f32, tokens.hairline_strong),
+        );
+    }
+}
+
+/// M23A2: the dashed segments of an unassigned row's rail — 4 px marks with a
+/// gap, so the rail reads as an empty slot rather than a speaker's solid band.
+fn rail_dashes(rail: Rect) -> Vec<Rect> {
+    let mut dashes = Vec::new();
+    let mut top = rail.top();
+    while top + 0.5 < rail.bottom() {
+        let bottom = (top + UNASSIGNED_DASH).min(rail.bottom());
+        dashes.push(Rect::from_min_max(
+            pos2(rail.left(), top),
+            pos2(rail.right(), bottom),
+        ));
+        top += UNASSIGNED_DASH + UNASSIGNED_GAP;
+    }
+    dashes
 }
 
 /// The export sheet's body: the format chips, the bilingual switch and the two
@@ -1509,5 +1663,93 @@ mod tests {
             type_scale::tabular_width("Line length 44", size),
             type_scale::tabular_width("Line length 84", size)
         );
+    }
+
+    /// M23A2 fix 1: the chip's condition is selected **and** outside the band.
+    /// Inside the band the selected row shows nothing; outside it, only the
+    /// selected row shows the read-out.
+    #[test]
+    fn the_advisory_chip_needs_a_selected_row_and_a_crossed_band() {
+        let long = "a".repeat(48);
+        // Selected + outside the band → the chip exists.
+        assert!(advisory_for_row(true, &long, 0, 4_000).is_some());
+        // Selected + inside the band → no chip.
+        assert!(advisory_for_row(true, "A short line.", 0, 4_000).is_none());
+        // Outside the band + not selected → no chip (the row is not being read).
+        assert!(advisory_for_row(false, &long, 0, 4_000).is_none());
+        // Pace crosses on its own and is equally gated.
+        let dense = "word word word word\n".repeat(8);
+        assert!(advisory_for_row(true, &dense, 0, 2_000)
+            .expect("pace out of band")
+            .starts_with("Pace "));
+        assert!(advisory_for_row(false, &dense, 0, 2_000).is_none());
+    }
+
+    /// M23A2 fix 2: the lane's unlabelled stretches are the complement of the
+    /// turns over the whole recording — head, tail, between turns, and the
+    /// whole audio when nothing is tagged.
+    #[test]
+    fn the_strip_spans_the_recording_and_paints_the_unlabelled_stretch() {
+        let turns = vec![
+            SpeakerTurn::new(0, 0, 4_200, 0),
+            SpeakerTurn::new(1, 4_200, 8_400, 1),
+        ];
+        // The phone's fixture: 12.6 s of audio, labels ending at 8.4 s. The
+        // strip must still account for the last 4.2 s.
+        assert_eq!(unlabelled_spans(&turns, 12_600), vec![(8_400, 12_600)]);
+
+        // A gap at the head and at the tail.
+        let middle = vec![SpeakerTurn::new(0, 1_000, 2_000, 0)];
+        assert_eq!(
+            unlabelled_spans(&middle, 4_000),
+            vec![(0, 1_000), (2_000, 4_000)]
+        );
+
+        // Overlapping turns are one covered stretch, never a painted gap.
+        let overlap = vec![
+            SpeakerTurn::new(0, 0, 2_000, 0),
+            SpeakerTurn::new(1, 1_000, 3_000, 1),
+        ];
+        assert!(unlabelled_spans(&overlap, 3_000).is_empty());
+
+        // No turns at all: the whole recording is one unlabelled stretch.
+        assert_eq!(unlabelled_spans(&[], 5_000), vec![(0, 5_000)]);
+
+        // A turn past the audio is clipped; a zero-length audio paints nothing.
+        let over = vec![SpeakerTurn::new(0, 0, 9_000, 0)];
+        assert!(unlabelled_spans(&over, 5_000).is_empty());
+        assert!(unlabelled_spans(&turns, 0).is_empty());
+    }
+
+    /// M23A2 fix 3: the unassigned rail is a 4 px dashed mark — the same
+    /// column as a speaker's rail, broken so it cannot read as a solid band.
+    #[test]
+    fn an_unassigned_rail_is_dashed_not_a_solid_band() {
+        let rail = Rect::from_min_max(pos2(10.0, 20.0), pos2(14.0, 92.0));
+        let dashes = rail_dashes(rail);
+        assert!(
+            dashes.len() >= 8,
+            "a 72 pt rail breaks into dashes: {dashes:?}"
+        );
+        for dash in &dashes {
+            assert!((dash.width() - PHONE_RAIL_W).abs() < 0.01, "{dash:?}");
+            assert!(dash.height() <= UNASSIGNED_DASH + 0.01, "{dash:?}");
+            assert!(dash.top() >= rail.top() - 0.01 && dash.bottom() <= rail.bottom() + 0.01);
+        }
+        for pair in dashes.windows(2) {
+            assert!(
+                pair[1].top() - pair[0].bottom() >= UNASSIGNED_GAP - 0.01,
+                "dashes must be separated: {pair:?}"
+            );
+        }
+        let painted: f32 = dashes.iter().map(Rect::height).sum();
+        assert!(
+            painted < rail.height() * 0.7,
+            "a dashed rail is mostly air, not a band: {painted} of {}",
+            rail.height()
+        );
+        // A rail shorter than one dash still paints one clipped mark.
+        let short = Rect::from_min_max(pos2(0.0, 0.0), pos2(4.0, 2.0));
+        assert_eq!(rail_dashes(short).len(), 1);
     }
 }

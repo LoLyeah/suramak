@@ -167,3 +167,113 @@ The new tests, by contract:
 * There is no voiceprint anywhere in this slice: no embeddings are computed,
   stored, compared, or carried across files. The manual run's provenance says
   "manual tags".
+
+## Design review (M23A2)
+
+M23A shipped a working speaker screen. A design review of
+`editor-tag-speakers-after.png` at the phone's 1216 × 2640 viewport found four
+things that still read as a prototype, plus one inconsistency. M23A2 fixes all
+five on the same screen; no store, export, diarization or machine-contract
+change rides along.
+
+### 1. The advisory stops looking like debug output
+
+"The line-length advisory" was amber (`warn`) inline text at the header's right
+edge. On the selected row it looked like a stray trace label, not product. It is
+now a **quiet caption chip**: 20 pt tall, 10 pt radius, `control_fill` with a
+`hairline` border, caption type in `ink_soft`, right-aligned before the play
+mark. It exists only when the row is selected **and** a metric is outside its
+target band; inside the band the header is clean, and an unselected row never
+shows it even when it is out of band. The chip is recorded as a caption in the
+frame audit (so the suite can prove presence/absence and the helper tone) while
+the row's spoken label still carries the reading.
+
+### 2. The timeline strip accounts for unassigned audio
+
+The lane drew only the assigned turns, so a 12.6 s recording whose last label
+ended at 8.4 s showed a strip that stopped a third short of the right edge — it
+read as truncated. The unlabelled stretches are now computed as the complement
+of the turn intervals (clipped to `audio_ms`, overlaps merged) and painted
+`panel_faint` with a 1 px `hairline_strong` top edge. The shared turn bands draw
+over them, so the strip always spans the whole recording and the silence between
+labels is visible as muted tone. A recording with no turns at all paints one
+muted, hairlined strip rather than nothing.
+
+### 3. Unassigned rows get a state, not an absence
+
+An untagged row had no rail and only a small pill, so it read as a different
+kind of row. It now keeps the 4 px rail column but **dashes it** (4 pt on,
+3.5 pt off) in muted ink, beside the `Assign speaker` pill. The same leading
+column now says "this row has no speaker yet" instead of "this row has no
+treatment"; labelled rows keep their solid speaker-coloured rail.
+
+### 4. The words stop being ambiguous
+
+| Where | M23A | M23A2 |
+|---|---|---|
+| Row pill | `+ Speaker` | `Assign speaker` |
+| Bottom bar | `2 speakers` (a sentence) | `Speakers · 2` (count secondary to the control) |
+| Pencil (a11y) | shared with the name | `Rename speaker` |
+| Turn header (a11y) | `<name> — rename, colour, merge or remove` | `Speaker options` |
+
+The bottom bar still reads `Tag speakers` before the first label (that state is
+a call to action, not a count). The two header affordances are now separate tap
+targets with segment-keyed ids — which also removes the **pre-existing duplicate
+widget-id overlay** that the old `editor-speakers` golden shipped (two rows of
+the same speaker reused one control id). The JSON state's `speaker_button`
+string is unchanged, so the M23A machine contract stays byte-compatible.
+
+### 5. Badges stay consistent, and identity is never an icon alone
+
+A default speaker shows its numeral in the badge and its full label
+(`Speaker 1`) in the header; a renamed one shows the initial and the name
+(`Budi`). The name column used to appear only where the speaker changed, which
+left the later rows of a turn with a badge and no name. Every labelled row now
+carries the name column, so a reader never has to infer the owner from a
+coloured icon; unlabelled rows put the pill in the same column position.
+
+### Shots
+
+| Surface | Before | After |
+|---|---|---|
+| Tagged editor | ![before](M23a-shots/editor-tag-speakers-after.png) | ![after](M23a-shots/editor-tag-speakers-review.png) |
+| Advisory chip | — | ![chip](M23a-shots/editor-advisory-chip.png) |
+| Unassigned rail + pill | — | ![rail](M23a-shots/editor-unassigned-rail.png) |
+
+Golden set re-blessed: `editor`, `editor-speakers`, `editor-tag-speakers`,
+`editor-speaker-sheet`, `editor-speakers-sheet`, `editor-turn-strip`,
+`editor-scrolled` (the selected long row's chip), and `export-sheet` /
+`export-written` (the fixed rows are visible above the sheet). New:
+`editor-advisory-chip`, `editor-unassigned-rail`.
+
+### Verification (M23A2)
+
+| Gate | Command | Result |
+|---|---|---|
+| Format | `cargo fmt --all -- --check` | clean |
+| Host clippy | `cargo clippy --workspace --all-targets -- -D warnings` | exit 0 |
+| Full workspace | `cargo test --workspace` | **1341 passed, 0 failed** (baseline 1336; +5 M23A2 tests) |
+| NDK check | `cargo ndk -t arm64-v8a --platform 29 check -p suramak-android -p suramak-android-spike --locked` | clean |
+| NDK clippy | `cargo ndk -t arm64-v8a --platform 29 clippy -p suramak-android -p suramak-android-spike --all-targets -- -D warnings` | exit 0 |
+
+The new tests, by contract:
+
+* **Unit (editor):** the chip's condition (selected **and** out of band; inside
+  the band → absent; unselected long row → absent; Pace gated the same way); the
+  unlabelled spans are the complement of the turns (tail, head + tail, overlap
+  merge, whole recording, clip past the audio, zero-length audio); the unassigned
+  rail is a dashed 4 pt column, never a solid band.
+* **Phone UI:** the selected long row paints `Line length …` in `ink_soft` at
+  caption size (never `warn`), and a clean selected row paints no advisory at
+  all; the unassigned row renders ≥ 4 dashes in the rail column while the
+  labelled rows keep solid rails, and the pill reads `Assign speaker`; the
+  bottom-bar control reads `Speakers · N`; every row of a multi-row turn carries
+  `Speaker options` + `Rename speaker` and paints the full `Speaker 1` label.
+
+### One unrelated fix the build required
+
+The v0.5.0 release commit bumped `FileVersion`/`ProductVersion` in
+`packaging/windows/suramak.rc` but left `FILEVERSION 0,4,3,0`; the UI crate's
+build script asserts that literal on every target, so a fresh tree could not
+build. The numeric lines were corrected to `0,5,0,0`. No CI or packaging
+behaviour changed.

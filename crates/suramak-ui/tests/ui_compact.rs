@@ -232,7 +232,7 @@ fn the_pill_opens_the_turn_strip_on_the_unlabelled_segment() {
 
     let mut h = Harness::new(app);
     h.frame();
-    let pill = h.control("Tag this segment with a speaker");
+    let pill = h.control("Assign speaker");
     h.touch(1, egui::TouchPhase::Start, pill.center());
     h.touch(1, egui::TouchPhase::End, pill.center());
     let strip = h.app.turn_strip.expect("the strip opened");
@@ -414,6 +414,236 @@ fn the_new_speaker_sheet_and_turn_strip_are_shots() {
     app.advance(12.0);
     let list = render(&mut app, "editor-speakers-sheet");
     assert!(list.painted_fraction(egui::Color32::BLACK) > 0.5);
+}
+
+/// M23A2: every shape in a frame, nested vectors flattened.
+fn frame_shapes(output: &egui::FullOutput) -> Vec<egui::epaint::Shape> {
+    fn walk(shape: egui::epaint::Shape, out: &mut Vec<egui::epaint::Shape>) {
+        match shape {
+            egui::epaint::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    let mut out = Vec::new();
+    for clipped in &output.shapes {
+        walk(clipped.shape.clone(), &mut out);
+    }
+    out
+}
+
+/// The frame's painted text runs: (text, colour, size). The chip test needs the
+/// colour, which a screenshot cannot name.
+fn painted_texts(output: &egui::FullOutput) -> Vec<(String, egui::Color32, f32)> {
+    frame_shapes(output)
+        .into_iter()
+        .filter_map(|shape| match shape {
+            egui::epaint::Shape::Text(text) => {
+                let section = text.galley.job.sections.first();
+                Some((
+                    text.galley.text().to_string(),
+                    text.override_text_color
+                        .or_else(|| section.map(|section| section.format.color))
+                        .unwrap_or(egui::Color32::TRANSPARENT),
+                    section.map_or(0.0, |section| section.format.font_id.size),
+                ))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// One editor frame in a fresh context (shapes + a11y audit), the same frame the
+/// goldens rasterise.
+fn editor_frame(app: &mut CompactApp) -> (egui::Context, egui::FullOutput) {
+    let ctx = fresh_context(app);
+    let screen = compact::phone_screen_rect();
+    let output = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            time: Some(10.0),
+            ..Default::default()
+        },
+        |ctx| {
+            let _ = compact::ui(ctx, app);
+        },
+    );
+    (ctx, output)
+}
+
+/// M23A2 fix 1: the advisory is a quiet caption chip on the selected row, and
+/// only when a value is outside its target band. Inside the band there is no
+/// chip at all; outside it the text is the helper tone (`ink_soft`), never the
+/// warn amber that read as debug output.
+#[test]
+fn the_advisory_chip_appears_only_on_a_selected_row_outside_the_band() {
+    // Inside both bands: selecting the row shows nothing.
+    let mut short_app = seeded_app();
+    let short = transcript("Short take", "en", &["A short line."], 0);
+    short_app.set_library(vec![short.clone()]);
+    short_app.open_editor(short, 0.0);
+    short_app.advance(10.0);
+    short_app.editor.as_mut().expect("editor").select(0);
+    let (ctx, output) = editor_frame(&mut short_app);
+    let labels = a11y::controls(&ctx)
+        .into_iter()
+        .map(|control| control.label)
+        .collect::<Vec<_>>();
+    assert!(
+        !labels
+            .iter()
+            .any(|label| label.contains("Line length") || label.contains("Pace")),
+        "a clean selected row must show no chip: {labels:?}"
+    );
+    assert!(
+        !painted_texts(&output)
+            .iter()
+            .any(|(text, ..)| text.contains("Line length") || text.contains("Pace")),
+        "no advisory text is painted on a clean row"
+    );
+
+    // Outside the band on the selected row: the chip exists, in the helper tone.
+    let mut app = seeded_app();
+    let target = app.transcripts[0].clone();
+    app.open_editor(target, 0.0);
+    app.advance(10.0);
+    app.editor.as_mut().expect("editor").select(1);
+    let (ctx, output) = editor_frame(&mut app);
+    let labels = a11y::controls(&ctx)
+        .into_iter()
+        .map(|control| control.label)
+        .collect::<Vec<_>>();
+    assert!(
+        labels.iter().any(|label| label.starts_with("Line length ")),
+        "the selected long row reads its line length: {labels:?}"
+    );
+    let tokens = theme::tokens(AppTheme::Dark);
+    let (_, colour, size) = painted_texts(&output)
+        .into_iter()
+        .find(|(text, ..)| text.starts_with("Line length "))
+        .expect("the chip is painted");
+    assert_eq!(colour, tokens.ink_soft, "the chip is the helper tone");
+    assert_ne!(colour, tokens.warn, "the chip is never the warn amber");
+    assert_eq!(
+        size, 12.5,
+        "the chip is the caption size, not a numeral run"
+    );
+
+    let shot = render(&mut app, "editor-advisory-chip");
+    assert!(shot.painted_fraction(egui::Color32::BLACK) > 0.5);
+}
+
+/// M23A2 fix 3: an unassigned row keeps the rail column but breaks it into
+/// dashes, and carries the `Assign speaker` pill — "unassigned" is a state, not
+/// the absence of a row treatment.
+#[test]
+fn an_unassigned_row_wears_the_dashed_rail_and_the_assign_pill() {
+    let mut app = seeded_app();
+    let target = app.transcripts[0].clone();
+    app.open_editor(target, 0.0);
+    app.advance(10.0);
+    seed_tagged_speakers(&mut app);
+    app.editor.as_mut().expect("editor").select(2);
+    let (ctx, output) = editor_frame(&mut app);
+    let labels = a11y::controls(&ctx)
+        .into_iter()
+        .map(|control| control.label)
+        .collect::<Vec<_>>();
+    assert!(
+        labels.iter().any(|label| label == "Assign speaker"),
+        "the unlabelled row offers the pill: {labels:?}"
+    );
+
+    let rails: Vec<egui::Rect> = frame_shapes(&output)
+        .into_iter()
+        .filter_map(|shape| match shape {
+            egui::epaint::Shape::Rect(rect) => Some(rect.rect),
+            _ => None,
+        })
+        .filter(|rect| (rect.width() - 4.0).abs() < 0.01 && rect.left() < 10.0)
+        .collect();
+    let dashes = rails.iter().filter(|rect| rect.height() <= 4.01).count();
+    let solid = rails.iter().filter(|rect| rect.height() > 8.0).count();
+    assert!(
+        dashes >= 4,
+        "the unassigned rail is dashed, got {dashes} dashes: {rails:?}"
+    );
+    assert!(
+        solid >= 2,
+        "the labelled rows keep a solid rail, got {solid}: {rails:?}"
+    );
+
+    let shot = render(&mut app, "editor-unassigned-rail");
+    assert!(shot.painted_fraction(egui::Color32::BLACK) > 0.5);
+}
+
+/// M23A2 fix 4/5: the words on the speaker surface are the designed ones, and
+/// every labelled row names its speaker — a turn's name repeats rather than
+/// leaving later rows with a badge alone.
+#[test]
+fn the_speaker_surface_speaks_the_designed_words_on_every_row() {
+    use suramak_core::diarization::{Speaker, SpeakerTurn};
+
+    let mut app = seeded_app();
+    let roll = transcript(
+        "Roll call",
+        "en",
+        &[
+            "One short line.",
+            "Another short line.",
+            "A third short line.",
+        ],
+        0,
+    );
+    app.set_library(vec![roll.clone()]);
+    app.open_editor(roll.clone(), 0.0);
+    app.advance(10.0);
+    let speakers = vec![Speaker::new(0, "Speaker 1", 0)];
+    let turns = vec![SpeakerTurn::new(0, 0, 8_400, 0)];
+    app.editor.as_mut().expect("editor").speakers = Some(compact::CompactSpeakers {
+        speakers,
+        per_segment: suramak_core::diarization::speaker_for_segments(&roll.segments, &turns),
+        turns,
+        stale: false,
+        audio_ms: 12_600,
+        edited_since_export: false,
+    });
+    app.editor.as_mut().expect("editor").select(2);
+
+    let (ctx, output) = editor_frame(&mut app);
+    let labels = a11y::controls(&ctx)
+        .into_iter()
+        .map(|control| control.label)
+        .collect::<Vec<_>>();
+    let count = |needle: &str| labels.iter().filter(|label| *label == needle).count();
+    assert_eq!(
+        count("Speaker options"),
+        2,
+        "both rows of the turn name their speaker: {labels:?}"
+    );
+    assert_eq!(
+        count("Rename speaker"),
+        2,
+        "both rows carry the pencil target"
+    );
+    assert_eq!(count("Assign speaker"), 1, "the third row is unassigned");
+    assert!(!labels.iter().any(|label| label == "2 speakers"));
+    assert!(
+        labels.iter().any(|label| label == "Speakers · 1"),
+        "the bottom-bar control is `Speakers · N`, not a sentence: {labels:?}"
+    );
+
+    let headers = painted_texts(&output)
+        .into_iter()
+        .filter(|(text, ..)| text == "Speaker 1")
+        .count();
+    assert_eq!(
+        headers, 2,
+        "the full default label is painted on both rows, not just the first"
+    );
 }
 
 #[test]
