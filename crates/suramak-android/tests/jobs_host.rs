@@ -698,6 +698,9 @@ fn the_manifest_declares_the_share_matrix_and_the_service() {
         "android.permission.FOREGROUND_SERVICE_MICROPHONE",
         "app.suramak.mic.RecordingService",
         "foregroundServiceType=\"microphone\"",
+        // M24C: the Open Transcribe action is declared and nothing else about
+        // the contract lives in the manifest (the extras are code).
+        "app.suramak.action.TRANSCRIBE",
     ] {
         assert!(
             manifest.contains(needle),
@@ -737,6 +740,81 @@ fn the_bridge_reports_the_foreground_type_per_api() {
     assert_eq!(status["ok"], true);
     assert_eq!(status["total"], 0);
     assert_eq!(status["running"], false);
+}
+
+/// M24C — the Open Transcribe protocol: the op names Kotlin sends, the parse
+/// the host performs, and the one reply shape. The service's half is Kotlin,
+/// but every rule it relies on is exercised here.
+#[test]
+fn the_open_transcribe_protocol_parses_refuses_and_builds_the_reply() {
+    let dirs = dirs("open-transcribe");
+    let (backend, _steps, _control) = FakeBackend::new(true);
+    let host =
+        JobHost::with_prefetcher(backend, ThreadedPrefetch::new(Box::new(FileDecoder)), dirs);
+
+    let parsed: serde_json::Value = serde_json::from_str(&host.dispatch(
+        r#"{"op":"open_transcribe_request",
+                "action":"app.suramak.action.TRANSCRIBE",
+                "stream":"content://com.example.provider/audio/7",
+                "mime":"audio/ogg",
+                "language":"ID",
+                "sender":"  Rina  ",
+                "has_result_intent":true}"#,
+    ))
+    .unwrap();
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["language"], "id");
+    assert_eq!(parsed["sender"], "Rina");
+    assert_eq!(parsed["uri"], "content://com.example.provider/audio/7");
+
+    // A language the engine cannot select falls back to auto, named.
+    let fallback: serde_json::Value = serde_json::from_str(&host.dispatch(
+        r#"{"op":"open_transcribe_request",
+                "action":"app.suramak.action.TRANSCRIBE",
+                "stream":"content://x/1","mime":"audio/ogg",
+                "language":"English","has_result_intent":true}"#,
+    ))
+    .unwrap();
+    assert_eq!(fallback["ok"], true);
+    assert_eq!(fallback["language"], "auto");
+    assert_eq!(fallback["ignored_language"], "English");
+
+    // No reply route: refused before a job exists.
+    let refused: serde_json::Value = serde_json::from_str(&host.dispatch(
+        r#"{"op":"open_transcribe_request",
+                "action":"app.suramak.action.TRANSCRIBE",
+                "stream":"content://x/1","mime":"audio/ogg",
+                "has_result_intent":false}"#,
+    ))
+    .unwrap();
+    assert_eq!(refused["ok"], false);
+    assert_eq!(refused["code"], "missing_result_intent");
+    assert!(refused["reason"]
+        .as_str()
+        .unwrap()
+        .contains("RESULT_INTENT"));
+    assert_eq!(host.status().total, 0, "a refusal never creates a job");
+
+    // The failure payload: the contract's action and the ERROR extra only.
+    let failure: serde_json::Value = serde_json::from_str(
+        &host.dispatch(r#"{"op":"open_transcribe_failure","reason":"the audio track is empty"}"#),
+    )
+    .unwrap();
+    assert_eq!(failure["ok"], true);
+    assert_eq!(failure["action"], "app.suramak.action.TRANSCRIBE_RESULT");
+    assert_eq!(
+        failure["extras"]["app.suramak.extra.ERROR"],
+        "the audio track is empty"
+    );
+    assert!(failure["extras"]
+        .get("app.suramak.extra.TRANSCRIPT_TEXT")
+        .is_none());
+
+    // An empty reason is refused here rather than sent as a blank failure.
+    let empty: serde_json::Value =
+        serde_json::from_str(&host.dispatch(r#"{"op":"open_transcribe_failure","reason":"  "}"#))
+            .unwrap();
+    assert_eq!(empty["ok"], false);
 }
 
 /// Phase is reported while the copy is running, and the queue count is the

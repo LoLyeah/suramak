@@ -99,6 +99,40 @@ object TranscribeBridge {
     /** M22B — retry the failed job that still owns its copied audio. */
     fun retry(key: String): JSONObject = dispatch(JSONObject().put("op", "retry").put("key", key))
 
+    /**
+     * M24C — the Open Transcribe request parse. The rules (required
+     * `content://` uri, the import's mime matrix, `auto` for an unusable
+     * language, a required `RESULT_INTENT`) live in Rust and are host-tested;
+     * this only hands over the platform facts. A refusal answers
+     * `{ok:false, code, reason}`.
+     */
+    fun openTranscribeRequest(
+        action: String,
+        stream: String?,
+        mime: String,
+        language: String?,
+        sender: String?,
+        hasResultIntent: Boolean,
+    ): JSONObject {
+        val request = JSONObject()
+            .put("op", "open_transcribe_request")
+            .put("action", action)
+            .put("mime", mime)
+            .put("has_result_intent", hasResultIntent)
+        if (stream != null) request.put("stream", stream)
+        if (language != null) request.put("language", language)
+        if (sender != null) request.put("sender", sender)
+        return dispatch(request)
+    }
+
+    /** M24C — the stored transcript as the contract's reply payload. */
+    fun openTranscribeResult(transcriptId: String): JSONObject =
+        dispatch(JSONObject().put("op", "open_transcribe_result").put("transcript_id", transcriptId))
+
+    /** M24C — a named failure as the contract's reply payload. */
+    fun openTranscribeFailure(reason: String): JSONObject =
+        dispatch(JSONObject().put("op", "open_transcribe_failure").put("reason", reason))
+
     /** M22B — the live notification's one honest sentence. */
     fun progressText(percent: Int): JSONObject =
         dispatch(JSONObject().put("op", "progress_text").put("percent", percent))

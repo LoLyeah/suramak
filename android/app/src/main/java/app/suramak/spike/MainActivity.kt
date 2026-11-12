@@ -2,6 +2,7 @@ package app.suramak.spike
 
 import android.Manifest
 import android.animation.ValueAnimator
+import android.app.PendingIntent
 import android.content.ClipData
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -31,6 +32,7 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.core.content.FileProvider
+import androidx.core.content.IntentCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import app.suramak.mic.MicBridge
@@ -38,6 +40,7 @@ import app.suramak.mic.RecordingService
 import app.suramak.transcribe.ImportSource
 import app.suramak.transcribe.ModelChoice
 import app.suramak.transcribe.Notify
+import app.suramak.transcribe.OpenTranscribe
 import app.suramak.transcribe.TranscribeBridge
 import app.suramak.models.DeviceMemory
 import app.suramak.models.ModelDownloadJobService
@@ -327,6 +330,21 @@ class MainActivity : GameActivity() {
         /** M22B — the notification's Share-quote-card action. */
         const val ACTION_VOICE_NOTE_QUOTE = "app.suramak.transcribe.SHARE_QUOTE"
 
+        /**
+         * M24C — the Open Transcribe contract (`docs/OPEN-TRANSCRIBE.md`).
+         *
+         * The action, the extras and both payload rules live in
+         * `crates/suramak-android/src/open_transcribe.rs` and are host-tested;
+         * these constants only mirror the names for this Activity, and
+         * [OpenTranscribe] holds them for the service. The caller is another
+         * app: it hands one `content://` uri and its own reply `PendingIntent`,
+         * and gets a broadcast — never a sheet.
+         */
+        const val ACTION_TRANSCRIBE = OpenTranscribe.ACTION
+        const val ACTION_TRANSCRIBE_RESULT = OpenTranscribe.ACTION_RESULT
+        private const val EXTRA_OPEN_TRANSCRIBE_LANGUAGE = OpenTranscribe.EXTRA_LANGUAGE
+        private const val EXTRA_OPEN_TRANSCRIBE_RESULT_INTENT = OpenTranscribe.EXTRA_RESULT_INTENT
+
         private const val EXTRA_FORMAT = "format"
         private const val EXTRA_BILINGUAL = "bilingual"
         private const val EXTRA_SPEAKERS = "speakers"
@@ -448,6 +466,9 @@ class MainActivity : GameActivity() {
     /**
      * A second share/notification tap arrives here (the Activity is
      * `singleTask`): the same handler as `onCreate`, so there is one path.
+     * That includes M24C's `ACTION_TRANSCRIBE`: a request that arrives while
+     * the task is alive is handled by the same `handleLaunchIntent` case, not
+     * by a second receiver.
      */
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -553,6 +574,9 @@ class MainActivity : GameActivity() {
      *
      * * a share (`ACTION_SEND` / `ACTION_SEND_MULTIPLE`) or a picker result
      *   becomes a transcription job;
+     * * an Open Transcribe request (`ACTION_TRANSCRIBE`, M24C) is validated and
+     *   queued with `kind = open_transcribe`, and its caller is answered by the
+     *   service through the request's own `PendingIntent`;
      * * the launcher shortcut's `ACTION_IMPORT_AUDIO` opens the SAF picker;
      * * the completion notification's tap carries a transcript id and lands
      *   here: today a toast naming the row (there is no compact library yet —
@@ -575,6 +599,7 @@ class MainActivity : GameActivity() {
                 }
             }
             ACTION_IMPORT_AUDIO -> importLauncher.launch(arrayOf("audio/*", "video/*"))
+            ACTION_TRANSCRIBE -> acceptOpenTranscribe(intent)
             Notify.ACTION_OPEN_TRANSCRIPT -> {
                 val id = intent.getStringExtra(Notify.EXTRA_TRANSCRIPT_ID)
                 if (id != null) showTranscript(id)
@@ -626,6 +651,94 @@ class MainActivity : GameActivity() {
                 intent.getStringExtra(Notify.EXTRA_SENDER),
             )
         }
+    }
+
+    /**
+     * M24C — one `app.suramak.action.TRANSCRIBE` request
+     * (`docs/OPEN-TRANSCRIBE.md`).
+     *
+     * The caller is another app. It hands one `content://` uri and its own
+     * `PendingIntent`, and waits for a broadcast; there is no sheet, because a
+     * sheet would be a question the caller cannot answer. The parse (required
+     * uri, `content://` scheme, the import's mime matrix, `auto` for an
+     * unusable language, a required reply route) is Rust's and host-tested;
+     * this method only reads the platform extras and schedules the one job.
+     *
+     * A refusal that still has a reply route is answered with the named reason
+     * instead of a toast: the caller may be in the background, and silence is
+     * the one answer the contract does not allow.
+     */
+    private fun acceptOpenTranscribe(intent: Intent) {
+        val uri = IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
+        // The contract's type is `audio/*` / `video/*`; when the sender left it
+        // as `*/*` (or absent) the provider's own type is the honest source.
+        val declared = intent.type?.trim().orEmpty()
+        val mime = declared.takeIf { it.isNotEmpty() && it != "*/*" }
+            ?: uri?.let { runCatching { contentResolver.getType(it) }.getOrNull() }.orEmpty()
+        val reply = IntentCompat.getParcelableExtra(
+            intent,
+            EXTRA_OPEN_TRANSCRIBE_RESULT_INTENT,
+            PendingIntent::class.java,
+        )
+        val parsed = TranscribeBridge.openTranscribeRequest(
+            action = intent.action.orEmpty(),
+            stream = uri?.toString(),
+            mime = mime,
+            language = intent.getStringExtra(EXTRA_OPEN_TRANSCRIBE_LANGUAGE),
+            sender = intent.getStringExtra(EXTRA_SENDER),
+            hasResultIntent = reply != null,
+        )
+        if (!parsed.optBoolean("ok", false)) {
+            val reason = parsed.optString("reason").ifEmpty { getString(R.string.transcribe_failed_body) }
+            logToRust("open transcribe: refused (${parsed.optString("code")}) — $reason")
+            if (reply != null) {
+                OpenTranscribe.send(this, reply, TranscribeBridge.openTranscribeFailure(reason))
+            } else {
+                Toast.makeText(this, reason, Toast.LENGTH_LONG).show()
+            }
+            return
+        }
+        if (reply == null) {
+            // `parse` cannot succeed without a reply route; this guard exists
+            // so a future refactor cannot schedule a job nobody hears about.
+            logToRust("open transcribe: parsed without a reply route — ignored")
+            return
+        }
+        val chosen = parsed.optString("language").ifEmpty { "auto" }
+        val sender = parsed.optString("sender").takeIf { it.isNotEmpty() }
+        parsed.optString("ignored_language").takeIf { it.isNotEmpty() }?.let { ignored ->
+            logToRust("open transcribe: \"$ignored\" is not a two-letter language code; using auto")
+        }
+        val model = ModelChoice.forJob(this, chosen)
+        if (model == null) {
+            val reason = getString(R.string.transcribe_no_model_body)
+            OpenTranscribe.send(this, reply, TranscribeBridge.openTranscribeFailure(reason))
+            Notify.show(
+                this,
+                Notify.STATUS_ID,
+                Notify.status(this, getString(R.string.transcribe_no_model_title), reason),
+            )
+            logToRust("open transcribe: no model installed; the caller was told")
+            return
+        }
+        val requestId = OpenTranscribe.newRequestId()
+        OpenTranscribe.hold(requestId, reply)
+        val scheduled = TranscriptionJobService.enqueue(
+            this,
+            listOf(Uri.parse(parsed.optString("uri"))),
+            chosen,
+            TranscriptionJobService.KIND_OPEN_TRANSCRIBE,
+            sender,
+            requestId,
+        )
+        if (!scheduled) {
+            OpenTranscribe.forget(requestId)
+            val reason = getString(R.string.transcribe_schedule_failed)
+            OpenTranscribe.send(this, reply, TranscribeBridge.openTranscribeFailure(reason))
+            logToRust("open transcribe: the platform refused to schedule the job; the caller was told")
+            return
+        }
+        logToRust("open transcribe: queued ${parsed.optString("mime")} as $chosen (open_transcribe)")
     }
 
     /**

@@ -42,6 +42,9 @@
     <string name="transcribe_timed_out_body">Batas waktu sistem menghentikannya. Saat Suramak dibuka lagi, Anda ditawari untuk melanjutkan.</string>
     <string name="transcribe_cancelled_title">Transkripsi dibatalkan</string>
     <string name="transcribe_cancelled_body">Salinan impor dihapus; tidak ada yang ditambahkan ke pustaka.</string>
+    <!-- M24C: alasan kegagalan untuk pemanggil Open Transcribe. -->
+    <string name="transcribe_open_transcribe_paused">sistem menghentikan tugas sebelum selesai; Suramak menyimpan salinan berkas dan menawarkan lanjutkan saat dibuka lagi</string>
+    <string name="transcribe_open_transcribe_cancelled">permintaan dibatalkan sebelum selesai; tidak ada yang ditambahkan ke pustaka</string>
     <string name="transcribe_recovery_title">Transkripsi belum selesai</string>
     <string name="transcribe_recovery_resume">Lanjutkan</string>
     <string name="transcribe_recovery_discard">Buang</string>

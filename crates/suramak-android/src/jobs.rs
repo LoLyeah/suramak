@@ -260,8 +260,9 @@ pub struct JobRecord {
     pub title: String,
     /// The name the sharing app reported (kept for `Source::File`).
     pub source_name: String,
-    /// M22B: `import`, `recording` or `voice_note`. An absent value (a journal
-    /// written before M22B) behaves exactly like `import`.
+    /// M22B: `import`, `recording`, `voice_note` or (M24C) `open_transcribe`.
+    /// An absent value (a journal written before M22B) behaves exactly like
+    /// `import`.
     #[serde(default)]
     pub kind: String,
     /// M22B: the sender the share intent provided. Never derived; the
@@ -1192,6 +1193,26 @@ impl<B: InferenceBackend + Send + 'static, P: Prefetcher + Send + 'static> JobHo
         ))
     }
 
+    /// M24C: the Open Transcribe reply for a stored row — the same cleaned,
+    /// speaker-prefixed text the notification's Copy carries, as the contract's
+    /// payload. A row that reads back empty is an error here, never a blank
+    /// success: the caller is told the transcript has no text.
+    pub fn open_transcribe_result(
+        &self,
+        id: &str,
+    ) -> Result<crate::open_transcribe::ResultPayload, String> {
+        let uuid = uuid_parse(id).ok_or_else(|| format!("'{id}' is not a transcript id"))?;
+        let store = Store::open(&self.shared.dirs.db_path)
+            .map_err(|err| format!("the library could not be opened: {err}"))?;
+        let transcript = store
+            .get_transcript(uuid)
+            .map_err(|err| format!("the transcript could not be read: {err}"))?;
+        let diarization = store.diarization(uuid).ok().flatten();
+        let text = crate::open_transcribe::text_for(&transcript, diarization.as_ref());
+        crate::open_transcribe::ResultPayload::success(&transcript.id.to_string(), &text)
+            .map_err(|err| err.sentence().to_string())
+    }
+
     /// M22B: renders the page the notification is showing into a staged PNG.
     pub fn stage_quote_card(
         &self,
@@ -1317,6 +1338,58 @@ impl<B: InferenceBackend + Send + 'static, P: Prefetcher + Send + 'static> JobHo
                         reply.to_string()
                     }
                     Err(reason) => json!({ "ok": false, "error": reason }).to_string(),
+                }
+            }
+            // M24C: the Open Transcribe contract. The request is parsed here
+            // (not in Kotlin) so the rules are host-tested; the two payload
+            // builders are the only shape a reply can take.
+            "open_transcribe_request" => {
+                let facts = crate::open_transcribe::IntentFacts {
+                    action: value.get("action").and_then(Value::as_str),
+                    stream: value.get("stream").and_then(Value::as_str),
+                    mime: value.get("mime").and_then(Value::as_str),
+                    language: value.get("language").and_then(Value::as_str),
+                    sender: value.get("sender").and_then(Value::as_str),
+                    has_result_intent: value
+                        .get("has_result_intent")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                };
+                match crate::open_transcribe::parse(&facts) {
+                    Ok(request) => json!({
+                        "ok": true,
+                        "uri": request.uri,
+                        "mime": request.mime,
+                        "language": request.language,
+                        "sender": request.sender,
+                        "ignored_language": request.ignored_language,
+                    })
+                    .to_string(),
+                    Err(refusal) => json!({
+                        "ok": false,
+                        "code": refusal.code(),
+                        "reason": refusal.sentence(),
+                    })
+                    .to_string(),
+                }
+            }
+            "open_transcribe_result" => match self.open_transcribe_result(text("transcript_id")) {
+                Ok(payload) => {
+                    let mut reply = serde_json::to_value(&payload).unwrap_or_else(|_| json!({}));
+                    reply["ok"] = json!(true);
+                    reply.to_string()
+                }
+                Err(reason) => json!({ "ok": false, "reason": reason }).to_string(),
+            },
+            "open_transcribe_failure" => {
+                match crate::open_transcribe::ResultPayload::failure(text("reason")) {
+                    Ok(payload) => {
+                        let mut reply =
+                            serde_json::to_value(&payload).unwrap_or_else(|_| json!({}));
+                        reply["ok"] = json!(true);
+                        reply.to_string()
+                    }
+                    Err(err) => json!({ "ok": false, "reason": err.sentence() }).to_string(),
                 }
             }
             "progress_text" => {

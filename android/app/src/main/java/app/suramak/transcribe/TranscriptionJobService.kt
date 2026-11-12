@@ -17,6 +17,7 @@ import android.os.PowerManager
 import android.util.Log
 import androidx.core.os.BundleCompat
 import app.suramak.spike.R
+import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -77,6 +78,27 @@ class TranscriptionJobService : JobService() {
     /** M22B: the sender the intent provided (null when it did not). */
     private var voiceNoteSender: String? = null
 
+    /** M24C: this run came from an Open Transcribe request. */
+    private var openTranscribe = false
+
+    /**
+     * M24C: the request id whose `PendingIntent` the reply goes to. Null for a
+     * resumed journal job — a process restart loses the caller's reply route,
+     * which the docs name as a limit rather than paper over.
+     */
+    private var openTranscribeReply: String? = null
+
+    /** The run's one reply has been sent (or there was no route). */
+    private val replyLock = Any()
+    private var openTranscribeReplied = false
+
+    /**
+     * M24C: the host key of this run's import. The reply's failure branch
+     * matches on it so a stale `last_failed` from an earlier job can never be
+     * reported to this caller as its own reason.
+     */
+    private var openTranscribeKey: String? = null
+
     /** `jobFinished` exactly once per `onStartJob` that returned true. */
     private val finishLock = Any()
     private var finished = false
@@ -98,8 +120,13 @@ class TranscriptionJobService : JobService() {
         val uris = sharedUris(params)
         val mode = params.extras.getString(KEY_MODE) ?: MODE_IMPORT
         val resume = mode == MODE_RESUME
-        voiceNote = params.extras.getString(KEY_KIND) == KIND_VOICE_NOTE
+        val kind = params.extras.getString(KEY_KIND).orEmpty()
+        voiceNote = kind == KIND_VOICE_NOTE
         voiceNoteSender = params.extras.getString(KEY_SENDER)?.takeIf { it.isNotEmpty() }
+        openTranscribe = kind == KIND_OPEN_TRANSCRIBE
+        openTranscribeReply = params.extras.getString(KEY_REPLY)?.takeIf { it.isNotEmpty() }
+        openTranscribeReplied = false
+        openTranscribeKey = null
 
         if (!resume && uris.isEmpty()) {
             // Nothing to import and nothing to resume: a replaced job's echo.
@@ -116,6 +143,15 @@ class TranscriptionJobService : JobService() {
                     getString(R.string.transcribe_no_model_title),
                     getString(R.string.transcribe_no_model_body),
                 ),
+            )
+            // M24C: the caller is owed an answer even when the job never
+            // starts — the model disappeared between the Activity's check and
+            // this one.
+            replyOpenTranscribe(
+                TranscribeBridge.openTranscribeFailure(
+                    getString(R.string.transcribe_no_model_body),
+                ),
+                getString(R.string.transcribe_no_model_body),
             )
             return false
         }
@@ -161,7 +197,11 @@ class TranscriptionJobService : JobService() {
             declared,
             model,
             language,
-            kind = if (voiceNote) KIND_VOICE_NOTE else "import",
+            kind = when {
+                openTranscribe -> KIND_OPEN_TRANSCRIBE
+                voiceNote -> KIND_VOICE_NOTE
+                else -> "import"
+            },
             sender = voiceNoteSender,
         )
         if (!begun.optBoolean("ok", false)) {
@@ -178,6 +218,7 @@ class TranscriptionJobService : JobService() {
             return false
         }
         val key = begun.optString("key")
+        if (openTranscribe) openTranscribeKey = key
         val destination = File(begun.optString("media_path"))
         return try {
             val descriptor = contentResolver.openFileDescriptor(uri, "r")
@@ -328,9 +369,19 @@ class TranscriptionJobService : JobService() {
                     ),
                 )
             }
+            if (lastKind == KIND_OPEN_TRANSCRIBE) {
+                // M24C: the caller has been waiting since it sent the intent.
+                // The notification above is the fallback, not a substitute.
+                replyOpenTranscribe(
+                    TranscribeBridge.openTranscribeResult(last.optString("transcript_id")),
+                    getString(R.string.transcribe_failed_body),
+                )
+            }
         } else if (failed > 0 || lastError.isNotEmpty()) {
             val message = status.optString("message").ifEmpty { lastError }
             val failure = status.optJSONObject("last_failed")
+            val reason = failure?.optString("reason").orEmpty().ifEmpty { message }
+                .ifEmpty { getString(R.string.transcribe_failed_body) }
             if (failure != null && failure.optString("kind") == KIND_VOICE_NOTE) {
                 Notify.show(
                     this,
@@ -339,8 +390,7 @@ class TranscriptionJobService : JobService() {
                         this,
                         readyId,
                         getString(R.string.transcribe_failed_title),
-                        failure.optString("reason").ifEmpty { message }
-                            .ifEmpty { getString(R.string.transcribe_failed_body) },
+                        reason,
                         failure.optString("key"),
                         failure.optString("sender").ifEmpty { voiceNoteSender },
                     ),
@@ -352,8 +402,16 @@ class TranscriptionJobService : JobService() {
                     Notify.status(
                         this,
                         getString(R.string.transcribe_failed_title),
-                        message.ifEmpty { getString(R.string.transcribe_failed_body) },
+                        reason,
                     ),
+                )
+            }
+            if (openTranscribe && failure != null && failure.optString("key") == openTranscribeKey) {
+                // M24C: the queue's own sentence for *this* job, not a stale
+                // failure from an earlier run.
+                replyOpenTranscribe(
+                    TranscribeBridge.openTranscribeFailure(reason),
+                    getString(R.string.transcribe_failed_body),
                 )
             }
         } else if (status.optInt("cancelled", 0) > 0) {
@@ -366,6 +424,27 @@ class TranscriptionJobService : JobService() {
                     getString(R.string.transcribe_cancelled_body),
                 ),
             )
+            if (openTranscribe) {
+                replyOpenTranscribe(
+                    TranscribeBridge.openTranscribeFailure(
+                        getString(R.string.transcribe_open_transcribe_cancelled),
+                    ),
+                    getString(R.string.transcribe_cancelled_body),
+                )
+            }
+        }
+        // M24C: a caller is answered exactly once, whatever the branches above
+        // matched. This is the belt for a run that ended without a transcript
+        // and without a named failure — waiting forever is the one outcome the
+        // contract does not allow.
+        if (openTranscribe) {
+            replyOpenTranscribe(
+                TranscribeBridge.openTranscribeFailure(
+                    lastError.ifEmpty { status.optString("message") }
+                        .ifEmpty { getString(R.string.transcribe_failed_body) },
+                ),
+                getString(R.string.transcribe_failed_body),
+            )
         }
         stopForeground(STOP_FOREGROUND_REMOVE)
         releaseWakeLock()
@@ -373,6 +452,49 @@ class TranscriptionJobService : JobService() {
         if (params != null) {
             finishJob(params, retry = false)
         }
+    }
+
+    /**
+     * M24C — sends this run's one Open Transcribe reply.
+     *
+     * `payload` is a host-built `{ok, action, extras}`; a payload the host
+     * refused (an empty transcript, a row that could not be read) becomes a
+     * failure reply carrying the host's own sentence, so a caller is never
+     * left without an answer and never receives a blank "success".
+     *
+     * A run with no request id (a journal job resumed after a restart) and a
+     * `PendingIntent` the caller has cancelled both end in a log line: the
+     * transcript is already in the library and the notification is the
+     * documented fallback. Nothing here throws.
+     */
+    private fun replyOpenTranscribe(payload: JSONObject, fallbackReason: String) {
+        val token = openTranscribeReply
+        synchronized(replyLock) {
+            if (openTranscribeReplied) return
+            openTranscribeReplied = true
+        }
+        if (token == null) {
+            Log.i(TAG, "open transcribe: no reply route for this run (resumed or restarted)")
+            return
+        }
+        val reply = OpenTranscribe.take(token)
+        if (reply == null) {
+            Log.w(TAG, "open transcribe: the caller's PendingIntent is gone; the notification stands")
+            return
+        }
+        var out = payload
+        if (!out.optBoolean("ok", false)) {
+            Log.w(TAG, "open transcribe: the reply payload was refused — ${out.optString("reason")}")
+            out = TranscribeBridge.openTranscribeFailure(
+                out.optString("reason").ifEmpty { fallbackReason },
+            )
+        }
+        if (!out.optBoolean("ok", false)) {
+            Log.w(TAG, "open transcribe: no reply could be built; the notification stands")
+            return
+        }
+        val delivered = OpenTranscribe.send(this, reply, out)
+        Log.i(TAG, if (delivered) "open transcribe: replied" else "open transcribe: the reply was not delivered")
     }
 
     // --- lifecycle ----------------------------------------------------------
@@ -395,6 +517,14 @@ class TranscriptionJobService : JobService() {
                 getString(R.string.transcribe_paused_title),
                 getString(R.string.transcribe_paused_body),
             ),
+        )
+        // M24C: the caller cannot wait across a system pause. Answer now with
+        // the honest sentence; the copy is kept and resume is offered later.
+        replyOpenTranscribe(
+            TranscribeBridge.openTranscribeFailure(
+                getString(R.string.transcribe_open_transcribe_paused),
+            ),
+            getString(R.string.transcribe_paused_body),
         )
         finishJob(params, retry = false)
         return false
@@ -420,6 +550,12 @@ class TranscriptionJobService : JobService() {
                 getString(R.string.transcribe_paused_title),
                 getString(R.string.transcribe_timed_out_body),
             ),
+        )
+        replyOpenTranscribe(
+            TranscribeBridge.openTranscribeFailure(
+                getString(R.string.transcribe_open_transcribe_paused),
+            ),
+            getString(R.string.transcribe_timed_out_body),
         )
         val params = activeParams
         if (params != null) {
@@ -525,10 +661,14 @@ class TranscriptionJobService : JobService() {
         private const val KEY_MODE = "mode"
         private const val KEY_KIND = "kind"
         private const val KEY_SENDER = "sender"
+        /** M24C: the Open Transcribe request id whose reply this run owes. */
+        private const val KEY_REPLY = "reply"
         private const val MODE_IMPORT = "import"
         private const val MODE_RESUME = "resume"
         /** M22B: this job came from a share intent's voice note. */
         const val KIND_VOICE_NOTE = "voice_note"
+        /** M24C: this job came from an Open Transcribe request. */
+        const val KIND_OPEN_TRANSCRIBE = OpenTranscribe.KIND
         private const val COPY_CHUNK = 64 * 1024
         private const val PROGRESS_STEP = 256 * 1024L
         private const val POLL_MS = 300L
@@ -548,6 +688,7 @@ class TranscriptionJobService : JobService() {
             language: String = "auto",
             kind: String = "import",
             sender: String? = null,
+            reply: String? = null,
         ): Boolean {
             if (uris.isEmpty()) return false
             val transient = Bundle().apply {
@@ -558,6 +699,7 @@ class TranscriptionJobService : JobService() {
                 putString(KEY_LANGUAGE, language)
                 putString(KEY_KIND, kind)
                 putString(KEY_SENDER, sender)
+                putString(KEY_REPLY, reply)
             }
             val builder = JobInfo.Builder(
                 NEXT_JOB_ID.getAndIncrement(),

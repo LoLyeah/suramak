@@ -142,6 +142,35 @@
                 <data android:mimeType="video/*" />
             </intent-filter>
 
+            <!-- M24C — Open Transcribe (`docs/OPEN-TRANSCRIBE.md`). Another app
+                 sends `app.suramak.action.TRANSCRIBE` with one content:// uri
+                 and its own reply PendingIntent; the Activity validates and
+                 queues the existing job with kind=open_transcribe. The mime
+                 matrix is the share target's, because the import path checks
+                 it with the same function. No permission is added on either
+                 side: the caller grants read on its own uri, and the reply
+                 broadcast is sent under the caller's identity. -->
+            <intent-filter>
+                <action android:name="app.suramak.action.TRANSCRIBE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="audio/*" />
+                <data android:mimeType="application/ogg" />
+                <data android:mimeType="application/x-ogg" />
+                <data android:mimeType="audio/opus" />
+                <data android:mimeType="audio/ogg" />
+                <data android:mimeType="audio/webm" />
+                <data android:mimeType="video/webm" />
+                <data android:mimeType="video/mp4" />
+                <data android:mimeType="video/x-matroska" />
+            </intent-filter>
+            <!-- A caller that leaves the type unset resolves through this
+                 filter; the parser then takes the provider's own type (or
+                 refuses with `unsupported_mime` when there is none). -->
+            <intent-filter>
+                <action android:name="app.suramak.action.TRANSCRIBE" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+
             <!-- The launcher long-press shortcut ("Import audio") needs no
                  permission and no in-app button: the spike's egui screens stay
                  exactly as the four checks expect them. -->

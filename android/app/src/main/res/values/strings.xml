@@ -46,6 +46,9 @@
     <string name="transcribe_timed_out_body">The system time limit stopped it. The next time Suramak opens it offers to resume.</string>
     <string name="transcribe_cancelled_title">Transcription cancelled</string>
     <string name="transcribe_cancelled_body">The imported copy was removed; nothing was added to the library.</string>
+    <!-- M24C: the Open Transcribe caller's failure reasons. -->
+    <string name="transcribe_open_transcribe_paused">the system stopped the job before it finished; Suramak keeps the copied file and offers to resume on the next launch</string>
+    <string name="transcribe_open_transcribe_cancelled">the request was cancelled before it finished; nothing was added to the library</string>
     <string name="transcribe_recovery_title">Unfinished transcription</string>
     <string name="transcribe_recovery_resume">Resume</string>
     <string name="transcribe_recovery_discard">Discard</string>
