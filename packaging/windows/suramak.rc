@@ -36,12 +36,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Suramak"
             VALUE "FileDescription", "Suramak - on-device transcription"
-            VALUE "FileVersion", "0.4.3"
+            VALUE "FileVersion", "0.5.0"
             VALUE "InternalName", "suramak"
             VALUE "LegalCopyright", "GPL-3.0-or-later"
             VALUE "OriginalFilename", "suramak.exe"
             VALUE "ProductName", "Suramak"
-            VALUE "ProductVersion", "0.4.3"
+            VALUE "ProductVersion", "0.5.0"
         END
     END
     BLOCK "VarFileInfo"

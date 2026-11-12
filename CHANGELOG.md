@@ -4,7 +4,24 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased]
 
-## [0.4.3] - 2026-11-12
+## 0.5.0 - 2026-11-12
+
+### Added
+- **The UI refresh (M20A–E)** — the five slices the owner asked for ("dated, no motion, too barebones"), with Liquid Glass kept and real AppKit glass used on macOS:
+  - **Type**: bundled Inter, Newsreader (serif titles, the empty state) and Geist Mono, on a written scale with tabular numerals; the phone's timecodes and transport counters now sit in fixed-width cells, so playback stops jittering.
+  - **Material**: seven frost tokens per ladder with WCAG-asserted contrast (lowest 6.23:1), `frosted_panel`/scrim/dock/card primitives, deterministic grain, a shadow budget, and 11 painted round-cap icons at 44 pt hit boxes.
+  - **Library**: serif title, gear action, frosted search, one honest model banner (absent when a verified model is in use), type-scaled rows with hairlines and press motion, the Newsreader empty state, and a floating frosted dock (Import secondary, Record primary in record red).
+  - **Settings**: one grouped model card with human tier names (Quick test / Compact / Balanced / Highly accurate), a real Recommended badge, a full-bleed accent selection, RAM-named state-aware copy, no raw ids or engine strings on the primary surface, Quit hidden on Android.
+  - **Editor and sheets**: body type scale, kit-drawn speaker headers with a pencil, "Line length" instead of CPL on the phone, every sheet on the Sheet plane with slide + scrim motion, pressed-spring buttons, Newsreader onboarding.
+- **A queue that survives the OS (M22A/A2)**: schema v8 job journal + segment checkpointing. Committed text is durable before the journal records it, torn writes reconcile in both directions on open, and a job killed mid-file resumes at the boundary. Proven by a SIGKILL test whose resumed transcript is byte-equal to an uninterrupted run. Resume is wired into all three hosts (CLI, desktop, Android) through one shared helper.
+- **The voice note comes back as a transcript (M22B)**: share audio → a 1.2 s frosted sheet → the existing FGS queue transcribes headlessly → a paged notification with honest "Transcribing… N%" progress, then the transcript with Copy / Next page / Open editor / Share quote card. Speaker prefixes only when diarization ran; the sender's name only when the intent carried it. No new permissions, no NotificationListener, no media scraping.
+- **Library-wide search (M22C)**: schema v9 FTS5 segment index; the Library field searches titles *and* spoken text, with phrases, AND terms and `speaker:` filters; hits show a bracketed snippet and tap through to the editor at that segment. Audit gate as a test: 8,000 segments / 400k words, p95 **16.05 ms** (bar 50 ms). Rows gained a mini-waveform, speaker pips (+N) and tabular durations.
+- **Speaker tagging on the phone (M23A)**: `Speaker 1…N` by hand, per recording — add, assign ("this turn" or "from here down"), rename, colour, merge into…, remove label, clear all, with undo on every verb. Exports can include speakers (SRT/VTT/Markdown) and never rewrite a file silently: the sheet says when speakers changed since the last export.
+
+### Fixed
+- **BACK on the Android share sheet now refuses the share**, not just closes the sheet — the pending URIs are dropped with it (the emulator smoke caught the offer staying armed).
+- **macOS CI**: a restored `target/` made the sherpa build script count as fresh and skip copying its dylibs, so bundling failed; the bundler now recovers the pinned files from sherpa-rs's own cache and still verifies every sha256.
+- The smoke's clearance assertion now asks the right question: the Quit row must sit above the viewport edge (which already excludes the gesture inset), not have its own trailing padding visible.
 
 ## 0.4.3 - 2026-11-11
 
