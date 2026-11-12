@@ -1065,7 +1065,11 @@ class MainActivity : GameActivity() {
      */
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (event.keyCode == KeyEvent.KEYCODE_BACK) {
-            if (lastImeBottom > 0) {
+            // The IME owns back only when nothing modal is in front of it. A
+            // pending voice-note share is a modal offer: with the keyboard up
+            // (the smoke's emulator had one), deferring to the IME swallowed
+            // the first press and the share stayed armed — CI run 43199127756.
+            if (lastImeBottom > 0 && pendingVoiceNote == null) {
                 return super.dispatchKeyEvent(event)
             }
             if (event.action == KeyEvent.ACTION_DOWN) {

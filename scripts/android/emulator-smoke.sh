@@ -686,11 +686,21 @@ if [ "$MODEL_PRESENT" != "yes" ]; then
   echo "M22B-SKIP: no speech model at $MODEL_FILE — the micro-sheet was asserted; the"
   echo "           notification step needs a model (set SURAMAK_SMOKE_MODEL to a"
   echo "           ggml-tiny.bin to run it). This is a gate, not a pass for the notification."
-  "$ADB" shell input keyevent 4
-  sleep 1
-  app_log | grep -q "voice note: the offer was dismissed" \
-    || fail "BACK on the voice-note sheet did not dismiss the share"
-  echo "   sheet:    dismissed by BACK; nothing was scheduled"
+  # BACK up to three times: a soft keyboard in front of the app legitimately
+  # eats the first press (the IME owns back), and which press lands is an
+  # emulator detail, not a product contract. The contract is that BACK
+  # eventually refuses the share and nothing is scheduled.
+  dismissed=no
+  for press in 1 2 3; do
+    "$ADB" shell input keyevent 4
+    sleep 1
+    if app_log | grep -q "voice note: the offer was dismissed"; then
+      dismissed=yes
+      echo "   sheet:    dismissed by BACK (press $press); nothing was scheduled"
+      break
+    fi
+  done
+  [ "$dismissed" = yes ] || fail "BACK on the voice-note sheet did not dismiss the share (3 presses)"
 else
   # Run 1 — cancel while it is transcribing. The key is the service's own log
   # line, never a guess; Cancel is the same broadcast the notification uses.
