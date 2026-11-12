@@ -17,6 +17,7 @@ use suramak_asr::EngineId;
 use suramak_core::diagnostics::SubtitleLimits;
 use suramak_core::export as core_export;
 use suramak_core::models as core_models;
+use suramak_core::notes::NotePreset;
 use suramak_core::segment_edit::{
     EditKind, SegmentHistory, SegmentRow, SegmentSnapshot, UNDO_DEPTH,
 };
@@ -65,6 +66,8 @@ pub mod keymap;
 pub mod library;
 pub mod model_manager;
 pub mod models;
+// M24B: the citation-verified notes flow (the sheet itself is shared).
+pub mod notes;
 pub mod polish;
 pub mod quit_confirm;
 pub mod record;
@@ -1179,6 +1182,8 @@ pub struct AppState {
     /// session; they queue as soon as it stops (`begin_imports` refuses a
     /// live recording by design).
     watch_deferred: Vec<PathBuf>,
+    /// M24B: the citation-verified notes sheet (shared with the phone).
+    pub notes: crate::notes_sheet::NotesSheet,
 }
 
 /// M24A: what the Library's watch row says.
@@ -1307,6 +1312,22 @@ pub enum Effect {
     /// Run the polish call for this transcript on a background thread
     /// (core's client is blocking HTTP; never the ASR worker). M4.
     PolishTranscript { transcript: Box<Transcript> },
+    /// M24B: read the open transcript's stored notes (the sheet's open path).
+    LoadNotes { transcript: Uuid },
+    /// M24B: generate one preset's notes through the polish client's own
+    /// endpoint. `speakers` are the segment labels the diarization view knows
+    /// (empty on a plain transcript).
+    GenerateNotes {
+        transcript: Box<Transcript>,
+        preset: NotePreset,
+        speakers: Vec<(u32, String)>,
+    },
+    /// M24B: persist one citation-checked note (one row per preset).
+    SaveNote {
+        note: Box<suramak_core::store::NoteRecord>,
+    },
+    /// M24B: write the exact stored Markdown to a file picked by the user.
+    ExportNote { dest: PathBuf, markdown: String },
     /// M15.8: run the opt-in translation for these segments on a background
     /// thread. `only` restricts the run to a retry's failed ids. Emitted **only**
     /// by the export sheet's Translate action — never by a panel open.
@@ -1457,6 +1478,7 @@ impl AppState {
             hud_loaded_note: None,
             watch: None,
             watch_deferred: Vec::new(),
+            notes: crate::notes_sheet::NotesSheet::new(),
         }
     }
 
@@ -3524,6 +3546,9 @@ impl AppState {
         // transcript must never inherit it (M4).
         self.polish = PolishState::Idle;
         self.polish_undo = None;
+        // M24B: the notes sheet belongs to the transcript that was open; a
+        // different one starts closed with no stored rows from the old one.
+        self.notes = crate::notes_sheet::NotesSheet::new();
         // M15.3: the structural edit log belongs to the transcript that was
         // open; a different one starts with no history.
         self.segment_history.clear();

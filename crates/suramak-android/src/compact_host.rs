@@ -26,7 +26,8 @@ use serde_json::{json, Value};
 use suramak_core::device::DeviceProfile;
 use suramak_core::diarization::{speaker_for_segments, SpeakerHistory, TimeRange};
 use suramak_core::export::ExportSpeakers;
-use suramak_core::settings::{LangMode, Settings};
+use suramak_core::notes::{generate_notes, NotePreset};
+use suramak_core::settings::{LangMode, PolishSettings, Settings};
 use suramak_core::store::Store;
 use suramak_ui::deck::compact::{
     CompactAction, CompactApp, CompactExportFormat, CompactRoute, CompactSetting, CompactSettings,
@@ -76,6 +77,12 @@ impl CompactHost {
         };
         app.settings.language = language;
         app.first_run_seen = settings.ui.first_run_seen;
+        // M24B: the Notes action's gate is the polish endpoint + its key.
+        app.notes_configured = settings
+            .polish
+            .as_ref()
+            .is_some_and(|polish| !polish.base_url.trim().is_empty())
+            && suramak_core::keychain::get_api_key().is_ok();
         // M24A: the watched inbox's persisted switch/folder and ledger count.
         // The live status (failure, new imports) is refreshed by the shell.
         let watch_imports = Store::open(&dirs.db_path)
@@ -174,6 +181,10 @@ impl CompactHost {
             "export_shared" => inner.finish_shared(&value),
             "export_cancel" => inner.cancel_export(&value),
             "export_failed" => inner.fail_export(&value),
+            "notes_load" => inner.notes_load(&value),
+            "notes_generate" => inner.notes_generate(&value),
+            "note_save" => json!({ "ok": true }).to_string(),
+            "note_export" => inner.note_export(&value),
             "add_speaker" => inner.add_speaker(),
             "assign_speaker" => inner.assign_speaker(&value, false),
             "new_speaker_assign" => inner.assign_speaker(&value, true),
@@ -308,6 +319,7 @@ impl Inner {
                 Some(Sheet::Speakers) => "speakers",
                 Some(Sheet::Speaker) => "speaker",
                 Some(Sheet::TurnStrip) => "turn_strip",
+                Some(Sheet::Notes) => "notes",
                 None => "none",
             },
             "status": self.app.status.as_ref().map(|(text, error)| json!({"text": text, "error": error})),
@@ -1017,6 +1029,156 @@ impl Inner {
     /// `export` / `export_share`: render through the M15 serializer, stage the
     /// bytes atomically, and hand Kotlin the one file. The bytes exist before
     /// the platform stream is opened; `export_done` verifies the write.
+    /// M24B: the open transcript's stored notes (the sheet's open path).
+    fn notes_load(&mut self, value: &Value) -> String {
+        let Some(id) = value
+            .get("transcript_id")
+            .and_then(Value::as_str)
+            .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
+        else {
+            return error("notes_load needs a transcript_id");
+        };
+        let result = Store::open(&self.dirs.db_path)
+            .map_err(|err| err.to_string())
+            .and_then(|store| {
+                store
+                    .notes_for(id)
+                    .map(|rows| rows.iter().map(|row| row.stored()).collect())
+                    .map_err(|err| err.to_string())
+            });
+        self.app.on_notes_loaded(id, result);
+        self.snapshot()
+    }
+
+    /// M24B: generate one preset through the user's own polish endpoint, check
+    /// every citation, store the row, and hand the outcome to the sheet.
+    fn notes_generate(&mut self, value: &Value) -> String {
+        let Some(id) = value
+            .get("transcript_id")
+            .and_then(Value::as_str)
+            .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
+        else {
+            return error("notes_generate needs a transcript_id");
+        };
+        let preset = value
+            .get("preset")
+            .and_then(Value::as_str)
+            .and_then(NotePreset::parse)
+            .unwrap_or(NotePreset::Minutes);
+        let settings = Settings::load(&self.settings_path).unwrap_or_default();
+        let Some(polish) = settings.polish else {
+            self.app
+                .on_notes_done(Err(suramak_ui::notes_sheet::NOTES_SETUP_NOTE.to_string()));
+            return self.snapshot();
+        };
+        let cfg = PolishSettings {
+            base_url: polish.base_url,
+            model: polish.model,
+            send_audio: false,
+        };
+        let store = match Store::open(&self.dirs.db_path) {
+            Ok(store) => store,
+            Err(err) => {
+                self.app
+                    .on_notes_done(Err(format!("library database unavailable: {err}")));
+                return self.snapshot();
+            }
+        };
+        let transcript = match store.get_transcript(id) {
+            Ok(transcript) => transcript,
+            Err(err) => {
+                self.app.on_notes_done(Err(err.to_string()));
+                return self.snapshot();
+            }
+        };
+        let speakers = store
+            .diarization(id)
+            .ok()
+            .flatten()
+            .map(|run| {
+                let rows = run.segment_speakers(&transcript.segments);
+                transcript
+                    .segments
+                    .iter()
+                    .zip(rows.iter())
+                    .filter_map(|(segment, row)| {
+                        row.map(|speaker| {
+                            let label = run
+                                .speakers
+                                .iter()
+                                .find(|candidate| candidate.speaker_id == speaker.primary)
+                                .map(|candidate| candidate.label.clone())
+                                .unwrap_or_else(|| {
+                                    suramak_core::diarization::default_label(speaker.primary)
+                                });
+                            (segment.idx, label)
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let outcome = generate_notes(
+            &transcript.title,
+            transcript.language.as_deref(),
+            &transcript.segments,
+            &speakers,
+            preset,
+            &cfg,
+        );
+        if let Ok(note) = &outcome {
+            let record = suramak_core::store::NoteRecord {
+                transcript_id: id,
+                preset: note.preset,
+                body_md: note.body_md.clone(),
+                citations_checked: note.citations_checked,
+                citations_removed: note.citations_removed,
+                model: note.model.clone(),
+                created_at: suramak_core::Utc::now(),
+            };
+            if let Err(err) = store.save_note(&record) {
+                log::warn!("notes: generated but not saved: {err}");
+            }
+        }
+        self.app
+            .on_notes_done(outcome.map_err(|err| err.to_string()));
+        self.snapshot()
+    }
+
+    /// M24B: stage the exact stored Markdown for the phone's share sheet.
+    fn note_export(&mut self, value: &Value) -> String {
+        let Some(name) = value.get("name").and_then(Value::as_str) else {
+            return error("note_export needs a name");
+        };
+        let Some(markdown) = value.get("markdown").and_then(Value::as_str) else {
+            return error("note_export needs markdown");
+        };
+        let root = self
+            .dirs
+            .media_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.dirs.media_dir.clone());
+        let dir = root.join("exports");
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            return error(&err.to_string());
+        }
+        let safe: String = name
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.') {
+                    c
+                } else {
+                    ' '
+                }
+            })
+            .collect();
+        let path = dir.join(safe.trim());
+        match std::fs::write(&path, markdown.as_bytes()) {
+            Ok(()) => json!({ "ok": true, "path": path.to_string_lossy() }).to_string(),
+            Err(err) => error(&err.to_string()),
+        }
+    }
+
     fn prepare_export(&mut self, value: &Value, share: bool) -> String {
         let format = match value.get("format").and_then(Value::as_str) {
             Some("txt") => CompactExportFormat::Txt,

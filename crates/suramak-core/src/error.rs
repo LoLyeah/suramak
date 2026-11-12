@@ -92,6 +92,11 @@ pub enum SuramakError {
     #[error("Polish backend error: {0}")]
     Polish(String),
 
+    /// M24B: the notes path refused before a request (an empty transcript) —
+    /// a property of the input, not of the LLM backend.
+    #[error("Notes: {0}")]
+    Notes(String),
+
     #[error("Bad polish response: {0}")]
     BadResponse(String),
 

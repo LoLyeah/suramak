@@ -1063,6 +1063,20 @@ impl App {
             self.apply(effects);
         }
 
+        // M24B: the notes run (its own thread, one preset at a time).
+        let notes = self
+            .runtime
+            .as_mut()
+            .and_then(|runtime| runtime.notes_status());
+        if let Some(result) = notes {
+            changed = true;
+            let effects = match self.shell.as_mut() {
+                Some(shell) => shell.app.on_notes_done(result),
+                None => Vec::new(),
+            };
+            self.apply(effects);
+        }
+
         // M15.8: translation progress / terminal outcome (its own thread; the
         // event slot is drained here so a cancelled or partial run lands in the
         // UI even if the user navigated away mid-run).

@@ -3100,3 +3100,71 @@ fn the_richer_rows_keep_the_press_and_the_dock_clearance() {
     let shot = h.shot("library-bottom");
     assert!(shot.painted_fraction(egui::Color32::BLACK) > 0.5);
 }
+
+#[test]
+fn the_notes_sheet_paints_the_presets_the_gate_and_the_result_line() {
+    let mut app = seeded_app();
+    let target = app.transcripts[0].clone();
+    app.open_editor(target, 0.0);
+    app.advance(10.0);
+    app.notes_configured = true;
+    app.open_notes_sheet(10.0);
+    app.advance(11.0);
+    let (ctx, _output) = editor_frame(&mut app);
+    let labels: Vec<String> = a11y::controls(&ctx)
+        .into_iter()
+        .map(|control| control.label)
+        .collect();
+    for label in ["Minutes", "Action items", "Bilingual brief (EN↔ID)", "Run"] {
+        assert!(
+            labels.iter().any(|candidate| candidate == label),
+            "the sheet must paint {label}: {labels:?}"
+        );
+    }
+
+    // A stored result shows the one honest line.
+    app.notes
+        .adopt_stored(vec![suramak_core::notes::StoredNote {
+            preset: suramak_core::notes::NotePreset::Minutes,
+            body_md: "# Minutes\n\n- shipped [00:04]\n".to_string(),
+            citations_checked: 12,
+            citations_removed: 1,
+            breakdown: suramak_core::notes::CitationBreakdown {
+                removed: 1,
+                ..Default::default()
+            },
+            model: "mock".to_string(),
+            created_at: "2026-01-01T00:00:00+00:00".to_string(),
+        }]);
+    let (_, output) = editor_frame(&mut app);
+    assert!(
+        painted_texts(&output)
+            .iter()
+            .any(|(text, ..)| text.as_str()
+                == "12 citations checked · 1 removed (no matching audio)"),
+        "the result line is painted verbatim"
+    );
+    assert!(
+        painted_texts(&output)
+            .iter()
+            .any(|(text, ..)| text.as_str() == "Export .md"),
+        "the export action is painted"
+    );
+
+    // The not-configured state paints the setup sentence and disables Run.
+    app.notes_configured = false;
+    app.open_notes_sheet(12.0);
+    app.advance(13.0);
+    let (ctx, output) = editor_frame(&mut app);
+    let labels: Vec<String> = a11y::controls(&ctx)
+        .into_iter()
+        .map(|control| control.label)
+        .collect();
+    assert!(labels.iter().any(|label| label == "Run"));
+    assert!(
+        painted_texts(&output)
+            .iter()
+            .any(|(text, ..)| text.contains("notes are not configured")),
+        "the gate sentence is painted"
+    );
+}

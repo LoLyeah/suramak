@@ -34,7 +34,7 @@ use crate::theme::{self, Tokens};
 
 use super::polish::{PolishState, POLISH_SETUP_NOTE};
 use super::views::{pane_caption, PANE_PAD_X};
-use super::{count_noun, export, format_transport, AppState, Effect};
+use super::{count_noun, export, format_transport, notes, AppState, Effect};
 
 /// The deck band's height (workorder §3: ~96 px).
 pub const DECK_HEIGHT: f32 = 96.0;
@@ -42,6 +42,8 @@ pub const DECK_HEIGHT: f32 = 96.0;
 pub const DECK_PAD_X: f32 = 18.0;
 /// The `Export…` button's designed size (the deck's right anchor).
 pub const EXPORT_SIZE: Vec2 = Vec2::new(96.0, 30.0);
+/// M24B: the header's Notes action (left of Export).
+pub const NOTES_SIZE: Vec2 = Vec2::new(84.0, 30.0);
 /// The time readout's reserved width (`mm:ss.mmm / mm:ss.mmm`, mono 12).
 pub const READOUT_WIDTH: f32 = 158.0;
 /// The transcript's mono timecode gutter width.
@@ -143,6 +145,8 @@ pub struct DeckLayout {
     pub lane: Rect,
     pub waveform: Rect,
     pub readout: Rect,
+    /// M24B: the Notes action, between the readout and Export.
+    pub notes: Rect,
     pub export: Rect,
 }
 
@@ -164,8 +168,15 @@ pub fn deck_layout(pane: Rect) -> DeckLayout {
         ),
         EXPORT_SIZE,
     );
+    let notes = Rect::from_min_size(
+        pos2(
+            export.left() - 8.0 - NOTES_SIZE.x,
+            band.center().y - NOTES_SIZE.y / 2.0,
+        ),
+        NOTES_SIZE,
+    );
     let readout = Rect::from_min_size(
-        pos2(export.left() - 14.0 - READOUT_WIDTH, band.center().y - 9.0),
+        pos2(notes.left() - 14.0 - READOUT_WIDTH, band.center().y - 9.0),
         vec2(READOUT_WIDTH, 18.0),
     );
     let wave_left = transport.right() + 18.0;
@@ -184,6 +195,7 @@ pub fn deck_layout(pane: Rect) -> DeckLayout {
         lane,
         waveform,
         readout,
+        notes,
         export,
     }
 }
@@ -205,6 +217,7 @@ pub fn ui(
 
     // The export sheet hangs from the deck's button (anchored card, no band).
     // It draws itself only while open or mid-close (M9c: base enter / fast exit).
+    notes::sheet(ui.ctx(), tokens, motion, state, effects, deck.notes);
     export::sheet(ui.ctx(), tokens, motion, state, effects, deck.export);
 
     // ---- title line: serif title + the capsule action cluster --------------
@@ -374,6 +387,24 @@ fn deck_band(
         FontId::new(12.0, FontFamily::Monospace),
         tokens.ink_soft,
     );
+
+    // ---- Notes (M24B: the citation-verified presets) ------------------------
+    ui.scope_builder(egui::UiBuilder::new().max_rect(deck.notes), |ui| {
+        let response = controls::button_sized(
+            ui,
+            tokens,
+            motion,
+            "deck-notes",
+            "Notes",
+            Tier::Secondary,
+            state.editor.is_some(),
+            NOTES_SIZE,
+        )
+        .on_hover_text("Minutes, action items or a bilingual brief — every citation checked");
+        if response.clicked() {
+            effects.extend(state.toggle_notes());
+        }
+    });
 
     // ---- Export… (the one tier-2 action in the header) ---------------------
     ui.scope_builder(egui::UiBuilder::new().max_rect(deck.export), |ui| {
@@ -1966,10 +1997,15 @@ mod tests {
         assert_eq!(deck.export.size(), EXPORT_SIZE);
         assert_eq!(deck.export.center().y, deck.band.center().y);
 
-        // Readout: sits between the waveform and the export button.
-        assert!(deck.readout.right() <= deck.export.left());
+        // Readout: sits between the waveform and the Notes action.
+        assert!(deck.readout.right() <= deck.notes.left());
         assert!(deck.readout.left() > deck.transport.right());
         assert_eq!(deck.readout.width(), READOUT_WIDTH);
+
+        // Notes: between the readout and Export.
+        assert!(deck.notes.right() <= deck.export.left());
+        assert_eq!(deck.notes.size(), NOTES_SIZE);
+        assert_eq!(deck.notes.center().y, deck.band.center().y);
 
         // Waveform: the middle band, after the capsule, before the readout.
         assert!(deck.waveform.left() > deck.transport.right());
@@ -1978,7 +2014,13 @@ mod tests {
         assert!(deck.waveform.height() > 20.0);
 
         // Every anchor lives inside the band.
-        for anchor in [deck.transport, deck.waveform, deck.readout, deck.export] {
+        for anchor in [
+            deck.transport,
+            deck.waveform,
+            deck.readout,
+            deck.notes,
+            deck.export,
+        ] {
             assert!(
                 deck.band.contains_rect(anchor),
                 "{anchor:?} must sit inside the band"

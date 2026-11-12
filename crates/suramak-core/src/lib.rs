@@ -11,6 +11,8 @@ pub mod error;
 pub mod export;
 pub mod keychain;
 pub mod models;
+// M24B: citation-verified notes (Minutes / Action items / EN↔ID brief).
+pub mod notes;
 pub mod paths;
 pub mod polish;
 pub mod resample;

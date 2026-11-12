@@ -35,6 +35,10 @@ pub(crate) use desktop::{
 // exists anywhere.
 
 pub use suramak_ui::deck::{motion, theme};
+// M24B: the Notes sheet's shared state machine (lib module, same path in the
+// desktop binary and the phone host).
+#[allow(unused_imports)]
+pub(crate) use suramak_ui::notes_sheet;
 
 #[cfg(target_os = "android")]
 fn main() {

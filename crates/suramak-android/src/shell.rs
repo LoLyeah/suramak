@@ -55,6 +55,8 @@ const ACTION_FINISH: &str = "app.suramak.action.COMPACT_FINISH";
 const ACTION_SHARE_CRASH: &str = "app.suramak.action.COMPACT_SHARE_CRASH";
 const ACTION_VOICE_NOTE_ACCEPT: &str = "app.suramak.action.VOICE_NOTE_ACCEPT";
 const ACTION_VOICE_NOTE_CANCEL: &str = "app.suramak.action.VOICE_NOTE_CANCEL";
+/// M24B: the Notes sheet's Copy (the Activity owns the clipboard).
+const ACTION_COPY: &str = "app.suramak.action.COMPACT_COPY";
 
 /// One intent extra (only the shapes the compact verbs need).
 enum Extra<'a> {
@@ -551,6 +553,53 @@ impl CompactShell {
                     ("speakers", Extra::Bool(speakers)),
                 ],
             ),
+            // M24B: the notes sheet's three host calls. The Rust host owns the
+            // store and the polish settings, so the phone needs no second path.
+            CompactAction::LoadNotes { transcript } => {
+                let reply = host.dispatch(
+                    &serde_json::json!({
+                        "op": "notes_load",
+                        "transcript_id": transcript.to_string(),
+                    })
+                    .to_string(),
+                );
+                log_reply("load notes", &reply);
+            }
+            CompactAction::GenerateNote { request } => {
+                let reply = host.dispatch(
+                    &serde_json::json!({
+                        "op": "notes_generate",
+                        "transcript_id": request.transcript.to_string(),
+                        "preset": request.preset.key(),
+                    })
+                    .to_string(),
+                );
+                log_reply("generate notes", &reply);
+            }
+            CompactAction::SaveNote { .. } => {
+                // Android's host persists in `notes_generate` (one transaction
+                // per run); the desktop emits this effect because its thread
+                // does not own the store.
+            }
+            CompactAction::ExportNote { name, markdown } => {
+                let reply = host.dispatch(
+                    &serde_json::json!({
+                        "op": "note_export",
+                        "name": name,
+                        "markdown": markdown,
+                    })
+                    .to_string(),
+                );
+                log_reply("export note", &reply);
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&reply) {
+                    if let Some(path) = value.get("path").and_then(serde_json::Value::as_str) {
+                        send_intent(ACTION_SHARE, &[("path", Extra::Str(path))]);
+                    }
+                }
+            }
+            CompactAction::CopyNote { text } => {
+                send_intent(ACTION_COPY, &[("text", Extra::Str(text.as_str()))]);
+            }
             // M23A: every speaker verb is one store call and one re-read; the
             // host answers with the same snapshot shape the UI shows.
             CompactAction::AddSpeaker { transcript } => {

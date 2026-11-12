@@ -21,3 +21,5 @@ pub mod deck;
 /// phone has its own jobs host).
 #[cfg(not(target_os = "android"))]
 pub mod durable_queue;
+/// M24B: the Notes sheet's shared state machine (phone + desktop).
+pub mod notes_sheet;

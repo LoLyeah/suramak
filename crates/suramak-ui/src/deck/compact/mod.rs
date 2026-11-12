@@ -169,12 +169,23 @@ pub fn ui(ctx: &egui::Context, state: &mut CompactApp) -> Vec<CompactAction> {
             )
         } else if sheet == Sheet::Export {
             chrome::sheet_sized(&mut sheet_ui, &tokens, screen, slide, 480.0)
+        } else if sheet == Sheet::Notes {
+            chrome::sheet_sized(&mut sheet_ui, &tokens, screen, slide, 600.0)
         } else {
             chrome::sheet(&mut sheet_ui, &tokens, screen, slide)
         };
         match sheet {
             Sheet::Export => {
                 actions.extend(editor::export_sheet(
+                    &mut sheet_ui,
+                    &tokens,
+                    &motion,
+                    state,
+                    sheet_rect,
+                ));
+            }
+            Sheet::Notes => {
+                actions.extend(editor::notes_sheet(
                     &mut sheet_ui,
                     &tokens,
                     &motion,

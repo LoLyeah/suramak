@@ -369,6 +369,35 @@ impl OpenAiCompat {
         Ok(HttpReply { status, body })
     }
 
+    /// One free-form Markdown completion through the **same** POST path the
+    /// polish call uses (M24B): the notes presets reuse this endpoint, model
+    /// and error shape — there is no second HTTP path.
+    ///
+    /// The response's `message.content` is returned verbatim (the notes
+    /// validator, not this method, owns the citation contract).
+    pub fn complete_markdown(
+        &self,
+        system: &str,
+        user: &str,
+        cfg: &PolishSettings,
+    ) -> Result<String, SuramakError> {
+        let api_key = crate::keychain::get_api_key()?;
+        let url = Self::completions_url(cfg);
+        let body = serde_json::json!({
+            "model": cfg.model,
+            "temperature": 0,
+            "messages": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": user },
+            ],
+        });
+        let reply = self.post(&url, &api_key, &body)?;
+        if !reply.is_success() {
+            return Err(SuramakError::Polish(reply.error_message()));
+        }
+        content_of(&reply.body)
+    }
+
     /// One text-only request — today's exact body — with response validation.
     fn text_only(
         &self,

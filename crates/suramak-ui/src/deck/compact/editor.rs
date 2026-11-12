@@ -16,6 +16,7 @@ use egui::{
 
 use suramak_core::diagnostics::{diagnose, Level, SubtitleLimits};
 use suramak_core::diarization::SpeakerTurn;
+use suramak_core::notes::NotePreset;
 
 use crate::deck::icons::{self, Icon};
 use crate::deck::material::{self, Plane};
@@ -74,19 +75,24 @@ pub fn ui(
         return actions;
     };
     let now = ui.input(|input| input.time);
-    let (back, _) = chrome::app_bar(
+    let (back, notes_hit) = chrome::app_bar(
         ui,
         tokens,
         motion,
         bands.app_bar,
         &editor.transcript.title,
         true,
-        None,
+        Some(("Notes", true)),
     );
     let mut left_editor = false;
     if back {
         state.back(now);
         left_editor = state.nav.current() != super::model::CompactRoute::Editor;
+    }
+    if notes_hit {
+        if let Some(action) = state.open_notes_sheet(now) {
+            actions.push(action);
+        }
     }
 
     // --- meta line ---------------------------------------------------------
@@ -1628,6 +1634,230 @@ fn truncate(text: &str, chars: usize) -> String {
     let mut out: String = text.chars().take(chars.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+/// M24B: the phone's Notes sheet — the three presets, Run, and the stored
+/// result with its one honest citation line. The state machine is the shared
+/// [`crate::notes_sheet::NotesSheet`]; this only paints it at phone scale.
+pub fn notes_sheet(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    state: &mut CompactApp,
+    body: Rect,
+) -> Vec<CompactAction> {
+    let mut actions = Vec::new();
+    paint_display_centered(
+        ui,
+        pos2(body.center().x, body.top() + 30.0),
+        "Notes",
+        tokens.ink,
+    );
+    if let Some(gate) = (!state.notes_configured).then_some(crate::notes_sheet::NOTES_SETUP_NOTE) {
+        let gate_rect = Rect::from_min_size(
+            pos2(body.left() + GUTTER, body.top() + 52.0),
+            vec2(body.width() - GUTTER * 2.0, 44.0),
+        );
+        let mut gate_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(gate_rect)
+                .layout(Layout::top_down(Align::Min)),
+        );
+        gate_ui.label(egui::RichText::new(gate).size(12.0).color(tokens.ink_soft));
+    }
+
+    // ---- the three presets, one full-width row each -----------------------
+    let row_h = 44.0;
+    let mut y = body.top() + 100.0;
+    for preset in NotePreset::ALL {
+        let rect = Rect::from_min_size(
+            pos2(body.left() + GUTTER, y),
+            vec2(body.width() - GUTTER * 2.0, row_h),
+        );
+        let selected = state.notes.preset == preset;
+        let stored = state.notes.stored.iter().any(|note| note.preset == preset);
+        let label = if stored {
+            format!("{}  ✓", preset.label())
+        } else {
+            preset.label().to_string()
+        };
+        let response = a11y::touch(
+            ui,
+            tokens,
+            rect,
+            ("notes-preset", preset.key()),
+            WidgetType::RadioButton,
+            &label,
+            !state.notes.phase.is_running(),
+        );
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(tokens.radius.control),
+            if selected {
+                tokens.accent_tint
+            } else {
+                tokens.control_fill
+            },
+            Stroke::new(
+                1.0_f32,
+                if selected {
+                    tokens.accent
+                } else {
+                    tokens.hairline
+                },
+            ),
+            StrokeKind::Inside,
+        );
+        ui.painter().text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            &label,
+            type_scale::row_value().font,
+            if selected { tokens.accent } else { tokens.ink },
+        );
+        if response.clicked() {
+            state.select_note_preset(preset);
+        }
+        y += row_h + 6.0;
+    }
+    if state.notes.short {
+        ui.painter().text(
+            pos2(body.left() + GUTTER, y + 8.0),
+            Align2::LEFT_TOP,
+            crate::notes_sheet::NOTES_SHORT_NOTE,
+            type_scale::caption().font,
+            tokens.ink_soft,
+        );
+        y += 24.0;
+    }
+
+    // ---- Run ---------------------------------------------------------------
+    let run_rect = Rect::from_min_size(pos2(body.left() + GUTTER, y + 8.0), vec2(140.0, MIN_TOUCH));
+    if chrome::action_button(
+        ui,
+        tokens,
+        motion,
+        run_rect,
+        "notes-run",
+        if state.notes.current().is_some() {
+            "Regenerate"
+        } else {
+            "Run"
+        },
+        state.notes.can_run(),
+    )
+    .clicked()
+    {
+        if let Some(action) = state.start_note() {
+            actions.push(action);
+        }
+    }
+    if state.notes.phase.is_running() {
+        ui.painter().text(
+            pos2(run_rect.right() + 12.0, run_rect.center().y),
+            Align2::LEFT_CENTER,
+            "Writing notes…",
+            type_scale::caption().font,
+            tokens.ink_soft,
+        );
+    }
+    if let Some((preset, message)) = state.notes.failure() {
+        ui.painter().text(
+            pos2(body.left() + GUTTER, run_rect.bottom() + 14.0),
+            Align2::LEFT_TOP,
+            format!("{} failed — {message}", preset.label()),
+            type_scale::caption().font,
+            tokens.record_red_text,
+        );
+    }
+    y = run_rect.bottom() + 40.0;
+
+    // ---- the stored result -------------------------------------------------
+    let Some(note) = state.notes.current().cloned() else {
+        return actions;
+    };
+    ui.painter().text(
+        pos2(body.left() + GUTTER, y),
+        Align2::LEFT_TOP,
+        note.result_line(),
+        type_scale::row_value().font,
+        tokens.ink,
+    );
+    y += 22.0;
+    if let Some(breakdown) = state.notes.breakdown_line() {
+        ui.painter().text(
+            pos2(body.left() + GUTTER, y),
+            Align2::LEFT_TOP,
+            breakdown,
+            type_scale::caption().font,
+            tokens.ink_soft,
+        );
+        y += 20.0;
+    }
+    let buttons_h = MIN_TOUCH + 12.0;
+    let body_rect = Rect::from_min_max(
+        pos2(body.left() + GUTTER, y + 4.0),
+        pos2(body.right() - GUTTER, body.bottom() - buttons_h - 12.0),
+    );
+    let mut body_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(body_rect)
+            .layout(Layout::top_down(Align::Min)),
+    );
+    ScrollArea::vertical()
+        .id_salt("compact-notes-body")
+        .max_height(body_rect.height())
+        .show(&mut body_ui, |ui| {
+            for line in crate::notes_sheet::note_lines(&note.body_md) {
+                let mut text = egui::RichText::new(line.text).color(tokens.ink);
+                text = match line.level {
+                    0 => text.size(13.0),
+                    _ => text.size(15.0).strong(),
+                };
+                ui.label(text);
+            }
+        });
+
+    // ---- Export .md / Copy --------------------------------------------------
+    let export_rect = Rect::from_min_size(
+        pos2(body.left() + GUTTER, body.bottom() - buttons_h + 4.0),
+        vec2((body.width() - GUTTER * 2.0 - 10.0) / 2.0, MIN_TOUCH),
+    );
+    if chrome::action_button(
+        ui,
+        tokens,
+        motion,
+        export_rect,
+        "notes-export",
+        "Export .md",
+        state.notes.current().is_some(),
+    )
+    .clicked()
+    {
+        if let Some(action) = state.note_export_action() {
+            actions.push(action);
+        }
+    }
+    let copy_rect = Rect::from_min_size(
+        pos2(export_rect.right() + 10.0, export_rect.top()),
+        export_rect.size(),
+    );
+    if chrome::action_button(
+        ui,
+        tokens,
+        motion,
+        copy_rect,
+        "notes-copy",
+        "Copy",
+        state.notes.current().is_some(),
+    )
+    .clicked()
+    {
+        if let Some(action) = state.note_copy_action() {
+            actions.push(action);
+        }
+    }
+    actions
 }
 
 #[cfg(test)]

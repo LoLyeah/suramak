@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Local};
 use suramak_core::device::{self, DeviceProfile, PhoneTier};
 use suramak_core::models::{ModelFileState, MODELS};
+use suramak_core::notes::{NotePreset, NotesOutcome};
 use suramak_core::settings::Appearance;
 use suramak_core::store::WordAlignment;
 use suramak_core::transcript::{Segment, Transcript, WordTiming};
@@ -20,8 +21,22 @@ use uuid::Uuid;
 
 use crate::deck::nav::{BackOutcome, NavStack};
 use crate::deck::theme::AppTheme;
+use crate::notes_sheet::NotesSheet;
 
 use super::motion::{ListAnim, ProgressAnim, SheetAnim};
+
+/// M24B: the phone's notes request — the editor snapshot plus the preset and
+/// the speaker labels the host's generation call needs. A plain value so the
+/// action stays `PartialEq` (a `Transcript` is not).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NoteRequest {
+    pub transcript: Uuid,
+    pub title: String,
+    pub language: Option<String>,
+    pub preset: NotePreset,
+    pub segments: Vec<Segment>,
+    pub speakers: Vec<(u32, String)>,
+}
 
 /// The three screens of the G1 compact profile, plus G3's Diagnostics card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -866,6 +881,27 @@ pub enum CompactAction {
     },
     /// M22B: the offer was dismissed without starting anything.
     VoiceNoteDismiss,
+    /// M24B: read the open transcript's stored notes.
+    LoadNotes {
+        transcript: Uuid,
+    },
+    /// M24B: generate one preset from this snapshot (unsaved edits included).
+    GenerateNote {
+        request: Box<NoteRequest>,
+    },
+    /// M24B: persist one citation-checked note (one row per preset).
+    SaveNote {
+        note: Box<suramak_core::store::NoteRecord>,
+    },
+    /// M24B: write the exact stored Markdown through ACTION_CREATE_DOCUMENT.
+    ExportNote {
+        name: String,
+        markdown: String,
+    },
+    /// M24B: copy the exact stored Markdown to the clipboard.
+    CopyNote {
+        text: String,
+    },
     /// Quit: the host runs capture → jobs → services → exit.
     Quit,
     /// Back at the root: the host finishes the Activity.
@@ -887,6 +923,8 @@ pub enum Sheet {
     Speaker,
     /// M23A: the per-segment turn strip (assign this turn / from here down).
     TurnStrip,
+    /// M24B: the citation-verified notes sheet.
+    Notes,
 }
 
 impl Sheet {
@@ -1437,6 +1475,10 @@ pub struct CompactApp {
     pub undo_toast: Option<UndoToast>,
     /// M23A: `Clear all speakers` is destructive; the first tap only arms it.
     pub speakers_confirm_clear: bool,
+    /// M24B: the citation-verified notes sheet (the shared state machine).
+    pub notes: NotesSheet,
+    /// M24B: whether the polish endpoint is configured, seeded by the host.
+    pub notes_configured: bool,
     /// M23A: whether the host has a speaker snapshot to undo (the turn strip's
     /// and the toast's Undo state; the host owns the log).
     pub speakers_undo_available: bool,
@@ -1547,6 +1589,8 @@ impl CompactApp {
             turn_strip: None,
             undo_toast: None,
             speakers_confirm_clear: false,
+            notes: NotesSheet::new(),
+            notes_configured: false,
             speakers_undo_available: false,
             voice_note: None,
             settings_anchor: None,
@@ -2357,6 +2401,128 @@ impl CompactApp {
     /// Closes the export sheet (Done, or a tap outside).
     pub fn close_export_sheet(&mut self, now: f64) {
         self.sheet_anim.begin(false, now);
+    }
+
+    // ---- M24B: the notes sheet -------------------------------------------
+
+    /// Opens the Notes sheet and asks the host for the stored rows.
+    pub fn open_notes_sheet(&mut self, now: f64) -> Option<CompactAction> {
+        let editor = self.editor.as_ref()?;
+        let id = editor.transcript.id;
+        self.notes
+            .open(self.notes_configured, Vec::new(), &editor.transcript);
+        self.sheet = Some(Sheet::Notes);
+        self.sheet_anim.begin(true, now);
+        Some(CompactAction::LoadNotes { transcript: id })
+    }
+
+    pub fn close_notes_sheet(&mut self, now: f64) {
+        self.sheet_anim.begin(false, now);
+    }
+
+    pub fn select_note_preset(&mut self, preset: NotePreset) {
+        self.notes.select(preset);
+    }
+
+    /// The sheet's Run button: one request for the selected preset, from the
+    /// editor's current text (drafts included) and speaker labels.
+    pub fn start_note(&mut self) -> Option<CompactAction> {
+        let preset = match self.notes.start() {
+            Ok(preset) => preset,
+            Err(message) => {
+                self.status = Some((message, true));
+                return None;
+            }
+        };
+        let editor = self.editor.as_ref()?;
+        let mut transcript = editor.transcript.clone();
+        for segment in &mut transcript.segments {
+            if let Some(text) = editor.drafts.get(&segment.idx) {
+                segment.text = text.clone();
+            }
+        }
+        let speakers = editor
+            .speakers
+            .as_ref()
+            .map(|view| {
+                transcript
+                    .segments
+                    .iter()
+                    .zip(view.per_segment.iter())
+                    .filter_map(|(segment, speaker)| {
+                        speaker.map(|speaker| (segment.idx, view.label(speaker.primary)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(CompactAction::GenerateNote {
+            request: Box::new(NoteRequest {
+                transcript: transcript.id,
+                title: transcript.title,
+                language: transcript.language,
+                preset,
+                segments: transcript.segments,
+                speakers,
+            }),
+        })
+    }
+
+    /// The host's store read for the open transcript's notes.
+    pub fn on_notes_loaded(
+        &mut self,
+        id: Uuid,
+        result: Result<Vec<suramak_core::notes::StoredNote>, String>,
+    ) {
+        if self.notes.transcript != Some(id) {
+            return;
+        }
+        match result {
+            Ok(stored) => self.notes.adopt_stored(stored),
+            Err(message) => {
+                self.status = Some((format!("notes could not be read — {message}"), true))
+            }
+        }
+    }
+
+    /// The host finished a notes run: store it in memory and return the row the
+    /// host must persist.
+    pub fn on_notes_done(&mut self, result: Result<NotesOutcome, String>) -> Option<CompactAction> {
+        let id = self.notes.transcript?;
+        let stored = self
+            .notes
+            .on_done(result, suramak_core::Utc::now().to_rfc3339())?;
+        let created = DateTime::parse_from_rfc3339(&stored.created_at)
+            .map(|at| at.with_timezone(&suramak_core::Utc))
+            .unwrap_or_else(|_| suramak_core::Utc::now());
+        self.status = Some((format!("{} ready", stored.preset.label()), false));
+        Some(CompactAction::SaveNote {
+            note: Box::new(suramak_core::store::NoteRecord {
+                transcript_id: id,
+                preset: stored.preset,
+                body_md: stored.body_md,
+                citations_checked: stored.citations_checked,
+                citations_removed: stored.citations_removed,
+                model: stored.model,
+                created_at: created,
+            }),
+        })
+    }
+
+    /// `Export .md`: the exact stored Markdown and the suggested file name.
+    pub fn note_export_action(&self) -> Option<CompactAction> {
+        let editor = self.editor.as_ref()?;
+        let markdown = self.notes.export_text()?.to_string();
+        Some(CompactAction::ExportNote {
+            name: self.notes.export_name(&editor.transcript),
+            markdown,
+        })
+    }
+
+    /// `Copy`: the exact stored Markdown.
+    pub fn note_copy_action(&self) -> Option<CompactAction> {
+        self.notes.copy_text().map(|text| CompactAction::CopyNote {
+            text: text.to_string(),
+        })
     }
 
     // ---- M23A: the speaker surfaces --------------------------------------
@@ -3821,5 +3987,113 @@ mod tests {
         );
         assert_eq!(app.back(2.0), BackOutcome::Popped);
         assert_eq!(app.nav.current(), CompactRoute::Settings);
+    }
+
+    #[test]
+    fn the_notes_sheet_runs_the_shared_state_machine() {
+        let mut app = app();
+        app.notes_configured = true;
+        let first = app.transcripts[0].clone();
+        app.open_editor(first, 0.0);
+
+        let action = app.open_notes_sheet(1.0).expect("the sheet asks for rows");
+        assert!(matches!(action, CompactAction::LoadNotes { .. }));
+        assert_eq!(app.sheet, Some(Sheet::Notes));
+        assert_eq!(app.notes.stored.len(), 0);
+
+        app.select_note_preset(NotePreset::ActionItems);
+        let action = app.start_note().expect("a request");
+        match action {
+            CompactAction::GenerateNote { request } => {
+                assert_eq!(request.preset, NotePreset::ActionItems);
+                assert!(!request.segments.is_empty());
+            }
+            other => panic!("expected a notes request, got {other:?}"),
+        }
+        assert!(app.notes.phase.is_running());
+        app.select_note_preset(NotePreset::Minutes);
+        assert_eq!(
+            app.notes.preset,
+            NotePreset::ActionItems,
+            "a selection cannot move mid-run"
+        );
+
+        let outcome = NotesOutcome {
+            preset: NotePreset::ActionItems,
+            body_md: "# Action items\n\n- ship [00:04]\n".to_string(),
+            citations_checked: 1,
+            citations_removed: 0,
+            breakdown: Default::default(),
+            parts: 1,
+            model: "mock".to_string(),
+        };
+        let action = app.on_notes_done(Ok(outcome)).expect("a save");
+        assert!(matches!(action, CompactAction::SaveNote { .. }));
+        assert_eq!(
+            app.notes.result_line().as_deref(),
+            Some("1 citations checked · 0 removed")
+        );
+        match app.note_export_action().expect("export") {
+            CompactAction::ExportNote { name, markdown } => {
+                assert!(name.ends_with("— Action items.md"), "unexpected: {name}");
+                assert_eq!(markdown, "# Action items\n\n- ship [00:04]\n");
+            }
+            other => panic!("expected an export, got {other:?}"),
+        }
+        match app.note_copy_action().expect("copy") {
+            CompactAction::CopyNote { text } => {
+                assert_eq!(text, "# Action items\n\n- ship [00:04]\n")
+            }
+            other => panic!("expected a copy, got {other:?}"),
+        }
+
+        // The stored rows come back from the host in product order.
+        app.on_notes_loaded(
+            app.notes.transcript.unwrap(),
+            Ok(vec![
+                suramak_core::notes::StoredNote {
+                    preset: NotePreset::BilingualBrief,
+                    body_md: "# Brief (EN↔ID)\n".to_string(),
+                    citations_checked: 0,
+                    citations_removed: 0,
+                    breakdown: Default::default(),
+                    model: "mock".to_string(),
+                    created_at: "2026-01-01T00:00:00+00:00".to_string(),
+                },
+                suramak_core::notes::StoredNote {
+                    preset: NotePreset::Minutes,
+                    body_md: "# Minutes\n".to_string(),
+                    citations_checked: 2,
+                    citations_removed: 1,
+                    breakdown: Default::default(),
+                    model: "mock".to_string(),
+                    created_at: "2026-01-01T00:00:00+00:00".to_string(),
+                },
+            ]),
+        );
+        assert_eq!(
+            app.notes
+                .stored
+                .iter()
+                .map(|note| note.preset)
+                .collect::<Vec<_>>(),
+            vec![NotePreset::Minutes, NotePreset::BilingualBrief],
+            "the host's rows are sorted by preset"
+        );
+        assert!(app.back(2.0) == BackOutcome::Dismissed);
+    }
+
+    #[test]
+    fn the_phone_notes_sheet_refuses_run_when_not_configured() {
+        let mut app = app();
+        app.notes_configured = false;
+        let first = app.transcripts[0].clone();
+        app.open_editor(first, 0.0);
+        app.open_notes_sheet(1.0);
+        assert!(!app.notes.can_run());
+        assert!(app.start_note().is_none());
+        let (text, error) = app.status.as_ref().expect("the refusal is named");
+        assert!(text.contains("not configured"));
+        assert!(error);
     }
 }

@@ -14,6 +14,7 @@ use crate::diarization::{
     TurnSource, COLOR_SLOTS, MAX_SPEAKERS,
 };
 use crate::export::ZeroDuration;
+use crate::notes::NotePreset;
 use crate::search::{self, HitKind, SearchHit, SearchOptions, SearchResults};
 use crate::segment_edit::{merge_rows, split_rows, EditError, SegmentRow, SegmentSnapshot};
 use crate::textrules::{Correction, Dictionary, Glossary, PromptMeasurement, TextSettings};
@@ -151,7 +152,11 @@ pub const WAVEFORM_BARS: usize = 28;
 ///   watched inbox actually imported (`path`, `size`, `mtime`, `sha256`,
 ///   `imported_at`, `transcript_id`). The sha256 is the dedupe key: the same
 ///   bytes under a new name never queue twice. No existing table is rebuilt.
-pub const SCHEMA_VERSION: i64 = 11;
+/// - **v12** — M24B, additive only: `notes` — one row per (transcript, preset)
+///   holding the citation-checked Markdown, the checked/removed counts, the
+///   model and the generation time. Regenerating replaces that row. No existing
+///   table is rebuilt.
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// SQLite-backed transcript library with WAL mode.
 pub struct Store {
@@ -335,6 +340,57 @@ impl JobRecord {
             .and_then(|failure| failure.strip_prefix(RESUME_UNAVAILABLE_PREFIX))
             .map(str::trim)
     }
+}
+
+/// One stored note (M24B): the citation-checked Markdown for one
+/// (transcript, preset), with the validator's counts and its provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteRecord {
+    pub transcript_id: Uuid,
+    pub preset: NotePreset,
+    pub body_md: String,
+    pub citations_checked: u32,
+    pub citations_removed: u32,
+    pub model: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl NoteRecord {
+    /// The UI's read shape (the breakdown is not stored — the counts are).
+    pub fn stored(&self) -> crate::notes::StoredNote {
+        crate::notes::StoredNote {
+            preset: self.preset,
+            body_md: self.body_md.clone(),
+            citations_checked: self.citations_checked,
+            citations_removed: self.citations_removed,
+            breakdown: crate::notes::CitationBreakdown::default(),
+            model: self.model.clone(),
+            created_at: self.created_at.to_rfc3339(),
+        }
+    }
+}
+
+/// Decodes one `notes` row (the seven columns every query selects, in order).
+fn note_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NoteRecord> {
+    let transcript: String = row.get(0)?;
+    let preset: String = row.get(1)?;
+    let checked: i64 = row.get(3)?;
+    let removed: i64 = row.get(4)?;
+    let created: String = row.get(6)?;
+    Ok(NoteRecord {
+        transcript_id: Uuid::parse_str(&transcript).unwrap_or(Uuid::nil()),
+        // The key set is closed by this build; an unreadable key can only come
+        // from a corrupt row, and reading it as Minutes keeps the document
+        // visible rather than dropping it silently. No writer emits one.
+        preset: NotePreset::parse(&preset).unwrap_or(NotePreset::Minutes),
+        body_md: row.get(2)?,
+        citations_checked: u32::try_from(checked).unwrap_or(0),
+        citations_removed: u32::try_from(removed).unwrap_or(0),
+        model: row.get(5)?,
+        created_at: DateTime::parse_from_rfc3339(&created)
+            .map(|at| at.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+    })
 }
 
 /// One row of the watched inbox's import ledger (M24A).
@@ -656,7 +712,21 @@ impl Store {
                  imported_at   TEXT NOT NULL,
                  transcript_id TEXT
              );
-             CREATE INDEX IF NOT EXISTS watched_files_sha ON watched_files(sha256);",
+             CREATE INDEX IF NOT EXISTS watched_files_sha ON watched_files(sha256);
+             -- M24B (schema v12): citation-verified notes. One row per
+             -- (transcript, preset); regenerating replaces that row. `body_md`
+             -- is the stored, citation-checked Markdown and the counts are the
+             -- validator's own — a reloaded note never has to guess.
+             CREATE TABLE IF NOT EXISTS notes (
+                 transcript_id     TEXT NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
+                 preset            TEXT NOT NULL,
+                 body_md           TEXT NOT NULL,
+                 citations_checked INTEGER NOT NULL DEFAULT 0,
+                 citations_removed INTEGER NOT NULL DEFAULT 0,
+                 model             TEXT NOT NULL DEFAULT '',
+                 created_at        TEXT NOT NULL,
+                 PRIMARY KEY (transcript_id, preset)
+             );",
         )?;
         self.migrate()?;
         self.recover_job_checkpoints()?;
@@ -750,6 +820,9 @@ impl Store {
         }
         if version < 11 {
             self.upgrade_to_v11()?;
+        }
+        if version < 12 {
+            self.upgrade_to_v12()?;
         }
         Ok(())
     }
@@ -1079,6 +1152,100 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// v11 → v12, one transaction: the notes table. A fresh database already
+    /// has it from the DDL above, and a re-run is a no-op.
+    fn upgrade_to_v12(&self) -> Result<(), SuramakError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS notes (
+                 transcript_id     TEXT NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
+                 preset            TEXT NOT NULL,
+                 body_md           TEXT NOT NULL,
+                 citations_checked INTEGER NOT NULL DEFAULT 0,
+                 citations_removed INTEGER NOT NULL DEFAULT 0,
+                 model             TEXT NOT NULL DEFAULT '',
+                 created_at        TEXT NOT NULL,
+                 PRIMARY KEY (transcript_id, preset)
+             );",
+        )?;
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ---- M24B: citation-verified notes -------------------------------------
+
+    /// Inserts or replaces one (transcript, preset) note. Regenerating is a
+    /// replace: the row's body, counts, model and `created_at` all move.
+    pub fn save_note(&self, note: &NoteRecord) -> Result<(), SuramakError> {
+        self.conn.execute(
+            "INSERT INTO notes(transcript_id, preset, body_md, citations_checked,
+                               citations_removed, model, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(transcript_id, preset) DO UPDATE SET
+                 body_md           = excluded.body_md,
+                 citations_checked = excluded.citations_checked,
+                 citations_removed = excluded.citations_removed,
+                 model             = excluded.model,
+                 created_at        = excluded.created_at",
+            params![
+                note.transcript_id.to_string(),
+                note.preset.key(),
+                note.body_md,
+                i64::from(note.citations_checked),
+                i64::from(note.citations_removed),
+                note.model,
+                note.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// One (transcript, preset) note, or `None`.
+    pub fn note(
+        &self,
+        transcript_id: Uuid,
+        preset: NotePreset,
+    ) -> Result<Option<NoteRecord>, SuramakError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT transcript_id, preset, body_md, citations_checked,
+                        citations_removed, model, created_at
+                 FROM notes WHERE transcript_id = ?1 AND preset = ?2",
+                params![transcript_id.to_string(), preset.key()],
+                note_row,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Every note for a transcript, in the product's preset order (Minutes,
+    /// Action items, Bilingual brief) — the sheet's row order.
+    pub fn notes_for(&self, transcript_id: Uuid) -> Result<Vec<NoteRecord>, SuramakError> {
+        let mut statement = self.conn.prepare(
+            "SELECT transcript_id, preset, body_md, citations_checked,
+                    citations_removed, model, created_at
+             FROM notes WHERE transcript_id = ?1
+             ORDER BY CASE preset
+                 WHEN 'minutes' THEN 0
+                 WHEN 'action_items' THEN 1
+                 WHEN 'bilingual_brief' THEN 2
+                 ELSE 3
+             END",
+        )?;
+        let rows = statement.query_map(params![transcript_id.to_string()], note_row)?;
+        let mut notes = Vec::new();
+        for row in rows {
+            notes.push(row?);
+        }
+        Ok(notes)
     }
 
     // ---- M24A: the watched inbox ledger ------------------------------------
@@ -7975,7 +8142,7 @@ mod tests {
             .unwrap();
         }
         let store = Store::open(&path).expect("v10 must upgrade");
-        assert_eq!(store.schema_version().unwrap(), 11);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(store.list_transcripts().unwrap().len(), 1, "rows survive");
         assert_eq!(store.watched_import_count().unwrap(), 0);
         store
@@ -7983,11 +8150,208 @@ mod tests {
             .unwrap();
         assert_eq!(store.watched_import_count().unwrap(), 1);
         drop(store);
-        // Idempotent: a second open is still v11.
+        // Idempotent: a second open is still the current version.
         let again = Store::open(&path).expect("reopen");
-        assert_eq!(again.schema_version().unwrap(), 11);
+        assert_eq!(again.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(again.watched_import_count().unwrap(), 1);
         drop(again);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- M24B: citation-verified notes -------------------------------------
+
+    fn note_for(
+        id: Uuid,
+        preset: NotePreset,
+        body: &str,
+        checked: u32,
+        removed: u32,
+        model: &str,
+        created: &str,
+    ) -> NoteRecord {
+        NoteRecord {
+            transcript_id: id,
+            preset,
+            body_md: body.to_string(),
+            citations_checked: checked,
+            citations_removed: removed,
+            model: model.to_string(),
+            created_at: DateTime::parse_from_rfc3339(created)
+                .unwrap()
+                .with_timezone(&Utc),
+        }
+    }
+
+    #[test]
+    fn a_v11_database_upgrades_to_v12_and_keeps_its_rows() {
+        let dir = std::env::temp_dir().join(format!("suramak-v11v12-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v11.db");
+        let id = {
+            let store = Store::open(&path).expect("fresh store");
+            assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+            let transcript = sample("keep.wav");
+            let id = transcript.id;
+            store.insert_transcript(&transcript).unwrap();
+            store
+                .record_watched_file(&watched("/inbox/a.m4a", 1, "aa"))
+                .unwrap();
+            id
+        };
+        // Make the file a truthful v11 database: drop the new table and stamp
+        // the old version. Every other row must survive untouched.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "DROP TABLE notes;
+                 UPDATE meta SET value = '11' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).expect("v11 must upgrade");
+        assert_eq!(store.schema_version().unwrap(), 12);
+        assert_eq!(store.list_transcripts().unwrap().len(), 1, "rows survive");
+        assert_eq!(store.watched_import_count().unwrap(), 1, "ledger survives");
+        assert!(store.notes_for(id).unwrap().is_empty());
+        store
+            .save_note(&note_for(
+                id,
+                NotePreset::Minutes,
+                "# Minutes\n\n- shipped [00:12]\n",
+                1,
+                0,
+                "mock-model",
+                "2026-01-01T00:00:00Z",
+            ))
+            .unwrap();
+        assert_eq!(store.notes_for(id).unwrap().len(), 1);
+        drop(store);
+        // Idempotent: a second open is still v12.
+        let again = Store::open(&path).expect("reopen");
+        assert_eq!(again.schema_version().unwrap(), 12);
+        assert_eq!(again.notes_for(id).unwrap().len(), 1);
+        drop(again);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn notes_are_one_row_per_preset_and_regenerating_replaces() {
+        let dir =
+            std::env::temp_dir().join(format!("suramak-notes-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("notes.db")).unwrap();
+        let transcript = sample("notes.wav");
+        let id = transcript.id;
+        store.insert_transcript(&transcript).unwrap();
+
+        store
+            .save_note(&note_for(
+                id,
+                NotePreset::Minutes,
+                "first [00:01]",
+                1,
+                0,
+                "model-a",
+                "2026-01-01T00:00:00Z",
+            ))
+            .unwrap();
+        store
+            .save_note(&note_for(
+                id,
+                NotePreset::Minutes,
+                "second [00:02]",
+                2,
+                1,
+                "model-b",
+                "2026-01-02T00:00:00Z",
+            ))
+            .unwrap();
+
+        let rows = store.notes_for(id).unwrap();
+        assert_eq!(rows.len(), 1, "one row per (transcript, preset)");
+        assert_eq!(rows[0].body_md, "second [00:02]");
+        assert_eq!(rows[0].citations_checked, 2);
+        assert_eq!(rows[0].citations_removed, 1);
+        assert_eq!(rows[0].model, "model-b");
+        assert_eq!(
+            rows[0].created_at.to_rfc3339(),
+            "2026-01-02T00:00:00+00:00",
+            "the regeneration time replaces the old one"
+        );
+        // The single-row read agrees.
+        let one = store.note(id, NotePreset::Minutes).unwrap().unwrap();
+        assert_eq!(one.body_md, "second [00:02]");
+        assert!(store.note(id, NotePreset::ActionItems).unwrap().is_none());
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn notes_read_in_the_product_preset_order() {
+        let dir = std::env::temp_dir().join(format!("suramak-notes-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("notes.db")).unwrap();
+        let transcript = sample("order.wav");
+        let id = transcript.id;
+        store.insert_transcript(&transcript).unwrap();
+
+        // Written in reverse product order on purpose.
+        for (preset, body) in [
+            (NotePreset::BilingualBrief, "brief"),
+            (NotePreset::ActionItems, "actions"),
+            (NotePreset::Minutes, "minutes"),
+        ] {
+            store
+                .save_note(&note_for(
+                    id,
+                    preset,
+                    body,
+                    7,
+                    0,
+                    "m",
+                    "2026-01-01T00:00:00Z",
+                ))
+                .unwrap();
+        }
+        let order: Vec<NotePreset> = store
+            .notes_for(id)
+            .unwrap()
+            .iter()
+            .map(|note| note.preset)
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                NotePreset::Minutes,
+                NotePreset::ActionItems,
+                NotePreset::BilingualBrief
+            ]
+        );
+
+        // Another transcript's notes never leak into this read.
+        let other = sample("other.wav");
+        let other_id = other.id;
+        store.insert_transcript(&other).unwrap();
+        store
+            .save_note(&note_for(
+                other_id,
+                NotePreset::Minutes,
+                "other minutes",
+                1,
+                0,
+                "m",
+                "2026-01-01T00:00:00Z",
+            ))
+            .unwrap();
+        assert_eq!(store.notes_for(id).unwrap().len(), 3);
+
+        // Deleting the transcript removes its notes.
+        store.delete_transcript(id).unwrap();
+        assert!(store.notes_for(id).unwrap().is_empty());
+        drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

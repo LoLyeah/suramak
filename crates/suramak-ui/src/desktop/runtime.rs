@@ -43,11 +43,12 @@ use suramak_asr::queue::driver::{
 };
 use suramak_asr::worker::{Job, JobStage, Worker, WorkerEvent};
 use suramak_core::models as core_models;
+use suramak_core::notes::{generate_notes, NotePreset, NotesOutcome};
 use suramak_core::paths;
 use suramak_core::polish::{OpenAiCompat, PolishBackend, PolishOutcome};
 use suramak_core::resample;
 use suramak_core::settings::{EngineSetting, LangMode, PolishSettings, RecordSource, Settings};
-use suramak_core::store::Store;
+use suramak_core::store::{NoteRecord, Store};
 use suramak_core::textrules::{
     build_prompt, EstimatedTokens, PromptBudget, PromptMeasurement, TextSettings,
 };
@@ -101,6 +102,8 @@ pub struct Runtime {
     download: Option<DownloadJob>,
     /// Background polish run (one at a time, M4).
     polish: Option<PolishJob>,
+    /// M24B: the background notes run (one at a time).
+    notes: Option<NotesJob>,
     /// The live output engine (M8), keyed by the file it was opened for.
     playback: Option<PlaybackSession>,
     /// A playback session that could not even be started (thread spawn);
@@ -198,6 +201,12 @@ struct PolishJob {
 /// plus any M11 degradation notes — Err = the raw backend/reply error shown to
 /// the user).
 type PolishSlot = Arc<Mutex<Option<Result<PolishOutcome, String>>>>;
+
+/// A notes run on a detached thread (M24B): the same blocking HTTP client,
+/// one request per preset (or per chunk). The UI polls it once.
+struct NotesJob {
+    result: Arc<Mutex<Option<Result<NotesOutcome, String>>>>,
+}
 
 /// A live playback engine and the file it was opened for (M8). The engine's
 /// thread owns the cpal stream; the runtime only sends it commands.
@@ -302,6 +311,7 @@ impl Runtime {
             live: None,
             download: None,
             polish: None,
+            notes: None,
             playback: None,
             playback_error: None,
             peaks: None,
@@ -649,6 +659,17 @@ impl Runtime {
         let result = job.result.lock().ok().and_then(|guard| guard.clone());
         if result.is_some() {
             self.polish = None;
+        }
+        result
+    }
+
+    /// M24B: outcome of the background notes run, if one finished since the
+    /// last poll. Terminal-once.
+    pub fn notes_status(&mut self) -> Option<Result<NotesOutcome, String>> {
+        let job = self.notes.as_ref()?;
+        let result = job.result.lock().ok().and_then(|guard| guard.clone());
+        if result.is_some() {
+            self.notes = None;
         }
         result
     }
@@ -1304,6 +1325,44 @@ impl Runtime {
                         queue.extend(state.on_polish_done(Err(err)));
                     }
                 }
+                Effect::LoadNotes { transcript } => {
+                    let result = match &self.store {
+                        Some(store) => store
+                            .notes_for(transcript)
+                            .map(|rows| rows.iter().map(NoteRecord::stored).collect())
+                            .map_err(|err| err.to_string()),
+                        None => Err("library database unavailable".to_string()),
+                    };
+                    state.on_notes_loaded(transcript, result);
+                }
+                Effect::GenerateNotes {
+                    transcript,
+                    preset,
+                    speakers,
+                } => {
+                    if let Err(err) = self.start_notes(*transcript, preset, speakers) {
+                        queue.extend(state.on_notes_done(Err(err)));
+                    }
+                }
+                Effect::SaveNote { note } => {
+                    let result = match &self.store {
+                        Some(store) => store.save_note(&note).map_err(|err| err.to_string()),
+                        None => Err("library database unavailable".to_string()),
+                    };
+                    if let Err(message) = result {
+                        state.set_status(format!("notes could not be saved — {message}"), true);
+                    }
+                }
+                Effect::ExportNote { dest, markdown } => {
+                    let name = dest
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("note.md")
+                        .to_string();
+                    let result =
+                        std::fs::write(&dest, markdown.as_bytes()).map_err(|err| err.to_string());
+                    state.on_note_exported(&name, result);
+                }
                 Effect::TranslateTranscript {
                     transcript,
                     target,
@@ -1411,6 +1470,74 @@ impl Runtime {
                 Ok(())
             }
             Err(err) => Err(format!("cannot start the polish thread: {err}")),
+        }
+    }
+
+    /// M24B: runs one notes preset on a detached `suramak-notes` thread — the
+    /// same blocking client the polish flow uses, never the ASR worker or the
+    /// UI thread. The gate is re-checked here so a stale UI flag can never fire
+    /// a request with no endpoint.
+    fn start_notes(
+        &mut self,
+        transcript: Transcript,
+        preset: NotePreset,
+        speakers: Vec<(u32, String)>,
+    ) -> Result<(), String> {
+        if self.notes.is_some() {
+            return Err("a notes run is already in progress".to_string());
+        }
+        let config = polish::polish_config(&self.settings, key_present())?;
+        let cfg = PolishSettings {
+            base_url: config.base_url,
+            model: config.model,
+            send_audio: false,
+        };
+        let title = transcript.title;
+        let language = transcript.language;
+        let segments = transcript.segments;
+        let result: Arc<Mutex<Option<Result<NotesOutcome, String>>>> = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&result);
+        let ctx = self.ctx.clone();
+        tracing::info!(
+            endpoint = %cfg.base_url,
+            model = %cfg.model,
+            segments = segments.len(),
+            preset = preset.key(),
+            "notes: starting the background run"
+        );
+        let spawned = thread::Builder::new()
+            .name("suramak-notes".to_string())
+            .spawn(move || {
+                let run = generate_notes(
+                    &title,
+                    language.as_deref(),
+                    &segments,
+                    &speakers,
+                    preset,
+                    &cfg,
+                )
+                .map_err(|err| error_chain(&err));
+                match &run {
+                    Ok(outcome) => tracing::info!(
+                        preset = outcome.preset.key(),
+                        parts = outcome.parts,
+                        checked = outcome.citations_checked,
+                        removed = outcome.citations_removed,
+                        "notes: reply validated"
+                    ),
+                    Err(err) => tracing::warn!(error = %err, "notes: run failed"),
+                }
+                if let Ok(mut guard) = slot.lock() {
+                    *guard = Some(run);
+                }
+                ctx.request_repaint();
+            });
+        match spawned {
+            Ok(_handle) => {
+                self.notes = Some(NotesJob { result });
+                Ok(())
+            }
+            Err(err) => Err(format!("cannot start the notes thread: {err}")),
         }
     }
 
