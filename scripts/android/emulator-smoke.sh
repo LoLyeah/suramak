@@ -910,13 +910,23 @@ if inset_bottom <= 0.0:
         "inset_bottom is 0 on the gesture-nav AVD — the WindowInsets never reached the "
         "shell, so every clearance number above is measured against a guess"
     )
-if quit_bottom + clearance > viewport_bottom + 0.5:
+# The row must be fully ABOVE the viewport's bottom edge, which already
+# excludes the gesture inset: that is what "not clipped by the pill" means.
+# Its trailing padding may legitimately scroll past that edge — demanding the
+# padding itself be visible (quit_bottom + clearance <= viewport_bottom) failed
+# a healthy layout by 20 pt, because at max scroll the content bottom aligns
+# with the viewport and the padding is exactly what hangs off it.
+if quit_bottom > viewport_bottom + 0.5:
     sys.exit(
-        f"the Quit row ({quit_bottom:.1f} pt) plus its clearance ({clearance:.1f} pt) runs "
-        f"past the viewport ({viewport_bottom:.1f} pt) at full scroll — the row is still "
-        "under the gesture pill / clipped at the screen edge"
+        f"the Quit row ({quit_bottom:.1f} pt) runs past the viewport bottom "
+        f"({viewport_bottom:.1f} pt) at rest — it is clipped by the gesture area"
     )
-print("   clearance: the Quit row and its padding sit above the viewport at rest")
+if clearance + 0.5 < inset_bottom:
+    sys.exit(
+        f"the list's trailing clearance ({clearance:.1f} pt) is smaller than the gesture "
+        f"inset ({inset_bottom:.1f} pt) — the last row has no room above the pill"
+    )
+print("   clearance: the Quit row sits fully above the gesture area at rest")
 PY
 
 tap_and_wait_route "$(dp 28)" Library || fail "could not return to the Library after the clearance check"
