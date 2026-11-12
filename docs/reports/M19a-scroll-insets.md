@@ -267,7 +267,198 @@ flow, not the phone.
 
 ---
 
-## 6. Verification
+## 6. M19A2 — the audit's verified findings, fixed
+
+Source: `docs/reports/appendix-m19a-carbon-audit.md` (Carbon's high-effort
+re-audit of `fcef4a4`, verbatim), adopted per `docs/WORKORDER-M19A2.md`. Every
+finding below was parent-verified against the code before it was assigned; the
+audit's rejected items are **not** touched (notably §A3, the
+`ui.allocate_space` "double cursor" claim: `a11y::describe` only *records*, it
+never advances the cursor, and `ui.interact` does not either — the scroll range
+was already right, the smoke's `settings-bottom-inset` golden and
+`…the_device_note_clears_a_54_px_bottom_inset` both pin it).
+
+### 6.1 The clearance probe measures the Quit row (A1, blocking)
+
+`log_layout_probe` reported the `DEVICE_NOTE` label. The list does not end
+there: a Diagnostics section and the **Quit** row follow it (`settings.rs`), so
+at full scroll the DEVICE note is a *middle* element — it clears the pill even
+when Quit is clipped under it.
+
+- `settings::QUIT_LABEL` is now one constant used by the a11y call, the painted
+  text and the probe (a second literal would drift).
+- `settings::LayoutProbe::from_controls` reads **both** rects out of the frame's
+  a11y registry; the line carries `quit_top`/`quit_bottom` *and*
+  `device_top`/`device_bottom`, plus `clearance`, `viewport_bottom`,
+  `content_bottom` (kept for M19A's readers), `screen_bottom`, `inset_bottom`
+  and `inset_top`.
+- `bottom_clearance(inset_bottom, floor)` gained the platform floor: `0` on
+  desktop (bit-for-bit the old `inset + GUTTER`), `ANDROID_MIN_CLEARANCE`
+  (24 dp) on the phone. `CompactApp::clearance_floor` carries it; the Android
+  shell sets 24, every other host leaves 0. A window that reports
+  `inset_bottom == 0` (immersive, or the frames before the Kotlin inset
+  listener fires) now ends its scroll range 30 pt + 40 pt above the last row
+  instead of pinning it to the screen edge.
+- The smoke asserts `quit_bottom + clearance <= viewport_bottom` on the
+  **resting** line and `inset_bottom > 0`; a synthetic 54 px golden alone can
+  only prove arithmetic, so the emulator is the real check.
+
+There is deliberately **no** assertion on `device_bottom` any more: it is
+printed, because it still names the device's disk truth, but it cannot witness
+clipping.
+
+### 6.2 The still-frame control no longer sees the status bar (A2, pixel half)
+
+`inspect_screencap.py --diff` gained `--crop-top PIXELS`: the top band is
+dropped from **both** frames before the luma comparison, and the JSON records
+`crop_top_px` / `compared_rows`. `crop_status_band` refuses a crop that leaves
+nothing, or less than half the frame — an oversized crop would turn the control
+into a tautology.
+
+The band is measured, not guessed: the smoke takes the shell's own
+`inset_top` (points) × `ppp` (from `SURAMAK-INPUT`), adds 2 px for the bar's
+1-px shadow/edge, and floors it at 24 dp for the window in which the inset
+listener has not fired yet. What is cropped is exactly the region the app does
+not draw.
+
+**Evidence, `--self-test`** (CI runs it before the APK build). Two synthetic
+1080×2400 frames whose only difference is a clock patch *inside* the band:
+
+```
+[self-test] ticking clock: uncropped 0.606 (want > 0.05), cropped 0.000 (want 0)
+[self-test] OK: positives pass, blanks fail
+```
+
+The uncropped number is above the smoke's 0.05 still-frame ceiling — that is
+the CI flake reproduced — and the cropped number is **exactly** 0.0. A crop of
+`-1`, `2400`, `2401` or `1300` rows (empty / gutted) raises and is asserted.
+
+### 6.3 The layout probe logs on change and again on rest (A2, log half)
+
+M19A's one-second wall clock could leave `tail -1` reading a **mid-swipe**
+line: the last change inside the same second is dropped, and a reactive render
+loop stops drawing once the finger stops, so no later frame repairs it.
+
+`settings::ProbeLog` replaces the wall clock:
+
+- a line whenever the geometry **changes**, at most one per 250 ms (4 Hz);
+- **one more** 300 ms after the geometry stops changing — the resting line the
+  smoke reads, marked `settled=1`;
+- one settled line per resting position, never repeated; a change after a rest
+  re-arms it; leaving Settings resets the gate so the next visit logs again;
+- when a settled line is still owed, the shell calls
+  `ctx.request_repaint_after(due)` — under `ControlFlow::Wait` nothing would
+  draw at +300 ms otherwise.
+
+The probe does not need a second channel for the scroll offset: both rects are a
+rigid function of it, so "the same `quit_top` and `device_bottom` for 300 ms"
+*is* "the offset has not moved for 300 ms", measured in tenths of a point so
+pixel-snap noise cannot keep a resting list looking busy.
+
+The line now carries `ts=<device Unix ms>` and `settled=<0|1>`. The smoke takes
+the host clock (`now_ms`, in the same unit) immediately before the **final**
+swipe and fails if the resting line is older than that (1 s clock allowance), if
+`settled != 1`, or if the required fields are absent — so "the line describes
+where the finger left the list" is now checked, not assumed.
+
+### 6.4 Event ordering: a cancel can no longer land on the next finger (B1)
+
+`prepare_events` rebuilt its output at the **tail** of the frame, so
+`[cancel A, start B]` appended A's `PointerMoved(OFF_SCREEN)` + release +
+`PointerGone` *after* B's press — releasing the pointer on top of the new
+gesture and parking it mid-press.
+
+The list is now rebuilt in place: each synthesised event sits immediately after
+the `Event::Touch` that caused it. Tests pin both orders and one more:
+
+| Test | Pins |
+|---|---|
+| `a_cancel_releases_before_the_next_finger_presses` | `[cancel A, start B]` → release, gone, *then* move+press at B; B owns the pointer |
+| `a_start_before_a_cancel_leaves_the_new_gesture_alone` | `[start B, cancel A]` while A holds the pointer → B stays a raw touch, A's cancel parks |
+| `a_late_cancel_for_a_finished_finger_does_not_release_the_new_one` | A's cancel one frame late, same frame as B's start → B's press survives |
+
+The `OFF_SCREEN` + `PointerGone` cancel pattern and the frame-wide
+`PointerButton` idempotence guard are unchanged (Carbon calls both correct).
+
+### 6.5 Move dedupe is frame-level, not a 0.5 pt guess (B2)
+
+`TouchPhase::Move` used to skip synthesis if *any* `PointerMoved` in the frame
+was within 0.5 pt. That double-counted some drags and swallowed others:
+240 Hz panels deliver several sub-pixel samples inside one 60 Hz frame, and the
+proximity test also ignored later samples that sat > 0.5 pt from the
+integration's earlier one.
+
+Now the frame is read once: if it contains **any** `PointerMoved`, the
+integration translated this frame's motion and no synthetic move is added;
+otherwise every sample is emitted.
+
+| Test | Pins |
+|---|---|
+| `one_integration_move_suppresses_every_synthetic_move_in_the_frame` | presence, not proximity (1.4 pt apart, still suppressed) |
+| `two_sub_pixel_moves_in_one_frame_both_survive` | 0.2 pt samples both survive when the integration is absent |
+
+### 6.6 `ppp` on the first frame (C2)
+
+`prime_input` runs before `draw`, so frame 1 logged `ppp=0.000` from the empty
+cache. egui 0.33 has no `RawInput::pixels_per_point` — the value lives in
+`ViewportInfo::native_pixels_per_point`, which `egui-winit` fills from
+`window.scale_factor()` on every `take_egui_input`, first frame included — so
+`input::frame_pixels_per_point(raw, cached)` reads that and falls back to the
+cache only when the integration reports nothing usable. Nothing in this product
+sets egui's zoom factor, so the native value and `ctx.pixels_per_point()` are
+the same number. `the_frame_ppp_comes_from_the_raw_input_not_the_empty_cache`
+pins the four cases (Some(value), Some beats cache, None → cache, zero →
+cache).
+
+### 6.7 A build blocker found on the way (not in the audit)
+
+`crates/suramak-android/src/shell.rs` did not compile for the Android target at
+`HEAD`: `last_resumes` was declared `u64` (M19A) while
+`SpikeState::resumes` is `u32` (M13b). Nothing on the host compiles that module
+(`#[cfg(target_os = "android")]`), so `cargo test` never saw it; the APK build
+would have. Fixed to `u32` — the field is a copy of `state.resumes`.
+
+Verified for the Android target, not just on the host:
+
+```
+cargo ndk -t arm64-v8a --platform 29 check  -p suramak-android   # clean
+cargo ndk -t arm64-v8a --platform 29 clippy -p suramak-android -- -D warnings   # clean
+```
+
+### 6.8 Verification
+
+| Command | Result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | **1186 passed, 0 failed** (baseline 1172 + 14 new) |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo fmt --all -- --check` | clean |
+| `python3 tests/android-smoke/inspect_screencap.py --self-test` | OK — positives pass, blanks fail; ticking clock 0.606 → 0.000 |
+| `bash -n scripts/android/emulator-smoke.sh` | clean |
+| Android target (`cargo ndk`, aarch64-linux-android) check + clippy | clean |
+| `tests/ui-compact/shots/*.png` | unchanged (no golden was rewritten) |
+
+New tests (14): 6 in `compact::input`, 7 in `compact::settings`, 1 in
+`ui_compact`.
+
+**Not run here:** the emulator smoke itself — this host has no `/dev/kvm` and
+no emulator package, so the harness cannot boot. What was exercised instead:
+
+- the whole M19A block was extracted and run end-to-end against a **stubbed
+  `adb`** (fake `wm size`/`wm density`, `input`, logcat and screencaps taken
+  from `tests/ui-compact/shots`). It printed the 65 px crop band, read Step 0,
+  passed both cropped diffs, and accepted a resting line whose `ts` was newer
+  than the final swipe. Making the stub emit `settled=0`, a 9 s-stale `ts`,
+  `inset_bottom=0.0` or a clipped Quit row turned it red in each case, with the
+  matching verdict — and the four verdicts were also driven directly against
+  the extracted checker (six fixtures, including a missing-field line);
+- the crop band was computed for the Pixel-6 geometry (24 dp × 2.625 + 2 =
+  **65 px**, and also 65 px with no inset, via the 24 dp floor);
+- `--diff --crop-top` was driven end to end on synthetic frames (0.606
+  uncropped → 0.000 cropped), not only through `--self-test`.
+
+---
+
+## 7. Verification
 
 | Command | Result |
 |---|---|
@@ -290,7 +481,7 @@ workspace members): it was already stale against `Cargo.toml` at HEAD, and any
 
 ---
 
-## 7. What this does not claim
+## 8. What this does not claim
 
 - **No emulator evidence yet.** Whether the phone path really delivers
   `PointerButton` and how the panel's density maps to points is asserted by the

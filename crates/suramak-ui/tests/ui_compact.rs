@@ -1112,8 +1112,8 @@ fn the_device_note_clears_a_54_px_bottom_inset() {
 
     let bands = chrome::bands(h.screen, h.app.insets.top, h.app.insets.bottom, None);
     let note = h.control(compact::settings::DEVICE_NOTE);
-    let quit = h.control("Quit Suramak");
-    let tail = compact::settings::bottom_clearance(inset);
+    let quit = h.control(compact::settings::QUIT_LABEL);
+    let tail = compact::settings::bottom_clearance(inset, 0.0);
     assert!(
         (tail - (inset + chrome::GUTTER)).abs() < 0.01,
         "inset + gutter"
@@ -1136,4 +1136,59 @@ fn the_device_note_clears_a_54_px_bottom_inset() {
 
     let shot = h.shot("settings-bottom-inset");
     assert!(shot.painted_fraction(egui::Color32::BLACK) > 0.5);
+}
+
+#[test]
+fn the_quit_row_clears_the_pill_when_android_reports_no_inset() {
+    // The audit's clipping case: the platform pushes no bottom inset (immersive
+    // window, or the first frames before the Kotlin listener fires). The phone
+    // floor — 24 dp — is what keeps the Quit row off the gesture pill; without
+    // it the scroll range ends at the row's own edge and the row sits under the
+    // pill at full scroll.
+    let mut app = overflowing_settings();
+    app.insets.bottom = 0.0;
+    app.clearance_floor = compact::settings::ANDROID_MIN_CLEARANCE;
+    let mut h = Harness::new(app);
+    h.frame();
+    h.frame();
+    h.app.settings_scroll = Some(100_000.0);
+    h.frame();
+    h.frame();
+
+    let bands = chrome::bands(h.screen, h.app.insets.top, 0.0, None);
+    let quit = h.control(compact::settings::QUIT_LABEL);
+    let tail = compact::settings::bottom_clearance(0.0, compact::settings::ANDROID_MIN_CLEARANCE);
+    assert!(
+        (tail - (compact::settings::ANDROID_MIN_CLEARANCE + chrome::GUTTER)).abs() < 0.01,
+        "the floor replaces the missing inset: {tail}"
+    );
+    assert!(
+        quit.bottom() + tail <= bands.content.bottom() + 0.5,
+        "quit {} + clearance {} must sit inside the viewport {}",
+        quit.bottom(),
+        tail,
+        bands.content.bottom()
+    );
+    assert!(
+        quit.bottom() < bands.content.bottom() - compact::settings::ANDROID_MIN_CLEARANCE,
+        "the row clears the 24 dp gesture area at full scroll: quit {} viewport {}",
+        quit.bottom(),
+        bands.content.bottom()
+    );
+
+    // A desktop (floor 0) with the same zero inset keeps the old geometry: the
+    // floor is the phone's, not a new default.
+    let mut desktop = overflowing_settings();
+    desktop.insets.bottom = 0.0;
+    let mut h = Harness::new(desktop);
+    h.frame();
+    h.frame();
+    h.app.settings_scroll = Some(100_000.0);
+    h.frame();
+    h.frame();
+    let quit_desktop = h.control(compact::settings::QUIT_LABEL);
+    assert!(
+        (quit_desktop.bottom() - quit.bottom()).abs() > 1.0,
+        "the phone floor moves the last row up; desktop keeps the plain gutter"
+    );
 }

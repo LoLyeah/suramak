@@ -23,8 +23,17 @@ synthetic negative controls, so the gate cannot silently stop biting.
 Usage:
   inspect_screencap.py --shot build/android-smoke/library.png \\
                        --baseline build/android-smoke/launcher.png
-  inspect_screencap.py --diff before.png after.png --min-mean-diff 0.4
+  inspect_screencap.py --diff before.png after.png --min-mean-diff 0.4 \\
+                       --crop-top 98
   inspect_screencap.py --self-test
+
+The `--diff` mode optionally drops the top `--crop-top` pixel rows from **both**
+frames before comparing (M19A2). That band is the Android status bar: its clock
+rolls over, its battery/network icons redraw, and a still-frame negative control
+that sees those pixels can flake even when nothing in the app moved. The band's
+height comes from the shell's own top inset times the frame's pixels-per-point
+(see `scripts/android/emulator-smoke.sh`), so what is cropped is exactly what
+the app does not own.
 """
 
 import argparse
@@ -51,6 +60,9 @@ MIN_CONTRAST_SHARE = 0.004    # 0.4% of a band is text/controls
 # The light ladder's app bar (#EDEFF4) and window (#E9EBF0) are three levels
 # apart, so a real Library yields 2 distinct band tones; a flat fill yields 1.
 MIN_DISTINCT_BANDS = 2
+# A status-bar crop may never remove more than half the frame (M19A2): beyond
+# that the "still frame" it is meant to rescue has no evidence left in it.
+MIN_KEPT_SHARE = 0.5
 
 
 def read_png(path):
@@ -303,8 +315,24 @@ def inspect(shot_path, baseline_path=None):
 
 
 def write_solid_png(path, width, height, rgba):
-    row = bytes(rgba) * width
-    raw = b"".join(b"\x00" + row for _ in range(height))
+    write_png(path, width, height, rgba)
+
+
+def write_png(path, width, height, background, patches=()):
+    """Write an RGBA PNG: one solid colour plus a few opaque rectangles.
+
+    The synthetic frames the self-test needs are a flat app surface plus the
+    status-bar band's moving parts (a clock, a battery icon) — no image library
+    is on the CI runner, and this is all a cropper test wants.
+    """
+    pixel = bytes(background)
+    rows = [bytearray(pixel * width) for _ in range(height)]
+    for x, y, rect_w, rect_h, colour in patches:
+        band = bytes(colour) * rect_w
+        for row_y in range(max(0, y), min(height, y + rect_h)):
+            start = max(0, x) * len(pixel)
+            rows[row_y][start : start + len(band)] = band
+    raw = b"".join(b"\x00" + bytes(row) for row in rows)
     compressed = zlib.compress(raw, 6)
 
     def chunk(kind, payload):
@@ -372,6 +400,39 @@ def self_test(reference_dir):
         if differs <= 0.4:
             failures.append(f"diff of library vs black is {differs}, want > 0.4")
 
+        # M19A2: the status-bar crop. Two captures of a still screen whose only
+        # difference is the clock — a minute rollover moves the digits — must
+        # move the comparator while uncropped (that is the CI flake this
+        # exists for) and compare EXACTLY equal once the band is cropped.
+        status_h = 96
+        background = (14, 21, 38, 255)
+        clock = (236, 238, 244, 255)
+        clock_a = os.path.join(tmp, "clock-a.png")
+        clock_b = os.path.join(tmp, "clock-b.png")
+        write_png(clock_a, 1080, 2400, background, [(760, 18, 96, 60, clock)])
+        write_png(clock_b, 1080, 2400, background, [(700, 18, 96, 60, clock)])
+        uncropped = mean_abs_luma_diff(clock_a, clock_b)
+        cropped = mean_abs_luma_diff(clock_a, clock_b, crop_top=status_h)
+        print(
+            f"[self-test] ticking clock: uncropped {uncropped:.3f} (want > 0.05), "
+            f"cropped {cropped:.3f} (want 0)"
+        )
+        if uncropped <= 0.05:
+            failures.append(
+                f"a ticking clock must fail the uncropped still-frame control, got {uncropped}"
+            )
+        if cropped != 0.0:
+            failures.append(f"the cropped still frame differs by {cropped}, want 0")
+
+        # A crop that would empty (or gut) the frame is refused, not silently
+        # turned into a comparison of nothing.
+        for bad in (-1, 2400, 2401, 1300):
+            try:
+                mean_abs_luma_diff(clock_a, clock_b, crop_top=bad)
+            except ValueError:
+                continue
+            failures.append(f"crop_top={bad} should have been refused")
+
     if failures:
         for failure in failures:
             print(f"[self-test] FAILED: {failure}", file=sys.stderr)
@@ -380,11 +441,36 @@ def self_test(reference_dir):
     return 0
 
 
-def mean_abs_luma_diff(shot_path, other_path):
+def crop_status_band(width, height, channels, pixels, crop_top):
+    """Drop the top `crop_top` pixel rows from a decoded frame.
+
+    `crop_top` is the status-bar band, in pixels, measured from the top edge.
+    A crop that leaves nothing to compare — or less than half the frame — is
+    refused: a diff over an empty or gutted image cannot witness anything, and
+    a silently oversized crop would turn the still-frame control into a
+    tautology (M19A2).
+    """
+    if crop_top < 0:
+        raise ValueError(f"--crop-top must be >= 0, got {crop_top}")
+    if crop_top >= height:
+        raise ValueError(
+            f"--crop-top {crop_top} would leave no pixels of a {height}-row frame"
+        )
+    if height - crop_top < height * MIN_KEPT_SHARE:
+        raise ValueError(
+            f"--crop-top {crop_top} keeps only {height - crop_top} of {height} rows "
+            f"(less than {MIN_KEPT_SHARE:.0%} of the frame) — refusing to crop the evidence away"
+        )
+    stride = width * channels
+    return pixels[crop_top * stride :]
+
+
+def mean_abs_luma_diff(shot_path, other_path, crop_top=0):
     """Mean |ΔL| between two same-size screenshots (0 = identical frames).
 
     The emulator smoke's scroll proof: the compact surface is one OS window, so
     uiautomator cannot see the list move — the pixels are the only witness.
+    `crop_top` removes the status-bar band from both frames first (M19A2).
     """
     width, height, channels, pixels = read_png(shot_path)
     other_w, other_h, other_channels, other_pixels = read_png(other_path)
@@ -393,21 +479,41 @@ def mean_abs_luma_diff(shot_path, other_path):
             f"resolution mismatch: {shot_path} {width}x{height} vs "
             f"{other_path} {other_w}x{other_h}"
         )
-    left = luminance(pixels, channels)
-    right = luminance(other_pixels, other_channels)
+    left = luminance(crop_status_band(width, height, channels, pixels, crop_top), channels)
+    right = luminance(
+        crop_status_band(width, height, other_channels, other_pixels, crop_top),
+        other_channels,
+    )
     return sum(abs(a - b) for a, b in zip(left, right)) / len(left)
 
 
 def diff_main(args):
     try:
-        diff = mean_abs_luma_diff(args.diff[0], args.diff[1])
+        diff = mean_abs_luma_diff(args.diff[0], args.diff[1], args.crop_top)
     except ValueError as error:
         print(f"SCREENCAP-DIFF-FAIL: {error}", file=sys.stderr)
         return 1
-    detail = f"mean |ΔL|={diff:.3f} between {args.diff[0]} and {args.diff[1]}"
+    width, height = read_png(args.diff[0])[:2]
+    band = (
+        f"; status-bar band rows 0..{args.crop_top} cropped from both frames "
+        f"({width}x{height - args.crop_top} compared)"
+        if args.crop_top
+        else f"; full frame ({width}x{height} compared)"
+    )
+    detail = f"mean |ΔL|={diff:.3f} between {args.diff[0]} and {args.diff[1]}{band}"
     if args.json:
         with open(args.json, "w", encoding="utf-8") as handle:
-            json.dump({"mean_abs_luma_diff": round(diff, 4), "a": args.diff[0], "b": args.diff[1]}, handle, indent=2)
+            json.dump(
+                {
+                    "mean_abs_luma_diff": round(diff, 4),
+                    "a": args.diff[0],
+                    "b": args.diff[1],
+                    "crop_top_px": args.crop_top,
+                    "compared_rows": height - args.crop_top,
+                },
+                handle,
+                indent=2,
+            )
     if args.min_mean_diff is not None and diff < args.min_mean_diff:
         print(f"SCREENCAP-DIFF-FAIL: {detail} (need >= {args.min_mean_diff})")
         return 1
@@ -431,6 +537,14 @@ def main():
     )
     parser.add_argument("--min-mean-diff", type=float, default=None)
     parser.add_argument("--max-mean-diff", type=float, default=None)
+    parser.add_argument(
+        "--crop-top",
+        type=int,
+        default=0,
+        metavar="PIXELS",
+        help="drop the top PIXELS rows (the status-bar band) from both frames "
+        "before --diff compares them (M19A2)",
+    )
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument(
         "--reference-dir",

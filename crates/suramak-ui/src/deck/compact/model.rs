@@ -1111,6 +1111,10 @@ pub struct CompactApp {
     /// A system-bar inset in points (the Kotlin shim reports pixels; the host
     /// converts with the same pixels_per_point the surface uses).
     pub insets: Insets,
+    /// The smallest bottom clearance the content leaves under its last
+    /// control, even when the platform reports no inset (M19A2). 0 on desktop;
+    /// the Android shell sets [`super::settings::ANDROID_MIN_CLEARANCE`].
+    pub clearance_floor: f32,
     pub reduce_motion: bool,
     /// The resolved token ladder (the host resolves System against the OS).
     pub theme: AppTheme,
@@ -1182,6 +1186,7 @@ impl CompactApp {
             ram_bytes: None,
             status: None,
             insets: Insets::default(),
+            clearance_floor: 0.0,
             reduce_motion: false,
             theme: AppTheme::Dark,
             version: env!("CARGO_PKG_VERSION").to_string(),

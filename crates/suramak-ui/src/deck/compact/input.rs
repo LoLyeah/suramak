@@ -25,9 +25,15 @@
 //! * a cancel parks the pointer far off-screen **before** releasing, so a
 //!   back-swipe or a notification shade can never click whatever sat under the
 //!   finger when the system took the gesture away;
+//! * **ordering (M19A2):** each synthesised event is rebuilt *immediately
+//!   after* the `Event::Touch` that caused it — never appended at the tail of
+//!   the frame, where a cancelled finger's release could land after another
+//!   finger's press;
 //! * **idempotence:** if the frame's event list already contains a
 //!   `PointerButton`, the integration translated this phase and the
-//!   synthesiser appends nothing for it.
+//!   synthesiser emits nothing for it; if it contains a `PointerMoved`, the
+//!   integration translated this frame's motion and no synthetic move is
+//!   added.
 //!
 //! [`apply_touch_options`] is the second half of M19A's thumb work: egui's
 //! defaults (`max_click_dist` 6 pt, `max_click_duration` 0.25 s) are tuned for
@@ -66,6 +72,28 @@ pub fn input_log_enabled() -> bool {
     }
 }
 
+/// The frame's pixels-per-point.
+///
+/// Read from the raw input's viewport info — `egui-winit` fills
+/// `native_pixels_per_point` from `window.scale_factor()` on every
+/// `take_egui_input`, including the very first frame — and only fall back to
+/// the shell's cached value (which `draw` sets from `ctx.pixels_per_point()`)
+/// when the integration reported nothing. Nothing in this product sets egui's
+/// zoom factor, so the native value and the context's are the same number.
+///
+/// Before M19A2 the shell logged `ppp=0.000` on frame 1: `prime_input` runs
+/// before `draw`, so it read the cache before the cache existed.
+pub fn frame_pixels_per_point(raw: &RawInput, cached: f32) -> f32 {
+    let native = raw
+        .viewports
+        .get(&raw.viewport_id)
+        .and_then(|info| info.native_pixels_per_point);
+    match native {
+        Some(ppp) if ppp.is_finite() && ppp > 0.0 => ppp,
+        _ => cached,
+    }
+}
+
 /// The touch→pointer state machine. One per surface; it tracks the finger that
 /// owns the pointer across frames.
 #[derive(Debug, Default)]
@@ -99,102 +127,133 @@ impl TouchPointer {
     }
 
     /// [`Self::prepare`] on a bare event list (the unit tests drive this).
+    ///
+    /// **Ordering (M19A2).** Every synthesised event is rebuilt immediately
+    /// after the `Event::Touch` that caused it, instead of being appended at
+    /// the tail of the frame. The tail append put a cancelled finger's release
+    /// *after* a later finger's press in the same frame — `[cancel A, start B]`
+    /// released the pointer on top of B's new press and parked it, so a
+    /// back-swipe that ended exactly as the next touch began left the surface
+    /// with no pointer down. Rebuilding keeps each touch and its pointer
+    /// events adjacent, so the frame reads in the order the platform delivered
+    /// it.
     pub fn prepare_events(&mut self, events: &mut Vec<Event>) -> usize {
-        let touches: Vec<(TouchId, TouchPhase, Pos2)> = events
+        // The common frame carries no touch at all: leave it untouched (no
+        // rebuild, no allocation) exactly as before.
+        if !events
             .iter()
-            .filter_map(|event| match event {
-                Event::Touch { id, phase, pos, .. } => Some((*id, *phase, *pos)),
-                _ => None,
-            })
-            .collect();
-        if touches.is_empty() {
+            .any(|event| matches!(event, Event::Touch { .. }))
+        {
             return 0;
         }
 
-        // The idempotence guard: an integration that already translated this
-        // phase leaves a `PointerButton` in the frame. Stand down for the whole
-        // phase rather than delivering a second press/release.
-        let integration_translated = events
+        // What the integration already did, read from the frame as delivered
+        // and never from our own output: a `PointerButton` means it translated
+        // the press/release phase, a `PointerMoved` means it translated motion.
+        let translated = events
             .iter()
             .any(|event| matches!(event, Event::PointerButton { .. }));
+        let moved = events
+            .iter()
+            .any(|event| matches!(event, Event::PointerMoved(_)));
 
-        let mut appended = Vec::new();
-        for (id, phase, pos) in touches {
-            match phase {
-                TouchPhase::Start => {
-                    // Only the first finger owns the pointer; a second one keeps
-                    // its raw `Event::Touch` and nothing else.
-                    if self.active.is_some() {
-                        continue;
-                    }
-                    self.active = Some(id);
-                    if integration_translated {
-                        continue;
-                    }
-                    appended.push(Event::PointerMoved(pos));
-                    appended.push(Event::PointerButton {
-                        pos,
-                        button: PointerButton::Primary,
-                        pressed: true,
-                        modifiers: Modifiers::NONE,
-                    });
+        let mut rebuilt = Vec::with_capacity(events.len() + 4);
+        let mut appended = 0;
+        for event in events.drain(..) {
+            let touch = match &event {
+                Event::Touch { id, phase, pos, .. } => Some((*id, *phase, *pos)),
+                _ => None,
+            };
+            rebuilt.push(event);
+            let Some((id, phase, pos)) = touch else {
+                continue;
+            };
+            let before = rebuilt.len();
+            self.fold(id, phase, pos, translated, moved, &mut rebuilt);
+            appended += rebuilt.len() - before;
+        }
+        *events = rebuilt;
+        appended
+    }
+
+    /// Writes the pointer events one touch sample needs, in order.
+    fn fold(
+        &mut self,
+        id: TouchId,
+        phase: TouchPhase,
+        pos: Pos2,
+        integration_translated: bool,
+        integration_moved: bool,
+        out: &mut Vec<Event>,
+    ) {
+        match phase {
+            TouchPhase::Start => {
+                // Only the first finger owns the pointer; a second one keeps
+                // its raw `Event::Touch` and nothing else.
+                if self.active.is_some() {
+                    return;
                 }
-                TouchPhase::Move => {
-                    if self.active != Some(id) {
-                        continue;
-                    }
-                    // A duplicate move at the same position would only repeat
-                    // the integration's event; skip it instead of double-
-                    // counting motion in egui's velocity tracker.
-                    let already_moved = events.iter().any(
-                        |event| matches!(event, Event::PointerMoved(at) if at.distance(pos) < 0.5),
-                    );
-                    if already_moved {
-                        continue;
-                    }
-                    appended.push(Event::PointerMoved(pos));
+                self.active = Some(id);
+                if integration_translated {
+                    return;
                 }
-                TouchPhase::End => {
-                    if self.active != Some(id) {
-                        continue;
-                    }
-                    self.active = None;
-                    if integration_translated {
-                        continue;
-                    }
-                    appended.push(Event::PointerButton {
-                        pos,
-                        button: PointerButton::Primary,
-                        pressed: false,
-                        modifiers: Modifiers::NONE,
-                    });
-                    // Without this egui keeps the last row hovered: a touch
-                    // screen has no cursor to move away.
-                    appended.push(Event::PointerGone);
+                out.push(Event::PointerMoved(pos));
+                out.push(Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                });
+            }
+            TouchPhase::Move => {
+                if self.active != Some(id) {
+                    return;
                 }
-                TouchPhase::Cancel => {
-                    if self.active != Some(id) {
-                        continue;
-                    }
-                    self.active = None;
-                    // Never release on top of a button: park the pointer first.
-                    // (egui-winit's own emulation releases nothing on a cancel,
-                    // so this path is also what clears a stranded button.)
-                    appended.push(Event::PointerMoved(OFF_SCREEN));
-                    appended.push(Event::PointerButton {
-                        pos: OFF_SCREEN,
-                        button: PointerButton::Primary,
-                        pressed: false,
-                        modifiers: Modifiers::NONE,
-                    });
-                    appended.push(Event::PointerGone);
+                // Frame-level dedupe (M19A2): when the integration translated
+                // this frame's motion, every synthetic move is a duplicate.
+                // A per-position proximity test both double-counted slow drags
+                // and swallowed sub-pixel ones; presence is the honest signal.
+                if integration_moved {
+                    return;
                 }
+                out.push(Event::PointerMoved(pos));
+            }
+            TouchPhase::End => {
+                if self.active != Some(id) {
+                    return;
+                }
+                self.active = None;
+                if integration_translated {
+                    return;
+                }
+                out.push(Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Modifiers::NONE,
+                });
+                // Without this egui keeps the last row hovered: a touch
+                // screen has no cursor to move away.
+                out.push(Event::PointerGone);
+            }
+            TouchPhase::Cancel => {
+                if self.active != Some(id) {
+                    return;
+                }
+                self.active = None;
+                // Never release on top of a button: park the pointer first.
+                // (egui-winit's own emulation releases nothing on a cancel,
+                // so this path is also what clears a stranded button.)
+                out.push(Event::PointerMoved(OFF_SCREEN));
+                out.push(Event::PointerButton {
+                    pos: OFF_SCREEN,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Modifiers::NONE,
+                });
+                out.push(Event::PointerGone);
             }
         }
-
-        let count = appended.len();
-        events.extend(appended);
-        count
     }
 }
 
@@ -303,6 +362,32 @@ mod tests {
                 )),
                 Event::PointerGone => Some("gone".to_string()),
                 _ => None,
+            })
+            .collect()
+    }
+
+    /// Every event in list order, touches included: the ordering tests read
+    /// the frame exactly as egui will.
+    fn all_events(events: &[Event]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| match event {
+                Event::Touch { id, phase, pos, .. } => format!(
+                    "touch:{}:{}@{:.0},{:.0}",
+                    id.0,
+                    match phase {
+                        TouchPhase::Start => "start",
+                        TouchPhase::Move => "move",
+                        TouchPhase::End => "end",
+                        TouchPhase::Cancel => "cancel",
+                    },
+                    pos.x,
+                    pos.y
+                ),
+                other => pointer_events(std::slice::from_ref(other))
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| "other".to_string()),
             })
             .collect()
     }
@@ -420,6 +505,173 @@ mod tests {
         assert_eq!(pointer.prepare_events(&mut frame), 0);
         let mut moved = vec![touch(4, TouchPhase::Move, Pos2::new(6.0, 5.0))];
         assert_eq!(pointer.prepare_events(&mut moved), 1);
+    }
+
+    #[test]
+    fn one_integration_move_suppresses_every_synthetic_move_in_the_frame() {
+        // The frame-level rule (M19A2): presence of a `PointerMoved` anywhere
+        // in the frame means the integration translated this frame's motion,
+        // so no synthetic move is added — even one 1.4 pt away, which the old
+        // 0.5 pt proximity test would have duplicated.
+        let mut pointer = TouchPointer::new();
+        let mut start = vec![touch(4, TouchPhase::Start, Pos2::new(5.0, 5.0))];
+        pointer.prepare_events(&mut start);
+        let mut frame = vec![
+            touch(4, TouchPhase::Move, Pos2::new(5.0, 5.0)),
+            Event::PointerMoved(Pos2::new(5.0, 5.0)),
+            touch(4, TouchPhase::Move, Pos2::new(6.4, 5.0)),
+        ];
+        assert_eq!(pointer.prepare_events(&mut frame), 0);
+    }
+
+    #[test]
+    fn two_sub_pixel_moves_in_one_frame_both_survive() {
+        // ...and when the integration is absent, slow drags must not be
+        // swallowed: 0.2 pt samples are real motion (240 Hz panels deliver
+        // them inside one 60 Hz frame).
+        let mut pointer = TouchPointer::new();
+        let mut start = vec![touch(4, TouchPhase::Start, Pos2::new(100.0, 100.0))];
+        pointer.prepare_events(&mut start);
+        let mut frame = vec![
+            touch(4, TouchPhase::Move, Pos2::new(100.0, 100.2)),
+            touch(4, TouchPhase::Move, Pos2::new(100.0, 100.4)),
+        ];
+        assert_eq!(pointer.prepare_events(&mut frame), 2);
+        let moves: Vec<Pos2> = frame
+            .iter()
+            .filter_map(|event| match event {
+                Event::PointerMoved(pos) => Some(*pos),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            moves,
+            vec![Pos2::new(100.0, 100.2), Pos2::new(100.0, 100.4)],
+            "a sub-pixel drag keeps both samples"
+        );
+    }
+
+    #[test]
+    fn a_cancel_releases_before_the_next_finger_presses() {
+        // [cancel A, start B] in one frame. The tail-append bug released A
+        // *after* B's press, parking the new gesture. Rebuilt in order, A's
+        // release lands before B's press, and B owns the pointer at the end.
+        let mut pointer = TouchPointer::new();
+        let mut start_a = vec![touch(1, TouchPhase::Start, Pos2::new(200.0, 700.0))];
+        pointer.prepare_events(&mut start_a);
+
+        let mut frame = vec![
+            touch(1, TouchPhase::Cancel, Pos2::new(200.0, 700.0)),
+            touch(2, TouchPhase::Start, Pos2::new(40.0, 90.0)),
+        ];
+        assert_eq!(pointer.prepare_events(&mut frame), 5);
+        assert_eq!(
+            all_events(&frame),
+            vec![
+                "touch:1:cancel@200,700",
+                "move@-10000,-10000",
+                "release@-10000,-10000",
+                "gone",
+                "touch:2:start@40,90",
+                "move@40,90",
+                "press@40,90",
+            ],
+            "each synthesised event sits right after its touch: {:?}",
+            all_events(&frame)
+        );
+        assert_eq!(
+            pointer.active(),
+            Some(TouchId::from(2)),
+            "the new finger owns the pointer"
+        );
+    }
+
+    #[test]
+    fn a_start_before_a_cancel_leaves_the_new_gesture_alone() {
+        // [start B, cancel A] while A still owns the pointer: B is a second
+        // finger (raw touch only), and A's cancel parks the pointer — it never
+        // lands on B's start, which is where a tail append would have put it.
+        let mut pointer = TouchPointer::new();
+        let mut start_a = vec![touch(1, TouchPhase::Start, Pos2::new(200.0, 700.0))];
+        pointer.prepare_events(&mut start_a);
+
+        let mut frame = vec![
+            touch(2, TouchPhase::Start, Pos2::new(40.0, 90.0)),
+            touch(1, TouchPhase::Cancel, Pos2::new(200.0, 700.0)),
+        ];
+        assert_eq!(pointer.prepare_events(&mut frame), 3);
+        assert_eq!(
+            all_events(&frame),
+            vec![
+                "touch:2:start@40,90",
+                "touch:1:cancel@200,700",
+                "move@-10000,-10000",
+                "release@-10000,-10000",
+                "gone",
+            ]
+        );
+        assert_eq!(pointer.active(), None);
+    }
+
+    #[test]
+    fn a_late_cancel_for_a_finished_finger_does_not_release_the_new_one() {
+        // A's cancel arrives one frame after A was already released, in the
+        // same frame B starts: B's press is already out, A's late cancel is
+        // ignored, and the pointer stays down on B.
+        let mut pointer = TouchPointer::new();
+        let mut start_a = vec![touch(1, TouchPhase::Start, Pos2::new(200.0, 700.0))];
+        pointer.prepare_events(&mut start_a);
+        let mut end_a = vec![touch(1, TouchPhase::End, Pos2::new(200.0, 700.0))];
+        pointer.prepare_events(&mut end_a);
+
+        let mut frame = vec![
+            touch(2, TouchPhase::Start, Pos2::new(40.0, 90.0)),
+            touch(1, TouchPhase::Cancel, Pos2::new(200.0, 700.0)),
+        ];
+        assert_eq!(pointer.prepare_events(&mut frame), 2);
+        assert_eq!(
+            all_events(&frame),
+            vec![
+                "touch:2:start@40,90",
+                "move@40,90",
+                "press@40,90",
+                "touch:1:cancel@200,700",
+            ],
+            "the late cancel must not release B: {:?}",
+            all_events(&frame)
+        );
+        assert_eq!(pointer.active(), Some(TouchId::from(2)));
+    }
+
+    #[test]
+    fn the_frame_ppp_comes_from_the_raw_input_not_the_empty_cache() {
+        let mut raw = RawInput::default();
+        let id = raw.viewport_id;
+        raw.viewports.get_mut(&id).unwrap().native_pixels_per_point = Some(2.625);
+        assert_eq!(
+            frame_pixels_per_point(&raw, 0.0),
+            2.625,
+            "frame 1 must not log ppp=0.000"
+        );
+        assert_eq!(
+            frame_pixels_per_point(&raw, 1.0),
+            2.625,
+            "the frame's own value wins over the cache"
+        );
+
+        raw.viewports.get_mut(&id).unwrap().native_pixels_per_point = None;
+        assert_eq!(
+            frame_pixels_per_point(&raw, 2.625),
+            2.625,
+            "an integration that reports nothing falls back to the cache"
+        );
+
+        raw.viewports.get_mut(&id).unwrap().native_pixels_per_point = Some(0.0);
+        assert_eq!(
+            frame_pixels_per_point(&raw, 2.625),
+            2.625,
+            "a zero is not a usable scale"
+        );
     }
 
     #[test]

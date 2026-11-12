@@ -83,10 +83,11 @@ pub struct CompactShell {
     ppp: f32,
     /// The route the last frame painted (the navigation marker's edge).
     last_route: Option<CompactRoute>,
-    /// When the Settings layout probe was last logged.
-    last_layout_log: Option<Instant>,
+    /// M19A2: when the Settings layout probe should be written (log on change,
+    /// plus one resting line per settled scroll position).
+    probe_log: compact::settings::ProbeLog,
     /// The resume counter the touch tracker was last reset for.
-    last_resumes: u64,
+    last_resumes: u32,
     /// M19B: the last model truth marker (one line per state change). The
     /// emulator smoke asserts "no In use on a fresh install" from these lines,
     /// because uiautomator cannot read egui's painted text.
@@ -116,7 +117,7 @@ impl CompactShell {
             input_log: compact::input::input_log_enabled(),
             ppp: 0.0,
             last_route: None,
-            last_layout_log: None,
+            probe_log: compact::settings::ProbeLog::default(),
             last_resumes: 0,
             last_model_header: None,
             last_model_can_record: None,
@@ -162,9 +163,18 @@ impl CompactShell {
         // M19A Step 0 / the synthesis. The description is taken BEFORE the
         // fold-in so it reports what the integration delivered (the question
         // Step 0 asks), with `synth=` naming what this shell had to add.
+        //
+        // The pixels-per-point comes from the frame's own raw input (M19A2):
+        // `prime_input` runs before `draw`, so reading the cache here logged
+        // `ppp=0.000` on frame 1 and made every first-frame touch coordinate
+        // look wrong.
+        let ppp = compact::input::frame_pixels_per_point(raw, self.ppp);
+        if ppp > 0.0 {
+            self.ppp = ppp;
+        }
         let described = self
             .input_log
-            .then(|| compact::input::describe_frame(raw, self.ppp));
+            .then(|| compact::input::describe_frame(raw, ppp));
         let synthesized = self.touch_pointer.prepare(raw);
         if let Some(line) = described {
             log::info!("SURAMAK-INPUT {line} synth={synthesized}");
@@ -219,6 +229,10 @@ impl CompactShell {
         let drew = host.with_app(|app| {
             app.insets.top = (state.insets.top as f32 / ppp).max(0.0);
             app.insets.bottom = (state.insets.bottom as f32 / ppp).max(0.0);
+            // M19A2: the phone's gesture area is at least 24 dp even when the
+            // platform has not pushed an inset yet (immersive, or the first
+            // frames before the Kotlin listener fires). Desktops keep 0.
+            app.clearance_floor = compact::settings::ANDROID_MIN_CLEARANCE;
             app.reduce_motion = platform_reduce_motion();
             app.set_diagnostics(diagnostics);
             if !self.started_host {
@@ -248,13 +262,15 @@ impl CompactShell {
                 log::info!("compact route: {route:?}");
             }
             if self.input_log {
-                layout_probe = Some((
-                    compact::a11y::controls(ctx)
-                        .into_iter()
-                        .find(|control| control.label == compact::settings::DEVICE_NOTE)
-                        .map(|control| control.rect),
-                    app.insets.bottom,
-                ));
+                // M19A2: the list's REAL last control (the Quit row) is the
+                // clearance witness; the DEVICE note rides along as the second
+                // field because it still names the device's disk truth.
+                layout_probe = compact::settings::LayoutProbe::from_controls(
+                    &compact::a11y::controls(ctx),
+                    app.insets,
+                    app.clearance_floor,
+                    ctx.content_rect(),
+                );
             }
             // M19B: the model table's truth, one line per state change. This is
             // the only readable witness on the emulator — egui paints pixels,
@@ -293,31 +309,36 @@ impl CompactShell {
         actions
     }
 
-    /// One line a second while Settings is up, naming where the DEVICE note
-    /// ended up relative to the content band and the gesture inset (M19A's
-    /// bottom-clearance proof; the emulator smoke reads the last line).
-    fn log_layout_probe(&mut self, ctx: &egui::Context, probe: Option<(Option<egui::Rect>, f32)>) {
-        let Some((Some(rect), inset)) = probe else {
+    /// Writes the Settings layout probe (M19A's bottom-clearance proof, M19A2's
+    /// ordering fix): a line whenever the geometry **changes** (at most 4 Hz)
+    /// and one more once it has been still for 300 ms — the resting scroll
+    /// position the emulator smoke asserts on. The resting line carries the
+    /// device's Unix time in ms, so the smoke can prove it is newer than the
+    /// swipe it drove.
+    fn log_layout_probe(
+        &mut self,
+        ctx: &egui::Context,
+        probe: Option<compact::settings::LayoutProbe>,
+    ) {
+        let Some(probe) = probe else {
+            // Leaving Settings starts a fresh gate: the next visit is a new
+            // line even at the same scroll offset.
+            if self.last_route != Some(CompactRoute::Settings) {
+                self.probe_log.reset();
+            }
             return;
         };
         let now = Instant::now();
-        if self
-            .last_layout_log
-            .is_some_and(|at| now.duration_since(at) < Duration::from_secs(1))
-        {
-            return;
+        if let Some(settled) = self.probe_log.observe(probe.key(), now) {
+            log::info!("{}", probe.line(unix_millis(), settled));
         }
-        self.last_layout_log = Some(now);
-        let screen = ctx.content_rect();
-        log::info!(
-            "SURAMAK-LAYOUT route=Settings device_top={:.1} device_bottom={:.1} \
-             content_bottom={:.1} screen_bottom={:.1} inset_bottom={:.1}",
-            rect.top(),
-            rect.bottom(),
-            screen.bottom() - inset,
-            screen.bottom(),
-            inset
-        );
+        if let Some(due) = self.probe_log.pending() {
+            // A reactive render loop (`ControlFlow::Wait`) stops drawing the
+            // moment the finger stops, so without a timer the resting line
+            // would wait for the next unrelated frame — the stale `tail -1` the
+            // audit found. Wake once, for exactly the settle window.
+            ctx.request_repaint_after(due.saturating_duration_since(now));
+        }
     }
 
     /// One line per model-row state change (M19B).
@@ -715,6 +736,15 @@ fn read_resume_offer() -> Option<ResumeOffer> {
 /// is 0, or the accessibility toggle is on). Read through `platform`.
 fn platform_reduce_motion() -> bool {
     suramak_android_spike::platform::reduce_motion()
+}
+
+/// The device's Unix time in milliseconds — the `ts=` field of the layout
+/// probe, so the emulator smoke can compare it with its own clock.
+fn unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0)
 }
 
 fn draw_starting(ctx: &egui::Context) {

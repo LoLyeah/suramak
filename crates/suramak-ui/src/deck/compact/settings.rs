@@ -12,6 +12,8 @@ use egui::{
     StrokeKind, Ui, WidgetType,
 };
 
+use std::time::{Duration, Instant};
+
 use suramak_core::settings::Appearance;
 
 use crate::deck::motion::Motion;
@@ -19,17 +21,35 @@ use crate::deck::theme::Tokens;
 
 use super::a11y;
 use super::chrome::{self, GUTTER, MIN_TOUCH};
-use super::model::{bytes_label, CompactAction, CompactApp, CompactSetting, Sheet};
+use super::model::{bytes_label, CompactAction, CompactApp, CompactSetting, Insets, Sheet};
 
-/// The DEVICE card's last line — also the smoke's bottom-clearance probe (the
-/// shell's layout log reports this label's rect).
+/// The DEVICE card's last line — the smoke's second probe field, kept because
+/// it names the phone's disk truth (M19A2).
 pub const DEVICE_NOTE: &str = "Everything runs on this phone. No analytics, no uploads.";
 
-/// The padding the list leaves under its last control: the gesture inset the
-/// shell reports plus the standard gutter (M19A).
-pub fn bottom_clearance(inset_bottom: f32) -> f32 {
-    inset_bottom.max(0.0) + GUTTER
+/// The Quit row's accessibility label — **the list's real last control**, and
+/// therefore the element the bottom-clearance probe measures (M19A2). It is a
+/// constant because the shell finds the row by label in the frame's a11y
+/// registry; a string literal in two places would drift.
+pub const QUIT_LABEL: &str = "Quit Suramak";
+
+/// The clearance the content always leaves under its last control.
+///
+/// `floor` is the platform's minimum bottom inset: 0 on desktop (the value is
+/// the platform's own inset plus the standard gutter) and
+/// [`ANDROID_MIN_CLEARANCE`] on the phone, so a window that has not pushed its
+/// insets yet — or an immersive one — still scrolls the Quit row clear of the
+/// gesture pill instead of pinning it to the screen's edge.
+pub fn bottom_clearance(inset_bottom: f32, floor: f32) -> f32 {
+    inset_bottom.max(floor).max(0.0) + GUTTER
 }
+
+/// Android's minimum bottom clearance, in points: 24 dp, the gesture handle's
+/// own height on every Android release that ships gesture navigation.
+///
+/// A point is a dp on Android (`pixels_per_point` is `density / 160`), which
+/// is why this number is the platform's, not a design choice.
+pub const ANDROID_MIN_CLEARANCE: f32 = 24.0;
 
 pub fn ui(
     ui: &mut Ui,
@@ -470,10 +490,11 @@ pub fn ui(
             FontId::proportional(11.5),
             tokens.ink_faint,
         );
-        // The DEVICE note is the bottom-clearance probe: the shell's layout log
-        // reports this label's rect, and the emulator smoke asserts it sits
-        // above the gesture pill after a scroll to the end. It also gives
-        // TalkBack the sentence instead of leaving it as anonymous paint.
+        // The DEVICE note stays a named label (TalkBack reads the sentence
+        // instead of anonymous paint) and a second probe field in the shell's
+        // layout line. It is no longer the clearance witness: Diagnostics and
+        // the Quit row follow it, so at full scroll Quit is what sits under the
+        // gesture pill (M19A2).
         a11y::describe(
             ui,
             Rect::from_min_size(
@@ -514,7 +535,7 @@ pub fn ui(
             quit,
             "settings-quit",
             WidgetType::Button,
-            "Quit Suramak",
+            QUIT_LABEL,
             true,
         );
         ui.painter().rect(
@@ -527,7 +548,7 @@ pub fn ui(
         ui.painter().text(
             quit.center(),
             Align2::CENTER_CENTER,
-            "Quit Suramak",
+            QUIT_LABEL,
             FontId::proportional(15.0),
             tokens.record_red_text,
         );
@@ -535,14 +556,15 @@ pub fn ui(
             state.request_quit();
         }
         y = quit.bottom() + 30.0;
-        // M19A bottom clearance. The viewport ends at the content band's
-        // bottom, which already excludes the gesture inset the shell reports —
-        // but a phone that has not pushed its insets yet (or an immersive
-        // window) reports zero, and a maxed-out scroll then pins the last
-        // line to the pill. Padding the CONTENT by the inset plus the standard
-        // gutter is what the last line scrolls above; without it the scroll
-        // range ends exactly at the DEVICE card's edge.
-        let tail = bottom_clearance(state.insets.bottom);
+        // M19A bottom clearance, M19A2 floor. The viewport ends at the content
+        // band's bottom, which already excludes the gesture inset the shell
+        // reports — but a phone that has not pushed its insets yet (or an
+        // immersive window) reports zero, and a maxed-out scroll then pins the
+        // last control to the pill. Padding the CONTENT by the inset (or the
+        // platform's floor) plus the standard gutter is what the Quit row
+        // scrolls above; without it the scroll range ends exactly at the row's
+        // own edge.
+        let tail = bottom_clearance(state.insets.bottom, state.clearance_floor);
         ui.allocate_space(vec2(width, (y - top).max(0.0) + tail));
     });
 
@@ -551,6 +573,184 @@ pub fn ui(
         // The sheet itself is drawn by the dispatcher.
     }
     actions
+}
+
+/// The geometry one `SURAMAK-LAYOUT` line carries (M19A2).
+///
+/// `quit` is the list's **real last control**: Diagnostics and the Quit row
+/// follow the DEVICE card, so at full scroll the Quit row is what sits under
+/// the gesture pill. M19A probed the DEVICE note — a middle element that
+/// clears the pill even when Quit is clipped under it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayoutProbe {
+    pub quit: Rect,
+    pub device_note: Rect,
+    pub inset_top: f32,
+    pub inset_bottom: f32,
+    /// The padding the list leaves under its last control, floor included.
+    pub clearance: f32,
+    /// Where the scroll viewport ends: the content band's bottom, i.e. the
+    /// screen's bottom minus the bottom inset.
+    pub viewport_bottom: f32,
+    pub screen_bottom: f32,
+}
+
+impl LayoutProbe {
+    /// Reads both probe controls out of the frame's a11y registry.
+    ///
+    /// `None` when either is missing — which is exactly "the Settings list is
+    /// not on screen this frame", since the two are painted together.
+    pub fn from_controls(
+        controls: &[a11y::Control],
+        insets: Insets,
+        floor: f32,
+        screen: Rect,
+    ) -> Option<Self> {
+        let find = |label: &str| {
+            controls
+                .iter()
+                .find(|control| control.label == label)
+                .map(|control| control.rect)
+        };
+        let quit = find(QUIT_LABEL)?;
+        let device_note = find(DEVICE_NOTE)?;
+        Some(Self {
+            quit,
+            device_note,
+            inset_top: insets.top,
+            inset_bottom: insets.bottom,
+            clearance: bottom_clearance(insets.bottom, floor),
+            viewport_bottom: screen.bottom() - insets.bottom,
+            screen_bottom: screen.bottom(),
+        })
+    }
+
+    /// The line's geometry identity, in tenths of a point.
+    ///
+    /// Two frames with the same key drew the list at the same place; the
+    /// settle detector compares these, not floats, so pixel-snap noise cannot
+    /// keep a resting list looking busy.
+    pub fn key(&self) -> ProbeKey {
+        fn tenths(value: f32) -> i32 {
+            (value * 10.0).round() as i32
+        }
+        ProbeKey {
+            quit_top: tenths(self.quit.top()),
+            quit_bottom: tenths(self.quit.bottom()),
+            device_bottom: tenths(self.device_note.bottom()),
+            inset_top: tenths(self.inset_top),
+            inset_bottom: tenths(self.inset_bottom),
+            clearance: tenths(self.clearance),
+        }
+    }
+
+    /// One machine-readable line. `ts` is the device's Unix time in
+    /// milliseconds, so the emulator smoke can prove the line is newer than
+    /// the swipe it asserts on; `settled` marks a line written after the
+    /// geometry held still, i.e. the resting scroll position.
+    pub fn line(&self, timestamp_ms: u128, settled: bool) -> String {
+        format!(
+            "SURAMAK-LAYOUT ts={timestamp_ms} settled={} route=Settings \
+             quit_top={:.1} quit_bottom={:.1} device_top={:.1} device_bottom={:.1} \
+             clearance={:.1} viewport_bottom={:.1} content_bottom={:.1} \
+             screen_bottom={:.1} inset_bottom={:.1} inset_top={:.1}",
+            settled as u8,
+            self.quit.top(),
+            self.quit.bottom(),
+            self.device_note.top(),
+            self.device_note.bottom(),
+            self.clearance,
+            self.viewport_bottom,
+            self.viewport_bottom,
+            self.screen_bottom,
+            self.inset_bottom,
+            self.inset_top,
+        )
+    }
+}
+
+/// [`LayoutProbe`]'s comparable geometry ([`LayoutProbe::key`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeKey {
+    quit_top: i32,
+    quit_bottom: i32,
+    device_bottom: i32,
+    inset_top: i32,
+    inset_bottom: i32,
+    clearance: i32,
+}
+
+/// The longest a changed probe may go unlogged: four lines a second.
+pub const PROBE_LOG_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How long the geometry must hold before it counts as the resting position.
+pub const PROBE_SETTLE: Duration = Duration::from_millis(300);
+
+/// Decides when the shell writes a `SURAMAK-LAYOUT` line (M19A2).
+///
+/// M19A used a one-second wall clock. A swipe that ends in the same second as
+/// its last log left the shell's `tail -1` reading a **mid-swipe** line — and
+/// under reactive rendering (`ControlFlow::Wait`) the draw that would have
+/// written a newer one may never happen at all. This gate logs
+///
+/// * whenever the geometry **changes**, at most [`PROBE_LOG_INTERVAL`] apart;
+/// * once, [`PROBE_SETTLE`] after the geometry stops changing — the resting
+///   position the smoke asserts on.
+#[derive(Debug, Default)]
+pub struct ProbeLog {
+    current: Option<ProbeKey>,
+    current_since: Option<Instant>,
+    /// The key the resting line has already been written for.
+    settled: Option<ProbeKey>,
+    logged_at: Option<Instant>,
+}
+
+impl ProbeLog {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// `Some(settled)` when a line should be written now: `false` for a change
+    /// line, `true` for the resting line.
+    pub fn observe(&mut self, key: ProbeKey, now: Instant) -> Option<bool> {
+        if self.current != Some(key) {
+            self.current = Some(key);
+            self.current_since = Some(now);
+            // A new position owes its own resting line, even if this exact
+            // key was resting earlier (swipe away and back).
+            self.settled = None;
+            if self
+                .logged_at
+                .is_some_and(|at| now.saturating_duration_since(at) < PROBE_LOG_INTERVAL)
+            {
+                return None;
+            }
+            self.logged_at = Some(now);
+            return Some(false);
+        }
+        if self.settled == Some(key) {
+            return None;
+        }
+        if now.saturating_duration_since(self.current_since.unwrap_or(now)) < PROBE_SETTLE {
+            return None;
+        }
+        self.settled = Some(key);
+        self.logged_at = Some(now);
+        Some(true)
+    }
+
+    /// When the resting line is still owed, the instant it becomes due.
+    ///
+    /// The shell asks egui for a repaint at that instant: `ControlFlow::Wait`
+    /// stops drawing the moment the finger stops, so without a timer the
+    /// resting line would wait for the next unrelated frame.
+    pub fn pending(&self) -> Option<Instant> {
+        let key = self.current?;
+        if self.settled == Some(key) {
+            return None;
+        }
+        Some(self.current_since? + PROBE_SETTLE)
+    }
 }
 
 fn language_label(language: &str) -> &'static str {
@@ -590,4 +790,169 @@ fn truncate(text: &str, width: f32, font_size: f32) -> String {
     let mut out: String = text.chars().take(approximate.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::pos2;
+
+    fn probe(top: f32) -> LayoutProbe {
+        LayoutProbe {
+            quit: Rect::from_min_size(pos2(16.0, top), egui::vec2(300.0, 52.0)),
+            device_note: Rect::from_min_size(pos2(16.0, top - 200.0), egui::vec2(300.0, 16.0)),
+            inset_top: 24.0,
+            inset_bottom: 54.0 / 2.6,
+            clearance: bottom_clearance(54.0 / 2.6, ANDROID_MIN_CLEARANCE),
+            viewport_bottom: 900.0,
+            screen_bottom: 920.8,
+        }
+    }
+
+    #[test]
+    fn the_clearance_has_a_floor_and_desktops_keep_the_old_number() {
+        assert_eq!(
+            bottom_clearance(0.0, 0.0),
+            GUTTER,
+            "a desktop window with no inset keeps the plain gutter"
+        );
+        assert_eq!(
+            bottom_clearance(0.0, ANDROID_MIN_CLEARANCE),
+            ANDROID_MIN_CLEARANCE + GUTTER,
+            "an Android window that reports zero still leaves room for the pill"
+        );
+        assert_eq!(
+            bottom_clearance(30.0, ANDROID_MIN_CLEARANCE),
+            30.0 + GUTTER,
+            "a real inset above the floor is used as reported"
+        );
+        assert_eq!(
+            bottom_clearance(-4.0, ANDROID_MIN_CLEARANCE),
+            ANDROID_MIN_CLEARANCE + GUTTER,
+            "a negative inset is not trusted"
+        );
+    }
+
+    #[test]
+    fn the_probe_line_carries_the_quit_row_and_the_viewport() {
+        let line = probe(800.0).line(1_763_000_000_123, true);
+        assert!(
+            line.starts_with("SURAMAK-LAYOUT ts=1763000000123 settled=1"),
+            "{line}"
+        );
+        assert!(line.contains("quit_bottom=852.0"), "{line}");
+        assert!(line.contains("device_bottom=616.0"), "{line}");
+        assert!(line.contains("viewport_bottom=900.0"), "{line}");
+        assert!(line.contains("content_bottom=900.0"), "{line}");
+        assert!(line.contains("inset_bottom=20.8"), "{line}");
+        assert!(line.contains("inset_top=24.0"), "{line}");
+        assert!(
+            line.contains("clearance=40.0"),
+            "the phone floor lifts a 20.8 pt inset to 24 dp + gutter: {line}"
+        );
+        assert!(
+            !probe(800.0).line(0, false).contains("settled=1"),
+            "a change line is not a settled line"
+        );
+    }
+
+    #[test]
+    fn a_changed_probe_logs_at_once_but_never_faster_than_four_hertz() {
+        let mut log = ProbeLog::default();
+        let start = Instant::now();
+        assert_eq!(
+            log.observe(probe(800.0).key(), start),
+            Some(false),
+            "the first frame of Settings is worth a line"
+        );
+        assert_eq!(
+            log.observe(probe(760.0).key(), start + Duration::from_millis(100)),
+            None,
+            "a 60 Hz drag must not bury logcat"
+        );
+        assert_eq!(
+            log.observe(probe(720.0).key(), start + Duration::from_millis(260)),
+            Some(false),
+            "four lines a second is the ceiling"
+        );
+    }
+
+    #[test]
+    fn a_resting_list_logs_once_after_the_settle_window() {
+        let mut log = ProbeLog::default();
+        let start = Instant::now();
+        let key = probe(800.0).key();
+        assert_eq!(log.observe(key, start), Some(false));
+        assert_eq!(
+            log.observe(key, start + Duration::from_millis(200)),
+            None,
+            "not settled yet"
+        );
+        assert_eq!(
+            log.observe(key, start + Duration::from_millis(301)),
+            Some(true),
+            "the resting position gets its own line"
+        );
+        assert_eq!(
+            log.observe(key, start + Duration::from_millis(900)),
+            None,
+            "and only one"
+        );
+    }
+
+    #[test]
+    fn a_throttled_change_still_gets_its_resting_line() {
+        // The mid-swipe shape the audit found: two changes inside one 250 ms
+        // window, so the second is throttled away — the resting line at +300 ms
+        // is what `tail -1` must read.
+        let mut log = ProbeLog::default();
+        let start = Instant::now();
+        assert_eq!(log.observe(probe(800.0).key(), start), Some(false));
+        let resting = probe(700.0).key();
+        assert_eq!(
+            log.observe(resting, start + Duration::from_millis(100)),
+            None,
+            "throttled"
+        );
+        assert_eq!(
+            log.observe(resting, start + Duration::from_millis(399)),
+            None,
+            "300 ms has not passed since the change at +100 ms"
+        );
+        assert_eq!(
+            log.observe(resting, start + Duration::from_millis(401)),
+            Some(true),
+            "the last change is still reported, as the resting line"
+        );
+    }
+
+    #[test]
+    fn a_settle_is_owed_until_it_is_written() {
+        let mut log = ProbeLog::default();
+        let start = Instant::now();
+        let key = probe(800.0).key();
+        assert_eq!(log.pending(), None, "nothing to log before Settings draws");
+        log.observe(key, start);
+        assert_eq!(
+            log.pending(),
+            Some(start + PROBE_SETTLE),
+            "the shell must wake itself for the resting line"
+        );
+        log.observe(key, start + Duration::from_millis(301));
+        assert_eq!(log.pending(), None, "the line is written; no timer left");
+    }
+
+    #[test]
+    fn leaving_and_returning_to_settings_logs_again() {
+        let mut log = ProbeLog::default();
+        let start = Instant::now();
+        let key = probe(800.0).key();
+        assert_eq!(log.observe(key, start), Some(false));
+        log.reset();
+        assert_eq!(
+            log.observe(key, start + Duration::from_secs(5)),
+            Some(false),
+            "a fresh visit is a fresh line, even at the same scroll offset"
+        );
+    }
 }

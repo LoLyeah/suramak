@@ -12,10 +12,12 @@
 # M19A adds the phone-interaction steps: a tap opens Settings, a swipe moves the
 # list (proved by a screencap diff with a still-frame negative control), a tap
 # after the swipe still fires (proved by the shell's route marker), and the
-# DEVICE note ends above the gesture inset at full scroll (proved by the
-# shell's SURAMAK-LAYOUT probe). The same run records Step 0's two answers in
-# `input-log.txt`: whether pointer events already reach egui, and whether the
-# touch coordinates are egui points.
+# **Quit** row — the list's real last control — ends above the gesture inset at
+# full scroll (proved by the shell's SURAMAK-LAYOUT probe, on its resting line).
+# M19A2 crops the status-bar band out of both diff frames (the clock is not the
+# app's) and reads the probe's settled line by its own timestamp. The same run
+# records Step 0's two answers in `input-log.txt`: whether pointer events
+# already reach egui, and whether the touch coordinates are egui points.
 #
 # Requires (all provided by the CI job):
 #   - an x86_64 AVD package installed (`system-images;android-35;google_apis;x86_64`)
@@ -203,9 +205,19 @@ echo "   boot:     complete"
 "$ADB" shell settings put global window_animation_scale 0
 "$ADB" shell settings put global transition_animation_scale 0
 "$ADB" shell settings put global animator_duration_scale 0
+# M19A2: gesture navigation. The bottom-clearance assertion below is about the
+# gesture pill, and an AVD can boot in three-button mode (a 48 dp bar, no
+# pill). Enabling the gestural overlay before the app starts means the insets
+# the shell sees are the ones the assertion names. Best-effort: on an image
+# without the overlay the `settings` path is the fallback, and the assertion
+# itself is the real gate.
+"$ADB" shell cmd overlay enable-exclusive --category com.android.internal.systemui.navbar.gestural \
+  >/dev/null 2>&1 \
+  || "$ADB" shell settings put secure navigation_mode 2 >/dev/null 2>&1 \
+  || true
 "$ADB" shell input keyevent 82 >/dev/null 2>&1 || true
 "$ADB" shell wm dismiss-keyguard >/dev/null 2>&1 || true
-sleep 2
+sleep 3
 
 # The launcher shot is the baseline the app shot must differ from.
 "$ADB" exec-out screencap -p >"$OUT/launcher.png"
@@ -598,9 +610,10 @@ PY
 # Every assertion below is pixel- or log-derived: the compact surface is ONE
 # Android window, so uiautomator sees a single node and cannot describe the
 # list moving. The witnesses are (a) a screencap diff before/after a swipe,
-# with a still-frame negative control, (b) the shell's own route markers for
-# "a tap landed", and (c) the shell's SURAMAK-LAYOUT probe for where the DEVICE
-# note sits relative to the content band (the gesture inset).
+# with a still-frame negative control and the status-bar band cropped out of
+# both, (b) the shell's own route markers for "a tap landed", and (c) the
+# shell's SURAMAK-LAYOUT resting line for where the QUIT row — the list's last
+# control — sits relative to the viewport (the gesture inset).
 echo "== M19A: Settings scroll, tap after a swipe, gesture-pill clearance =="
 
 # Geometry in physical pixels: input tap/swipe take pixels, the shell logs
@@ -613,6 +626,11 @@ DENSITY="$("$ADB" shell wm density | tr -d '\r' | sed -n 's/.*: \([0-9]*\).*/\1/
 echo "   screen:   ${SCREEN_W}x${SCREEN_H} px, density ${DENSITY} dpi"
 
 dp() { awk -v value="$1" -v density="$DENSITY" 'BEGIN { printf "%d", value * density / 160 }'; }
+
+# The host clock in Unix milliseconds, the unit the shell's `ts=` uses. GNU
+# date's `%N` is nanoseconds on glibc whatever the width modifier says, so the
+# first 13 digits are seconds + milliseconds.
+now_ms() { date +%s%3N | cut -c1-13; }
 
 route_is() { app_log | grep -qF "compact route: $1"; }
 
@@ -654,6 +672,36 @@ enter_settings || {
   fail "a tap on the Library's Settings action never opened Settings — taps are dead, so the M19A steps cannot run (see $OUT/logcat-settings-failed.txt)"
 }
 sleep 1
+
+# --- the status-bar band to crop out of every diff (M19A2) -------------------
+# Two captures of a still screen flake when the status bar's clock rolls over or
+# its battery/network icons redraw. The band is measured from the app's OWN top
+# inset (`SURAMAK-LAYOUT inset_top`, in points) times the frame's
+# pixels-per-point (`SURAMAK-INPUT ppp`), with a 24 dp floor for the frames
+# before the Kotlin inset listener has fired — the app never draws there.
+last_layout_field() {
+  app_log | grep -F "SURAMAK-LAYOUT" | tail -1 \
+    | sed -n "s/.*[[:space:]]$1=\(-\{0,1\}[0-9.]*\).*/\1/p" || true
+}
+INSET_TOP_PT="$(last_layout_field inset_top)"
+PPP="$(app_log | grep -F "SURAMAK-INPUT" | tail -1 \
+  | sed -n 's/.*ppp=\([0-9.]*\).*/\1/p' || true)"
+if [ -z "$PPP" ]; then
+  # egui's ppp on Android is the display density over 160, and the debug APK's
+  # first SURAMAK-INPUT line may not have been written yet.
+  PPP="$(awk -v density="$DENSITY" 'BEGIN { printf "%.3f", density / 160 }')"
+fi
+[ -n "$INSET_TOP_PT" ] || INSET_TOP_PT=0
+CROP_TOP="$(awk -v top="$INSET_TOP_PT" -v ppp="$PPP" -v density="$DENSITY" 'BEGIN {
+  px = top * ppp;
+  floor = 24 * density / 160;   # 24 dp: the shortest status bar Android ships
+  if (px < floor) px = floor;
+  printf "%d", px + 2;          # +2 px for the 1-px shadow at the bar edge
+}')"
+[ "$CROP_TOP" -gt 0 ] || fail "the status-bar crop band came out empty (inset_top=${INSET_TOP_PT} pt, ppp=${PPP})"
+[ "$CROP_TOP" -lt "$((SCREEN_H / 4))" ] \
+  || fail "the status-bar crop (${CROP_TOP} px) is over a quarter of the ${SCREEN_H} px screen — refusing to crop the evidence away"
+echo "   crop:     status bar rows 0..${CROP_TOP} px (inset_top ${INSET_TOP_PT} pt × ppp ${PPP}) — cropped from both diff frames"
 
 # --- the swipe: the list must move -------------------------------------------
 "$ADB" exec-out screencap -p >"$OUT/settings-before.png"
@@ -714,15 +762,17 @@ PY
 
 # --- the two pixel assertions ------------------------------------------------
 # Negative control first: two captures of a still screen must be identical, or
-# the diff below proves nothing.
+# the diff below proves nothing. Both frames are cropped to the status-bar band's
+# edge first (M19A2): the clock and the battery icon are the system's, not the
+# app's, and a minute rollover must not be able to fail this control.
 python3 tests/android-smoke/inspect_screencap.py \
   --diff "$OUT/settings-still.png" "$OUT/settings-before.png" \
-  --max-mean-diff 0.05 --json "$OUT/settings-still-diff.json" \
-  || fail "two captures of a still Settings screen differ — the screencap diff is not a stable witness (see $OUT/settings-still-diff.json)"
+  --crop-top "$CROP_TOP" --max-mean-diff 0.05 --json "$OUT/settings-still-diff.json" \
+  || fail "two captures of a still Settings screen differ below the status bar — the screencap diff is not a stable witness (see $OUT/settings-still-diff.json)"
 
 python3 tests/android-smoke/inspect_screencap.py \
   --diff "$OUT/settings-before.png" "$OUT/settings-after-swipe.png" \
-  --min-mean-diff 0.4 --json "$OUT/settings-swipe-diff.json" \
+  --crop-top "$CROP_TOP" --min-mean-diff 0.4 --json "$OUT/settings-swipe-diff.json" \
   || fail "the Settings list did not move after a swipe (see $OUT/settings-swipe-diff.json and the two shots) — the dead-scroll regression is back"
 
 # --- a tap after the swipe must still fire -----------------------------------
@@ -733,42 +783,87 @@ tap_and_wait_route "$(dp 28)" Library \
   || fail "a tap on Settings' back chevron after the swipe did not return to the Library — taps stop landing after a scroll"
 echo "   tap:      a tap fired after the swipe"
 
-# --- bottom clearance: the DEVICE note above the gesture area ----------------
+# --- bottom clearance: the QUIT row above the gesture area -------------------
+# M19A2: the probe measures the list's real last control. Diagnostics and the
+# Quit row follow the DEVICE card, so at full scroll Quit is what sits under the
+# pill — the M19A probe measured the DEVICE note, a middle element that cleared
+# the band even when Quit was clipped.
 enter_settings || fail "could not re-enter Settings for the bottom-clearance check"
 sleep 1
 # Scroll to the end (the list clamps at its own bottom; extra swipes are no-ops).
+# The shell logs a line on every geometry change (4 Hz ceiling) and one more
+# once the offset has been still for 300 ms; `LAST_SWIPE_MS` is the host clock
+# reading taken just before the final swipe, which the line's own `ts=` must
+# beat.
+LAST_SWIPE_MS=""
 for _ in 1 2 3 4 5; do
+  LAST_SWIPE_MS="$(now_ms)"
   "$ADB" shell input swipe \
     "$((SCREEN_W / 2))" "$((SCREEN_H * 72 / 100))" \
     "$((SCREEN_W / 2))" "$((SCREEN_H * 28 / 100))" 200
   sleep 0.4
 done
-# The layout probe is rate-limited to one line a second.
+# The resting line lands 300 ms after the list stops; 2 s leaves room for a
+# slow software-rendered frame plus the logcat flush.
 sleep 2
 "$ADB" exec-out screencap -p >"$OUT/settings-bottom.png"
 app_log | grep -F "SURAMAK-LAYOUT" | tail -1 >"$OUT/layout.txt" || true
 
-python3 - "$OUT/layout.txt" <<'PY' || fail "the DEVICE note does not clear the gesture area (see $OUT/layout.txt and $OUT/settings-bottom.png)"
+python3 - "$OUT/layout.txt" "$LAST_SWIPE_MS" <<'PY' || fail "the Quit row does not clear the gesture area (see $OUT/layout.txt and $OUT/settings-bottom.png)"
 import re
 import sys
 
 line = open(sys.argv[1], encoding="utf-8", errors="replace").read().strip()
 values = dict(re.findall(r"([a-z_]+)=(-?[\d.]+)", line))
-if "device_bottom" not in values:
-    sys.exit(f"no SURAMAK-LAYOUT probe line: {line!r}")
-device_bottom = float(values["device_bottom"])
-content_bottom = float(values["content_bottom"])
-screen_bottom = float(values["screen_bottom"])
-inset_bottom = float(values["inset_bottom"])
-print(
-    f"   clearance: DEVICE note ends at {device_bottom:.1f} pt; content band ends at "
-    f"{content_bottom:.1f} (screen {screen_bottom:.1f} - gesture inset {inset_bottom:.1f})"
+required = (
+    "quit_bottom",
+    "clearance",
+    "viewport_bottom",
+    "inset_bottom",
+    "inset_top",
+    "settled",
+    "ts",
 )
-if device_bottom > content_bottom - 1.0:
+missing = [field for field in required if field not in values]
+if missing:
+    sys.exit(f"the SURAMAK-LAYOUT line is missing {missing}: {line!r}")
+
+quit_bottom = float(values["quit_bottom"])
+clearance = float(values["clearance"])
+viewport_bottom = float(values["viewport_bottom"])
+inset_bottom = float(values["inset_bottom"])
+inset_top = float(values["inset_top"])
+settled = int(float(values["settled"]))
+ts = float(values["ts"])
+swipe_ms = float(sys.argv[2] or 0)
+
+print(
+    f"   clearance: QUIT ends at {quit_bottom:.1f} pt + {clearance:.1f} pt padding; viewport "
+    f"ends at {viewport_bottom:.1f} (inset_bottom {inset_bottom:.1f}, inset_top "
+    f"{inset_top:.1f}); settled={settled}, ts={ts:.0f}"
+)
+if settled != 1:
     sys.exit(
-        f"the DEVICE note ({device_bottom:.1f} pt) is not above the content band's bottom "
-        f"({content_bottom:.1f} pt) at full scroll — it is still under the gesture pill"
+        f"the last SURAMAK-LAYOUT line is a mid-swipe line ({line!r}) — the resting line "
+        "never landed, so `tail -1` proves nothing about where the list came to rest"
     )
+if swipe_ms and ts + 1000 < swipe_ms:
+    sys.exit(
+        f"the resting line is older than the final swipe (ts={ts:.0f} ms, last swipe "
+        f"{swipe_ms:.0f} ms) — it describes a position the finger has already left"
+    )
+if inset_bottom <= 0.0:
+    sys.exit(
+        "inset_bottom is 0 on the gesture-nav AVD — the WindowInsets never reached the "
+        "shell, so every clearance number above is measured against a guess"
+    )
+if quit_bottom + clearance > viewport_bottom + 0.5:
+    sys.exit(
+        f"the Quit row ({quit_bottom:.1f} pt) plus its clearance ({clearance:.1f} pt) runs "
+        f"past the viewport ({viewport_bottom:.1f} pt) at full scroll — the row is still "
+        "under the gesture pill / clipped at the screen edge"
+    )
+print("   clearance: the Quit row and its padding sit above the viewport at rest")
 PY
 
 tap_and_wait_route "$(dp 28)" Library || fail "could not return to the Library after the clearance check"
