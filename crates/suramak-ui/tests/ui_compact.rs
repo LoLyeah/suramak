@@ -320,6 +320,143 @@ fn the_settings_shot_shows_the_low_tier_refusals() {
     assert_eq!(app.tier, Some(suramak_core::device::PhoneTier::BelowFloor));
 }
 
+/// M20D: the four per-model cards are ONE grouped card in human tier order,
+/// with the manifest ids demoted to a mono second line. The golden is scrolled
+/// so the whole card (four offered rows on a 12 GB phone) plus the Appearance
+/// control are in frame.
+#[test]
+fn the_model_card_is_one_grouped_card_with_human_tiers() {
+    let mut app = seeded_app();
+    app.settings.model_id = "base".to_string();
+    app.seed_device(
+        DeviceProfile::new(12_000_000_000, 8_000_000_000, false, true),
+        &["base".to_string()],
+    );
+    app.open_settings(0.0);
+    app.advance(10.0);
+    app.settings_scroll = Some(232.0);
+    let shot = render(&mut app, "settings-models-grouped");
+    assert!(shot.painted_fraction(egui::Color32::BLACK) > 0.5);
+
+    let offered: Vec<&str> = app
+        .models
+        .iter()
+        .filter(|row| row.offered)
+        .map(|row| row.id.as_str())
+        .collect();
+    assert_eq!(
+        offered,
+        vec!["tiny", "base", "small", "turbo-q5-0"],
+        "12 GB offers all four tiers, cheapest first"
+    );
+
+    // The spoken surface: human names first, ids still reachable as whole
+    // words (support reads them; nobody has to parse them).
+    let ctx = fresh_context(&app);
+    let (_, _, scale) = compact::phone_viewport();
+    let screen = compact::phone_screen_rect();
+    let _ = snapshot::render(&ctx, screen, scale, |ctx| {
+        let _ = compact::ui(ctx, &mut app);
+    });
+    let labels: Vec<String> = a11y::controls(&ctx)
+        .into_iter()
+        .map(|control| control.label)
+        .collect();
+    for name in ["Quick test", "Compact", "Balanced", "Highly accurate"] {
+        assert!(
+            labels.iter().any(|label| label.contains(name)),
+            "the tier {name:?} is on the surface: {labels:?}"
+        );
+    }
+    assert!(
+        labels
+            .iter()
+            .any(|label| label == "Balanced, 488 MB: Better accuracy for longer recordings."),
+        "the row's spoken copy carries the tier, size and human note: {labels:?}"
+    );
+}
+
+/// M20D: the same screen on the light ladder — the section labels, the grouped
+/// card's veil and the segmented tint all have to hold there too.
+#[test]
+fn the_settings_light_shot_is_the_same_surface() {
+    let mut app = seeded_app();
+    app.theme = AppTheme::Light;
+    app.settings.appearance = suramak_core::settings::Appearance::Light;
+    app.open_settings(0.0);
+    app.advance(10.0);
+    let shot = render(&mut app, "settings-light");
+    assert!(
+        shot.painted_fraction(egui::Color32::BLACK) > 0.9,
+        "the light ladder must not render a dark screen"
+    );
+    assert!(
+        shot.painted_fraction(egui::Color32::WHITE) > 0.05,
+        "cards and text paint over the light window"
+    );
+}
+
+/// M20D: no build vocabulary on the primary Settings surface. The control and
+/// description registry is the rendered surface's own text (egui paints pixels,
+/// so this is the closest a test can get to reading the screen), and every
+/// model row's copy is checked for all six manifest entries — including the
+/// hidden ones, which a screenshot cannot reach.
+#[test]
+fn the_settings_surface_carries_no_build_jargon() {
+    const BANNED: [&str; 7] = [
+        "CI + tests",
+        "optional/legacy",
+        "macOS",
+        "pyannote",
+        "SURAMAK_",
+        "CPL",
+        "arm64",
+    ];
+    let mut app = seeded_app();
+    app.settings.model_id = "small".to_string();
+    app.seed_device(
+        DeviceProfile::new(12_000_000_000, 8_000_000_000, false, true),
+        &["small".to_string()],
+    );
+    app.open_settings(0.0);
+    app.advance(10.0);
+    let ctx = fresh_context(&app);
+    let (_, _, scale) = compact::phone_viewport();
+    let screen = compact::phone_screen_rect();
+    let _ = snapshot::render(&ctx, screen, scale, |ctx| {
+        let _ = compact::ui(ctx, &mut app);
+    });
+    let labels: Vec<String> = a11y::controls(&ctx)
+        .into_iter()
+        .map(|control| control.label)
+        .collect();
+    assert!(
+        labels.len() > 10,
+        "the surface registered its text: {labels:?}"
+    );
+    for label in &labels {
+        for banned in BANNED {
+            assert!(
+                !label.contains(banned),
+                "{banned:?} is build vocabulary, not Settings copy: {label:?}"
+            );
+        }
+    }
+    // The off-screen manifest rows too (a hidden row must not smuggle a role
+    // string onto the phone if a future device offers it).
+    for row in &app.models {
+        for text in [
+            row.tier_name().to_string(),
+            row.tier_line(),
+            row.phone_note(),
+        ] {
+            for banned in BANNED {
+                assert!(!text.contains(banned), "{banned:?} in {text:?}");
+            }
+        }
+    }
+}
+
 #[test]
 fn a_fresh_phone_reads_not_downloaded_and_never_in_use() {
     // The owner's defect: the configured model read "In use" with no file.
@@ -353,7 +490,7 @@ fn a_fresh_phone_reads_not_downloaded_and_never_in_use() {
         .map(|control| control.label)
         .collect();
     assert!(
-        labels.iter().any(|label| label == "Download base"),
+        labels.iter().any(|label| label == "Download Compact"),
         "the configured model with no file offers a primary Download: {labels:?}"
     );
     assert!(
@@ -373,7 +510,7 @@ fn a_fresh_phone_reads_not_downloaded_and_never_in_use() {
         .map(|control| control.label)
         .collect();
     assert!(
-        labels.iter().any(|label| label == "In use base"),
+        labels.iter().any(|label| label == "In use Compact"),
         "a verified + selected file is the only 'In use': {labels:?}"
     );
 }

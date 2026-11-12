@@ -469,28 +469,53 @@ impl ModelState {
 }
 
 impl ModelRow {
-    /// `"78 MB · CI + tests"` — the one-line subtitle the cards reuse. A role
-    /// that only describes the desktop (`desktop default`) is omitted: no
-    /// platform-confusing copy on the phone.
-    pub fn size_role(&self) -> String {
-        if self.role.is_empty() {
-            super::model::bytes_label(self.size_bytes)
-        } else {
-            format!(
-                "{} · {}",
-                super::model::bytes_label(self.size_bytes),
-                self.role
-            )
+    /// The phone's **human tier name** for this model (M20D).
+    ///
+    /// The manifest ids (`tiny`, `base`, `small`, `turbo-q5-0`) are the stable
+    /// machine vocabulary; they are not what a person should read first. The
+    /// Settings card leads with these names and keeps the id on a mono second
+    /// line (and in Diagnostics) so support can still name the file exactly.
+    pub fn tier_name(&self) -> &'static str {
+        match self.id.as_str() {
+            "tiny" => "Quick test",
+            "base" => "Compact",
+            "small" => "Balanced",
+            "turbo-q5-0" => "Highly accurate",
+            "turbo-q8-0" => "High accuracy",
+            "turbo" => "Full accuracy",
+            _ => "Model",
         }
     }
 
-    /// The Settings row's second line: size, role and the disk truth.
-    pub fn subtitle(&self) -> String {
-        format!(
-            "{} · {}",
-            self.size_role(),
-            self.disk.label().to_lowercase()
-        )
+    /// The size a person compares against: `"78 MB"`, `"148 MB"`, `"488 MB"`.
+    pub fn tier_line(&self) -> String {
+        super::model::bytes_label(self.size_bytes)
+    }
+
+    /// One human sentence about what the tier is for (M20D).
+    ///
+    /// The manifest's `phone.note` is the refusal/guidance string and speaks
+    /// in ids and RAM bands ("the smaller pinned model; the phone default on
+    /// 4–6 GB devices"); this is the sentence the grouped card shows, in the
+    /// product's own words. Unknown ids fall back to the manifest note.
+    pub fn phone_note(&self) -> String {
+        match self.id.as_str() {
+            "tiny" => "For quick tests — the least accurate, especially in Indonesian.".to_string(),
+            "base" => "The lightest model for everyday notes.".to_string(),
+            "small" => "Better accuracy for longer recordings.".to_string(),
+            "turbo-q5-0" => "Slower, but the most accurate model that fits a phone.".to_string(),
+            _ => self.note.clone(),
+        }
+    }
+
+    /// The phone's size label (`"78 MB"`).
+    ///
+    /// The manifest's `role` is build vocabulary (`CI + tests`, `optional/
+    /// legacy`, `fast`): it is never spoken or painted on the phone. The size
+    /// is the one fact a person compares tiers by; the human name comes from
+    /// [`tier_name`](Self::tier_name).
+    pub fn size_role(&self) -> String {
+        super::model::bytes_label(self.size_bytes)
     }
 
     /// The five-state machine for this row (M19B).
@@ -2463,17 +2488,42 @@ mod tests {
         let turbo = find_row(&rows, "turbo-q5-0");
         assert_eq!(turbo.role, "", "the catalog role is desktop-only copy");
         assert_eq!(turbo.size_role(), "574 MB");
-        assert!(!turbo.subtitle().contains("desktop"));
-        assert!(!turbo.subtitle().contains("macOS"));
         for row in &rows {
             assert!(!row.role.contains("macOS"), "{}: {}", row.id, row.role);
             assert!(!row.note.contains("macOS"), "{}: {}", row.id, row.note);
         }
-        // A model with a real phone role keeps it.
+        // The size is the whole phone subtitle — the manifest role never
+        // reaches the screen, even when it is a seemingly harmless word.
         let small = find_row(&rows, "small");
         assert_eq!(small.role, "fast");
-        assert_eq!(small.size_role(), "488 MB · fast");
-        assert_eq!(small.subtitle(), "488 MB · fast · not downloaded");
+        assert_eq!(small.size_role(), "488 MB");
+    }
+
+    #[test]
+    fn the_phone_tiers_are_human_and_the_ids_stay_machine_readable() {
+        let rows = rows_at(12.0, &[]);
+        let expected = [
+            ("tiny", "Quick test", "78 MB"),
+            ("base", "Compact", "148 MB"),
+            ("small", "Balanced", "488 MB"),
+            ("turbo-q5-0", "Highly accurate", "574 MB"),
+        ];
+        for (id, name, size) in expected {
+            let row = find_row(&rows, id);
+            assert_eq!(row.tier_name(), name, "{id}");
+            assert_eq!(row.tier_line(), size, "{id}");
+            assert!(
+                !row.phone_note().contains(id),
+                "{}: the note must not name the manifest id: {}",
+                id,
+                row.phone_note()
+            );
+        }
+        // The hidden manifest entries still answer with a human name (no id
+        // leakage if a future phone offers them).
+        for row in &rows {
+            assert_ne!(row.tier_name(), "Model", "{}", row.id);
+        }
     }
 
     #[test]

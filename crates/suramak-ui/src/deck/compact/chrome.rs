@@ -388,7 +388,11 @@ struct RowPress {
     motion: PressMotion,
 }
 
-fn press_frame(ctx: &Context, id: egui::Id, pressed: bool, reduce: bool) -> PressFrame {
+/// The row/button press frame for `id`: `FAST` down, [`motion::SPRING_DURATION`]
+/// spring back, Reduce Motion keeping only the wash. Shared by the Library
+/// rows, the dock and the M20D Settings rows (which paint their own multi-line
+/// bodies).
+pub(crate) fn press_frame(ctx: &Context, id: egui::Id, pressed: bool, reduce: bool) -> PressFrame {
     let now = ctx.input(|input| input.time);
     let mut state = ctx.data_mut(|data| {
         data.get_temp::<RowPress>(id).unwrap_or(RowPress {
@@ -409,7 +413,7 @@ fn press_frame(ctx: &Context, id: egui::Id, pressed: bool, reduce: bool) -> Pres
 }
 
 /// A type token scaled about its size and line height (the press's 0.97 body).
-fn scaled(token: &TypeToken, scale: f32) -> TypeToken {
+pub(crate) fn scaled(token: &TypeToken, scale: f32) -> TypeToken {
     if (scale - 1.0).abs() < f32::EPSILON {
         return token.clone();
     }
@@ -420,14 +424,23 @@ fn scaled(token: &TypeToken, scale: f32) -> TypeToken {
     token
 }
 
-/// A section label above a card.
+/// A section label above a card: the type scale's **section label** role
+/// (Inter SemiBold 11 / +0.8 / 16), set in CAPS by this call, in `ink_soft`.
+///
+/// `pos` is the label's **top-left**, not its centre: the M20D rhythm lays
+/// every section out as label (16) → 8 → card, and a centre-aligned call would
+/// force every caller to re-derive the half-height.
 pub fn section_label(ui: &mut Ui, tokens: &Tokens, pos: egui::Pos2, label: &str) {
+    let token = type_scale::section_label();
+    // `ink_soft`, not `ink_faint`: 11 pt text needs 4.5:1, and the light
+    // ladder's faint (#8a92a2 on #e9ebf0) is 2.6:1 — a label nobody can read
+    // is not "quiet". Size and CAPS carry the quiet, not a failing alpha.
     ui.painter().text(
         pos,
-        Align2::LEFT_CENTER,
+        Align2::LEFT_TOP,
         label.to_uppercase(),
-        FontId::proportional(11.5),
-        tokens.ink_faint,
+        token.font,
+        tokens.ink_soft,
     );
 }
 
