@@ -411,7 +411,15 @@ impl Inner {
     }
 
     fn back(&mut self) -> String {
+        // M22B follow-up: BACK on the share sheet is a refusal of the share, not
+        // just a closed sheet. The Activity holds the URIs, so the reply has to
+        // say what was dismissed or it would keep an offer the user cancelled
+        // (CI run 43186421484 caught exactly that: the sheet vanished, the
+        // pending share stayed armed, and no dismissal was ever logged).
+        let dismissed_voice_note = self.app.sheet == Some(Sheet::VoiceNote);
         let outcome = self.app.back(self.started_now());
+        let dismissed_voice_note =
+            dismissed_voice_note && outcome == suramak_ui::deck::nav::BackOutcome::Dismissed;
         // Back out of an export sheet also releases the staged job: the sheet
         // is gone, so nothing can ever finish it and a second export would be
         // refused as "already in flight".
@@ -434,6 +442,9 @@ impl Inner {
             suramak_ui::deck::nav::BackOutcome::Finish => "finish",
         });
         reply["finish"] = json!(outcome == suramak_ui::deck::nav::BackOutcome::Finish);
+        if dismissed_voice_note {
+            reply["voice_note"] = json!("dismissed");
+        }
         reply.to_string()
     }
 
@@ -1362,6 +1373,49 @@ mod tests {
         });
         let route: Value = serde_json::from_str(&host.dispatch(r#"{"op":"route"}"#)).expect("json");
         assert_eq!(route["sheet"], "voice_note");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn back_on_the_share_sheet_tells_the_activity_the_share_was_refused() {
+        let dir =
+            std::env::temp_dir().join(format!("suramak-compact-host-{}", uuid::Uuid::new_v4()));
+        fixture(&dir);
+        let host = CompactHost::new(&dir);
+        let _: Value = serde_json::from_str(
+            &host.dispatch(
+                &json!({
+                    "op": "voice_note_offer",
+                    "title": "Ptt 2026-11-12.opus",
+                    "model": "tiny",
+                    "language": "id",
+                })
+                .to_string(),
+            ),
+        )
+        .expect("json");
+        host.with_app(|app| app.begin_voice_note(12.5));
+
+        // BACK while the share sheet is up must say *what* it dismissed: the
+        // Activity holds the URIs, and a bare "dismissed" left the offer armed
+        // (the emulator smoke found this, run 43186421484).
+        let reply: Value = serde_json::from_str(&host.dispatch(r#"{"op":"back"}"#)).expect("json");
+        assert_eq!(reply["back"], "dismissed");
+        assert_eq!(
+            reply["voice_note"], "dismissed",
+            "the reply must tell the Activity to drop the pending share"
+        );
+
+        // A back with no share on screen carries no share marker: a fresh host
+        // at the library root reports "finish", not a phantom refusal.
+        let other_host = CompactHost::new(&dir);
+        let other: Value =
+            serde_json::from_str(&other_host.dispatch(r#"{"op":"back"}"#)).expect("json");
+        assert_eq!(other["back"], "finish");
+        assert!(
+            other.get("voice_note").is_none(),
+            "no phantom share refusal"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

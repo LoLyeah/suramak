@@ -1095,6 +1095,13 @@ class MainActivity : GameActivity() {
         try {
             val reply = UiBridge.back()
             if (reply.optBoolean("ok")) {
+                if (reply.optString("voice_note") == "dismissed") {
+                    // BACK closed the share sheet: the offer is refused, and the
+                    // URIs go with it. Same line the notification's Cancel
+                    // emits, so the smoke has one witness for both paths.
+                    pendingVoiceNote = null
+                    logToRust("voice note: the offer was dismissed; nothing was scheduled")
+                }
                 if (reply.optBoolean("finish")) {
                     if (voiceNoteKeepAlive()) {
                         // M22B: a live voice-note job keeps the process; send
