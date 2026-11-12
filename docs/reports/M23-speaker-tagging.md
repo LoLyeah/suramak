@@ -27,11 +27,15 @@ set ("manual naming only" = no stored gallery, no cross-file suggestions).
 ## Why manual first, automatic second
 
 Carbon's slice-1 proposal (compile sherpa for `arm64-v8a`, then pass a phone
-gate at RTF ≤ 0.45, RSS ≤ +180 MB, battery ≤ 10%) is right in principle but
-carries a hard dependency risk: `sherpa-rs` ships prebuilt natives per target
-and Android is not one of its advertised targets. If it needs a from-source
-NDK build, that is a multi-day detour — and the owner's literal ask (tag
-Speaker 1/2/3) does not need the engine at all.
+gate at RTF ≤ 0.45, RSS ≤ +180 MB, battery ≤ 10%) is right in principle.
+(The dependency fear written here first — "sherpa-rs ships prebuilt natives
+per target and Android is not one of its advertised targets" — turned out to
+be **wrong**: `sherpa-rs-sys 0.6.8` ships an Android prebuilt set. See
+`docs/reports/M23b-android-diarization-gate.md`, verdict **BORDERLINE**, for
+the two real blockers: 4 KB-page-aligned ONNX Runtime in the pinned 1.12.9
+build, and the in-memory waveform's memory profile for long recordings.) The
+owner's literal ask (tag Speaker 1/2/3) still does not need the engine, which
+is why manual tagging shipped first.
 
 So:
 
