@@ -99,6 +99,11 @@ pub struct CompactShell {
     /// M22B: whether the voice-note sheet's "shown" line was logged for the
     /// current offer (the emulator smoke's witness that the sheet painted).
     logged_voice_note_sheet: bool,
+    /// One line per Library draw with the Settings gear's real position: the
+    /// emulator smoke taps the gear, and a hard-coded pixel stops being true
+    /// the moment the header's type scale changes (it did — run 43223493395
+    /// tapped 40 px above it). Logged in DEVICE pixels, ready for `input tap`.
+    logged_settings_point: bool,
 }
 
 impl Default for CompactShell {
@@ -128,6 +133,7 @@ impl CompactShell {
             last_model_can_record: None,
             last_model_rows: std::collections::BTreeMap::new(),
             logged_voice_note_sheet: false,
+            logged_settings_point: false,
         }
     }
 
@@ -265,6 +271,25 @@ impl CompactShell {
                 app.status = Some((status, true));
             }
             actions = compact::ui(ctx, app);
+            // The gear's true position, once per Library visit (device pixels).
+            if app.nav.current() == compact::CompactRoute::Library {
+                if !self.logged_settings_point {
+                    if let Some(gear) = compact::a11y::controls(ctx)
+                        .into_iter()
+                        .find(|control| control.label == "Settings")
+                    {
+                        self.logged_settings_point = true;
+                        let center = gear.rect.center();
+                        log::info!(
+                            "compact library: settings at {:.0},{:.0}",
+                            center.x * ppp,
+                            center.y * ppp
+                        );
+                    }
+                }
+            } else {
+                self.logged_settings_point = false;
+            }
             // M22B: BACK on the voice-note offer drops the pending share. The
             // gesture has no action vector; the *host reply* carries the
             // dismissal to the Activity (`voice_note: dismissed`), and the

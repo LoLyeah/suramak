@@ -821,9 +821,17 @@ tap_and_wait_route() {
 }
 
 enter_settings() {
-  # The trailing "Settings" hit area: 48 dp tall in the middle of the 56 dp app
-  # bar, its right edge GUTTER + 12 dp from the window edge. 40 dp in from the
-  # right is inside it on every density.
+  # The gear's REAL position, as the shell logged it when it drew the Library
+  # (`compact library: settings at X,Y`, device pixels). The dp guesses below
+  # stopped being true when the header took the new type scale: run 43223493395
+  # tapped 13 px above a gear whose centre had moved to ~196 px (66 dp).
+  local point
+  point="$(timeout 20 "$ADB" logcat -d 2>/dev/null | sed -n 's/.*compact library: settings at \([0-9]*\),\([0-9]*\).*/\1 \2/p' | tail -1)"
+  if [ -n "$point" ]; then
+    set -- $point
+    if tap_and_wait_route "$1" Settings; then return 0; fi
+  fi
+  # Fallbacks, in dp from the top edge, for a build that predates the marker.
   tap_and_wait_route "$((SCREEN_W - $(dp 40)))" Settings
 }
 
