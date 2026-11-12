@@ -176,8 +176,14 @@ impl CompactShell {
             .input_log
             .then(|| compact::input::describe_frame(raw, ppp));
         let synthesized = self.touch_pointer.prepare(raw);
+        // Only frames that carried input are logged. One line per idle frame
+        // (the loop runs at vsync) floods logcat at ~60 lines/s and rolls the
+        // buffer past the launch markers the CI smoke waits on — it made a
+        // healthy relaunch look like "never painted".
         if let Some(line) = described {
-            log::info!("SURAMAK-INPUT {line} synth={synthesized}");
+            if synthesized > 0 || !raw.events.is_empty() {
+                log::info!("SURAMAK-INPUT {line} synth={synthesized}");
+            }
         }
     }
 

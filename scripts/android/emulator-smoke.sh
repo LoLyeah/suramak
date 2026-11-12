@@ -185,8 +185,15 @@ export ANDROID_SERIAL="$SERIAL"
 echo "   serial:   $SERIAL"
 
 boot_completed() {
-  [ "$("$ADB" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ] \
-    && "$ADB" shell service check package 2>/dev/null | grep -q "found"
+  [ "$("$ADB" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ] || return 1
+  # Capture then match (SIGPIPE + pipefail: `adb | grep -q` reports a
+  # non-match the moment grep exits early).
+  local svc
+  svc="$("$ADB" shell service check package 2>/dev/null || true)"
+  case "$svc" in
+    *found*) return 0 ;;
+  esac
+  return 1
 }
 while [ "$SECONDS" -lt "$DEADLINE" ]; do
   if boot_completed; then
@@ -264,9 +271,15 @@ wait_for_log() {
     # loop (observed: the step blew its 30-minute CI timeout inside one
     # logcat call). 20 s per attempt, marker grepped over the full log —
     # the marker text is unique, so no -s tag filter needed.
-    if timeout 20 "$ADB" logcat -d 2>/dev/null | grep -qF "$pattern"; then
-      return 0
-    fi
+    # Capture first, match after: `logcat | grep -q` under `pipefail` reports
+    # logcat's SIGPIPE (141) as a non-match the moment grep exits early — the
+    # marker was IN the buffer and the wait still timed out (the input-log
+    # flood made the race almost certain).
+    local captured
+    captured="$(timeout 20 "$ADB" logcat -d 2>/dev/null || true)"
+    case "$captured" in
+      *"$pattern"*) return 0 ;;
+    esac
     echo "   wait:     ${pattern} (attempt ${attempt})"
     attempt=$((attempt + 1))
     sleep 2
@@ -282,10 +295,14 @@ wait_for_log() {
 wait_for_library_ready() {
   local deadline=$((SECONDS + LIBRARY_TIMEOUT))
   while [ "$SECONDS" -lt "$deadline" ]; do
-    if app_log | grep -qF "compact library surface: ready"; then
-      echo "   library:  ready (compact host up, first real draw)"
-      return 0
-    fi
+    local captured
+    captured="$(app_log)"
+    case "$captured" in
+      *"compact library surface: ready"*)
+        echo "   library:  ready (compact host up, first real draw)"
+        return 0
+        ;;
+    esac
     if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
       echo "== the EMULATOR PROCESS DIED mid-wait (pid $EMULATOR_PID) ==" >&2
       tail -40 "$OUT/emulator.log" >&2 2>/dev/null || true
@@ -333,7 +350,13 @@ latest_main_entry() {
 
 # The pid wrote <pattern> (fixed string)? ($1 pid, $2 pattern)
 pid_log_has() {
-  app_log | awk -v pid="$1" '$3 == pid' | grep -qF "$2"
+  # Capture the pid's lines first, then match — see wait_for_log's SIGPIPE note.
+  local lines
+  lines="$(app_log | awk -v pid="$1" '$3 == pid' || true)"
+  case "$lines" in
+    *"$2"*) return 0 ;;
+  esac
+  return 1
 }
 
 # Does the package have no process at all?
@@ -489,10 +512,13 @@ echo "   relaunch: first frame presented by pid $NEW_PID"
 # The guard's own marker must never appear in a passing run: it means a launch
 # entered android_main in a process that already had a loop — the exact state
 # the finish-path exit exists to prevent.
-if app_log | grep -qF "EventLoop can't be recreated"; then
-  app_log | grep -nF "EventLoop can't be recreated" >&2 || true
-  fail "'EventLoop can't be recreated' was logged — android_main ran again in a process that already had an event loop; the finish path must exit the process"
-fi
+APP_LOG_ALL="$(app_log)"
+case "$APP_LOG_ALL" in
+  *"EventLoop can't be recreated"*)
+    printf '%s\n' "$APP_LOG_ALL" | grep -nF "EventLoop can't be recreated" >&2 || true
+    fail "'EventLoop can't be recreated' was logged — android_main ran again in a process that already had an event loop; the finish path must exit the process"
+    ;;
+esac
 
 wait_for_library_ready || fail "the compact Library never drew (no 'compact library surface: ready' marker within ${LIBRARY_TIMEOUT}s) — the compact host never came up"
 
@@ -632,7 +658,14 @@ dp() { awk -v value="$1" -v density="$DENSITY" 'BEGIN { printf "%d", value * den
 # first 13 digits are seconds + milliseconds.
 now_ms() { date +%s%3N | cut -c1-13; }
 
-route_is() { app_log | grep -qF "compact route: $1"; }
+route_is() {
+  local lines
+  lines="$(app_log)"
+  case "$lines" in
+    *"compact route: $1"*) return 0 ;;
+  esac
+  return 1
+}
 
 # Taps the app bar at `x` on a small ladder of heights and stops at the first
 # one that changes the route: the bar's centre is `status bar + 28 dp`, and the
