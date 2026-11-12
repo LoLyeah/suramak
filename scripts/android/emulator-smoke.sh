@@ -759,12 +759,34 @@ echo "   crop:     status bar rows 0..${CROP_TOP} px (inset_top ${INSET_TOP_PT} 
 sleep 0.4
 "$ADB" exec-out screencap -p >"$OUT/settings-still.png"
 
-# A thumb flick: 30% of the screen height, 250 ms, inside the list.
-"$ADB" shell input swipe \
-  "$((SCREEN_W / 2))" "$((SCREEN_H * 65 / 100))" \
-  "$((SCREEN_W / 2))" "$((SCREEN_H * 35 / 100))" 250
-sleep 1
-"$ADB" exec-out screencap -p >"$OUT/settings-after-swipe.png"
+# A thumb flick: 30% of the screen height, 250 ms, inside the list. Retried up
+# to three times: on the software-rendered emulator a flick occasionally lands
+# while the frame loop is still catching up and moves nothing, which is not the
+# dead-scroll regression this gate exists for (run 43247699252 failed on a
+# docs-only commit whose binary was identical to a green run). The evidence
+# names the attempt that moved, so a real regression still fails all three.
+swiped=no
+for swipe_try in 1 2 3; do
+  "$ADB" shell input swipe \
+    "$((SCREEN_W / 2))" "$((SCREEN_H * 65 / 100))" \
+    "$((SCREEN_W / 2))" "$((SCREEN_H * 35 / 100))" 250
+  sleep 1
+  "$ADB" exec-out screencap -p >"$OUT/settings-after-swipe.png"
+  if python3 tests/android-smoke/inspect_screencap.py \
+      --diff "$OUT/settings-before.png" "$OUT/settings-after-swipe.png" \
+      --crop-top "$CROP_TOP" --min-mean-diff 0.4 \
+      --json "$OUT/settings-swipe-diff.json" >/dev/null 2>&1; then
+    swiped=yes
+    echo "   swipe:    the list moved (attempt ${swipe_try})"
+    break
+  fi
+  echo "   swipe:    no movement on attempt ${swipe_try} — retrying" >&2
+  # The new "before" is this attempt's frame: the diff must always compare the
+  # frame immediately preceding the swipe that moved it.
+  cp "$OUT/settings-after-swipe.png" "$OUT/settings-before.png"
+  sleep 0.4
+done
+[ "$swiped" = yes ] || fail "the Settings list did not move after three swipes (see $OUT/settings-swipe-diff.json and the shots) — the dead-scroll regression is back"
 
 # --- Step 0: the two answers, from the shell's raw-input log ------------------
 # The debug APK this job builds has SURAMAK_INPUT_LOG on by default (see
@@ -821,10 +843,8 @@ python3 tests/android-smoke/inspect_screencap.py \
   --crop-top "$CROP_TOP" --max-mean-diff 0.05 --json "$OUT/settings-still-diff.json" \
   || fail "two captures of a still Settings screen differ below the status bar — the screencap diff is not a stable witness (see $OUT/settings-still-diff.json)"
 
-python3 tests/android-smoke/inspect_screencap.py \
-  --diff "$OUT/settings-before.png" "$OUT/settings-after-swipe.png" \
-  --crop-top "$CROP_TOP" --min-mean-diff 0.4 --json "$OUT/settings-swipe-diff.json" \
-  || fail "the Settings list did not move after a swipe (see $OUT/settings-swipe-diff.json and the two shots) — the dead-scroll regression is back"
+# (the swipe loop above already asserted movement — this frame pair is the
+# evidence that moved; nothing to re-check here)
 
 # --- a tap after the swipe must still fire -----------------------------------
 # BACK is at a fixed spot whatever the list's offset: if the gesture left the
