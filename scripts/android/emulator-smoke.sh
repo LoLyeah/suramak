@@ -827,15 +827,23 @@ enter_settings() {
   # (`compact library: settings at X,Y`, device pixels). The dp guesses below
   # stopped being true when the header took the new type scale: run 43223493395
   # tapped 13 px above a gear whose centre had moved to ~196 px (66 dp).
-  local point
-  point="$(timeout 20 "$ADB" logcat -d 2>/dev/null | sed -n 's/.*compact library: settings at \([0-9]*\),\([0-9]*\).*/\1 \2/p' | tail -1)"
-  if [ -n "$point" ]; then
-    set -- $point
+  if [ -n "${SETTINGS_POINT:-}" ]; then
+    set -- $SETTINGS_POINT
     if tap_and_wait_route "$1" Settings "$2"; then return 0; fi
   fi
   # Fallbacks, in dp from the top edge, for a build that predates the marker.
   tap_and_wait_route "$((SCREEN_W - $(dp 40)))" Settings
 }
+
+# The gear's position, read BEFORE the log is cleared below — the shell logs it
+# once per Library draw, and clearing first would throw the witness away.
+SETTINGS_POINT="$(timeout 20 "$ADB" logcat -d 2>/dev/null \
+  | sed -n 's/.*compact library: settings at \([0-9]*\),\([0-9]*\).*/\1 \2/p' | tail -1)"
+if [ -n "$SETTINGS_POINT" ]; then
+  echo "   gear:     reported at ${SETTINGS_POINT%,*} px, ${SETTINGS_POINT#* } px"
+else
+  echo "   gear:     no position marker in the log — falling back to dp guesses"
+fi
 
 # Clear logcat so a route marker seen below is one THIS tap produced (the first
 # launch already logged "compact route: Library").
