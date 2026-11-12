@@ -803,8 +803,10 @@ route_is() {
 # status bar is 0–48 dp depending on the cutout. A fixed y would be a coin
 # flip on an unknown skin.
 tap_and_wait_route() {
-  local x="$1" route="$2" y attempt=0
-  for y in "$(dp 46)" "$(dp 70)" "$(dp 30)"; do
+  local x="$1" route="$2" y attempt=0 override="${3:-}"
+  local candidates
+  candidates="${override:-$(dp 46) $(dp 70) $(dp 30)}"
+  for y in $candidates; do
     attempt=$((attempt + 1))
     "$ADB" shell input tap "$x" "$y"
     local deadline=$((SECONDS + 8))
@@ -829,7 +831,7 @@ enter_settings() {
   point="$(timeout 20 "$ADB" logcat -d 2>/dev/null | sed -n 's/.*compact library: settings at \([0-9]*\),\([0-9]*\).*/\1 \2/p' | tail -1)"
   if [ -n "$point" ]; then
     set -- $point
-    if tap_and_wait_route "$1" Settings; then return 0; fi
+    if tap_and_wait_route "$1" Settings "$2"; then return 0; fi
   fi
   # Fallbacks, in dp from the top edge, for a build that predates the marker.
   tap_and_wait_route "$((SCREEN_W - $(dp 40)))" Settings
