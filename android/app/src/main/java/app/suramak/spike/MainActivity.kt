@@ -1071,11 +1071,13 @@ class MainActivity : GameActivity() {
             logToRust("key: code=${event.keyCode} action=${event.action} ime=$lastImeBottom")
         }
         if (event.keyCode == KeyEvent.KEYCODE_BACK) {
-            // The IME owns back only when nothing modal is in front of it. A
-            // pending voice-note share is a modal offer: with the keyboard up
-            // (the smoke's emulator had one), deferring to the IME swallowed
-            // the first press and the share stayed armed — CI run 43199127756.
-            if (lastImeBottom > 0 && pendingVoiceNote == null) {
+            // The IME owns back while a keyboard is up: closing it is the
+            // press's job, and a second press then reaches handleBack (the
+            // smoke's finish step relies on exactly that). An exception here
+            // made the root-finish step flaky (run 43214881548) without fixing
+            // the share sheet, so the rule stays simple until the key logs say
+            // what the sheet's presses actually do.
+            if (lastImeBottom > 0) {
                 return super.dispatchKeyEvent(event)
             }
             if (event.action == KeyEvent.ACTION_DOWN) {
