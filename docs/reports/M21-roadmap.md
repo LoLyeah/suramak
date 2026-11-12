@@ -44,11 +44,10 @@ marked scope conflicts.
   paginated transcript notification is new.
 - #3 ✓ today's search is per-transcript; library-wide FTS is new. The M15
   plan recorded "FTS5 only after an audit" — that audit is the gate.
-- #4 ⚠ **SCOPE CONFLICT.** `docs/PLAN-M15-M18.md` §M18.1 records
-  "voice-embedding storage stays outside this approval" and the product
-  forbids automatic identity inference. Carbon's "confirmable suggestion
-  chip" is a *manual-confirmed* variant, but storing CAM++ centroids is
-  exactly the embedding storage the plan deferred. **Owner decision needed.**
+- #4 ❌ **DECLINED (owner, 2026-11-12): "No — keep it manual naming only."**
+  No voiceprint gallery, no stored CAM++ centroids, no cross-recording
+  suggestion chips. Manual naming (M16I/M18.1) is the whole feature; any
+  future revisit starts from an explicit owner request.
 - #5 ✓ `suramak-taps` already captures system audio on macOS; the dual-bus +
   You-labelling is the addition. Carbon's gate (ScreenCaptureKit drift
   < 40 ms over 60 min) replaces the taps path only if it proves better —
@@ -66,9 +65,9 @@ marked scope conflicts.
   library-wide FTS (+ the richer rows that fall out of it).
 - **v0.6**: #6 watched inbox, #7 citation-verified polish views, #8 Open
   Transcribe.
-- **Gated before code**: #5 dual-bus drift spike; #4 waiting on the owner's
-  scope answer; the EN+ID "campur-code" dual-pass idea (B1 in the appendix)
-  needs the 25-clip WER gate.
+- **Gated before code**: #5 dual-bus drift spike; the EN+ID "campur-code"
+  dual-pass idea (B1 in the appendix) needs the 25-clip WER gate. #4 is
+  declined and out of the roadmap.
 
 ---
 *Epistemic tags: `(KNOWN)` = directly from brief; `(INFERRED)` = engineering, OS, or market deduction.*
