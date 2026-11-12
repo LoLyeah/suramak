@@ -828,51 +828,47 @@ sleep 1
 # once the offset has been still for 300 ms; `LAST_SWIPE_MS` is the host clock
 # reading taken just before the final swipe, which the line's own `ts=` must
 # beat.
-# Device clock, not the host's: the line's ts= comes from the emulator's
-# clock and a host/device skew would make every "newer than the swipe" test a
-# coin flip.
-device_ms() { "$ADB" shell date +%s%3N 2>/dev/null | tr -d '\r'; }
-
-# The resting line lands 300 ms after the geometry stops; poll instead of a
-# fixed sleep, and re-swipe when the list had not reached its end yet. A
-# single `tail -1` after a fixed sleep read a MID-SWIPE line once and failed a
-# healthy layout (settled=0 at quit_top=1030 while the list was still moving).
-settled_layout_line() {
-  local since="$1" attempt line ts settled
-  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    line="$(app_log | grep -F "SURAMAK-LAYOUT" | tail -1 || true)"
-    if [ -n "$line" ]; then
-      ts="$(printf '%s' "$line" | sed -n 's/.* ts=\([0-9]*\).*/\1/p')"
-      settled="$(printf '%s' "$line" | sed -n 's/.* settled=\([0-9]*\).*/\1/p')"
-      if [ "$settled" = "1" ] && [ -n "$ts" ] && [ "$ts" -ge "$since" ]; then
-        printf '%s\n' "$line"
+# A resting line is proven by the HARNESS: the last SURAMAK-LAYOUT line must be
+# IDENTICAL 600 ms later (no geometry change). This does not trust the app's
+# own settle timer, which only fires when a frame lands after the motion stops —
+# on a reactive loop that can be a coin flip, and one run had no settled line at
+# all. The app logs on every geometry change, so "same line twice" IS the rest.
+resting_layout_line() {
+  local first second attempt
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+    first="$(app_log | grep -F "SURAMAK-LAYOUT" | tail -1 || true)"
+    if [ -n "$first" ]; then
+      sleep 0.6
+      second="$(app_log | grep -F "SURAMAK-LAYOUT" | tail -1 || true)"
+      if [ "$first" = "$second" ]; then
+        printf '%s\n' "$first"
         return 0
       fi
+    else
+      sleep 0.6
     fi
-    sleep 0.3
   done
   return 1
 }
 
-LAST_SWIPE_MS=""
 LINE=""
-for round in 1 2 3; do
+for round in 1 2 3 4; do
   for _ in 1 2 3; do
-    LAST_SWIPE_MS="$(device_ms)"
     "$ADB" shell input swipe \
       "$((SCREEN_W / 2))" "$((SCREEN_H * 72 / 100))" \
       "$((SCREEN_W / 2))" "$((SCREEN_H * 28 / 100))" 200
     sleep 0.3
   done
-  if LINE="$(settled_layout_line "$((LAST_SWIPE_MS - 1500))")"; then
+  if LINE="$(resting_layout_line)"; then
     break
   fi
+  echo "   scroll:   list still moving after round $round — swiping again" >&2
 done
-[ -n "$LINE" ] || fail "no settled SURAMAK-LAYOUT line after the swipes — the resting position never landed (see the app log)"
+[ -n "$LINE" ] || fail "no resting SURAMAK-LAYOUT line after the swipes — the geometry never stopped changing (see the app log)"
 printf '%s\n' "$LINE" >"$OUT/layout.txt"
 "$ADB" exec-out screencap -p >"$OUT/settings-bottom.png"
 
-python3 - "$OUT/layout.txt" "$LAST_SWIPE_MS" <<'PY' || fail "the Quit row does not clear the gesture area (see $OUT/layout.txt and $OUT/settings-bottom.png)"
+python3 - "$OUT/layout.txt" "0" <<'PY' || fail "the Quit row does not clear the gesture area (see $OUT/layout.txt and $OUT/settings-bottom.png)"
 import re
 import sys
 
@@ -905,16 +901,10 @@ print(
     f"ends at {viewport_bottom:.1f} (inset_bottom {inset_bottom:.1f}, inset_top "
     f"{inset_top:.1f}); settled={settled}, ts={ts:.0f}"
 )
+# `settled` is the app's own timer; the harness already proved the line is the
+# resting one (identical 600 ms later), so it is reported, not required.
 if settled != 1:
-    sys.exit(
-        f"the last SURAMAK-LAYOUT line is a mid-swipe line ({line!r}) — the resting line "
-        "never landed, so `tail -1` proves nothing about where the list came to rest"
-    )
-if swipe_ms and ts + 1000 < swipe_ms:
-    sys.exit(
-        f"the resting line is older than the final swipe (ts={ts:.0f} ms, last swipe "
-        f"{swipe_ms:.0f} ms) — it describes a position the finger has already left"
-    )
+    print("   note:     the app's settle timer did not fire; rest proven by the harness")
 if inset_bottom <= 0.0:
     sys.exit(
         "inset_bottom is 0 on the gesture-nav AVD — the WindowInsets never reached the "
