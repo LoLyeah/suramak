@@ -4,6 +4,16 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased]
 
+## 0.6.0 - 2026-11-13
+
+### Added
+- **The watched inbox**: point Suramak at a folder once — a phone sync folder, a recorder's output, a colleague's drop — and every audio file that finishes landing there imports itself. A 5 s poll (3 levels deep, 200 entries per scan), a 2 s size-settle gate so half-written files wait, `.part`/`.crdownload` blocked by name and sibling, and sha256 dedupe through a new ledger, so the same file copied twice transcribes once. It rides the existing queue, and the Library says `Watching · 3 imports` — or names the failure when the folder disappears.
+- **Citation-verified notes**: Minutes, Action items and a bilingual EN↔ID brief, generated through your own OpenAI-compatible endpoint from the transcript's segments. Every `[mm:ss]` is checked against a real segment (±1.5 s): valid ones are rewritten to canonical times, and fabricated, past-the-end, malformed or duplicate citations are **removed and counted** — the sheet reads `12 citations checked · 1 removed (no matching audio)` instead of quietly shipping a timestamp that isn't there. Stored per transcript and preset; export as Markdown.
+- **Open Transcribe (Android)**: a documented intent contract — `app.suramak.action.TRANSCRIBE` with a `content://` uri and your own `PendingIntent` — so another app can hand Suramak audio and receive the transcript back as a broadcast. One queue, no new permission, no NotificationListener, no media-folder access. Caller docs in `docs/OPEN-TRANSCRIBE.md`.
+
+### Fixed
+- A removed citation no longer leaves its separator behind: "approved [13:00]." becomes "approved.", not "approved ." — pinned for end-of-line, mid-line and sentence-final cases.
+
 ## 0.5.0 - 2026-11-12
 
 ### Added
