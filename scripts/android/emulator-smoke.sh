@@ -587,7 +587,22 @@ echo "   focus:    $PACKAGE/.MainActivity"
 
 if [ -s "$OUT/window-library.xml" ]; then
   if grep -qiE "has stopped|isn't responding|Application Not Responding" "$OUT/window-library.xml"; then
-    fail "the uiautomator dump carries a crash/ANR dialog"
+    # Whose dialog? The software-rendered emulator's own launcher ANRs under
+    # load ("Pixel Launcher isn't responding", run 43340921030) — that is the
+    # harness's environment, not this app. A dialog naming another package is
+    # dismissed and reported; one naming Suramak fails the run.
+    if grep -qiE "has stopped|isn't responding|Application Not Responding" "$OUT/window-library.xml" \
+       && ! grep -qiE "$PACKAGE" "$OUT/window-library.xml"; then
+      echo "   dialog:   the emulator's own UI ANR'd (not this app) — dismissing it"
+      "$ADB" shell input tap 540 1359 >/dev/null 2>&1 || true   # "Wait" on the ANR dialog
+      sleep 2
+      # Re-dump: the file on disk still holds the dialog, and the assertions
+      # below read it. A second dialog would fail the re-check honestly.
+      timeout 45 "$ADB" shell uiautomator dump /sdcard/window-library.xml >/dev/null 2>&1 || true
+      "$ADB" pull /sdcard/window-library.xml "$OUT/window-library.xml" >/dev/null 2>&1 || true
+    else
+      fail "the uiautomator dump carries a crash/ANR dialog naming $PACKAGE"
+    fi
   fi
   grep -q "$PACKAGE" "$OUT/window-library.xml" \
     || fail "the uiautomator dump does not name $PACKAGE"
