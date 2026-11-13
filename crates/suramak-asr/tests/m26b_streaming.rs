@@ -454,10 +454,19 @@ fn rss_30_minutes_streaming_is_200mb_lower() {
             output.status.success(),
             "RSS child ({mode}) failed:\n{stdout}\n{stderr}"
         );
+        // The marker may share a line with libtest's "test rss_child ... "
+        // prefix (libtest writes the name without a newline before --nocapture
+        // output), so search INSIDE the line rather than requiring it at the
+        // start — the strict form failed on CI while passing locally.
         stdout
             .lines()
-            .find_map(|line| line.strip_prefix("M26B_RSS_KB="))
-            .and_then(|value| value.trim().parse().ok())
+            .find_map(|line| line.split("M26B_RSS_KB=").nth(1))
+            .and_then(|value| {
+                value
+                    .split_whitespace()
+                    .next()
+                    .and_then(|number| number.parse().ok())
+            })
             .unwrap_or_else(|| panic!("no VmHWM in child output:\n{stdout}\n{stderr}"))
     };
     let old_kb = run("old");
