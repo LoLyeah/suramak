@@ -764,10 +764,13 @@ fn decode_window(
 ) -> LiveResult {
     let run = (|| -> Result<Vec<Segment>, AsrError> {
         let ctx = cache.get_or_load(&settings.model_path, settings.plan.engine.use_gpu())?;
+        // A live window is a short slice (seconds), so the in-memory wrapper is
+        // exact and allocation-light; the file path is only for file jobs.
+        let samples = suramak_core::pcm::PcmSlice::from_samples(window.samples.clone());
         let outcome = whisper::transcribe(
             ctx,
             &settings.model_path,
-            &window.samples,
+            &samples,
             &settings.lang,
             settings.initial_prompt.as_deref(),
             settings.n_threads,

@@ -1,13 +1,16 @@
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use rubato::{FftFixedIn, Resampler};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::LazyLock;
 use symphonia::core::audio::{AudioBufferRef, Signal};
-use symphonia::core::codecs::{CodecRegistry, CodecType, DecoderOptions};
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::codecs::{CodecRegistry, CodecType, Decoder, DecoderOptions};
+use symphonia::core::formats::{FormatOptions, FormatReader};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use symphonia_adapter_libopus::OpusDecoder;
 
+use crate::pcm::{self, PcmSlice};
+use crate::resample::TARGET_RATE;
 use crate::SuramakError;
 
 /// Decoded audio ready for resampling.
@@ -211,15 +214,21 @@ fn decode_stream(
     }
 }
 
-fn decode_stream_inner(
+/// The container + first audio track, opened once and driven packet by packet.
+struct DecoderSetup {
+    format: Box<dyn FormatReader>,
+    decoder: Box<dyn Decoder>,
+    track_id: u32,
+    rate: u32,
+    channels: u16,
+    declared_frames: Option<u64>,
+}
+
+fn open_decoder(
     mss: MediaSourceStream,
     hint: Hint,
     label: &InputLabel,
-    cancelled: &dyn Fn() -> bool,
-) -> Result<AudioBuffer, SuramakError> {
-    if cancelled() {
-        return Err(SuramakError::Cancelled);
-    }
+) -> Result<DecoderSetup, SuramakError> {
     let format_opts = FormatOptions::default();
     let meta_opts = MetadataOptions::default();
     let dec_opts = DecoderOptions::default();
@@ -241,7 +250,7 @@ fn decode_stream_inner(
         }
         Err(err) => return Err(SuramakError::Symphonia(err)),
     };
-    let mut format = probed.format;
+    let format = probed.format;
 
     // The first track with a real codec: for video files this skips the video
     // streams (demuxers map them to `CODEC_TYPE_NULL`) and picks the audio track.
@@ -252,7 +261,7 @@ fn decode_stream_inner(
         .ok_or(SuramakError::NoAudioData)?;
 
     let track_id = track.id;
-    let mut decoder = match codec_registry().make(&track.codec_params, &dec_opts) {
+    let decoder = match codec_registry().make(&track.codec_params, &dec_opts) {
         Ok(decoder) => decoder,
         // The container demuxed, but there is no decoder for its audio codec
         // (e.g. ALAC in an m4a; Opus decoded natively since M10C) —
@@ -273,7 +282,32 @@ fn decode_stream_inner(
     // lets a cut-off file fail below instead of looking like a short recording.
     let declared_frames = track.codec_params.n_frames;
 
+    Ok(DecoderSetup {
+        format,
+        decoder,
+        track_id,
+        rate,
+        channels,
+        declared_frames,
+    })
+}
+
+fn decode_stream_inner(
+    mss: MediaSourceStream,
+    hint: Hint,
+    label: &InputLabel,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<AudioBuffer, SuramakError> {
+    if cancelled() {
+        return Err(SuramakError::Cancelled);
+    }
+    let mut setup = open_decoder(mss, hint, label)?;
+    let rate = setup.rate;
+    let channels = setup.channels;
+    let declared_frames = setup.declared_frames;
+
     let mut samples: Vec<f32> = Vec::new();
+    let mut frames_decoded = 0u64;
 
     // Third-party demuxers can panic on malformed input (symphonia-format-mkv's
     // EBML reader does on a truncated Matroska cluster). The packet loop runs
@@ -281,13 +315,10 @@ fn decode_stream_inner(
     // abort. Panics from our own code are caught too — the alternative is a
     // crashed import for a file the user just shared.
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        decode_packets(
-            format.as_mut(),
-            decoder.as_mut(),
-            track_id,
-            &mut samples,
-            cancelled,
-        )
+        run_packets(&mut setup, &mut frames_decoded, cancelled, &mut |buf| {
+            append_samples(&mut samples, buf);
+            Ok(())
+        })
     }));
     match outcome {
         Ok(Ok(())) => {}
@@ -296,9 +327,7 @@ fn decode_stream_inner(
             // If the container declared a length and the panic happened with
             // most of it missing, "truncated" is the honest diagnosis; the
             // panic is just how this demuxer reports the missing bytes.
-            if let Some(err) =
-                truncation_error(label, declared_frames, samples.len(), channels, rate)
-            {
+            if let Some(err) = truncation_error(label, declared_frames, frames_decoded, rate) {
                 return Err(err);
             }
             return Err(SuramakError::DecoderPanic {
@@ -315,7 +344,7 @@ fn decode_stream_inner(
     // Truncation: a declared length minus a 100 ms codec-delay/padding tolerance
     // is the floor a complete file must reach. Short files fail with a named,
     // actionable error instead of silently importing half a voice note.
-    if let Some(err) = truncation_error(label, declared_frames, samples.len(), channels, rate) {
+    if let Some(err) = truncation_error(label, declared_frames, frames_decoded, rate) {
         return Err(err);
     }
 
@@ -326,21 +355,21 @@ fn decode_stream_inner(
     })
 }
 
-/// The packet loop, factored out so [`decode_stream`] can wrap it in
-/// `catch_unwind` (the decoder is foreign code).
-fn decode_packets(
-    format: &mut dyn symphonia::core::formats::FormatReader,
-    decoder: &mut dyn symphonia::core::codecs::Decoder,
-    track_id: u32,
-    samples: &mut Vec<f32>,
+/// The packet loop, factored out so callers can wrap it in `catch_unwind` (the
+/// decoder is foreign code) and choose where decoded frames go: the in-memory
+/// [`AudioBuffer`] or the streaming 16 kHz writer.
+fn run_packets(
+    setup: &mut DecoderSetup,
+    frames_decoded: &mut u64,
     cancelled: &dyn Fn() -> bool,
+    sink: &mut dyn FnMut(&AudioBufferRef<'_>) -> Result<(), SuramakError>,
 ) -> Result<(), SuramakError> {
     loop {
         // Cooperative cancellation: one check per demuxed packet (M15.2).
         if cancelled() {
             return Err(SuramakError::Cancelled);
         }
-        let packet = match format.next_packet() {
+        let packet = match setup.format.next_packet() {
             Ok(p) => p,
             Err(symphonia::core::errors::Error::IoError(e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof =>
@@ -348,17 +377,19 @@ fn decode_packets(
                 break;
             }
             Err(symphonia::core::errors::Error::ResetRequired) => {
-                decoder.reset();
+                setup.decoder.reset();
                 continue;
             }
             Err(e) => return Err(SuramakError::Symphonia(e)),
         };
 
-        if packet.track_id() != track_id {
+        if packet.track_id() != setup.track_id {
             continue;
         }
 
-        append_samples(samples, decoder.decode(&packet)?);
+        let decoded = setup.decoder.decode(&packet)?;
+        *frames_decoded += decoded.frames() as u64;
+        sink(&decoded)?;
     }
     Ok(())
 }
@@ -368,17 +399,15 @@ fn decode_packets(
 fn truncation_error(
     label: &InputLabel,
     declared_frames: Option<u64>,
-    sample_count: usize,
-    channels: u16,
+    frames_decoded: u64,
     rate: u32,
 ) -> Option<SuramakError> {
     let expected = declared_frames.filter(|frames| *frames > 0)?;
-    let decoded = (sample_count / usize::from(channels.max(1))) as u64;
     let tolerance = u64::from(rate) / 10;
-    if decoded.saturating_add(tolerance) >= expected {
+    if frames_decoded.saturating_add(tolerance) >= expected {
         return None;
     }
-    let got_s = decoded as f64 / f64::from(rate);
+    let got_s = frames_decoded as f64 / f64::from(rate);
     let want_s = expected as f64 / f64::from(rate);
     Some(SuramakError::Truncated {
         name: label.name.clone(),
@@ -562,99 +591,451 @@ fn normalize_pcm(sample: f32, full_scale: f32) -> f32 {
     (sample / full_scale).clamp(-1.0, 1.0)
 }
 
+/// The PCM16 rule, shared by the symphonia S16 branch and the WAV fast path so
+/// the two produce bit-identical samples.
+pub(crate) fn normalize_i16(sample: i16) -> f32 {
+    normalize_pcm(f32::from(sample), 32_768.0)
+}
+
+/// One decoded frame's value in channel `$channel`, converted to f32 by the
+/// closure-shaped `$conv` (each buffer variant has its own sample type).
+///
+/// The conversion expressions are the exact ones this file has always used; the
+/// mono mixer must normalize *before* summing, exactly like
+/// [`crate::resample::to_16khz_mono`] does over its interleaved input.
+macro_rules! append_frames {
+    ($out:expr, $b:expr, $conv:expr, $mono:expr) => {{
+        let out = $out;
+        let b = $b;
+        let convert = $conv;
+        let n_frames = b.frames();
+        let n_ch = b.spec().channels.count();
+        if $mono && n_ch != 1 {
+            let inv = 1.0f32 / n_ch as f32;
+            for i in 0..n_frames {
+                let mut sum = 0.0f32;
+                for ch in 0..n_ch {
+                    sum += convert(b.chan(ch)[i]);
+                }
+                out.push(sum * inv);
+            }
+        } else {
+            for i in 0..n_frames {
+                for ch in 0..n_ch {
+                    out.push(convert(b.chan(ch)[i]));
+                }
+            }
+        }
+    }};
+}
+
 /// Appends interleaved f32 samples from any `AudioBufferRef` variant.
-fn append_samples(out: &mut Vec<f32>, buf: AudioBufferRef<'_>) {
+fn append_samples(out: &mut Vec<f32>, buf: &AudioBufferRef<'_>) {
     match buf {
-        AudioBufferRef::F32(b) => {
-            let n_frames = b.frames();
-            let n_ch = b.spec().channels.count();
-            for i in 0..n_frames {
-                for ch in 0..n_ch {
-                    out.push(b.chan(ch)[i]);
-                }
-            }
-        }
-        AudioBufferRef::F64(b) => {
-            let n_frames = b.frames();
-            let n_ch = b.spec().channels.count();
-            for i in 0..n_frames {
-                for ch in 0..n_ch {
-                    out.push(b.chan(ch)[i] as f32);
-                }
-            }
-        }
+        AudioBufferRef::F32(b) => append_frames!(out, b, |sample: f32| sample, false),
+        AudioBufferRef::F64(b) => append_frames!(out, b, |sample: f64| sample as f32, false),
         AudioBufferRef::S8(b) => {
-            let n_frames = b.frames();
-            let n_ch = b.spec().channels.count();
-            for i in 0..n_frames {
-                for ch in 0..n_ch {
-                    out.push(normalize_pcm(b.chan(ch)[i] as f32, 128.0));
-                }
-            }
+            append_frames!(
+                out,
+                b,
+                |sample: i8| normalize_pcm(f32::from(sample), 128.0),
+                false
+            )
         }
         AudioBufferRef::U8(b) => {
-            let n_frames = b.frames();
-            let n_ch = b.spec().channels.count();
-            for i in 0..n_frames {
-                for ch in 0..n_ch {
-                    out.push((b.chan(ch)[i] as f32 - 128.0) / 128.0);
-                }
+            append_frames!(
+                out,
+                b,
+                |sample: u8| (f32::from(sample) - 128.0) / 128.0,
+                false
+            )
+        }
+        AudioBufferRef::S16(b) => append_frames!(out, b, normalize_i16, false),
+        AudioBufferRef::U16(b) => append_frames!(
+            out,
+            b,
+            |sample: u16| (f32::from(sample) - 32768.0) / 32768.0,
+            false
+        ),
+        AudioBufferRef::S24(b) => append_frames!(
+            out,
+            b,
+            |sample: symphonia::core::sample::i24| normalize_pcm(sample.0 as f32, 8_388_608.0),
+            false
+        ),
+        AudioBufferRef::U24(b) => append_frames!(
+            out,
+            b,
+            |sample: symphonia::core::sample::u24| (sample.0 as f32 - 8_388_608.0) / 8_388_608.0,
+            false
+        ),
+        AudioBufferRef::S32(b) => append_frames!(
+            out,
+            b,
+            |sample: i32| normalize_pcm(sample as f32, 2_147_483_648.0),
+            false
+        ),
+        AudioBufferRef::U32(b) => append_frames!(
+            out,
+            b,
+            |sample: u32| (sample as f32 - 2_147_483_648.0) / 2_147_483_648.0,
+            false
+        ),
+    }
+}
+
+/// Appends mono frames from any decoded buffer, averaging channels exactly as
+/// [`crate::resample`]'s mixdown does (normalize each channel, sum in channel
+/// order, multiply by `1/channels`).
+fn append_mono(out: &mut Vec<f32>, buf: &AudioBufferRef<'_>) {
+    match buf {
+        AudioBufferRef::F32(b) => append_frames!(out, b, |sample: f32| sample, true),
+        AudioBufferRef::F64(b) => append_frames!(out, b, |sample: f64| sample as f32, true),
+        AudioBufferRef::S8(b) => {
+            append_frames!(
+                out,
+                b,
+                |sample: i8| normalize_pcm(f32::from(sample), 128.0),
+                true
+            )
+        }
+        AudioBufferRef::U8(b) => {
+            append_frames!(
+                out,
+                b,
+                |sample: u8| (f32::from(sample) - 128.0) / 128.0,
+                true
+            )
+        }
+        AudioBufferRef::S16(b) => append_frames!(out, b, normalize_i16, true),
+        AudioBufferRef::U16(b) => append_frames!(
+            out,
+            b,
+            |sample: u16| (f32::from(sample) - 32768.0) / 32768.0,
+            true
+        ),
+        AudioBufferRef::S24(b) => append_frames!(
+            out,
+            b,
+            |sample: symphonia::core::sample::i24| normalize_pcm(sample.0 as f32, 8_388_608.0),
+            true
+        ),
+        AudioBufferRef::U24(b) => append_frames!(
+            out,
+            b,
+            |sample: symphonia::core::sample::u24| (sample.0 as f32 - 8_388_608.0) / 8_388_608.0,
+            true
+        ),
+        AudioBufferRef::S32(b) => append_frames!(
+            out,
+            b,
+            |sample: i32| normalize_pcm(sample as f32, 2_147_483_648.0),
+            true
+        ),
+        AudioBufferRef::U32(b) => append_frames!(
+            out,
+            b,
+            |sample: u32| (sample as f32 - 2_147_483_648.0) / 2_147_483_648.0,
+            true
+        ),
+    }
+}
+
+/// The pre-M26B reference path: decode the whole file into `AudioBuffer`, then
+/// resample into a second `Vec<f32>`.
+///
+/// Production never calls this. It is the acceptance test's "old path" — the
+/// exact two full-file allocations M26B removes — so the byte-identical and
+/// peak-RSS comparisons run against the code that shipped before the slice.
+#[doc(hidden)]
+pub fn decode_16khz_mono_in_memory_for_tests(
+    input: &std::path::Path,
+) -> Result<Vec<f32>, SuramakError> {
+    let buffer = decode_file(input)?;
+    crate::resample::to_16khz_mono(&buffer)
+}
+
+/// Decodes `input` and writes 16 kHz mono f32le to `out_path`, in bounded
+/// chunks, then maps the result as a [`PcmSlice`].
+///
+/// This is the one streaming decode path: no full-file `Vec<f32>` for the
+/// decoded audio and no full-file resample buffer. The working set is one
+/// decoded packet (the decoder's own buffer), at most one 1024-sample mono
+/// pending block and one rubato output chunk — a few tens of KiB, far under the
+/// 8 MB sample budget, independent of the recording's duration.
+///
+/// The bytes are produced by the same rules as
+/// [`crate::resample::to_16khz_mono`]: mono mixdown normalizes each channel and
+/// sums in channel order; rubato is fed the same 1024-sample chunks with the
+/// same final padding; the tail is cut to `round(frames × 16000 / rate)`. That
+/// is what makes the output sample-identical, not merely similar.
+pub fn decode_to_pcm16k_mono(
+    input: &std::path::Path,
+    out_path: &std::path::Path,
+) -> Result<PcmSlice, SuramakError> {
+    decode_to_pcm16k_mono_cancellable(input, out_path, &|| false)
+}
+
+/// [`decode_to_pcm16k_mono`] with a cooperative cancellation check per demuxed
+/// packet. A cancelled or failed decode removes the partial temp file.
+pub fn decode_to_pcm16k_mono_cancellable(
+    input: &std::path::Path,
+    out_path: &std::path::Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<PcmSlice, SuramakError> {
+    decode_to_pcm16k_mono_with_free_space(input, out_path, None, cancelled)
+}
+
+/// [`decode_to_pcm16k_mono_cancellable`] with the free-space answer injected
+/// (`None` probes the real volume). The preflight refusal is tested this way
+/// without filling a disk.
+#[doc(hidden)]
+pub fn decode_to_pcm16k_mono_with_free_space(
+    input: &std::path::Path,
+    out_path: &std::path::Path,
+    free_bytes: Option<u64>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<PcmSlice, SuramakError> {
+    let label = InputLabel::from_path(input);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        decode_to_pcm_inner(input, out_path, free_bytes, cancelled, &label)
+    }));
+    match outcome {
+        Ok(result) => result,
+        Err(payload) => Err(SuramakError::DecoderPanic {
+            name: label.name.clone(),
+            detail: panic_detail(payload.as_ref()),
+        }),
+    }
+}
+
+fn decode_to_pcm_inner(
+    input: &std::path::Path,
+    out_path: &std::path::Path,
+    free_bytes: Option<u64>,
+    cancelled: &dyn Fn() -> bool,
+    label: &InputLabel,
+) -> Result<PcmSlice, SuramakError> {
+    if cancelled() {
+        return Err(SuramakError::Cancelled);
+    }
+    let mut file = std::fs::File::open(input)?;
+    if let Some(detail) = file_truncation_detail(&mut file)? {
+        return Err(SuramakError::Truncated {
+            name: label.name.clone(),
+            detail,
+        });
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = input.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let mut setup = open_decoder(mss, hint, label)?;
+    let rate = setup.rate;
+    let declared_frames = setup.declared_frames;
+
+    // Disk preflight before the temp file exists: `duration × 64 000 + 100 MB`.
+    // A container that declares its frame count answers exactly; one that does
+    // not falls back to the header probe, and an unknowable duration is charged
+    // the fixed headroom only (never an invented length).
+    let duration_ms = declared_frames
+        .filter(|frames| *frames > 0)
+        .map(|frames| frames.saturating_mul(1000) / u64::from(rate.max(1)))
+        .or_else(|| probe_duration_ms(input));
+    let needed = pcm::temp_space_needed(duration_ms);
+    let out_dir = out_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let available = free_bytes.or_else(|| crate::download::available_space_bytes(out_dir));
+    pcm::check_temp_space(out_dir, needed, available)?;
+
+    // From here on the partial file is this function's to remove: cancellation,
+    // a decoder error, a resampler error and a panic all unwind through the
+    // guard. Only the successful `PcmSlice::open_temp` disarms it.
+    let mut guard = TempPcmGuard::new(out_path.to_path_buf());
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(out_path)?;
+    let mut writer = Pcm16kWriter::new(file, rate)?;
+
+    let mut frames_decoded = 0u64;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_packets(&mut setup, &mut frames_decoded, cancelled, &mut |buf| {
+            writer.push(buf)
+        })
+    }));
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return Err(err),
+        Err(payload) => {
+            return Err(SuramakError::DecoderPanic {
+                name: label.name.clone(),
+                detail: panic_detail(payload.as_ref()),
+            });
+        }
+    }
+
+    if frames_decoded == 0 {
+        return Err(SuramakError::NoAudioData);
+    }
+    if let Some(err) = truncation_error(label, declared_frames, frames_decoded, rate) {
+        return Err(err);
+    }
+    writer.finish()?;
+
+    let slice = PcmSlice::open_temp(out_path)?;
+    guard.disarm();
+    Ok(slice)
+}
+
+/// Deletes a partial temp file unless the decode committed it.
+struct TempPcmGuard {
+    path: std::path::PathBuf,
+    armed: bool,
+}
+
+impl TempPcmGuard {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TempPcmGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// The 1024-sample chunk `to_16khz_mono` feeds rubato, kept identical so the
+/// streaming state machine sees the same input sequence.
+const STREAM_CHUNK_SAMPLES: usize = 1024;
+/// Flush the little-endian byte staging buffer at 64 KiB.
+const STREAM_BYTE_BUFFER: usize = 64 * 1024;
+
+/// Incremental 16 kHz mono f32le writer.
+///
+/// Resident samples: `pending` (one decoded packet's mono frames, drained every
+/// 1024) + `chunk` (1024) + rubato's internal FFT buffers + one output chunk.
+/// For a 4096-frame packet that is under 20 KiB of f32; the writer never holds
+/// a whole-file buffer.
+struct Pcm16kWriter {
+    file: std::fs::File,
+    bytes: Vec<u8>,
+    pending: Vec<f32>,
+    chunk: Vec<f32>,
+    resampler: Option<FftFixedIn<f32>>,
+    rate: u32,
+    mono_frames: u64,
+    written_samples: u64,
+}
+
+impl Pcm16kWriter {
+    fn new(file: std::fs::File, rate: u32) -> Result<Self, SuramakError> {
+        let resampler = if rate == TARGET_RATE {
+            None
+        } else {
+            Some(
+                FftFixedIn::<f32>::new(
+                    rate as usize,
+                    TARGET_RATE as usize,
+                    STREAM_CHUNK_SAMPLES,
+                    2,
+                    1,
+                )
+                .map_err(|e| SuramakError::ResamplerInit(format!("resampler init: {e}")))?,
+            )
+        };
+        Ok(Self {
+            file,
+            bytes: Vec::with_capacity(STREAM_BYTE_BUFFER),
+            pending: Vec::with_capacity(STREAM_CHUNK_SAMPLES * 2),
+            chunk: vec![0.0; STREAM_CHUNK_SAMPLES],
+            resampler,
+            rate,
+            mono_frames: 0,
+            written_samples: 0,
+        })
+    }
+
+    fn push(&mut self, buf: &AudioBufferRef<'_>) -> Result<(), SuramakError> {
+        self.mono_frames += buf.frames() as u64;
+        append_mono(&mut self.pending, buf);
+        if self.resampler.is_none() {
+            return self.write_pending();
+        }
+        while self.pending.len() >= STREAM_CHUNK_SAMPLES {
+            self.chunk
+                .copy_from_slice(&self.pending[..STREAM_CHUNK_SAMPLES]);
+            self.pending.drain(..STREAM_CHUNK_SAMPLES);
+            let frames = self
+                .resampler
+                .as_mut()
+                .expect("resampler present")
+                .process(&[self.chunk.as_slice()], None)?;
+            self.write_samples(&frames[0])?;
+        }
+        Ok(())
+    }
+
+    fn write_pending(&mut self) -> Result<(), SuramakError> {
+        let pending = std::mem::take(&mut self.pending);
+        let result = self.write_samples(&pending);
+        self.pending = pending;
+        self.pending.clear();
+        result
+    }
+
+    fn finish(mut self) -> Result<(), SuramakError> {
+        if let Some(resampler) = self.resampler.as_mut() {
+            if !self.pending.is_empty() {
+                // The same padding `to_16khz_mono` applies to its last chunk.
+                self.pending.resize(STREAM_CHUNK_SAMPLES, 0.0);
+                let frames = resampler.process(&[self.pending.as_slice()], None)?;
+                self.write_samples(&frames[0])?;
+            }
+            self.flush_bytes()?;
+            // rubato's FFT latency can leave a clip a few frames short of the
+            // ideal length; the in-memory path truncates to the ideal, never
+            // pads to it. `min` reproduces both directions exactly.
+            let expected = ((self.mono_frames as f64 * f64::from(TARGET_RATE))
+                / f64::from(self.rate))
+            .round() as u64;
+            let bytes = expected.min(self.written_samples) * 4;
+            self.file.set_len(bytes)?;
+        } else {
+            self.write_pending()?;
+            self.flush_bytes()?;
+        }
+        self.file.flush()?;
+        Ok(())
+    }
+
+    fn write_samples(&mut self, samples: &[f32]) -> Result<(), SuramakError> {
+        self.written_samples += samples.len() as u64;
+        for sample in samples {
+            self.bytes.extend_from_slice(&sample.to_le_bytes());
+            if self.bytes.len() >= STREAM_BYTE_BUFFER {
+                self.flush_bytes()?;
             }
         }
-        AudioBufferRef::S16(b) => {
-            let n_frames = b.frames();
-            let n_ch = b.spec().channels.count();
-            for i in 0..n_frames {
-                for ch in 0..n_ch {
-                    out.push(normalize_pcm(b.chan(ch)[i] as f32, 32_768.0));
-                }
-            }
+        Ok(())
+    }
+
+    fn flush_bytes(&mut self) -> Result<(), SuramakError> {
+        if !self.bytes.is_empty() {
+            self.file.write_all(&self.bytes)?;
+            self.bytes.clear();
         }
-        AudioBufferRef::U16(b) => {
-            let n_frames = b.frames();
-            let n_ch = b.spec().channels.count();
-            for i in 0..n_frames {
-                for ch in 0..n_ch {
-                    out.push((b.chan(ch)[i] as f32 - 32768.0) / 32768.0);
-                }
-            }
-        }
-        AudioBufferRef::S24(b) => {
-            let n_frames = b.frames();
-            let n_ch = b.spec().channels.count();
-            for i in 0..n_frames {
-                for ch in 0..n_ch {
-                    out.push(normalize_pcm(b.chan(ch)[i].0 as f32, 8_388_608.0));
-                }
-            }
-        }
-        AudioBufferRef::U24(b) => {
-            let n_frames = b.frames();
-            let n_ch = b.spec().channels.count();
-            for i in 0..n_frames {
-                for ch in 0..n_ch {
-                    out.push((b.chan(ch)[i].0 as f32 - 8_388_608.0) / 8_388_608.0);
-                }
-            }
-        }
-        AudioBufferRef::S32(b) => {
-            let n_frames = b.frames();
-            let n_ch = b.spec().channels.count();
-            for i in 0..n_frames {
-                for ch in 0..n_ch {
-                    out.push(normalize_pcm(b.chan(ch)[i] as f32, 2_147_483_648.0));
-                }
-            }
-        }
-        AudioBufferRef::U32(b) => {
-            let n_frames = b.frames();
-            let n_ch = b.spec().channels.count();
-            for i in 0..n_frames {
-                for ch in 0..n_ch {
-                    out.push((b.chan(ch)[i] as f32 - 2_147_483_648.0) / 2_147_483_648.0);
-                }
-            }
-        }
+        Ok(())
     }
 }
 

@@ -67,6 +67,19 @@ pub enum SuramakError {
     #[error("Model not found: {0}")]
     ModelNotFound(String),
 
+    /// M26B: the temp volume cannot hold the decoded audio the preflight
+    /// requires. Named so callers and logs can tell the disk refusal apart from
+    /// a malformed input; both numbers are in the sentence the user reads.
+    #[error(
+        "temp_disk_full: need {needed} bytes for the decoded audio in {dir} but only \
+         {available} are free — free up space or choose a shorter file"
+    )]
+    TempDiskFull {
+        dir: std::path::PathBuf,
+        needed: u64,
+        available: u64,
+    },
+
     #[error("Transcript not found: {0}")]
     TranscriptNotFound(String),
 

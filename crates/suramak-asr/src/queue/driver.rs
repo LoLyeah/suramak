@@ -21,7 +21,7 @@ use std::thread::{self, JoinHandle};
 
 use suramak_core::decode;
 use suramak_core::limits::{self, Limits, ModelFootprint};
-use suramak_core::resample;
+use suramak_core::pcm::{self, PcmSlice};
 use suramak_core::settings::{EngineSetting, LangMode};
 use suramak_core::store::{JobRecord, JobStatus, Store, KILLED_BY_OS_PREFIX};
 use suramak_core::transcript::{Source, Transcript, WordTiming};
@@ -72,28 +72,32 @@ pub enum DecodeFailure {
 
 /// The decode-ahead supplier.
 pub trait AudioDecoder: Send + 'static {
-    fn decode(&self, input: &Path, cancel: &CancelToken) -> Result<Vec<f32>, DecodeFailure>;
+    fn decode(&self, input: &Path, cancel: &CancelToken) -> Result<PcmSlice, DecodeFailure>;
 }
 
-/// The production decoder: core's file decode + 16 kHz mono resample, with the
-/// same cooperative cancellation the pipeline uses (checked per demuxed packet,
-/// so a cancel mid-file drops the partial buffer).
+/// The production decoder: one streaming decode to `{temp}/suramak_*.pcm32`,
+/// with the same cooperative cancellation the pipeline uses (checked per
+/// demuxed packet, so a cancel mid-file drops the partial file). A 16 kHz mono
+/// PCM16 WAV this app wrote takes the no-decode fast path, exactly as the
+/// pipeline's front half does — one path for both callers.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FileDecoder;
 
 impl AudioDecoder for FileDecoder {
-    fn decode(&self, input: &Path, cancel: &CancelToken) -> Result<Vec<f32>, DecodeFailure> {
-        let buffer =
-            decode::decode_file_cancellable(input, &|| cancel.is_cancelled()).map_err(|err| {
-                match err {
-                    SuramakError::Cancelled => DecodeFailure::Cancelled,
-                    other => DecodeFailure::Failed(other.to_string()),
-                }
-            })?;
-        if cancel.is_cancelled() {
-            return Err(DecodeFailure::Cancelled);
+    fn decode(&self, input: &Path, cancel: &CancelToken) -> Result<PcmSlice, DecodeFailure> {
+        if let Some(samples) = PcmSlice::from_recording_wav(input) {
+            if cancel.is_cancelled() {
+                return Err(DecodeFailure::Cancelled);
+            }
+            return Ok(samples);
         }
-        resample::to_16khz_mono(&buffer).map_err(|err| DecodeFailure::Failed(err.to_string()))
+        let out_path = pcm::temp_pcm_path();
+        match decode::decode_to_pcm16k_mono_cancellable(input, &out_path, &|| cancel.is_cancelled())
+        {
+            Ok(samples) => Ok(samples),
+            Err(SuramakError::Cancelled) => Err(DecodeFailure::Cancelled),
+            Err(err) => Err(DecodeFailure::Failed(err.to_string())),
+        }
     }
 }
 
@@ -109,7 +113,7 @@ pub struct DecodeTask {
 #[derive(Debug)]
 pub struct DecodeDone {
     pub id: u64,
-    pub result: Result<Vec<f32>, DecodeFailure>,
+    pub result: Result<PcmSlice, DecodeFailure>,
 }
 
 /// The decode-ahead pool, abstracted so tests control its timing.
@@ -301,7 +305,7 @@ pub struct QueueDriver<B: InferenceBackend, P: Prefetcher> {
     prefetch: P,
     options: JobOptions,
     tokens: HashMap<u64, CancelToken>,
-    samples: HashMap<u64, Vec<f32>>,
+    samples: HashMap<u64, PcmSlice>,
     current: Option<Running>,
     events: Vec<QueueEvent>,
     /// Tasks handed to the prefetch pool whose completion has not arrived yet
@@ -791,7 +795,7 @@ impl<B: InferenceBackend, P: Prefetcher> QueueDriver<B, P> {
         self.prefetch_in_flight = self.prefetch_in_flight.saturating_sub(1);
         match done.result {
             Ok(samples) => {
-                let bytes = samples.len() * std::mem::size_of::<f32>();
+                let bytes = samples.byte_len();
                 match self.queue.mark_decoded(done.id, bytes) {
                     DecodeAdmission::Kept => {
                         self.samples.insert(done.id, samples);
@@ -1470,7 +1474,7 @@ mod tests {
         fn request(&mut self, task: DecodeTask) {
             self.done.push_back(DecodeDone {
                 id: task.id,
-                result: Ok(vec![0.0; 16_000]),
+                result: Ok(PcmSlice::from_samples(vec![0.0; 16_000])),
             });
         }
 
@@ -1551,7 +1555,7 @@ mod tests {
         for task in driver.prefetch.tasks.clone() {
             driver.prefetch.done.push_back(DecodeDone {
                 id: task.id,
-                result: Ok(vec![0.0; 16_000]),
+                result: Ok(PcmSlice::from_samples(vec![0.0; 16_000])),
             });
         }
         driver.run_once();
@@ -1932,13 +1936,13 @@ mod tests {
         // The late buffer arrives after the cancel: it is dropped, never run.
         driver.prefetch.done.push_back(DecodeDone {
             id: task.id,
-            result: Ok(vec![0.0; 16_000]),
+            result: Ok(PcmSlice::from_samples(vec![0.0; 16_000])),
         });
         for other in driver.prefetch.tasks.clone() {
             if other.id != task.id {
                 driver.prefetch.done.push_back(DecodeDone {
                     id: other.id,
-                    result: Ok(vec![0.0; 16_000]),
+                    result: Ok(PcmSlice::from_samples(vec![0.0; 16_000])),
                 });
             }
         }

@@ -526,10 +526,11 @@ fn e2e_live_partials_then_the_final_pass_replaces_them() {
         // closes (the skip-and-merge path is unit-tested; here every window
         // decodes, exactly as a fast machine behaves).
         for window in live.push_audio(&samples[index..end], false) {
+            let window_samples = suramak_core::pcm::PcmSlice::from_samples(window.samples.clone());
             let outcome = whisper::transcribe(
                 ctx,
                 &model_path,
-                &window.samples,
+                &window_samples,
                 &lang,
                 None,
                 whisper::default_threads(),

@@ -676,8 +676,12 @@ unsafe extern "C" fn abort_trampoline(user_data: *mut c_void) -> bool {
     token.is_cancelled()
 }
 
-/// Runs whisper on 16 kHz mono f32 `samples` and returns timed segments plus the engine
-/// that ran.
+/// Runs whisper on 16 kHz mono [`suramak_core::pcm::PcmSlice`] audio and returns
+/// timed segments plus the engine that ran.
+///
+/// `samples` is the whole job's audio: a mapped `.pcm32` for file jobs (M26B) or
+/// an in-memory buffer for a live window. `from_ms` selects the tail a resumed
+/// run starts at, so the slice is borrowed from the same mapping — no copy.
 ///
 /// `on_progress` receives whisper.cpp's progress percentage (0–100) as decoding advances.
 /// `cancel` is checked by whisper.cpp itself between decoding chunks (the abort
@@ -694,7 +698,7 @@ unsafe extern "C" fn abort_trampoline(user_data: *mut c_void) -> bool {
 pub fn transcribe(
     ctx: &WhisperContext,
     model_path: &Path,
-    samples: &[f32],
+    samples: &suramak_core::pcm::PcmSlice,
     lang: &LangMode,
     initial_prompt: Option<&str>,
     n_threads: i32,
@@ -772,6 +776,15 @@ pub fn transcribe(
         params.set_abort_callback(Some(abort_trampoline));
         params.set_abort_callback_user_data(cancel as *const CancelToken as *mut c_void);
     }
+
+    // M22A resume: `samples` is the job's whole 16 kHz mono audio and `from_ms`
+    // selects the tail this run starts at (16 samples/ms). The old pipeline
+    // sliced the `Vec<f32>` before the call; with a mapped `PcmSlice` the tail
+    // is a borrowed view into the same pages — no copy and no second buffer.
+    let start_sample = usize::try_from(from_ms.max(0))
+        .unwrap_or(usize::MAX)
+        .saturating_mul(16);
+    let samples = samples.as_slice().get(start_sample..).unwrap_or(&[]);
 
     let full = state.full(params, samples);
     // A cancelled run surfaces as a whisper error (the engine aborted the

@@ -16,6 +16,7 @@ pub mod models;
 // M24B: citation-verified notes (Minutes / Action items / EN↔ID brief).
 pub mod notes;
 pub mod paths;
+pub mod pcm;
 pub mod polish;
 pub mod resample;
 pub mod search;

@@ -48,6 +48,9 @@ pub mod watch_host;
 #[cfg(target_os = "android")]
 #[no_mangle]
 pub fn android_main(app: android_activity::AndroidApp) {
+    // M26B: LMKD or a swipe-away can kill the process mid-decode; the temp
+    // `.pcm32` then has no destructor to remove it. Sweep at process start.
+    suramak_core::pcm::sweep_orphaned_temp_pcm(&suramak_core::pcm::temp_pcm_dir());
     suramak_android_spike::android_entry(app, Box::new(shell::CompactShell::new()));
 }
 

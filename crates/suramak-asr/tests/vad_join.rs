@@ -485,10 +485,11 @@ fn transcribe(
     };
     let cancel = CancelToken::new();
     let ctx = cache.get_or_load(model, false).expect("load model");
+    let samples = suramak_core::pcm::PcmSlice::from_samples(samples.to_vec());
     whisper::transcribe(
         ctx,
         model,
-        samples,
+        &samples,
         lang,
         None,
         whisper::default_threads(),

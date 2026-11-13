@@ -153,6 +153,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let smoke = Smoke::from_env();
     // One Suramak at a time (skipped in smoke modes — transient runs).
     acquire_instance_lock(smoke.is_none());
+    // M26B: remove decode temp files left by a killed process, before the first
+    // job can create a live one. After the instance lock, so a second launch
+    // never sweeps the running instance's live mapping.
+    suramak_core::pcm::sweep_orphaned_temp_pcm(&suramak_core::pcm::temp_pcm_dir());
     // M9b: the user-event channel carries AccessKit's action requests back into
     // the loop (the proxy is handed to the shell's adapter at startup).
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;

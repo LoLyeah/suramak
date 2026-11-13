@@ -82,7 +82,7 @@ impl Prefetcher for InstantPrefetch {
     fn request(&mut self, task: DecodeTask) {
         self.done.push(DecodeDone {
             id: task.id,
-            result: Ok(vec![0.0; 16_000]),
+            result: Ok(suramak_core::pcm::PcmSlice::from_samples(vec![0.0; 16_000])),
         });
     }
 

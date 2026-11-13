@@ -43,6 +43,9 @@ enum Command {
 
 fn main() -> ExitCode {
     init_tracing();
+    // M26B: a kill (SIGKILL, LMKD) leaves the decode temp file behind because
+    // no destructor runs. Sweep before any job can create a live one.
+    suramak_core::pcm::sweep_orphaned_temp_pcm(&suramak_core::pcm::temp_pcm_dir());
     let cli = Cli::parse();
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,

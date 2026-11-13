@@ -35,7 +35,7 @@ pub enum JobStage {
 }
 
 /// A transcription job submitted to the worker.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Job {
     pub id: u64,
     pub input: PathBuf,
@@ -55,11 +55,13 @@ pub struct Job {
     /// and UI both construct jobs in-process).
     #[serde(skip)]
     pub cancel: CancelToken,
-    /// M16.1: the queue's decoded-ahead 16 kHz mono samples, when the prefetch
-    /// pool produced them. `None` = decode inside the pipeline exactly as before.
-    /// Not serialized (it is a large transient buffer, not job identity).
+    /// M16.1: the queue's decoded-ahead 16 kHz mono audio, when the prefetch
+    /// pool produced it. `None` = decode inside the pipeline exactly as before.
+    /// M26B: a mapped temp-file slice, not a whole-file `Vec<f32>`; its `Drop`
+    /// removes the temp file. Not serialized (it is a live mapping, not job
+    /// identity).
     #[serde(skip)]
-    pub samples: Option<Vec<f32>>,
+    pub samples: Option<suramak_core::pcm::PcmSlice>,
     /// M22A: the durable identity and the committed prefix/resume boundary.
     /// `None` when the queue runs without a journal (today's behavior).
     #[serde(skip)]

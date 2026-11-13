@@ -80,8 +80,14 @@ fn the_android_job_decodes_through_the_shared_parity_path() {
         let job = FileDecoder
             .decode(&path, &CancelToken::new())
             .unwrap_or_else(|err| panic!("{language}: {err:?}"));
+        same_pcm(
+            job.as_slice(),
+            &expected,
+            &format!("{language}: job decoder vs the shared decode+resample"),
+        );
         assert_eq!(
-            job, expected,
+            job.len(),
+            expected.len(),
             "{language}: the job decoder must not fork the shared decode"
         );
         let seconds = job.len() as f32 / 16_000.0;

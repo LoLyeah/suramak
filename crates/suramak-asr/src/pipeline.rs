@@ -16,9 +16,10 @@
 
 use std::path::Path;
 
+use suramak_core::pcm::PcmSlice;
 use suramak_core::settings::LangMode;
 use suramak_core::transcript::{Segment, Source, Transcript};
-use suramak_core::{decode, resample};
+use suramak_core::{decode, pcm, SuramakError};
 use whisper_rs::WhisperContext;
 
 use crate::cancel::CancelToken;
@@ -76,23 +77,40 @@ pub fn stage_check(cancel: &CancelToken) -> Result<(), AsrError> {
 /// Decode + resample to 16 kHz mono with the stage-boundary checks — the shared
 /// front half of every engine path.
 ///
-/// `prepared` (M16.1) is the queue's decoded-ahead buffer: when present it is
+/// `prepared` (M16.1) is the queue's decoded-ahead slice: when present it is
 /// already 16 kHz mono (the prefetch pool ran the same decode + resample), so
 /// the front half only has to re-check the cancel token. Without it the file is
-/// decoded here exactly as before.
+/// decoded here through one streaming path (M26B):
+///
+/// 1. a 16 kHz mono PCM16 WAV this app wrote takes [`PcmSlice::from_recording_wav`]
+///    — its data chunk is mapped, no decoder and no resampler;
+/// 2. everything else is decoded and resampled incrementally into
+///    `{temp}/suramak_*.pcm32` and mapped by [`decode::decode_to_pcm16k_mono_cancellable`].
+///
+/// Neither branch holds a full-file sample buffer in this process.
 fn prepare_samples(
     input: &Path,
-    prepared: Option<Vec<f32>>,
+    prepared: Option<PcmSlice>,
     cancel: &CancelToken,
-) -> Result<Vec<f32>, AsrError> {
+) -> Result<PcmSlice, AsrError> {
     stage_check(cancel)?;
-    let samples = match prepared {
-        Some(samples) => samples,
-        None => {
-            let buffer = decode::decode_file(input)?;
-            stage_check(cancel)?;
-            resample::to_16khz_mono(&buffer)?
-        }
+    if let Some(samples) = prepared {
+        stage_check(cancel)?;
+        return Ok(samples);
+    }
+    if let Some(samples) = PcmSlice::from_recording_wav(input) {
+        stage_check(cancel)?;
+        return Ok(samples);
+    }
+    let out_path = pcm::temp_pcm_path();
+    let samples = match decode::decode_to_pcm16k_mono_cancellable(input, &out_path, &|| {
+        cancel.is_cancelled()
+    }) {
+        Ok(samples) => samples,
+        // A cancel mid-decode is the job's terminal `Cancelled`, not a decode
+        // failure the queue would report as an error.
+        Err(SuramakError::Cancelled) => return Err(AsrError::Cancelled),
+        Err(err) => return Err(err.into()),
     };
     stage_check(cancel)?;
     Ok(samples)
@@ -163,7 +181,7 @@ pub fn transcribe_file(
     initial_prompt: Option<&str>,
     n_threads: i32,
     plan: &crate::engine::EngineDecision,
-    prepared: Option<Vec<f32>>,
+    prepared: Option<PcmSlice>,
     cancel: &CancelToken,
     checkpoint: Option<CheckpointRun<'_>>,
     mut on_stage: impl FnMut(JobStage),
@@ -201,7 +219,6 @@ pub fn transcribe_file(
             warnings: plan.warning.iter().cloned().collect(),
         });
     }
-    let tail: &[f32] = samples.get(start_sample..).unwrap_or(&[]);
 
     // A prompt is a start-of-file hint. Repeating it on a mid-file resume invites
     // the model to re-emit committed words, which is exactly the duplication the
@@ -210,7 +227,7 @@ pub fn transcribe_file(
     let outcome = whisper::transcribe(
         ctx,
         model_path,
-        tail,
+        &samples,
         lang,
         prompt,
         n_threads,
@@ -252,7 +269,7 @@ pub fn transcribe_file_parakeet(
     input: &Path,
     lang: &LangMode,
     plan: &crate::engine::EngineDecision,
-    prepared: Option<Vec<f32>>,
+    prepared: Option<PcmSlice>,
     cancel: &CancelToken,
     mut on_stage: impl FnMut(JobStage),
     mut on_progress: impl FnMut(u8),
@@ -265,7 +282,7 @@ pub fn transcribe_file_parakeet(
     let samples = prepare_samples(input, prepared, cancel)?;
     on_stage(JobStage::Transcribing);
     on_progress(50);
-    let result = recognizer.transcribe(&samples, 16_000)?;
+    let result = recognizer.transcribe(samples.as_slice(), 16_000)?;
     stage_check(cancel)?;
     on_progress(100);
     let audio_ms = samples.len() as i64 * 1000 / 16_000;
@@ -298,7 +315,7 @@ pub fn transcribe_file_speech_transcriber(
     input: &Path,
     lang: &LangMode,
     plan: &crate::engine::EngineDecision,
-    prepared: Option<Vec<f32>>,
+    prepared: Option<PcmSlice>,
     cancel: &CancelToken,
     mut on_stage: impl FnMut(JobStage),
     mut on_progress: impl FnMut(u8),

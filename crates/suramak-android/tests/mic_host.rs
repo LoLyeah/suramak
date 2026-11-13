@@ -609,9 +609,19 @@ fn a_capture_that_dies_is_settled_as_a_stream_error() {
     let host = MicHost::with_parts(mic_dirs, ending_spawner(), log_inbox(Arc::clone(&log)));
     host.start(true, true, "Recording dies", "tiny", "auto")
         .unwrap();
-    // The thread has already finished by the time status reconciles it.
-    let status = host.status();
-    assert!(!status.recording);
+    // The dying thread settles asynchronously. Poll to a deadline instead of
+    // assuming it has already landed: under a loaded full-suite run the first
+    // `status()` can still see `recording` (this flaked twice in full runs and
+    // passed 3/3 alone). A missed stop must still FAIL — the deadline is 2 s.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let status = loop {
+        let status = host.status();
+        if !status.recording || std::time::Instant::now() >= deadline {
+            break status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert!(!status.recording, "the dead capture never settled");
     let last = status.last_stop.expect("a settled stop");
     assert_eq!(last.reason, "stream_error");
     assert_eq!(last.frames, 0);
