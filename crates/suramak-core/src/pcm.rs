@@ -236,6 +236,29 @@ impl PcmSlice {
             Storage::Buffered(_) => "memory",
         }
     }
+
+    /// Drops the resident pages of `start_sample..end_sample` (M26C).
+    ///
+    /// A macro window is decoded once; its PCM pages do not need to stay in
+    /// the process's resident set while the next window runs. On unix this is
+    /// `madvise(MADV_DONTNEED)` over the page-aligned span — for a
+    /// `MAP_PRIVATE` read-only file mapping the kernel discards the clean
+    /// pages and re-faults them from the file if they are ever read again.
+    /// The buffered fallback owns one `Vec<f32>`, so there is nothing to drop;
+    /// the call is a no-op there and the `mmap` win remains unix-only, exactly
+    /// as [`PcmSlice::backend`] documents.
+    ///
+    /// Out-of-range bounds are clamped to the slice. The advice is a hint: a
+    /// refused `madvise` must never fail a job (the design's rule for
+    /// `POSIX_MADV_SEQUENTIAL` applies here too).
+    pub fn advise_dontneed(&self, start_sample: usize, end_sample: usize) {
+        #[cfg(unix)]
+        if let Storage::Mapped(mapping) = &self.storage {
+            mapping.advise_dontneed(start_sample.min(self.samples), end_sample.min(self.samples));
+        }
+        #[cfg(not(unix))]
+        let _ = (start_sample, end_sample);
+    }
 }
 
 impl std::fmt::Debug for PcmSlice {
@@ -341,6 +364,46 @@ impl Mapping {
         // exists.
         unsafe { std::slice::from_raw_parts(self.ptr as *const f32, self.len / 4) }
     }
+
+    /// `madvise(MADV_DONTNEED)` over the page-aligned span of a sample range.
+    fn advise_dontneed(&self, start_sample: usize, end_sample: usize) {
+        if end_sample <= start_sample {
+            return;
+        }
+        let page = page_size();
+        let byte_start = start_sample.saturating_mul(4).min(self.len);
+        let byte_end = end_sample.saturating_mul(4).min(self.len);
+        let aligned_start = byte_start / page * page;
+        let aligned_end = byte_end.div_ceil(page) * page;
+        let aligned_end = aligned_end.min(self.len);
+        let len = aligned_end.saturating_sub(aligned_start);
+        if len == 0 {
+            return;
+        }
+        // SAFETY: `aligned_start` is inside the live mapping (clamped) and `len`
+        // stays inside it; `madvise` only changes residency, never content of a
+        // shared read-only file mapping that is read again.
+        unsafe {
+            libc::madvise(
+                (self.ptr as *mut u8).add(aligned_start).cast(),
+                len,
+                libc::MADV_DONTNEED,
+            );
+        }
+    }
+}
+
+/// The host page size, without a crate. `sysconf(_SC_PAGESIZE)` is 4 KiB on
+/// every target this app ships; the call is still made so a 16 KiB-page kernel
+/// is handled by the kernel's own answer rather than an assumption.
+#[cfg(unix)]
+fn page_size() -> usize {
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if size > 0 {
+        size as usize
+    } else {
+        4096
+    }
 }
 
 #[cfg(unix)]
@@ -403,9 +466,29 @@ impl WindowPcmReader {
 /// (including the Linux host that tests this fallback) seeks a clone and reads,
 /// which is the same byte-for-byte contract without a platform crate.
 #[cfg(windows)]
-fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+    // Windows' FileExt offers `seek_read`, not `read_exact_at`, and it may
+    // return a SHORT read — loop until the window is full (the CI windows job
+    // caught the wrong method name: `no method named read_exact_at`).
     use std::os::windows::fs::FileExt;
-    file.read_exact_at(buf, offset)
+    while !buf.is_empty() {
+        match file.seek_read(buf, offset) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "a .pcm32 window ended before the file did",
+                ))
+            }
+            Ok(read) => {
+                let (_, tail) = buf.split_at_mut(read);
+                buf = tail;
+                offset += read as u64;
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]

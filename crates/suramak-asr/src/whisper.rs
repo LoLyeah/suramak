@@ -864,13 +864,33 @@ pub fn transcribe(
 /// carried through so the mapper can refuse the segment rather than invent a
 /// boundary.
 fn segment_token_spans(ctx: &WhisperContext, seg: &WhisperSegment<'_>) -> Vec<TokenSpan> {
+    segment_text_tokens(ctx, seg)
+        .into_iter()
+        .map(|token| TokenSpan::new(token.bytes, token.start_ms, token.end_ms, token.probability))
+        .collect()
+}
+
+/// One text token of a decoded segment, with the vocabulary id the prompt
+/// firewall needs (M26C). Times are relative to the decoded slice.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextToken {
+    pub id: i32,
+    pub bytes: Vec<u8>,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub probability: f32,
+}
+
+/// Reads a segment's text tokens: specials skipped, no time shift.
+fn segment_text_tokens(ctx: &WhisperContext, seg: &WhisperSegment<'_>) -> Vec<TextToken> {
     let eot = ctx.token_eot();
-    let mut spans = Vec::new();
+    let mut tokens = Vec::new();
     for index in 0..seg.n_tokens() {
         let Some(token) = seg.get_token(index) else {
             continue;
         };
-        if token.token_id() >= eot {
+        let id = token.token_id();
+        if id >= eot {
             continue;
         }
         let Ok(bytes) = token.to_bytes() else {
@@ -880,15 +900,222 @@ fn segment_token_spans(ctx: &WhisperContext, seg: &WhisperSegment<'_>) -> Vec<To
             continue;
         }
         let data = token.token_data();
-        spans.push(TokenSpan::new(
-            bytes.to_vec(),
-            data.t0 * 10,
-            data.t1 * 10,
-            data.p,
-        ));
+        tokens.push(TextToken {
+            id,
+            bytes: bytes.to_vec(),
+            start_ms: data.t0 * 10,
+            end_ms: data.t1 * 10,
+            probability: data.p,
+        });
     }
-    spans
+    tokens
 }
+
+/// The result of one macro window's decode (M26C).
+#[derive(Debug, Clone)]
+pub struct WindowOutcome {
+    pub segments: Vec<Segment>,
+    pub words: Vec<WordTiming>,
+    /// Every text token of the window, in reading order — the prompt firewall's
+    /// input and the seam's provenance.
+    pub tokens: Vec<TextToken>,
+}
+
+/// One reused whisper state for a sequence of macro windows (M26C).
+///
+/// The state is created **once** for the whole job: the M26C design reuses one
+/// `WhisperState` across the 15-minute windows so the KV cache and compute
+/// buffers are allocated at most once. Each window call clears the text context
+/// (`no_context = true`) and receives the sanitised prompt tokens explicitly.
+pub struct WindowSession {
+    state: WhisperState,
+    engine_used: EngineId,
+    warnings: Vec<String>,
+}
+
+impl WindowSession {
+    /// Creates the decode state for `plan` (Core ML fallback included) — the
+    /// same state-selection rule as the single call.
+    pub fn new(
+        ctx: &WhisperContext,
+        model_path: &Path,
+        plan: &EngineDecision,
+    ) -> Result<Self, AsrError> {
+        let mut warnings = Vec::new();
+        if let Some(warning) = &plan.warning {
+            warnings.push(warning.clone());
+        }
+        let (state, engine_used) = create_state_for_plan(ctx, model_path, plan, &mut warnings)?;
+        Ok(Self {
+            state,
+            engine_used,
+            warnings,
+        })
+    }
+
+    /// Engine that actually ran (Core ML only when whisper.cpp loaded it).
+    pub fn engine_used(&self) -> EngineId {
+        self.engine_used
+    }
+
+    /// Non-fatal engine notes collected at state creation.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    /// Decodes one macro window.
+    ///
+    /// The M26C guards are set **here only**: the single-call path
+    /// ([`transcribe`]) keeps its exact pre-slice params so a file at or below
+    /// the window target stays byte-identical. `prompt_tokens` is the
+    /// firewall's output (empty = cold start); `no_context` is explicit even
+    /// though it matches whisper's default, because reusing the state is what
+    /// makes it load-bearing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn transcribe(
+        &mut self,
+        ctx: &WhisperContext,
+        samples: &[f32],
+        lang: &LangMode,
+        prompt_tokens: &[i32],
+        n_threads: i32,
+        cancel: &CancelToken,
+        offset_ms: i64,
+        next_idx: u32,
+        on_progress: &mut dyn FnMut(u8),
+        on_segment: &mut dyn FnMut(Segment),
+    ) -> Result<WindowOutcome, AsrError> {
+        if samples.is_empty() {
+            return Err(AsrError::Inference("empty macro window".to_string()));
+        }
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        params.set_n_threads(n_threads);
+        params.set_language(match lang {
+            LangMode::Auto => None,
+            LangMode::Fixed(code) => Some(code.as_str()),
+        });
+        // M26C decoder guards (docs/WORKORDER-M26C.md deliverable 3).
+        params.set_no_context(true);
+        params.set_n_max_text_ctx(MACRO_N_MAX_TEXT_CTX);
+        params.set_temperature_inc(0.2);
+        params.set_entropy_thold(2.4);
+        params.set_logprob_thold(-1.0);
+        params.set_no_speech_thold(0.6);
+        params.set_max_tokens(0);
+        params.set_token_timestamps(true);
+        if !prompt_tokens.is_empty() {
+            params.set_tokens(prompt_tokens);
+        }
+        params.set_print_special(false);
+        params.set_print_progress(false);
+        params.set_print_realtime(false);
+        params.set_print_timestamps(false);
+
+        let mut progress_ctx = ProgressContext { on_progress };
+        // SAFETY: both pointers are valid for the whole `state.full()` call
+        // below; the callback only reads the percentage.
+        unsafe {
+            params.set_progress_callback(Some(progress_trampoline));
+            params.set_progress_callback_user_data(
+                &mut progress_ctx as *mut ProgressContext<'_> as *mut c_void,
+            );
+        }
+
+        let mut segment_ctx = SegmentContext {
+            on_segment,
+            offset_ms,
+            next_idx,
+        };
+        // SAFETY: `segment_ctx` lives on this frame for the whole call; the
+        // trampoline only reads the finalized segment.
+        unsafe {
+            params.set_new_segment_callback(Some(segment_trampoline));
+            params.set_new_segment_callback_user_data(
+                &mut segment_ctx as *mut SegmentContext<'_> as *mut c_void,
+            );
+        }
+
+        // SAFETY: `cancel` outlives the call (a borrow of the caller's token);
+        // the trampoline reads one atomic.
+        unsafe {
+            params.set_abort_callback(Some(abort_trampoline));
+            params.set_abort_callback_user_data(cancel as *const CancelToken as *mut c_void);
+        }
+
+        let full = self.state.full(params, samples);
+        if cancel.is_cancelled() {
+            return Err(AsrError::Cancelled);
+        }
+        full.map_err(|e| AsrError::Inference(e.to_string()))?;
+
+        let n_segments = self.state.full_n_segments();
+        if n_segments < 0 {
+            return Err(AsrError::Inference(format!(
+                "whisper returned a negative segment count ({n_segments})"
+            )));
+        }
+        let mut segments = Vec::with_capacity(n_segments as usize);
+        let mut words = Vec::new();
+        let mut tokens = Vec::new();
+        for (i, seg) in self.state.as_iter().enumerate() {
+            let text = match seg.to_str() {
+                Ok(text) => text.trim().to_string(),
+                Err(_) => seg
+                    .to_str_lossy()
+                    .map_err(|e| AsrError::SegmentText(e.to_string()))?
+                    .trim()
+                    .to_string(),
+            };
+            let start_ms = offset_ms + seg.start_timestamp() * 10;
+            let end_ms = offset_ms + seg.end_timestamp() * 10;
+            let idx = next_idx + i as u32;
+            let mut spans = segment_text_tokens(ctx, &seg);
+            for token in &mut spans {
+                if token.start_ms >= 0 {
+                    token.start_ms += offset_ms;
+                }
+                if token.end_ms >= 0 {
+                    token.end_ms += offset_ms;
+                }
+            }
+            let word_spans: Vec<TokenSpan> = spans
+                .iter()
+                .map(|token| {
+                    TokenSpan::new(
+                        token.bytes.clone(),
+                        token.start_ms,
+                        token.end_ms,
+                        token.probability,
+                    )
+                })
+                .collect();
+            words.extend(words::words_for_segment(
+                idx,
+                &text,
+                start_ms,
+                end_ms,
+                &word_spans,
+            ));
+            tokens.extend(spans);
+            segments.push(Segment {
+                idx,
+                start_ms,
+                end_ms,
+                text,
+            });
+        }
+        Ok(WindowOutcome {
+            segments,
+            words,
+            tokens,
+        })
+    }
+}
+
+/// `n_max_text_ctx` for a macro window: one full prompt (224 tokens, which is
+/// also `whisper_n_text_ctx / 2` on the shipped models), so the rolling text
+/// context can never grow with the file.
+pub const MACRO_N_MAX_TEXT_CTX: i32 = 224;
 
 #[cfg(test)]
 mod tests {
