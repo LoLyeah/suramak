@@ -2136,7 +2136,7 @@ impl AppState {
             provisional_skipped: 0,
             provisional_arrivals,
             stopping: false,
-            cap_ms: suramak_core::session::SESSION_CAP_ANDROID_MS,
+            cap_ms: suramak_core::session::session_cap_ms(),
             part_index: 1,
             part_note: None,
         });
@@ -2768,6 +2768,15 @@ impl AppState {
                     unavailable = Some(QueueFailure {
                         input: outcome.path.clone(),
                         message: reason.clone(),
+                    });
+                }
+                suramak_asr::ResumeOutcome::Quarantined { attempts } => {
+                    unavailable = Some(QueueFailure {
+                        input: outcome.path.clone(),
+                        message: format!(
+                            "killed_by_os: {name} was killed by the OS {attempts} times — \
+                             quarantined, not resumed"
+                        ),
                     });
                 }
                 suramak_asr::ResumeOutcome::Skipped { reason } => {

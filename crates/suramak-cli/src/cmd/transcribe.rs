@@ -350,6 +350,10 @@ pub fn run(args: TranscribeArgs) -> Result<()> {
                     file_label(&resume.path)
                 )
             }
+            ResumeOutcome::Quarantined { attempts } => eprintln!(
+                "killed_by_os: {} — the OS killed it {attempts} times; quarantined, not resumed",
+                file_label(&resume.path)
+            ),
             ResumeOutcome::Skipped { reason } => {
                 eprintln!("left pending: {} — {reason}", file_label(&resume.path))
             }

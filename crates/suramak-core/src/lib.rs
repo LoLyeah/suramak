@@ -10,6 +10,8 @@ pub mod download;
 pub mod error;
 pub mod export;
 pub mod keychain;
+// M26A: device-derived duration caps and the model-fit gate.
+pub mod limits;
 pub mod models;
 // M24B: citation-verified notes (Minutes / Action items / EN↔ID brief).
 pub mod notes;

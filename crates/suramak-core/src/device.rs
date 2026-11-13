@@ -22,6 +22,7 @@
 //! not here: the recommendation is derived from [`crate::models::MODELS`], so
 //! a pin and its phone guidance cannot drift apart.
 
+use crate::limits::{self, MemoryProbe, Platform};
 use crate::models::{ModelInfo, MODELS};
 
 const MIB: u64 = 1024 * 1024;
@@ -167,9 +168,29 @@ pub fn refusal_for(profile: DeviceProfile, _language: &str, model_id: &str) -> O
         );
     }
     if model.phone.min_ram_bytes <= profile.total_ram_bytes {
-        return None;
+        // M26A: the tier says the model is offered here; the device's own
+        // budget says whether it can actually load. The number is computed by
+        // the same formula the queue and the recorder use.
+        return budget_refusal(profile, model_id);
     }
     Some(refusal_reason(model, profile, tier))
+}
+
+/// M26A — the model-fit gate for a phone.
+///
+/// `None` when the model fits (or is outside the measured model table, which
+/// this build never gates by a number it did not measure). When it does not
+/// fit, the sentence is [`limits::model_fit_refusal`]: the model's need, the
+/// device's budget, and the largest models that do fit. There is no silent
+/// downgrade in this path — the model is refused and the user chooses.
+pub fn budget_refusal(profile: DeviceProfile, model_id: &str) -> Option<String> {
+    let footprint = limits::footprint_for(model_id)?;
+    // The gate is about whether the model can **ever** load on this device, so
+    // it uses the device's installed memory, not this instant's free pages
+    // (availMem moves by the second and would make the picker flicker).
+    let probe = MemoryProbe::new(profile.total_ram_bytes, None, profile.low_memory);
+    let limits = limits::compute_for(Platform::Android, probe, footprint, None);
+    limits::model_fit_refusal(footprint, &limits)
 }
 
 /// The refusal sentence for one model on one device.
@@ -213,7 +234,14 @@ pub fn recommend(profile: DeviceProfile, language: &str) -> Recommendation {
                     .to_string(),
             });
         } else if model.phone.min_ram_bytes <= profile.total_ram_bytes {
-            allowed.push(model.id);
+            // M26A: the tier offers it; the device budget must also fit it.
+            match budget_refusal(profile, model.id) {
+                None => allowed.push(model.id),
+                Some(reason) => refused.push(ModelRefusal {
+                    id: model.id,
+                    reason,
+                }),
+            }
         } else {
             refused.push(ModelRefusal {
                 id: model.id,
@@ -236,6 +264,16 @@ pub fn recommend(profile: DeviceProfile, language: &str) -> Recommendation {
         .map(|model| model.id);
     if default_model_id.is_none() && allowed.len() == 1 {
         default_model_id = allowed.first().copied();
+    }
+    // A tier default the budget refuses (a memory-starved device) is replaced
+    // by the largest model that does fit — a preselection, never the user's
+    // explicit choice.
+    if default_model_id.is_none() {
+        default_model_id = MODELS
+            .iter()
+            .filter(|model| allowed.contains(&model.id))
+            .max_by_key(|model| model.phone.min_ram_bytes)
+            .map(|model| model.id);
     }
 
     let headline = match tier {

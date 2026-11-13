@@ -642,6 +642,15 @@ impl Inner {
         let disk = self.model_disk_scan();
         self.migrate_model(profile, &disk);
         self.profile = Some(profile);
+        // M26A: the session cap and the streaming rotator are device-derived;
+        // this is the one Android report they read.
+        suramak_core::session::set_device_probe(
+            suramak_core::limits::MemoryProbe::from_android_report(
+                profile.total_ram_bytes,
+                profile.available_ram_bytes,
+                profile.low_memory,
+            ),
+        );
         self.app.seed_device_states(profile, &disk);
         self.app
             .set_free_space(value.get("free_bytes").and_then(Value::as_u64));

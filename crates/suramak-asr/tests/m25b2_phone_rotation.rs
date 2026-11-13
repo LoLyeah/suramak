@@ -196,11 +196,17 @@ fn a_47_minute_take_rotates_once_at_the_first_silence_after_45_minutes() {
 }
 
 #[test]
-fn the_phone_policy_is_the_45_minute_android_cap() {
+fn the_phone_policy_is_the_computed_session_cap() {
     use suramak_asr::capture_stream::RotationPolicy;
-    assert_eq!(RotationPolicy::PHONE.cap_ms, 45 * 60 * 1000);
-    assert_eq!(RotationPolicy::PHONE.grace_ms, 120_000);
-    assert_eq!(RotationPolicy::PHONE.silence_ms, 600);
+    let policy = RotationPolicy::phone();
+    assert_eq!(policy.cap_ms, suramak_core::session::session_cap_ms());
+    assert_eq!(policy.grace_ms, 120_000);
+    assert_eq!(policy.silence_ms, 600);
+    assert!(
+        (1..=480).contains(&(policy.cap_ms / 60_000)),
+        "a computed cap is 1..=480 minutes, got {}",
+        policy.cap_ms
+    );
 }
 
 #[test]

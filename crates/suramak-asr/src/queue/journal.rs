@@ -304,6 +304,7 @@ mod tests {
             last_committed_ms: 0,
             resumed: false,
             failure: None,
+            attempt_n: 0,
         }
     }
 

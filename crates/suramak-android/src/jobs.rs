@@ -1816,6 +1816,12 @@ fn adopt_resumed_jobs(
                     sender,
                 });
             }
+            ResumeOutcome::Quarantined { attempts } => {
+                state.message = format!(
+                    "killed_by_os: {} was killed by the OS {attempts} times — quarantined, not resumed",
+                    outcome.path.display()
+                );
+            }
             ResumeOutcome::Skipped { reason } => {
                 state.message = format!("left pending: {} — {reason}", outcome.path.display());
             }

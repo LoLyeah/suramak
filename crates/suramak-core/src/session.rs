@@ -1,15 +1,18 @@
-//! M25B — long sessions, honestly capped and split at pauses.
+//! M25B — long sessions, split at pauses. M26A — the cap is the device's.
 //!
-//! The M25A gate measured the in-memory single-pass path at **859 MB at 60
-//! minutes** and **722 MB interpolated at 45 minutes**. Chunked decoding of one
-//! file was measured and rejected on quality, so a long session is handled the
-//! only honest way: **cap the part, and split at a real pause**.
+//! The M25B gate measured the in-memory single-pass path and capped it at 45
+//! minutes on Android / 60 on desktop. Those constants were artifacts of the
+//! 3.7 GiB box the measurements came from. M26A replaces them with
+//! [`crate::limits::compute_device_limits`]: the cap is derived from this
+//! device's memory, the configured model's measured footprint and the free temp
+//! disk, and the model-fit gate refuses a model that cannot fit **before** a
+//! job starts.
 //!
 //! This module is the one place that owns:
 //!
-//! * the platform cap ([`SESSION_CAP_MS`]) and its named refusal
-//!   ([`SessionCapRefusal`], reason `session_too_long`) carrying the measured
-//!   budget;
+//! * the **computed** platform cap ([`session_cap_ms`], resolved once from
+//!   [`session_limits`]) and its named refusal ([`SessionCapRefusal`], reason
+//!   `session_too_long`) carrying the budget and the model's cost;
 //! * the silence rule ([`SPLIT_SILENCE_MS`] = 600 ms, grace
 //!   [`SPLIT_GRACE_MS`] = 120 s, then the nearest low-energy point with an
 //!   honest `no pause found` reason);
@@ -22,30 +25,16 @@
 //! uninterrupted capture (the PCM16 conversion is per-sample and deterministic).
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::decode;
+use crate::limits::{self, Limits, MemoryProbe, ModelFootprint, Platform};
 use crate::resample;
 use crate::transcript::Segment;
 use crate::SuramakError;
-
-/// Session cap on a 4 GB Android phone: 45 minutes (722 MB measured budget).
-pub const SESSION_CAP_ANDROID_MS: i64 = 45 * 60 * 1000;
-/// Session cap on desktop: 60 minutes (859 MB measured budget).
-pub const SESSION_CAP_DESKTOP_MS: i64 = 60 * 60 * 1000;
-/// The measured tiny-model peak at the Android cap (M25A, interpolated).
-pub const SESSION_PEAK_ANDROID_MB: u64 = 722;
-/// The measured tiny-model peak at the desktop cap (M25A).
-pub const SESSION_PEAK_DESKTOP_MB: u64 = 859;
-
-/// The cap this build enforces. Android is the phone target; every other host
-/// (desktop, CLI, tests) uses the 60-minute budget.
-#[cfg(target_os = "android")]
-pub const SESSION_CAP_MS: i64 = SESSION_CAP_ANDROID_MS;
-#[cfg(not(target_os = "android"))]
-pub const SESSION_CAP_MS: i64 = SESSION_CAP_DESKTOP_MS;
 
 /// A real pause of at least this long is a safe cut (M25B's rule).
 pub const SPLIT_SILENCE_MS: i64 = 600;
@@ -56,49 +45,108 @@ pub const ANALYSIS_FRAME_MS: i64 = 10;
 /// A frame is silent when its RMS is at or below this (≈ −40 dBFS).
 pub const SILENCE_RMS: f32 = 0.01;
 
-/// The platform a cap is being resolved for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionPlatform {
-    Android,
-    Desktop,
+/// The Android host's memory report, stored before the first cap is resolved.
+///
+/// Android's `isLowRamDevice` and its `availMem` are only visible from Java, so
+/// the host passes `DeviceMemory.Report` here (the M13d plumbing already does).
+/// The first report wins: the cap is resolved once per process, so the rotator
+/// and the final part write can never disagree about it.
+static DEVICE_PROBE: OnceLock<MemoryProbe> = OnceLock::new();
+/// The cap this process resolves, once, with the model it was computed for.
+static SESSION: OnceLock<(Limits, &'static ModelFootprint)> = OnceLock::new();
+
+/// Records the Android device report for the session cap.
+///
+/// Called from the host's `device`/`memory` op before any recording or import.
+/// A report that arrives after the cap is resolved is ignored (and logged at
+/// debug): a mid-recording cap change would make the rotator and the file
+/// split disagree.
+pub fn set_device_probe(probe: MemoryProbe) {
+    if SESSION.get().is_some() {
+        tracing::debug!(
+            total_bytes = probe.total_bytes,
+            "the session cap is already resolved; the late device report is ignored"
+        );
+        return;
+    }
+    let _ = DEVICE_PROBE.set(probe);
 }
 
-impl SessionPlatform {
-    /// The host this build is running on.
-    pub const fn host() -> Self {
-        if cfg!(target_os = "android") {
-            SessionPlatform::Android
-        } else {
-            SessionPlatform::Desktop
+/// The model the app is configured to run — the cap's model half.
+///
+/// A settings file that names a model outside the measured table is budgeted
+/// with `tiny`'s row (the audio slope), exactly like an unknown model path; the
+/// app only runs manifest models, so this is a safe last resort rather than a
+/// claim about an unmeasured file.
+pub fn session_model() -> &'static ModelFootprint {
+    let configured = crate::paths::settings_path()
+        .ok()
+        .and_then(|path| crate::settings::Settings::load(&path).ok())
+        .map(|settings| settings.asr.model_id);
+    configured
+        .as_deref()
+        .and_then(limits::footprint_for)
+        .or_else(|| limits::footprint_for("tiny"))
+        .expect("the model table always carries tiny")
+}
+
+/// The computed limits for this device and the configured model.
+///
+/// Resolved once per process. Precedence: a probe the Android host supplied
+/// ([`set_device_probe`]), else this platform's provider, else the documented
+/// 60-minute fallback (logged by [`limits::limits_from_probe`]).
+///
+/// When the configured model does not fit this device at all, the *job* is
+/// refused by the model-fit gate; the recording/import cap still has to be a
+/// usable number, so it is computed with the **largest model that does fit**
+/// (the conservative part size) and the substitution is logged, never silent.
+pub fn session_limits() -> Limits {
+    session_resolved().0
+}
+
+/// The model the cap was computed for.
+///
+/// Usually [`session_model`]; when the configured model cannot fit at all this
+/// is the largest model that does (see [`session_limits`]), so the refusal's
+/// arithmetic names the model it actually used.
+pub fn session_cap_model() -> &'static ModelFootprint {
+    session_resolved().1
+}
+
+fn session_resolved() -> (Limits, &'static ModelFootprint) {
+    *SESSION.get_or_init(|| {
+        let model = session_model();
+        let disk = limits::host_free_disk_bytes();
+        let compute = |model: &'static ModelFootprint| match DEVICE_PROBE.get() {
+            Some(probe) => limits::compute_for(Platform::host(), *probe, model, disk),
+            None => limits::limits_for_model(model, disk),
+        };
+        let primary = compute(model);
+        if primary.model_fits {
+            return (primary, model);
         }
-    }
+        let Some(cap_model) = limits::largest_fitting(primary.budget_mb) else {
+            return (primary, model);
+        };
+        tracing::warn!(
+            model = model.id,
+            cap_model = cap_model.id,
+            budget_mb = primary.budget_mb,
+            "the configured model does not fit this device; the recording cap uses the largest \
+             model that does (the job itself is refused by the model-fit gate)"
+        );
+        (compute(cap_model), cap_model)
+    })
 }
 
-/// The cap for `platform`, in milliseconds.
-pub const fn session_cap_ms_for(platform: SessionPlatform) -> i64 {
-    match platform {
-        SessionPlatform::Android => SESSION_CAP_ANDROID_MS,
-        SessionPlatform::Desktop => SESSION_CAP_DESKTOP_MS,
-    }
+/// The cap this build enforces, in milliseconds — `Limits.max_minutes` × 60 s.
+pub fn session_cap_ms() -> i64 {
+    session_limits().max_ms()
 }
 
-/// The measured peak budget for `platform`, in MB (the number the refusal
-/// carries; measured in `docs/reports/M25a-long-recording-gate.md`).
-pub const fn session_peak_mb_for(platform: SessionPlatform) -> u64 {
-    match platform {
-        SessionPlatform::Android => SESSION_PEAK_ANDROID_MB,
-        SessionPlatform::Desktop => SESSION_PEAK_DESKTOP_MB,
-    }
-}
-
-/// The cap this host enforces.
-pub const fn session_cap_ms() -> i64 {
-    SESSION_CAP_MS
-}
-
-/// The measured peak this host's cap corresponds to.
-pub const fn session_peak_mb() -> u64 {
-    session_peak_mb_for(SessionPlatform::host())
+/// The byte budget the cap came from (the refusal's `4,284 MB`).
+pub fn session_budget_mb() -> u32 {
+    session_limits().budget_mb
 }
 
 /// `45:00` / `60:00` — the cap's own clock. Minutes never fold into hours
@@ -108,35 +156,36 @@ pub fn clock(ms: i64) -> String {
     format!("{}:{:02}", total / 60, total % 60)
 }
 
-/// A refused session: `session_too_long` plus the measured budget.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A refused session: `session_too_long` plus the computed budget and the
+/// model's own cost.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SessionCapRefusal {
     pub audio_ms: i64,
-    pub cap_ms: i64,
-    pub peak_mb: u64,
-    pub platform: SessionPlatform,
+    pub limits: Limits,
+    pub model: &'static ModelFootprint,
 }
 
 impl SessionCapRefusal {
     /// The stable machine-readable code the queue and the UI key on.
     pub const CODE: &'static str = "session_too_long";
 
-    /// The named reason the job card shows. It carries the duration, the cap
-    /// and the measured budget — never a generic error.
+    /// The computed cap in milliseconds.
+    pub fn cap_ms(&self) -> i64 {
+        self.limits.max_ms()
+    }
+
+    /// The named reason the job card shows. It carries the duration, the cap,
+    /// the rule that set it, and the device's own budget — never a generic
+    /// error and never a number from another machine.
     pub fn reason(&self) -> String {
-        let where_ = match self.platform {
-            SessionPlatform::Android => "on a 4 GB phone",
-            SessionPlatform::Desktop => "on this machine",
-        };
         format!(
-            "{CODE}: this session is {}, over the {} cap; {} minutes measures {peak} MB peak \
-             {where_} — split it into shorter parts",
+            "{CODE}: this session is {}, over the {} cap ({why}); {budget} — \
+             split it into shorter parts",
             clock(self.audio_ms),
-            clock(self.cap_ms),
-            self.cap_ms / 60_000,
+            clock(self.cap_ms()),
+            why = self.limits.reason.as_str(),
+            budget = self.limits.budget_line(self.model),
             CODE = Self::CODE,
-            peak = self.peak_mb,
-            where_ = where_,
         )
     }
 }
@@ -147,26 +196,35 @@ impl std::fmt::Display for SessionCapRefusal {
     }
 }
 
-/// `Some` when `audio_ms` is over the platform cap. Exactly at the cap is
-/// accepted (a 45:00.000 file is a legal 45-minute session); one millisecond
+/// `Some` when `audio_ms` is over the computed cap. Exactly at the cap is
+/// accepted (a 45:00.000 file is a legal session at that cap); one millisecond
 /// over is refused.
-pub fn cap_refusal_for(audio_ms: i64, platform: SessionPlatform) -> Option<SessionCapRefusal> {
-    let cap_ms = session_cap_ms_for(platform);
-    if audio_ms > cap_ms {
+///
+/// `None` when the model does not fit at all: that refusal belongs to the
+/// model-fit gate ([`limits::model_fit_refusal`]), which names the model and
+/// the fix instead of pretending the session is too long.
+pub fn cap_refusal_for(
+    audio_ms: i64,
+    limits: Limits,
+    model: &'static ModelFootprint,
+) -> Option<SessionCapRefusal> {
+    if !limits.model_fits {
+        return None;
+    }
+    if audio_ms > limits.max_ms() {
         Some(SessionCapRefusal {
             audio_ms,
-            cap_ms,
-            peak_mb: session_peak_mb_for(platform),
-            platform,
+            limits,
+            model,
         })
     } else {
         None
     }
 }
 
-/// [`cap_refusal_for`] against this host's cap.
+/// [`cap_refusal_for`] against this process's computed cap.
 pub fn cap_refusal(audio_ms: i64) -> Option<SessionCapRefusal> {
-    cap_refusal_for(audio_ms, SessionPlatform::host())
+    cap_refusal_for(audio_ms, session_limits(), session_cap_model())
 }
 
 /// Why a cut exists — the row's honest explanation.
@@ -917,63 +975,147 @@ mod tests {
         out
     }
 
+    /// A phone's limits with the design's total-only budget (`availMem`
+    /// unwired), which is how the design's worked table is computed.
+    fn phone_limits(model: &'static ModelFootprint, total: u64, low_ram: bool) -> Limits {
+        limits::compute_device_limits(
+            Platform::Android,
+            total,
+            None,
+            low_ram,
+            model.baseline_mb,
+            model.slope_mb_per_min,
+            Some(64 * 1024 * 1024 * 1024),
+        )
+    }
+
     #[test]
-    fn the_cap_is_45_minutes_on_android_and_60_on_desktop() {
-        assert_eq!(session_cap_ms_for(SessionPlatform::Android), 2_700_000);
-        assert_eq!(session_cap_ms_for(SessionPlatform::Desktop), 3_600_000);
-        assert_eq!(session_cap_ms_for(SessionPlatform::Android), 45 * 60 * 1000);
-        assert_eq!(session_cap_ms_for(SessionPlatform::Desktop), 60 * 60 * 1000);
-        assert_eq!(session_peak_mb_for(SessionPlatform::Android), 722);
-        assert_eq!(session_peak_mb_for(SessionPlatform::Desktop), 859);
-        // The host build reads the one constant the app uses.
-        assert_eq!(session_cap_ms(), SESSION_CAP_MS);
+    fn the_cap_is_computed_per_device_not_a_static_constant() {
+        let tiny = limits::footprint_for("tiny").expect("the table model");
+        let four = phone_limits(tiny, 4_000_000_000, false);
+        let twelve = phone_limits(tiny, 12_000_000_000, false);
+        assert_eq!(four.max_minutes, 77);
+        assert_eq!(twelve.max_minutes, 431);
+        assert_ne!(
+            four.max_minutes, twelve.max_minutes,
+            "two devices, two caps — the point of the slice"
+        );
+
+        // The shipping function is the host's own computation, in minutes.
+        println!(
+            "M26A_SESSION model={} cap_model={} cap_ms={} limits={:?}",
+            session_model().id,
+            session_cap_model().id,
+            session_cap_ms(),
+            session_limits()
+        );
+        assert_eq!(session_cap_ms(), session_limits().max_ms());
         assert_eq!(
-            SessionPlatform::host(),
-            if cfg!(target_os = "android") {
-                SessionPlatform::Android
-            } else {
-                SessionPlatform::Desktop
-            }
+            session_cap_ms(),
+            i64::from(session_limits().max_minutes) * 60_000
+        );
+        assert_eq!(session_budget_mb(), session_limits().budget_mb);
+        assert!(session_limits().max_minutes <= limits::MAX_MINUTES_CEILING);
+        assert!(
+            session_limits().max_minutes >= 1,
+            "a recording cap is never zero, even when the configured model must be \
+             refused: {:?}",
+            session_limits()
+        );
+        // The configured model resolves through the one model table.
+        assert!(limits::MODEL_FOOTPRINTS
+            .iter()
+            .any(|model| model.id == session_model().id));
+    }
+
+    #[test]
+    fn exactly_at_the_computed_cap_is_accepted_and_one_millisecond_over_is_refused() {
+        let tiny = limits::footprint_for("tiny").expect("the table model");
+        let limits = phone_limits(tiny, 4_000_000_000, false);
+        let cap = limits.max_ms();
+        assert_eq!(cap, 77 * 60_000);
+        assert!(cap_refusal_for(cap, limits, tiny).is_none());
+        let refused = cap_refusal_for(cap + 1, limits, tiny).expect("1 ms over is refused");
+        assert_eq!(refused.audio_ms, cap + 1);
+        assert_eq!(refused.cap_ms(), cap);
+        let reason = refused.reason();
+        assert!(reason.starts_with("session_too_long:"), "{reason}");
+        assert!(reason.contains("split it into shorter parts"), "{reason}");
+        // The cap, its rule and the device's budget, not another machine's.
+        assert!(reason.contains("77:00"), "{reason}");
+        assert!(reason.contains("(memory)"), "{reason}");
+        assert!(
+            reason.contains("this device budgets 1,020 MB; tiny needs 310 MB + 9.2 MB per minute"),
+            "{reason}"
         );
     }
 
     #[test]
-    fn exactly_at_the_cap_is_accepted_and_one_millisecond_over_is_refused() {
-        for (platform, cap) in [
-            (SessionPlatform::Android, SESSION_CAP_ANDROID_MS),
-            (SessionPlatform::Desktop, SESSION_CAP_DESKTOP_MS),
-        ] {
-            assert!(cap_refusal_for(cap, platform).is_none());
-            let refused = cap_refusal_for(cap + 1, platform).expect("1 ms over is refused");
-            assert_eq!(refused.audio_ms, cap + 1);
-            assert_eq!(refused.cap_ms, cap);
-            assert!(refused.reason().starts_with("session_too_long:"));
-            assert!(refused.reason().contains("split it into shorter parts"));
-            assert!(refused
-                .reason()
-                .contains(if platform == SessionPlatform::Android {
-                    "722 MB"
-                } else {
-                    "859 MB"
-                }));
-        }
+    fn the_refusal_carries_the_computed_budget_and_the_model_cost() {
+        let tiny = limits::footprint_for("tiny").expect("the table model");
+        let limits = phone_limits(tiny, 12_000_000_000, false);
+        assert_eq!(limits.budget_mb, 4_284);
+        let refused = cap_refusal_for(limits.max_ms() + 62_000, limits, tiny).expect("over");
+        let reason = refused.reason();
+        assert!(reason.contains("431:00"), "{reason}");
+        assert!(reason.contains("432:02"), "{reason}");
+        assert!(
+            reason.contains("this device budgets 4,284 MB; tiny needs 310 MB + 9.2 MB per minute"),
+            "{reason}"
+        );
+        assert!(!reason.contains("4 GB phone"), "{reason}");
     }
 
     #[test]
-    fn the_refusal_carries_the_measured_budget_not_a_generic_error() {
-        let refused = cap_refusal_for(SESSION_CAP_ANDROID_MS + 62_000, SessionPlatform::Android)
-            .expect("over");
-        let reason = refused.reason();
-        assert!(reason.contains("45:00"), "{reason}");
-        assert!(reason.contains("722 MB"), "{reason}");
-        assert!(reason.contains("4 GB phone"), "{reason}");
-        assert!(reason.contains("46:02"), "{reason}");
+    fn the_session_refusal_steps_aside_when_the_model_does_not_fit() {
+        let turbo = limits::footprint_for("turbo-q5-0").expect("the table model");
+        let limits = phone_limits(turbo, 4_000_000_000, false);
+        assert!(!limits.model_fits);
+        assert!(
+            cap_refusal_for(1_000, limits, turbo).is_none(),
+            "the model-fit gate owns a model that cannot load"
+        );
+    }
+
+    /// The rotator reads the **computed** cap: a recording that reaches it
+    /// rotates there (the live tracker at the cap + grace, the file plan at the
+    /// cap). A 10 Hz fixture keeps the test cheap while the cap stays the real
+    /// 4 GB phone's 77 minutes on tiny.
+    #[test]
+    fn a_recording_at_the_computed_cap_rotates_there() {
+        let tiny = limits::footprint_for("tiny").expect("the table model");
+        let limits = phone_limits(tiny, 4_000_000_000, false);
+        let cap_ms = limits.max_ms();
+        let rate = 10u32;
+        let cap_samples = max_samples(rate, cap_ms);
+        let samples = vec![0.05f32; cap_samples + max_samples(rate, 180_000)];
+        let plan = plan_split(&samples, rate, cap_ms);
+        assert!(plan.parts.len() >= 2, "{}", plan.summary());
+        assert!(plan.all_within_cap());
+        assert_eq!(plan.cuts[0].reason, SplitReason::NoPause);
+        let cut = plan.parts[0].samples();
+        assert!(
+            cut <= cap_samples && cut + max_samples(rate, 2_000) > cap_samples,
+            "the no-pause cut lands at or before the computed cap ({cut} vs {cap_samples})"
+        );
+
+        // The live rotator: constant speech, so it rotates at cap + grace.
+        let mut tracker = LiveSplitTracker::new(rate, cap_ms);
+        let mut rotated = None;
+        for chunk in samples.chunks(rate as usize) {
+            if let Some(at) = tracker.push(chunk) {
+                rotated = Some(at);
+                break;
+            }
+        }
+        let at = rotated.expect("the tracker rotates at the computed cap");
+        assert_eq!(at, cap_samples + max_samples(rate, SPLIT_GRACE_MS));
     }
 
     #[test]
     fn a_short_session_is_one_part() {
         let samples = speech(1_000, 16_000);
-        let plan = plan_split(&samples, 16_000, SESSION_CAP_DESKTOP_MS);
+        let plan = plan_split(&samples, 16_000, session_cap_ms());
         assert!(plan.is_single());
         assert_eq!(plan.parts.len(), 1);
         assert_eq!(plan.parts[0].start, 0);

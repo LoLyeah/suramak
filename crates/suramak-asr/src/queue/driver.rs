@@ -20,9 +20,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
 use suramak_core::decode;
+use suramak_core::limits::{self, Limits, ModelFootprint};
 use suramak_core::resample;
 use suramak_core::settings::{EngineSetting, LangMode};
-use suramak_core::store::{JobRecord, JobStatus, Store};
+use suramak_core::store::{JobRecord, JobStatus, Store, KILLED_BY_OS_PREFIX};
 use suramak_core::transcript::{Source, Transcript, WordTiming};
 use suramak_core::{SuramakError, Uuid};
 
@@ -252,10 +253,13 @@ pub enum ResumeOutcome {
     Fresh,
     /// Left failed in the journal: the source or the model is gone.
     Unavailable { reason: String },
-    /// Left untouched in the journal: this launch cannot continue it (for
-    /// example it ran with another model). A later launch with the right model
-    /// can still resume it.
+    /// Skipped (no outcome): this launch cannot continue it (for example it
+    /// ran with another model). A later launch with the right model can still
+    /// resume it.
     Skipped { reason: String },
+    /// M26A: quarantined as `killed_by_os` — the OS killed it after two
+    /// counted attempts, and it is not resumable again.
+    Quarantined { attempts: u32 },
 }
 
 /// One journal row `resume_pending` looked at.
@@ -323,6 +327,17 @@ pub struct QueueDriver<B: InferenceBackend, P: Prefetcher> {
     meta: HashMap<u64, ItemMeta>,
     /// The checkpoint cadence (constant in production; tests may tighten it).
     policy: CheckpointPolicy,
+    /// M26A: the limits this driver computes the session cap and the model-fit
+    /// gate from. `None` resolves them per job from the host probe and the
+    /// job's model path (the production default); a host that already has a
+    /// device report (Android) or a test with a synthetic device sets them.
+    limits: Option<Limits>,
+}
+
+/// The smallest measured row — the budget used for a model path the table does
+/// not know (the audio slope is what the cap actually depends on).
+fn tiny_model() -> &'static ModelFootprint {
+    limits::footprint_for("tiny").expect("the model table always carries tiny")
 }
 
 impl<B: InferenceBackend, P: Prefetcher> QueueDriver<B, P> {
@@ -342,6 +357,7 @@ impl<B: InferenceBackend, P: Prefetcher> QueueDriver<B, P> {
             runs: HashMap::new(),
             meta: HashMap::new(),
             policy: CheckpointPolicy::default(),
+            limits: None,
         }
     }
 
@@ -351,6 +367,32 @@ impl<B: InferenceBackend, P: Prefetcher> QueueDriver<B, P> {
     pub fn with_journal(mut self, store: Store) -> Self {
         self.journal = Some(store);
         self
+    }
+
+    /// M26A: pins the limits this driver enforces (the Android host's
+    /// `DeviceMemory.Report` path, and the tests' synthetic devices).
+    pub fn with_limits(mut self, limits: Limits) -> Self {
+        self.limits = Some(limits);
+        self
+    }
+
+    /// The model footprint of this batch, when the model is one the table
+    /// measured. A custom/unmeasured file is not gated.
+    fn job_model(&self) -> Option<&'static ModelFootprint> {
+        limits::footprint_for_path(&self.options.model_path)
+    }
+
+    /// The limits for this batch: a pinned report, else the host probe with the
+    /// batch's model.
+    fn job_limits(&self) -> Limits {
+        self.limits.unwrap_or_else(|| {
+            limits::limits_for_model_path(&self.options.model_path, limits::host_free_disk_bytes())
+        })
+    }
+
+    /// The duration cap the queue enforces, from `Limits.max_minutes`.
+    fn session_cap_ms(&self) -> i64 {
+        self.job_limits().max_ms()
     }
 
     /// The journal, when this driver owns one (tests read it back through this).
@@ -452,6 +494,7 @@ impl<B: InferenceBackend, P: Prefetcher> QueueDriver<B, P> {
                     last_committed_ms: 0,
                     resumed: false,
                     failure: None,
+                    attempt_n: 0,
                 };
                 match store.insert_job(&record) {
                     Ok(()) => {
@@ -479,7 +522,13 @@ impl<B: InferenceBackend, P: Prefetcher> QueueDriver<B, P> {
     /// Returns one id per queued item. `Err` only when the file cannot be
     /// decoded to find its cuts; the caller shows that message verbatim.
     pub fn enqueue_import(&mut self, input: PathBuf, parts_dir: &Path) -> Result<Vec<u64>, String> {
-        self.enqueue_import_with_cap(input, parts_dir, suramak_core::session::session_cap_ms())
+        let limits = self.job_limits();
+        if !limits.model_fits {
+            // The model-fit gate refuses this job before any decode; splitting
+            // for a model that cannot load would only decode the file twice.
+            return Ok(vec![self.enqueue(input)]);
+        }
+        self.enqueue_import_with_cap(input, parts_dir, limits.max_ms())
     }
 
     /// [`Self::enqueue_import`] with an explicit cap (the test seam; production
@@ -614,6 +663,29 @@ impl<B: InferenceBackend, P: Prefetcher> QueueDriver<B, P> {
         let model = self.options.model_path.display().to_string();
         for record in jobs {
             let source = PathBuf::from(&record.path);
+            // M26A: two counted attempts and still no terminal status means the
+            // OS killed this job twice (`decoding`/`transcribing` is only
+            // written by a live process). Quarantine it instead of resuming
+            // forever: a crash loop is impossible from here on.
+            if record.attempt_n >= 2 {
+                if let Err(err) = store.quarantine_job_killed_by_os(record.id) {
+                    tracing::error!(job = %record.id, "cannot quarantine the killed job: {err}");
+                }
+                tracing::warn!(
+                    job = %record.id,
+                    path = %source.display(),
+                    attempts = record.attempt_n,
+                    "{KILLED_BY_OS_PREFIX} the OS killed this job twice; quarantined, not resumed"
+                );
+                outcomes.push(PendingResume {
+                    job_id: record.id,
+                    path: source,
+                    outcome: ResumeOutcome::Quarantined {
+                        attempts: record.attempt_n,
+                    },
+                });
+                continue;
+            }
             if record.model != model {
                 // Not this launch's job to fail: the row stays resumable for a
                 // run with the model it was accepted with.
@@ -942,18 +1014,61 @@ impl<B: InferenceBackend, P: Prefetcher> QueueDriver<B, P> {
         }
     }
 
+    /// M26A: refuses this item when its model cannot fit the device budget.
+    ///
+    /// Runs **before any decode** (audio or model). Returns `true` when the
+    /// item was failed, so the caller's loop moves on. The reason is the
+    /// [`limits::model_fit_refusal`] sentence — the model's need, the device's
+    /// budget, and the largest models that do fit. Nothing is downgraded.
+    fn refuse_model_fit(&mut self, id: u64, seq: usize, input: &Path) -> bool {
+        let Some(model) = self.job_model() else {
+            return false;
+        };
+        let limits = self.job_limits();
+        let Some(reason) = limits::model_fit_refusal(model, &limits) else {
+            return false;
+        };
+        tracing::warn!(
+            model = model.id,
+            budget_mb = limits.budget_mb,
+            "the model-fit gate refused the job before any decode"
+        );
+        if let (Some(store), Some(job_id)) =
+            (self.journal.as_ref(), self.durable_ids.get(&id).copied())
+        {
+            let _ = store.set_job_status(job_id, JobStatus::Failed, Some(&reason));
+        }
+        self.queue.on_failed(id, reason.clone());
+        self.tokens.remove(&id);
+        self.samples.remove(&id);
+        self.events.push(QueueEvent::Failed {
+            id,
+            seq,
+            input: input.to_path_buf(),
+            reason,
+        });
+        true
+    }
+
     /// Fills the inference slot when the queue allows it.
     fn start_inference(&mut self) -> bool {
         let Some(ticket) = self.queue.next_inference() else {
             return false;
         };
-        // M25B: the session cap is checked **before** a job starts. A file over
-        // the platform cap is refused by name (`session_too_long`) with the
-        // measured budget — never fed to the in-memory path where the phone's
-        // LMKD would kill the app. Imports over the cap are split by the host
-        // before they reach this queue; this is the safety net for every other
-        // submitter (and the honest refusal for a recording that somehow grew
-        // past its part).
+        // M26A: the model-fit gate runs **before** the slot is used and before
+        // any decode. A model whose baseline + 15 minutes exceeds this device's
+        // budget is refused by name with the exact numbers — never downgraded
+        // behind the user's back.
+        if self.refuse_model_fit(ticket.id, ticket.seq, &ticket.input) {
+            return true;
+        }
+        // M25B/M26A: the session cap is checked **before** a job starts. A file
+        // over the *computed* device cap is refused by name
+        // (`session_too_long`) with the budget and the model's cost — never fed
+        // to the in-memory path where the phone's LMKD would kill the app.
+        // Imports over the cap are split by the host before they reach this
+        // queue; this is the safety net for every other submitter (and the
+        // honest refusal for a recording that somehow grew past its part).
         if let Some(duration) = decode::probe_duration_ms(&ticket.input) {
             let duration = duration as i64;
             // A deliberate `Part N of M` may run up to the cap **plus the
@@ -965,16 +1080,16 @@ impl<B: InferenceBackend, P: Prefetcher> QueueDriver<B, P> {
                 .and_then(|name| name.to_str())
                 .and_then(suramak_core::session::PartInfo::from_name)
                 .is_some();
+            let cap_ms = self.session_cap_ms();
             let limit = if is_part {
-                suramak_core::session::session_cap_ms() + suramak_core::session::SPLIT_GRACE_MS
+                cap_ms + suramak_core::session::SPLIT_GRACE_MS
             } else {
-                suramak_core::session::session_cap_ms()
+                cap_ms
             };
-            if let Some(refusal) = suramak_core::session::cap_refusal_for(
-                duration,
-                suramak_core::session::SessionPlatform::host(),
-            )
-            .filter(|_| duration > limit)
+            let model = self.job_model().unwrap_or_else(tiny_model);
+            if let Some(refusal) =
+                suramak_core::session::cap_refusal_for(duration, self.job_limits(), model)
+                    .filter(|_| duration > limit)
             {
                 let reason = refusal.reason();
                 if let (Some(store), Some(job_id)) = (
@@ -1030,6 +1145,23 @@ impl<B: InferenceBackend, P: Prefetcher> QueueDriver<B, P> {
             samples,
             durable: durable.clone(),
         };
+        // M26A: the attempt is journaled **before** the inference slot is used.
+        // An OS kill leaves the row `decoding`/`transcribing` with this count;
+        // the next launch quarantines it at two. A refused or failed submit is
+        // closed as `failed` below, so only real starts are counted toward the
+        // quarantine.
+        if let (Some(store), Some(durable)) = (self.journal.as_ref(), durable.as_ref()) {
+            match store.record_job_attempt(durable.job_id) {
+                Ok(attempt) => tracing::info!(
+                    job_id = ticket.id,
+                    attempt,
+                    "journaled the attempt before the inference slot"
+                ),
+                Err(err) => {
+                    tracing::error!(job_id = ticket.id, "cannot journal the attempt: {err}")
+                }
+            }
+        }
         match self.backend.submit(job) {
             Ok(()) => {
                 if let Some(durable) = durable {
@@ -1170,6 +1302,11 @@ impl<B: InferenceBackend, P: Prefetcher> QueueDriver<B, P> {
         let Some(ticket) = self.queue.next_decode() else {
             return false;
         };
+        // M26A: the model-fit gate runs before the audio decode too — a job
+        // that can never load its model must not spend the decode on it.
+        if self.refuse_model_fit(ticket.id, ticket.seq, &ticket.input) {
+            return true;
+        }
         let token = self.tokens.entry(ticket.id).or_default().clone();
         self.prefetch.request(DecodeTask {
             id: ticket.id,
@@ -1507,6 +1644,7 @@ mod tests {
             last_committed_ms: 0,
             resumed: false,
             failure: None,
+            attempt_n: 0,
         }
     }
 
@@ -1912,19 +2050,44 @@ mod tests {
         dir
     }
 
-    /// M25B: a job 1 ms over the platform cap is refused by name before the
-    /// backend ever sees it; the reason carries the measured budget.
+    /// M26A: a 4 GB phone's computed limits for `model` — the device the
+    /// design's table newly protects (1,020 MB on tiny).
+    fn phone_limits(model: &str) -> Limits {
+        let footprint = suramak_core::limits::footprint_for(model).expect("the table model");
+        suramak_core::limits::compute_device_limits(
+            suramak_core::limits::Platform::Android,
+            4_000_000_000,
+            None,
+            false,
+            footprint.baseline_mb,
+            footprint.slope_mb_per_min,
+            Some(64 * 1024 * 1024 * 1024),
+        )
+    }
+
+    fn options_for(model: &str) -> JobOptions {
+        JobOptions {
+            model_path: PathBuf::from(format!("/tmp/{model}")),
+            ..options()
+        }
+    }
+
+    /// M26A: the queue rejects a session over the **computed** cap (77 minutes
+    /// on a 4 GB phone / tiny) and the refusal carries the device's budget and
+    /// the model's cost. 1 kHz keeps the fixture at one sample per millisecond.
     #[test]
-    fn a_session_one_millisecond_over_the_cap_is_refused_before_it_starts() {
-        let dir = scratch("cap");
+    fn an_over_limit_session_is_refused_with_the_computed_cap_and_reason() {
+        let dir = scratch("m26a-cap");
         let over = dir.join("over.wav");
-        // 8 kHz keeps the fixture small; the probe reads the header only.
-        wav_of_ms(&over, suramak_core::session::session_cap_ms() + 1, 8_000);
+        let cap_ms = phone_limits("tiny").max_ms();
+        assert_eq!(cap_ms, 77 * 60_000);
+        wav_of_ms(&over, cap_ms + 1, 1_000);
         let mut driver = QueueDriver::new(
             InstantBackend::new(&[]),
             ManualPrefetch::default(),
-            options(),
-        );
+            options_for("ggml-tiny.bin"),
+        )
+        .with_limits(phone_limits("tiny"));
         driver.enqueue(over);
         let events = drain_until_idle(&mut driver);
         let reason = events
@@ -1935,12 +2098,14 @@ mod tests {
             })
             .expect("the refusal event");
         assert!(reason.starts_with("session_too_long:"), "{reason}");
-        assert!(reason.contains("split it into shorter parts"), "{reason}");
-        assert_eq!(
-            driver.backend.submitted.len(),
-            0,
-            "the cap is checked before the inference slot opens"
+        assert!(reason.contains("77:00"), "{reason}");
+        assert!(reason.contains("(memory)"), "{reason}");
+        assert!(
+            reason.contains("this device budgets 1,020 MB; tiny needs 310 MB + 9.2 MB per minute"),
+            "{reason}"
         );
+        assert!(reason.contains("split it into shorter parts"), "{reason}");
+        assert_eq!(driver.backend.submitted.len(), 0, "no inference ran");
         assert!(
             driver.prefetch.tasks.is_empty(),
             "nothing was decoded ahead"
@@ -1948,23 +2113,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// M25B: a file exactly at the cap is not refused (the queue accepts it and
-    /// the pipeline runs).
+    /// M26A: exactly at the computed cap is accepted — the cap is a budget,
+    /// not an off-by-one.
     #[test]
-    fn a_session_exactly_at_the_cap_is_accepted() {
-        let dir = scratch("at-cap");
+    fn a_session_exactly_at_the_computed_cap_is_accepted() {
+        let dir = scratch("m26a-at-cap");
         let exact = dir.join("exact.wav");
-        wav_of_ms(&exact, suramak_core::session::session_cap_ms(), 8_000);
+        let cap_ms = phone_limits("tiny").max_ms();
+        wav_of_ms(&exact, cap_ms, 1_000);
         let mut driver = QueueDriver::new(
             InstantBackend::new(&[]),
-            InstantPrefetch::default(),
-            options(),
-        );
+            ManualPrefetch::default(),
+            options_for("ggml-tiny.bin"),
+        )
+        .with_limits(phone_limits("tiny"));
         driver.enqueue(exact);
         let events = drain_until_idle(&mut driver);
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, QueueEvent::Started { .. })));
         assert_eq!(driver.backend.submitted.len(), 1);
         assert!(!events
             .iter()
@@ -1972,22 +2136,162 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// M25B: a deliberate part may run past the cap into the rotation grace
-    /// (the recorder kept writing to the next pause) — it is not refused.
+    /// M26A: a model that cannot fit the device is refused **before any
+    /// decode** — the backend never sees it and the prefetch pool never reads
+    /// the file. The sentence carries the exact numbers and the fix.
+    #[test]
+    fn a_model_that_does_not_fit_is_refused_before_any_decode() {
+        let dir = scratch("m26a-fit");
+        let clip = dir.join("clip.wav");
+        wav_of_ms(&clip, 1_000, 16_000);
+        let mut driver = QueueDriver::new(
+            InstantBackend::new(&[]),
+            ManualPrefetch::default(),
+            options_for("ggml-turbo-q5-0.bin"),
+        )
+        .with_limits(phone_limits("turbo-q5-0"));
+        driver.enqueue(clip);
+        let events = drain_until_idle(&mut driver);
+        let reason = events
+            .iter()
+            .find_map(|event| match event {
+                QueueEvent::Failed { reason, .. } => Some(reason.clone()),
+                _ => None,
+            })
+            .expect("the model-fit refusal");
+        assert_eq!(
+            reason,
+            "model_too_large: turbo-q5-0 needs ~1,039 MB; this device budgets 1,020 MB — \
+             choose small or base"
+        );
+        assert!(
+            driver.backend.submitted.is_empty(),
+            "no inference ran for a model that cannot load"
+        );
+        assert!(
+            driver.prefetch.tasks.is_empty(),
+            "the audio was not even decoded"
+        );
+        assert!(driver.queue().item(1).unwrap().state.is_terminal());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M26A: the attempt count is journaled before the slot, and a row the OS
+    /// killed twice is quarantined on the next launch — never resumed forever.
+    #[test]
+    fn two_os_kills_quarantine_the_job_instead_of_resuming_forever() {
+        let dir = scratch("m26a-killed");
+        let source = dir.join("lecture.wav");
+        wav_of_ms(&source, 1_000, 16_000);
+        let model = dir.join("ggml-tiny.bin");
+        std::fs::write(&model, b"not a model").unwrap();
+        let db = dir.join("library.db");
+        let job_id = Uuid::new_v4();
+
+        // A process that died under the OS: the row is still `transcribing`
+        // and one attempt was already counted before its slot opened.
+        {
+            let store = Store::open(&db).unwrap();
+            let now = suramak_core::Utc::now();
+            store
+                .insert_job(&suramak_core::store::JobRecord {
+                    id: job_id,
+                    path: source.display().to_string(),
+                    model: model.display().to_string(),
+                    status: JobStatus::Transcribing,
+                    created_at: now,
+                    updated_at: now,
+                    transcript_id: None,
+                    last_committed_segment: 0,
+                    last_committed_ms: 0,
+                    resumed: false,
+                    failure: None,
+                    attempt_n: 1,
+                })
+                .unwrap();
+        }
+
+        // The next launch resumes it and counts attempt 2 before the slot.
+        let options = JobOptions {
+            model_path: model.clone(),
+            ..options()
+        };
+        {
+            let store = Store::open(&db).unwrap();
+            let mut driver = QueueDriver::new(
+                SilentBackend::default(),
+                ManualPrefetch::default(),
+                options.clone(),
+            )
+            .with_journal(store)
+            .with_limits(phone_limits("tiny"));
+            let outcomes = driver.resume_pending();
+            assert_eq!(outcomes.len(), 1);
+            assert!(matches!(
+                outcomes[0].outcome,
+                ResumeOutcome::Fresh | ResumeOutcome::Resumed { .. }
+            ));
+            assert!(driver.run_once());
+            let row = driver.journal().unwrap().job(job_id).unwrap().unwrap();
+            assert_eq!(row.attempt_n, 2, "the attempt is journaled before the slot");
+            assert_eq!(row.status, JobStatus::Decoding);
+            // The process is "killed" here: the driver is dropped with the job
+            // still running and no terminal status written.
+        }
+
+        // The launch after the second kill sees attempt_n == 2 and quarantines.
+        let store = Store::open(&db).unwrap();
+        let mut driver =
+            QueueDriver::new(SilentBackend::default(), ManualPrefetch::default(), options)
+                .with_journal(store)
+                .with_limits(phone_limits("tiny"));
+        let outcomes = driver.resume_pending();
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(
+                outcomes[0].outcome,
+                ResumeOutcome::Quarantined { attempts: 2 }
+            ),
+            "{:?}",
+            outcomes[0].outcome
+        );
+        assert!(
+            driver.queue().items().is_empty(),
+            "a quarantined job is not enqueued again"
+        );
+        let row = driver.journal().unwrap().job(job_id).unwrap().unwrap();
+        assert_eq!(row.status, JobStatus::Failed);
+        assert!(row.killed_by_os(), "{:?}", row.failure);
+        assert!(row.failure.unwrap().contains("after 2 attempts"));
+        assert!(driver
+            .journal()
+            .unwrap()
+            .resumable_jobs()
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M25B/M26A: a deliberate part may run past the computed cap into the
+    /// rotation grace (the recorder kept writing to the next pause) — it is not
+    /// refused. 1 kHz keeps the fixture at one sample per millisecond.
     #[test]
     fn a_part_inside_the_rotation_grace_is_accepted() {
         let dir = scratch("part-grace");
         let part = dir.join("Recording — Part 2 of 2.wav");
+        let cap_ms = phone_limits("tiny").max_ms();
+        assert_eq!(cap_ms, 77 * 60_000);
         wav_of_ms(
             &part,
-            suramak_core::session::session_cap_ms() + suramak_core::session::SPLIT_GRACE_MS / 2,
-            8_000,
+            cap_ms + suramak_core::session::SPLIT_GRACE_MS / 2,
+            1_000,
         );
         let mut driver = QueueDriver::new(
             InstantBackend::new(&[]),
             InstantPrefetch::default(),
-            options(),
-        );
+            options_for("ggml-tiny.bin"),
+        )
+        .with_limits(phone_limits("tiny"));
         driver.enqueue(part);
         let events = drain_until_idle(&mut driver);
         assert!(events

@@ -932,6 +932,7 @@ fn the_android_host_resumes_a_journal_row_when_the_driver_is_created() {
             last_committed_ms: 0,
             resumed: false,
             failure: None,
+            attempt_n: 0,
         };
         store.insert_job(&record).unwrap();
         let mut transcript = Transcript::new(

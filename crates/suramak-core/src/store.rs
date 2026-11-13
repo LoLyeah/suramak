@@ -162,7 +162,12 @@ pub const WAVEFORM_BARS: usize = 28;
 ///   `notes.session_id` (a whole-session note is keyed by
 ///   `(session_id, preset)` via a partial unique index). Existing rows keep
 ///   NULL for all four columns and render exactly as before.
-pub const SCHEMA_VERSION: i64 = 13;
+/// - **v14** — M26A, additive only: `jobs.attempt_n` — how many times this job
+///   was actually started (incremented in the journal **before** the inference
+///   slot opens). A row re-seen on launch with `attempt_n >= 2` was killed by
+///   the OS twice; it is quarantined as `killed_by_os` instead of resumed
+///   forever, so a crash loop is impossible. Existing rows default to `0`.
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// SQLite-backed transcript library with WAL mode.
 pub struct Store {
@@ -306,6 +311,10 @@ impl JobStatus {
 /// because its inputs are gone.
 pub const RESUME_UNAVAILABLE_PREFIX: &str = "resume_unavailable:";
 
+/// M26A: the prefix a job quarantined after two OS kills carries. A crash loop
+/// is impossible because the row is terminal from then on.
+pub const KILLED_BY_OS_PREFIX: &str = "killed_by_os:";
+
 /// One row of the durable job journal.
 ///
 /// `last_committed_segment` is the **number** of segments durably committed to
@@ -331,6 +340,10 @@ pub struct JobRecord {
     pub resumed: bool,
     /// The named failure, when `status` is `failed`.
     pub failure: Option<String>,
+    /// M26A: how many times this job was actually started. Incremented in the
+    /// journal before the inference slot opens; a row re-seen with `>= 2` was
+    /// killed by the OS twice and is quarantined instead of resumed forever.
+    pub attempt_n: u32,
 }
 
 impl JobRecord {
@@ -345,6 +358,13 @@ impl JobRecord {
             .as_deref()
             .and_then(|failure| failure.strip_prefix(RESUME_UNAVAILABLE_PREFIX))
             .map(str::trim)
+    }
+
+    /// M26A: whether this row was quarantined after repeated OS kills.
+    pub fn killed_by_os(&self) -> bool {
+        self.failure
+            .as_deref()
+            .is_some_and(|failure| failure.starts_with(KILLED_BY_OS_PREFIX))
     }
 }
 
@@ -709,7 +729,8 @@ impl Store {
                  last_committed_segment INTEGER NOT NULL DEFAULT 0,
                  last_committed_ms      INTEGER NOT NULL DEFAULT 0,
                  resumed                INTEGER NOT NULL DEFAULT 0,
-                 failure                TEXT
+                 failure                TEXT,
+                 attempt_n              INTEGER NOT NULL DEFAULT 0
              );
              CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
              CREATE INDEX IF NOT EXISTS jobs_path ON jobs(path);
@@ -882,6 +903,9 @@ impl Store {
         }
         if version < 13 {
             self.upgrade_to_v13()?;
+        }
+        if version < 14 {
+            self.upgrade_to_v14()?;
         }
         Ok(())
     }
@@ -1303,6 +1327,25 @@ impl Store {
         Ok(())
     }
 
+    /// v13 → v14, one transaction, additive only: `jobs.attempt_n` (M26A).
+    ///
+    /// Existing rows start at `0`: this build has not attempted them, and the
+    /// quarantine fires only after two **counted** attempts. A re-run is a
+    /// no-op (a fresh database already has the column from the DDL above).
+    fn upgrade_to_v14(&self) -> Result<(), SuramakError> {
+        let tx = self.conn.unchecked_transaction()?;
+        if !Self::column_exists(&tx, "jobs", "attempt_n")? {
+            tx.execute_batch("ALTER TABLE jobs ADD COLUMN attempt_n INTEGER NOT NULL DEFAULT 0")?;
+        }
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     // ---- M24B: citation-verified notes -------------------------------------
 
     /// Inserts or replaces one note. Regenerating is a replace: the row's
@@ -1523,12 +1566,16 @@ impl Store {
 
     /// Inserts (or replaces) one journal row. `created_at` is preserved on an
     /// existing row: the job's birthday does not move when it is updated.
+    ///
+    /// M26A: `attempt_n` is written on insert but **not** on the conflict
+    /// update — re-binding an existing row (a relaunch that sees a queued job)
+    /// must never reset the attempt count that quarantines a crash loop.
     pub fn insert_job(&self, job: &JobRecord) -> Result<(), SuramakError> {
         self.conn.execute(
             "INSERT INTO jobs(id, path, model, status, created_at, updated_at,
                               transcript_id, last_committed_segment, last_committed_ms,
-                              resumed, failure)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                              resumed, failure, attempt_n)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(id) DO UPDATE SET
                  path                   = excluded.path,
                  model                  = excluded.model,
@@ -1551,6 +1598,7 @@ impl Store {
                 job.last_committed_ms,
                 i64::from(job.resumed),
                 job.failure,
+                job.attempt_n,
             ],
         )?;
         Ok(())
@@ -1587,11 +1635,12 @@ impl Store {
             last_committed_ms: row.get(8)?,
             resumed: row.get::<_, i64>(9)? != 0,
             failure,
+            attempt_n: u32::try_from(row.get::<_, i64>(11)?).unwrap_or(0),
         })
     }
 
     const JOB_COLUMNS: &'static str = "id, path, model, status, created_at, updated_at,
-         transcript_id, last_committed_segment, last_committed_ms, resumed, failure";
+         transcript_id, last_committed_segment, last_committed_ms, resumed, failure, attempt_n";
 
     /// One journal row.
     pub fn job(&self, id: Uuid) -> Result<Option<JobRecord>, SuramakError> {
@@ -1715,6 +1764,44 @@ impl Store {
             id,
             JobStatus::Failed,
             Some(&format!("{RESUME_UNAVAILABLE_PREFIX} {reason}")),
+        )
+    }
+
+    /// M26A: counts one real attempt, **before** the inference slot opens.
+    ///
+    /// The counter is the crash-loop defence: a process killed by the OS never
+    /// gets to write a terminal status, so the next launch sees its row still
+    /// `decoding`/`transcribing` with the attempt already counted. Two such
+    /// launches and [`Self::quarantine_job_killed_by_os`] ends the loop.
+    ///
+    /// Returns the new count (the value the caller logs and the gate tests).
+    pub fn record_job_attempt(&self, id: Uuid) -> Result<u32, SuramakError> {
+        self.conn.execute(
+            "UPDATE jobs SET attempt_n = attempt_n + 1, updated_at = ?1 WHERE id = ?2",
+            params![Utc::now().to_rfc3339(), id.to_string()],
+        )?;
+        let attempt: i64 = self.conn.query_row(
+            "SELECT attempt_n FROM jobs WHERE id = ?1",
+            params![id.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(u32::try_from(attempt).unwrap_or(0))
+    }
+
+    /// M26A: quarantines a job the OS killed twice.
+    ///
+    /// The row becomes `failed` with the stable `killed_by_os:` prefix, so it
+    /// is no longer resumable and no launch can pick it up again. Nothing is
+    /// deleted: the checkpointed text stays in the library.
+    pub fn quarantine_job_killed_by_os(&self, id: Uuid) -> Result<(), SuramakError> {
+        let attempts = self.job(id)?.map(|row| row.attempt_n).unwrap_or(0);
+        self.set_job_status(
+            id,
+            JobStatus::Failed,
+            Some(&format!(
+                "{KILLED_BY_OS_PREFIX} the OS killed this job after {attempts} attempts \
+                 without a checkpoint; quarantined instead of resumed"
+            )),
         )
     }
 
@@ -7646,6 +7733,7 @@ mod tests {
             last_committed_ms: 0,
             resumed: false,
             failure: None,
+            attempt_n: 0,
         }
     }
 
@@ -7728,6 +7816,42 @@ mod tests {
             .resumable_job_for("/audio/lecture.wav", "/models/ggml-base.bin")
             .unwrap()
             .is_none());
+    }
+
+    /// M26A: the attempt counter survives a round-trip, increments before an
+    /// attempt, is **never reset** by re-binding the row, and two counted
+    /// attempts make the row a `killed_by_os` quarantine that no launch can
+    /// resume.
+    #[test]
+    fn the_job_journal_counts_attempts_and_quarantines_after_two_os_kills() {
+        let store = Store::open_in_memory().unwrap();
+        let job = journal_job("/audio/lecture.wav");
+        assert_eq!(job.attempt_n, 0);
+        store.insert_job(&job).unwrap();
+        assert_eq!(store.job(job.id).unwrap().unwrap().attempt_n, 0);
+
+        assert_eq!(store.record_job_attempt(job.id).unwrap(), 1);
+        assert_eq!(store.record_job_attempt(job.id).unwrap(), 2);
+        assert_eq!(store.job(job.id).unwrap().unwrap().attempt_n, 2);
+
+        // A relaunch re-binds the row (status, timestamps) with attempt_n 0 in
+        // its struct; the stored count must not move.
+        let mut rebind = store.job(job.id).unwrap().unwrap();
+        rebind.status = JobStatus::Transcribing;
+        rebind.attempt_n = 0;
+        store.insert_job(&rebind).unwrap();
+        assert_eq!(store.job(job.id).unwrap().unwrap().attempt_n, 2);
+
+        store.quarantine_job_killed_by_os(job.id).unwrap();
+        let row = store.job(job.id).unwrap().unwrap();
+        assert_eq!(row.status, JobStatus::Failed);
+        assert!(row.killed_by_os(), "{:?}", row.failure);
+        let failure = row.failure.expect("the quarantine names itself");
+        assert!(failure.starts_with("killed_by_os:"), "{failure}");
+        assert!(failure.contains("after 2 attempts"), "{failure}");
+        assert!(store.resumable_jobs().unwrap().is_empty());
+        // The row is still there — the checkpointed text is not deleted.
+        assert_eq!(store.jobs().unwrap().len(), 1);
     }
 
     /// A checkpoint writes the prefix and the journal count together; the row
@@ -8685,7 +8809,7 @@ mod tests {
     }
 
     #[test]
-    fn a_v12_library_upgrades_to_v13_and_keeps_its_rows_null() {
+    fn a_v12_library_upgrades_to_the_current_schema_and_keeps_its_rows_null() {
         let dir = std::env::temp_dir().join(format!("suramak-v12v13-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -8744,7 +8868,7 @@ mod tests {
         }
         let store = Store::open(&path).expect("v12 upgrades");
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 13);
+        assert_eq!(SCHEMA_VERSION, 14);
         // The existing row is untouched and still has no session.
         let old = store.get_transcript(id).unwrap();
         assert_eq!(old.title, "old meeting");

@@ -45,8 +45,7 @@ use std::path::{Path, PathBuf};
 use rubato::{FftFixedIn, Resampler};
 
 use suramak_core::session::{
-    clock, part_stem, PartInfo, SplitReason, SESSION_CAP_ANDROID_MS, SILENCE_RMS, SPLIT_GRACE_MS,
-    SPLIT_SILENCE_MS,
+    clock, part_stem, PartInfo, SplitReason, SILENCE_RMS, SPLIT_GRACE_MS, SPLIT_SILENCE_MS,
 };
 
 use crate::whisper::AsrError;
@@ -129,19 +128,23 @@ pub struct RotationPolicy {
 }
 
 impl RotationPolicy {
-    /// The phone's policy: the Android cap, the desktop grace and the desktop
-    /// pause length, so the two hosts cut a take on the same rule.
-    pub const PHONE: Self = Self {
-        cap_ms: SESSION_CAP_ANDROID_MS,
-        grace_ms: SPLIT_GRACE_MS,
-        silence_ms: SPLIT_SILENCE_MS,
-    };
+    /// The phone's policy: the **computed** session cap (M26A — the device's
+    /// memory and the configured model, not a constant), the desktop grace and
+    /// the desktop pause length, so the two hosts cut a take on the same rule.
+    pub fn phone() -> Self {
+        Self {
+            cap_ms: suramak_core::session::session_cap_ms(),
+            grace_ms: SPLIT_GRACE_MS,
+            silence_ms: SPLIT_SILENCE_MS,
+        }
+    }
 
     /// A policy with another cap (tests and future hosts).
     pub const fn with_cap(cap_ms: i64) -> Self {
         Self {
             cap_ms,
-            ..Self::PHONE
+            grace_ms: SPLIT_GRACE_MS,
+            silence_ms: SPLIT_SILENCE_MS,
         }
     }
 
@@ -770,9 +773,9 @@ impl StreamingWav {
         Self::create_with_policy(path, device_rate, RotationPolicy::single())
     }
 
-    /// Creates a take that rotates at the phone's cap (45 minutes).
+    /// Creates a take that rotates at this device's computed session cap.
     pub fn create_rotating(path: &Path, device_rate: u32) -> Result<Self, AsrError> {
-        Self::create_with_policy(path, device_rate, RotationPolicy::PHONE)
+        Self::create_with_policy(path, device_rate, RotationPolicy::phone())
     }
 
     /// Creates a take with an explicit rotation policy (tests, other hosts).
@@ -1657,10 +1660,18 @@ mod rotation_tests {
     }
 
     #[test]
-    fn the_ceiling_message_names_nine_hours_at_the_phone_cap() {
-        let message = part_ceiling_reason(SESSION_CAP_ANDROID_MS);
-        assert!(message.contains("longer than 9 hours"), "{message}");
-        assert!(message.contains("12 parts of 45:00"), "{message}");
+    fn the_ceiling_message_names_the_computed_cap() {
+        let cap = suramak_core::session::session_cap_ms();
+        let message = part_ceiling_reason(cap);
+        let hours = (cap.max(1) * i64::from(MAX_PARTS)) / 3_600_000;
+        assert!(
+            message.contains(&format!("longer than {hours} hours")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("12 parts of {}", clock(cap))),
+            "{message}"
+        );
     }
 
     #[test]

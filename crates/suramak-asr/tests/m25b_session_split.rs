@@ -123,19 +123,22 @@ fn concat_samples(paths: &[PathBuf]) -> Vec<f32> {
 
 #[test]
 #[ignore = "50-minute synthesized fixture (~96 MB); run explicitly for the M25B report"]
-fn a_fifty_minute_session_splits_under_the_android_cap_with_the_same_samples() {
+fn a_fifty_minute_session_splits_under_a_45_minute_cap_with_the_same_samples() {
+    // M26A: the cap is an input now, not a global constant. This fixture pins a
+    // 45-minute device class (the old Android cap) so the 50-minute split rule
+    // stays measurable without generating an 8-hour file on a large host.
+    const CAP_MS: i64 = 45 * 60 * 1000;
     let dir = scratch("50m");
     let input = dir.join("Long session.wav");
     write_fixture(&input);
     let input_probe = decode::probe_duration_ms(&input).expect("probe the fixture");
     assert_eq!(input_probe, TOTAL_MS as u64);
 
-    let output =
-        session::split_audio_file(&input, &dir.join("parts"), session::SESSION_CAP_ANDROID_MS)
-            .expect("split")
-            .expect("50 minutes is over the 45-minute Android cap");
+    let output = session::split_audio_file(&input, &dir.join("parts"), CAP_MS)
+        .expect("split")
+        .expect("50 minutes is over the 45-minute cap");
 
-    let cap_samples = (session::SESSION_CAP_ANDROID_MS as f64 * f64::from(RATE) / 1000.0) as usize;
+    let cap_samples = (CAP_MS as f64 * f64::from(RATE) / 1000.0) as usize;
     let mut total = 0usize;
     for (index, part) in output.parts.iter().enumerate() {
         let samples = part.span.samples();

@@ -53,6 +53,7 @@ fn seed_interrupted(db: &Path, source: &Path, model: &Path) {
         last_committed_ms: 0,
         resumed: false,
         failure: None,
+        attempt_n: 0,
     };
     store.insert_job(&record).unwrap();
     let transcript = Transcript::new(

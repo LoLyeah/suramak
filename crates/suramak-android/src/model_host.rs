@@ -39,6 +39,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 use suramak_core::device::{self, DeviceProfile, PhoneTier};
 use suramak_core::download;
+use suramak_core::limits::MemoryProbe;
 use suramak_core::models;
 use suramak_core::SuramakError;
 
@@ -162,6 +163,13 @@ impl ModelHost {
                 .unwrap_or(false),
         );
         *self.inner.profile.lock().expect("profile lock") = Some(profile);
+        // M26A: the session cap and the recorder rotator read the same Android
+        // report (total, available, `isLowRamDevice`) the tier rule does.
+        suramak_core::session::set_device_probe(MemoryProbe::from_android_report(
+            profile.total_ram_bytes,
+            profile.available_ram_bytes,
+            profile.low_memory,
+        ));
         let language = request
             .get("language")
             .and_then(Value::as_str)
