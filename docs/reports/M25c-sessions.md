@@ -244,7 +244,13 @@ transcribe the missing part or use This part
 | Full workspace | `cargo test --workspace` | see below |
 
 ```text
-FULL_WORKSPACE_PLACEHOLDER
+**Full workspace run (verified by the orchestrator after the child's cap):**
+`cargo test --workspace` → **1492 passed, 0 failed, 13 ignored**. Two stale
+assertions surfaced and were corrected, not worked around: the v1→current
+fixture test compared whole `transcripts` rows and the live table gained
+`session_id`/`part_index`/`part_count` in v13 (it now compares the v1 column
+projection, the same rule the segments comparison already used), and the
+schema tripwire in `persistence.rs` still said 12.
 ```
 
 ## 5. Deliberate limits
