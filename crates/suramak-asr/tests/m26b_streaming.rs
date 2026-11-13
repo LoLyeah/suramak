@@ -8,10 +8,9 @@
 
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-// The child-process RSS harness is unix-only (/proc); Windows clippy compiles
-// this file and flagged the import as unused before it was gated.
-#[cfg(unix)]
-use std::process::Command;
+// The child-process RSS harness is unix-only (/proc). `Command` is used fully
+// qualified at its one call site instead of imported, so no platform can flag
+// an unused import (CI's windows clippy did, twice, on two harnesses).
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -442,7 +441,7 @@ fn rss_30_minutes_streaming_is_200mb_lower() {
     }
     let exe = std::env::current_exe().expect("test binary path");
     let run = |mode: &str| -> u64 {
-        let output = Command::new(&exe)
+        let output = std::process::Command::new(&exe)
             .args(["--ignored", "--exact", "rss_child", "--nocapture"])
             .env("M26B_RSS_CHILD", mode)
             .env("M26B_RSS_FIXTURE", &long_form)

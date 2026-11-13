@@ -17,7 +17,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+// The RSS harness spawns itself only on Linux; `Command` is fully qualified at
+// that call site so no platform can flag an unused import.
 use std::sync::Mutex;
 
 use suramak_asr::engine::{EngineDecision, EngineId};
@@ -428,7 +429,7 @@ fn rss_90_minutes_is_flat() {
     };
     let exe = std::env::current_exe().expect("test binary path");
     let run = |fixture: &Path| -> (u64, usize) {
-        let output = Command::new(&exe)
+        let output = std::process::Command::new(&exe)
             .args(["--ignored", "--exact", "rss_child", "--nocapture"])
             .env("M26C_RSS_CHILD", fixture)
             .env("M26C_RSS_MODEL", &model)
