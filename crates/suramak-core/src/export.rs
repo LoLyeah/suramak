@@ -1,8 +1,12 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
+use chrono::{DateTime, Utc};
+
 use crate::diagnostics::{diagnose, SegmentDiagnostics, SubtitleLimits};
 use crate::diarization::{speaker_for_segments, Diarization, SpeakerTurn};
+use crate::notes::citation_clock;
+use crate::session::SessionTimeline;
 use crate::time::{fmt_ms, fmt_plain, fmt_srt, fmt_vtt};
 use crate::transcript::{Segment, Source, Transcript};
 use crate::translate::TranslationRecord;
@@ -113,6 +117,64 @@ pub fn to_markdown_with_speakers(
         writeln!(out).unwrap();
     }
     Ok(out)
+}
+
+/// M25C: one Markdown file for a whole session.
+///
+/// The header names the meeting once; each part then gets a
+/// `## Part N — mm:ss` divider whose time is the part's **session-absolute
+/// start**, and every body line carries the same absolute clock. A per-part
+/// export still goes through [`to_markdown`] and is byte-for-byte unchanged.
+pub fn to_session_markdown(
+    title: &str,
+    created_at: DateTime<Utc>,
+    source: &Source,
+    model: &str,
+    language: Option<&str>,
+    timeline: &SessionTimeline,
+) -> String {
+    let mut out = String::new();
+    writeln!(out, "# {title}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "- Date: {}",
+        created_at.format("%Y-%m-%d %H:%M:%S UTC")
+    )
+    .unwrap();
+    writeln!(out, "- Source: {}", source_label(source)).unwrap();
+    writeln!(out, "- Model: {model}").unwrap();
+    writeln!(out, "- Language: {}", language.unwrap_or("auto")).unwrap();
+    writeln!(out, "- Parts: {}", timeline.parts.len()).unwrap();
+    writeln!(out).unwrap();
+    for part in &timeline.parts {
+        writeln!(
+            out,
+            "## Part {} — {}",
+            part.part_index,
+            citation_clock(part.offset_ms)
+        )
+        .unwrap();
+        writeln!(out).unwrap();
+        let start = part.offset_ms;
+        let end = part.offset_ms + part.duration_ms;
+        for segment in timeline
+            .segments
+            .iter()
+            .filter(|segment| segment.start_ms >= start && segment.start_ms < end)
+        {
+            writeln!(
+                out,
+                "[{} → {}] {}",
+                fmt_ms(segment.start_ms),
+                fmt_ms(segment.end_ms),
+                segment.text.trim()
+            )
+            .unwrap();
+            writeln!(out).unwrap();
+        }
+    }
+    out
 }
 
 /// Exports a transcript to plain text (one line per segment).

@@ -147,6 +147,13 @@ impl CompactHost {
                     .map(|idx| idx as u32);
                 inner.open_transcript(id, segment)
             }
+            "open_session" => {
+                let session = value
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                inner.open_session(session)
+            }
             "search" => inner.search_library(&value),
             "voice_note_offer" => inner.voice_note_offer(&value),
             "back" => inner.back(),
@@ -205,7 +212,31 @@ impl Inner {
     fn reload_library(&mut self) {
         match Store::open(&self.dirs.db_path) {
             Ok(store) => match store.list_transcripts() {
-                Ok(items) => {
+                Ok(mut items) => {
+                    // M25C: grouping needs each part's duration, which lives in
+                    // its segments. The header list stays the base; only the
+                    // parts of a real session are read in full.
+                    let identities = store.session_identities().unwrap_or_default();
+                    let mut sessions: Vec<uuid::Uuid> = identities
+                        .values()
+                        .filter(|identity| identity.part_count >= 2)
+                        .map(|identity| identity.session_id)
+                        .collect();
+                    sessions.sort();
+                    sessions.dedup();
+                    let mut full = std::collections::HashMap::new();
+                    for session in sessions {
+                        if let Ok(parts) = store.session_parts(session) {
+                            for part in parts {
+                                full.insert(part.id, part);
+                            }
+                        }
+                    }
+                    for item in &mut items {
+                        if let Some(part) = full.remove(&item.id) {
+                            *item = part;
+                        }
+                    }
                     // M22C: the row facets are two batched reads, never one
                     // query per row (the phone library can be hundreds of
                     // headers).
@@ -229,7 +260,7 @@ impl Inner {
                             )
                         })
                         .collect();
-                    self.app.set_library(items);
+                    self.app.set_library_with_sessions(items, identities);
                     self.app.set_library_facets(facets);
                 }
                 Err(err) => self.app.set_library_error(err.to_string()),
@@ -320,6 +351,7 @@ impl Inner {
                 Some(Sheet::Speaker) => "speaker",
                 Some(Sheet::TurnStrip) => "turn_strip",
                 Some(Sheet::Notes) => "notes",
+                Some(Sheet::Session) => "session",
                 None => "none",
             },
             "status": self.app.status.as_ref().map(|(text, error)| json!({"text": text, "error": error})),
@@ -1030,6 +1062,14 @@ impl Inner {
     /// bytes atomically, and hand Kotlin the one file. The bytes exist before
     /// the platform stream is opened; `export_done` verifies the write.
     /// M24B: the open transcript's stored notes (the sheet's open path).
+    fn open_session(&mut self, raw: &str) -> String {
+        if let Ok(session) = uuid::Uuid::parse_str(raw) {
+            let now = self.started_now();
+            self.app.open_session(session, now);
+        }
+        self.snapshot()
+    }
+
     fn notes_load(&mut self, value: &Value) -> String {
         let Some(id) = value
             .get("transcript_id")
@@ -1038,13 +1078,19 @@ impl Inner {
         else {
             return error("notes_load needs a transcript_id");
         };
+        let session_id = value
+            .get("session_id")
+            .and_then(Value::as_str)
+            .and_then(|raw| uuid::Uuid::parse_str(raw).ok());
         let result = Store::open(&self.dirs.db_path)
             .map_err(|err| err.to_string())
             .and_then(|store| {
-                store
-                    .notes_for(id)
-                    .map(|rows| rows.iter().map(|row| row.stored()).collect())
-                    .map_err(|err| err.to_string())
+                match session_id {
+                    Some(session) => store.notes_for_session(session),
+                    None => store.notes_for(id),
+                }
+                .map(|rows| rows.iter().map(|row| row.stored()).collect())
+                .map_err(|err| err.to_string())
             });
         self.app.on_notes_loaded(id, result);
         self.snapshot()
@@ -1084,6 +1130,65 @@ impl Inner {
                 return self.snapshot();
             }
         };
+        // M25C: a whole-session run reads every part in order and puts them on
+        // one absolute timeline before the request. The citation validator sees
+        // that same timeline, so a citation in part 3 is checked, not dropped.
+        let whole_session = value
+            .get("scope")
+            .and_then(Value::as_str)
+            .is_some_and(|scope| scope == "Whole session");
+        let session_id = value
+            .get("session_id")
+            .and_then(Value::as_str)
+            .and_then(|raw| uuid::Uuid::parse_str(raw).ok());
+        if let (true, Some(session)) = (whole_session, session_id) {
+            let parts = match store.session_parts(session) {
+                Ok(parts) => parts,
+                Err(err) => {
+                    self.app.on_notes_done(Err(err.to_string()));
+                    return self.snapshot();
+                }
+            };
+            let identities = store.session_identities().unwrap_or_default();
+            let mut inputs = suramak_core::session::session_inputs(&parts);
+            for input in &mut inputs {
+                if let Some(identity) = identities.get(&input.transcript_id) {
+                    input.part_index = identity.part_index;
+                    input.part_count = identity.part_count;
+                }
+            }
+            let title = parts
+                .first()
+                .map(|part| suramak_core::session::base_name(&part.title))
+                .unwrap_or_else(|| "Session".to_string());
+            let language = parts.first().and_then(|part| part.language.clone());
+            let outcome = suramak_core::notes::generate_session_notes(
+                &title,
+                language.as_deref(),
+                &inputs,
+                &[],
+                preset,
+                &cfg,
+            );
+            if let Ok(note) = &outcome {
+                let record = suramak_core::store::NoteRecord {
+                    transcript_id: parts.first().map(|part| part.id).unwrap_or(id),
+                    preset: note.preset,
+                    body_md: note.body_md.clone(),
+                    citations_checked: note.citations_checked,
+                    citations_removed: note.citations_removed,
+                    model: note.model.clone(),
+                    created_at: suramak_core::Utc::now(),
+                    session_id: Some(session),
+                };
+                if let Err(err) = store.save_note(&record) {
+                    log::warn!("notes: generated but not saved: {err}");
+                }
+            }
+            self.app
+                .on_notes_done(outcome.map_err(|err| err.to_string()));
+            return self.snapshot();
+        }
         let transcript = match store.get_transcript(id) {
             Ok(transcript) => transcript,
             Err(err) => {
@@ -1134,6 +1239,7 @@ impl Inner {
                 citations_removed: note.citations_removed,
                 model: note.model.clone(),
                 created_at: suramak_core::Utc::now(),
+                session_id: None,
             };
             if let Err(err) = store.save_note(&record) {
                 log::warn!("notes: generated but not saved: {err}");

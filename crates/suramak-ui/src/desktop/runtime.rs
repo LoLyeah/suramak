@@ -981,9 +981,27 @@ impl Runtime {
                         "adopted the journal-resumed job already queued in the driver"
                     );
                 }
-                Effect::SaveTranscript { transcript, words } => {
-                    let result = self.insert(&transcript, &words);
+                Effect::SaveTranscript {
+                    transcript,
+                    words,
+                    session,
+                } => {
+                    let result = self.insert(&transcript, &words, session);
                     queue.extend(state.on_transcript_saved(*transcript, result));
+                }
+                Effect::AssignSession { id, identity } => {
+                    let result = match self.store.as_ref() {
+                        Some(store) => store
+                            .set_transcript_session(id, Some(identity))
+                            .map_err(|err| err.to_string()),
+                        None => Err("library database unavailable".to_string()),
+                    };
+                    if let Err(message) = result {
+                        state.set_status(
+                            format!("could not record the session identity — {message}"),
+                            true,
+                        );
+                    }
                 }
                 Effect::SaveEdits { updates } => {
                     let result = self.save_edits(state, &updates);
@@ -2283,12 +2301,21 @@ impl Runtime {
         &self,
         transcript: &Transcript,
         words: &[suramak_core::transcript::WordTiming],
+        session: Option<suramak_core::store::SessionIdentity>,
     ) -> Result<(), String> {
-        self.store
+        let store = self
+            .store
             .as_ref()
-            .ok_or_else(|| "library database unavailable".to_string())?
+            .ok_or_else(|| "library database unavailable".to_string())?;
+        store
             .insert_transcript_with_words(transcript, words)
-            .map_err(|err| err.to_string())
+            .map_err(|err| err.to_string())?;
+        if let Some(identity) = session {
+            store
+                .set_transcript_session(transcript.id, Some(identity))
+                .map_err(|err| err.to_string())?;
+        }
+        Ok(())
     }
 
     /// A transcript's stored word timing (M15.6), best-effort: a library that

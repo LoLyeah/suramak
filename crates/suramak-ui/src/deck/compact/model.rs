@@ -36,6 +36,10 @@ pub struct NoteRequest {
     pub preset: NotePreset,
     pub segments: Vec<Segment>,
     pub speakers: Vec<(u32, String)>,
+    /// M25C: the session this part belongs to, when it has one.
+    pub session: Option<Uuid>,
+    /// M25C: `This part` or `Whole session`.
+    pub scope: crate::notes_sheet::NoteScope,
 }
 
 /// The three screens of the G1 compact profile, plus G3's Diagnostics card.
@@ -68,6 +72,62 @@ pub struct LibraryRow {
     pub waveform: Vec<f32>,
     /// M25B: `Part 2 of 3` when this row is one part of a split session.
     pub part: Option<suramak_core::session::PartInfo>,
+    /// M25C: `Some` when this one row stands for a whole multi-part session.
+    pub session: Option<SessionSummary>,
+    /// M25C: the small chip (`3 parts`) a collapsed row draws; `None` on an
+    /// ordinary row.
+    pub part_chip: Option<String>,
+}
+
+/// M25C: a multi-part session as one library row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub session_id: Uuid,
+    pub part_count: u32,
+    /// Parts that actually have a transcript (a failed part is a hole, not a
+    /// shorter meeting).
+    pub transcribed: u32,
+    pub total_ms: i64,
+}
+
+/// M25C: one part inside the session view.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionPartRow {
+    pub id: Uuid,
+    pub part_index: u32,
+    pub title: String,
+    pub duration_ms: i64,
+    /// The first line of the part, one visual line, elided by the surface.
+    pub opening: String,
+}
+
+/// M25C: the session view behind a collapsed library row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionView {
+    pub session_id: Uuid,
+    pub title: String,
+    pub part_count: u32,
+    pub transcribed: u32,
+    pub total_ms: i64,
+    /// Ordered by `part_index`.
+    pub parts: Vec<SessionPartRow>,
+}
+
+impl SessionView {
+    /// `2 of 3 parts transcribed` — `None` when every part is present.
+    pub fn incomplete_line(&self) -> Option<String> {
+        (self.transcribed < self.part_count).then(|| {
+            suramak_core::session::session_incomplete_line(
+                self.transcribed as usize,
+                self.part_count as usize,
+            )
+        })
+    }
+
+    /// `3 parts · 2 h 10 m`.
+    pub fn meta(&self) -> String {
+        suramak_core::session::session_meta_label(self.part_count as usize, self.total_ms)
+    }
 }
 
 impl LibraryRow {
@@ -93,6 +153,38 @@ impl LibraryRow {
                 .and_then(|path| path.file_name().and_then(|name| name.to_str()))
                 .and_then(suramak_core::session::PartInfo::from_name)
                 .or_else(|| suramak_core::session::PartInfo::from_name(&transcript.title)),
+            session: None,
+            part_chip: None,
+        }
+    }
+
+    /// M25C: the one collapsed row for a whole session. `parts` is already
+    /// ordered by `part_index`; `transcribed` counts the rows that exist.
+    pub fn from_session(session_id: Uuid, parts: &[&Transcript], summary: SessionSummary) -> Self {
+        let first = parts.first().copied();
+        let newest = parts
+            .iter()
+            .map(|part| part.created_at)
+            .max()
+            .unwrap_or_else(chrono::Utc::now);
+        Self {
+            id: first.map(|part| part.id).unwrap_or(Uuid::nil()),
+            title: first
+                .map(|part| suramak_core::session::base_name(&part.title))
+                .unwrap_or_else(|| "Session".to_string()),
+            created_at: newest.with_timezone(&Local),
+            segments: parts.iter().map(|part| part.segments.len()).sum(),
+            duration_ms: summary.total_ms,
+            language: first.and_then(|part| part.language.clone()),
+            speakers: 0,
+            waveform: Vec::new(),
+            part: None,
+            session: Some(summary),
+            part_chip: Some(format!(
+                "{} part{}",
+                summary.part_count,
+                if summary.part_count == 1 { "" } else { "s" }
+            )),
         }
     }
 
@@ -773,6 +865,8 @@ pub enum CompactAction {
         id: Uuid,
         segment: Option<u32>,
     },
+    /// M25C: a collapsed multi-part row was tapped — open its session view.
+    OpenSession(Uuid),
     /// M22C: the Library field changed — run the store's segment search and
     /// hand the hits back through [`CompactApp::set_search_hits`].
     SearchLibrary {
@@ -892,6 +986,8 @@ pub enum CompactAction {
     /// M24B: read the open transcript's stored notes.
     LoadNotes {
         transcript: Uuid,
+        /// M25C: read the whole-session rows instead of the part's own.
+        session: Option<Uuid>,
     },
     /// M24B: generate one preset from this snapshot (unsaved edits included).
     GenerateNote {
@@ -903,6 +999,11 @@ pub enum CompactAction {
     },
     /// M24B: write the exact stored Markdown through ACTION_CREATE_DOCUMENT.
     ExportNote {
+        name: String,
+        markdown: String,
+    },
+    /// M25C: one Markdown file for a whole session, part dividers included.
+    ExportSession {
         name: String,
         markdown: String,
     },
@@ -933,6 +1034,8 @@ pub enum Sheet {
     TurnStrip,
     /// M24B: the citation-verified notes sheet.
     Notes,
+    /// M25C: the parts of one multi-part session, behind a collapsed row.
+    Session,
 }
 
 impl Sheet {
@@ -1402,6 +1505,25 @@ pub fn word_at(words: &[WordTiming], position_ms: i64) -> Option<usize> {
     after.checked_sub(1)
 }
 
+/// M25C: the one-line opening of a part for the session view: its first
+/// segment, collapsed to one visual line (`…` when it runs long). An empty
+/// part says so rather than inventing a sentence.
+pub fn opening_line(transcript: &Transcript) -> String {
+    let Some(first) = transcript.segments.first() else {
+        return "no speech in this part".to_string();
+    };
+    let text = first.text.trim();
+    let mut out: String = text.chars().take(96).collect();
+    if text.chars().count() > 96 {
+        out.push('…');
+    }
+    if out.is_empty() {
+        "no speech in this part".to_string()
+    } else {
+        out
+    }
+}
+
 /// A filesystem-safe stem for `ACTION_CREATE_DOCUMENT`'s suggestion.
 pub fn sanitise_stem(title: &str) -> String {
     let mut out: String = title
@@ -1433,6 +1555,12 @@ pub struct CompactApp {
     /// search reads the same values, so a hit can never disagree with a row.
     pub transcripts: Vec<Transcript>,
     pub rows: Vec<LibraryRow>,
+    /// M25C: the session identity of every part, as the host read it from the
+    /// store. Empty means an older host / no session rows — the library then
+    /// renders exactly as before.
+    pub session_identities: std::collections::HashMap<Uuid, suramak_core::store::SessionIdentity>,
+    /// M25C: the session view behind a collapsed row (`Sheet::Session`).
+    pub session_view: Option<SessionView>,
     pub library_query: String,
     /// M22C: the store's spoken-text hits for the current query, already ranked
     /// and limited. The library draws them under its "in transcripts" heading;
@@ -1572,6 +1700,8 @@ impl CompactApp {
             nav: NavStack::new(CompactRoute::Library),
             transcripts: Vec::new(),
             rows: Vec::new(),
+            session_identities: std::collections::HashMap::new(),
+            session_view: None,
             library_query: String::new(),
             search_hits: Vec::new(),
             library_error: None,
@@ -1953,13 +2083,212 @@ impl CompactApp {
     }
 
     /// Replaces the library list (a fresh `Store::list_transcripts`).
+    ///
+    /// M25C: with session identities attached, a session's parts collapse into
+    /// one row. Without them (an older host, or an ordinary library) every row
+    /// is exactly the pre-M25C row.
     pub fn set_library(&mut self, transcripts: Vec<Transcript>) {
-        self.rows = transcripts
-            .iter()
-            .map(LibraryRow::from_transcript)
-            .collect();
+        self.set_library_with_sessions(transcripts, std::collections::HashMap::new());
+    }
+
+    /// M25C: the library plus the store's `session_id`/`part_index` map.
+    ///
+    /// A session collapses when at least two of its parts are present. The
+    /// collapsed row takes the position of the session's newest part, so the
+    /// list stays newest-first. A session with one present part keeps today's
+    /// single row (and its `Part N of M` label) — a lone part is not a session
+    /// view until a second part exists.
+    pub fn set_library_with_sessions(
+        &mut self,
+        transcripts: Vec<Transcript>,
+        identities: std::collections::HashMap<Uuid, suramak_core::store::SessionIdentity>,
+    ) {
+        let mut groups: std::collections::HashMap<Uuid, Vec<&Transcript>> =
+            std::collections::HashMap::new();
+        for transcript in &transcripts {
+            if let Some(identity) = identities.get(&transcript.id) {
+                if identity.part_count >= 2 {
+                    groups
+                        .entry(identity.session_id)
+                        .or_default()
+                        .push(transcript);
+                }
+            }
+        }
+        let mut emitted: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        let mut rows = Vec::with_capacity(transcripts.len());
+        for transcript in &transcripts {
+            let identity = identities.get(&transcript.id);
+            if let Some(identity) = identity {
+                if identity.part_count >= 2 && groups.contains_key(&identity.session_id) {
+                    if !emitted.insert(identity.session_id) {
+                        continue;
+                    }
+                    let mut parts = groups[&identity.session_id].clone();
+                    parts.sort_by_key(|part| {
+                        identities
+                            .get(&part.id)
+                            .map(|identity| identity.part_index)
+                            .unwrap_or(u32::MAX)
+                    });
+                    let present = parts.len();
+                    if present < 2 {
+                        // One present part: keep the ordinary row (with its
+                        // honest `Part N of M` label).
+                        rows.push(LibraryRow::from_transcript(transcript));
+                        continue;
+                    }
+                    let total_ms = parts
+                        .iter()
+                        .map(|part| {
+                            part.segments
+                                .iter()
+                                .map(|segment| segment.end_ms)
+                                .max()
+                                .unwrap_or(0)
+                        })
+                        .sum();
+                    let summary = SessionSummary {
+                        session_id: identity.session_id,
+                        part_count: identity.part_count,
+                        transcribed: present as u32,
+                        total_ms,
+                    };
+                    rows.push(LibraryRow::from_session(
+                        identity.session_id,
+                        &parts,
+                        summary,
+                    ));
+                    continue;
+                }
+            }
+            rows.push(LibraryRow::from_transcript(transcript));
+        }
+        self.rows = rows;
+        self.session_identities = identities;
         self.transcripts = transcripts;
         self.library_error = None;
+    }
+
+    /// M25C: opens the session view for a collapsed row.
+    pub fn open_session(&mut self, session_id: Uuid, now: f64) {
+        let mut parts: Vec<&Transcript> = self
+            .transcripts
+            .iter()
+            .filter(|transcript| {
+                self.session_identities
+                    .get(&transcript.id)
+                    .is_some_and(|identity| identity.session_id == session_id)
+            })
+            .collect();
+        parts.sort_by_key(|part| {
+            self.session_identities
+                .get(&part.id)
+                .map(|identity| identity.part_index)
+                .unwrap_or(u32::MAX)
+        });
+        let part_count = self
+            .session_identities
+            .values()
+            .find(|identity| identity.session_id == session_id)
+            .map(|identity| identity.part_count)
+            .unwrap_or(parts.len() as u32);
+        let total_ms = parts
+            .iter()
+            .map(|part| {
+                part.segments
+                    .iter()
+                    .map(|segment| segment.end_ms)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .sum();
+        let rows = parts
+            .iter()
+            .map(|part| {
+                let identity = self.session_identities.get(&part.id);
+                SessionPartRow {
+                    id: part.id,
+                    part_index: identity.map(|identity| identity.part_index).unwrap_or(0),
+                    title: suramak_core::session::base_name(&part.title),
+                    duration_ms: part
+                        .segments
+                        .iter()
+                        .map(|segment| segment.end_ms)
+                        .max()
+                        .unwrap_or(0),
+                    opening: opening_line(part),
+                }
+            })
+            .collect::<Vec<_>>();
+        self.session_view = Some(SessionView {
+            session_id,
+            title: rows
+                .first()
+                .map(|row| row.title.clone())
+                .unwrap_or_else(|| "Session".to_string()),
+            part_count,
+            transcribed: rows.len() as u32,
+            total_ms,
+            parts: rows,
+        });
+        self.sheet = Some(Sheet::Session);
+        self.sheet_anim.begin(true, now);
+    }
+
+    /// M25C: one Markdown file for the open session view.
+    ///
+    /// The parts are put on the same session-absolute timeline the notes use;
+    /// the body's times are absolute and each part opens with a
+    /// `## Part N — mm:ss` divider. A part's own export is untouched.
+    pub fn session_export_action(&self) -> Option<CompactAction> {
+        let view = self.session_view.as_ref()?;
+        let mut parts: Vec<&Transcript> = self
+            .transcripts
+            .iter()
+            .filter(|transcript| {
+                self.session_identities
+                    .get(&transcript.id)
+                    .is_some_and(|identity| identity.session_id == view.session_id)
+            })
+            .collect();
+        parts.sort_by_key(|part| {
+            self.session_identities
+                .get(&part.id)
+                .map(|identity| identity.part_index)
+                .unwrap_or(u32::MAX)
+        });
+        let mut inputs = Vec::with_capacity(parts.len());
+        for part in &parts {
+            let identity = self.session_identities.get(&part.id)?;
+            inputs.push(suramak_core::session::SessionPartInput {
+                transcript_id: part.id,
+                title: suramak_core::session::base_name(&part.title),
+                part_index: identity.part_index,
+                part_count: identity.part_count,
+                duration_ms: part
+                    .segments
+                    .iter()
+                    .map(|segment| segment.end_ms)
+                    .max()
+                    .unwrap_or(0),
+                segments: part.segments.clone(),
+            });
+        }
+        let timeline = suramak_core::session::session_timeline(&inputs);
+        let first = parts.first()?;
+        let markdown = suramak_core::export::to_session_markdown(
+            &view.title,
+            first.created_at,
+            &first.source,
+            &first.model,
+            first.language.as_deref(),
+            &timeline,
+        );
+        Some(CompactAction::ExportSession {
+            name: format!("{}.md", sanitise_stem(&view.title)),
+            markdown,
+        })
     }
 
     /// Attaches the batched per-row facets (M22C): speaker counts for the pips
@@ -2417,11 +2746,35 @@ impl CompactApp {
     pub fn open_notes_sheet(&mut self, now: f64) -> Option<CompactAction> {
         let editor = self.editor.as_ref()?;
         let id = editor.transcript.id;
-        self.notes
-            .open(self.notes_configured, Vec::new(), &editor.transcript);
+        let session = self.session_identities.get(&id).copied().map(|identity| {
+            let transcribed = self
+                .transcripts
+                .iter()
+                .filter(|transcript| {
+                    self.session_identities
+                        .get(&transcript.id)
+                        .is_some_and(|other| other.session_id == identity.session_id)
+                })
+                .count() as u32;
+            (identity.session_id, identity.part_count, transcribed)
+        });
+        self.notes.open_with_session(
+            self.notes_configured,
+            Vec::new(),
+            &editor.transcript,
+            session,
+        );
         self.sheet = Some(Sheet::Notes);
         self.sheet_anim.begin(true, now);
-        Some(CompactAction::LoadNotes { transcript: id })
+        Some(CompactAction::LoadNotes {
+            transcript: id,
+            session: session.map(|(session, _, _)| session),
+        })
+    }
+
+    /// M25C: the sheet's `This part` / `Whole session` toggle.
+    pub fn set_notes_scope(&mut self, scope: crate::notes_sheet::NoteScope) {
+        self.notes.set_scope(scope);
     }
 
     pub fn close_notes_sheet(&mut self, now: f64) {
@@ -2471,6 +2824,8 @@ impl CompactApp {
                 preset,
                 segments: transcript.segments,
                 speakers,
+                session: self.notes.session,
+                scope: self.notes.scope,
             }),
         })
     }
@@ -2503,6 +2858,9 @@ impl CompactApp {
             .map(|at| at.with_timezone(&suramak_core::Utc))
             .unwrap_or_else(|_| suramak_core::Utc::now());
         self.status = Some((format!("{} ready", stored.preset.label()), false));
+        let session_id = (self.notes.scope == crate::notes_sheet::NoteScope::WholeSession)
+            .then_some(self.notes.session)
+            .flatten();
         Some(CompactAction::SaveNote {
             note: Box::new(suramak_core::store::NoteRecord {
                 transcript_id: id,
@@ -2512,6 +2870,7 @@ impl CompactApp {
                 citations_removed: stored.citations_removed,
                 model: stored.model,
                 created_at: created,
+                session_id,
             }),
         })
     }

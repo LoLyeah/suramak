@@ -38,6 +38,28 @@ impl NotesPhase {
     }
 }
 
+/// M25C: which timeline a notes run reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NoteScope {
+    /// One part's own segments and clock (M24B).
+    ThisPart,
+    /// Every part in order on the session-absolute clock (M25C).
+    #[default]
+    WholeSession,
+}
+
+impl NoteScope {
+    /// The two toggle labels, in order.
+    pub const LABELS: [&'static str; 2] = ["This part", "Whole session"];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            NoteScope::ThisPart => "This part",
+            NoteScope::WholeSession => "Whole session",
+        }
+    }
+}
+
 /// The Notes sheet's whole state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NotesSheet {
@@ -45,6 +67,14 @@ pub struct NotesSheet {
     pub open: bool,
     /// The transcript the stored notes belong to.
     pub transcript: Option<Uuid>,
+    /// M25C: the session the open part belongs to, when it has one.
+    pub session: Option<Uuid>,
+    /// M25C: parts that exist / parts the session declares.
+    pub transcribed: u32,
+    pub part_count: u32,
+    /// M25C: `This part` / `Whole session` (defaults to the whole session when
+    /// the transcript belongs to one).
+    pub scope: NoteScope,
     /// The selected preset row.
     pub preset: NotePreset,
     pub phase: NotesPhase,
@@ -68,6 +98,10 @@ impl Default for NotesSheet {
         Self {
             open: false,
             transcript: None,
+            session: None,
+            transcribed: 0,
+            part_count: 0,
+            scope: NoteScope::ThisPart,
             preset: NotePreset::Minutes,
             phase: NotesPhase::Ready,
             stored: Vec::new(),
@@ -119,7 +153,22 @@ impl NotesSheet {
 
     /// Opens the sheet with this transcript's stored notes (freshly read) and
     /// the endpoint gate.
-    pub fn open(&mut self, configured: bool, mut stored: Vec<StoredNote>, transcript: &Transcript) {
+    pub fn open(&mut self, configured: bool, stored: Vec<StoredNote>, transcript: &Transcript) {
+        self.open_with_session(configured, stored, transcript, None);
+    }
+
+    /// M25C: opens the sheet on a part that belongs to a session.
+    ///
+    /// The scope defaults to `Whole session` (the meeting is what the user is
+    /// usually after). The stored rows are whatever the host read for that
+    /// scope; `transcribed` / `part_count` drive the honest `2 of 3` line.
+    pub fn open_with_session(
+        &mut self,
+        configured: bool,
+        mut stored: Vec<StoredNote>,
+        transcript: &Transcript,
+        session: Option<(Uuid, u32, u32)>,
+    ) {
         sort_notes(&mut stored);
         self.transcript = Some(transcript.id);
         self.stored = stored;
@@ -134,10 +183,42 @@ impl NotesSheet {
             .unwrap_or(0)
             < 20_000;
         self.path = None;
+        match session {
+            Some((session_id, part_count, transcribed)) => {
+                self.session = Some(session_id);
+                self.part_count = part_count;
+                self.transcribed = transcribed;
+                self.scope = NoteScope::WholeSession;
+            }
+            None => {
+                self.session = None;
+                self.part_count = 0;
+                self.transcribed = 0;
+                self.scope = NoteScope::ThisPart;
+            }
+        }
         // Prefer the first preset that has a result; otherwise Minutes.
         if let Some(first) = self.stored.first() {
             self.preset = first.preset;
         }
+    }
+
+    /// M25C: switches the scope. Ignored while a run is in flight so a result
+    /// can never land under the wrong timeline.
+    pub fn set_scope(&mut self, scope: NoteScope) {
+        if !self.phase.is_running() {
+            self.scope = scope;
+        }
+    }
+
+    /// M25C: the honest incomplete-session line, shown under the scope toggle.
+    pub fn scope_note(&self) -> Option<String> {
+        (self.session.is_some() && self.transcribed < self.part_count).then(|| {
+            suramak_core::session::session_incomplete_line(
+                self.transcribed as usize,
+                self.part_count as usize,
+            )
+        })
     }
 
     /// Closes the sheet. A run in flight is not cancelled (batch only) — its
@@ -163,12 +244,23 @@ impl NotesSheet {
     }
 
     /// The Run action. Returns the preset to run, or the named refusal.
+    ///
+    /// M25C: a whole-session run over a session with a missing part is refused
+    /// before the request, with `session_incomplete` and the real count.
     pub fn start(&mut self) -> Result<NotePreset, String> {
         if self.phase.is_running() {
             return Err("a notes run is already in progress".to_string());
         }
         if !self.configured {
             return Err(NOTES_SETUP_NOTE.to_string());
+        }
+        if self.scope == NoteScope::WholeSession {
+            if let Some(reason) = suramak_core::session::session_incomplete_refusal(
+                self.transcribed as usize,
+                self.part_count as usize,
+            ) {
+                return Err(reason);
+            }
         }
         self.phase = NotesPhase::Running {
             preset: self.preset,

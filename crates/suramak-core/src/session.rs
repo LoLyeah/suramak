@@ -24,9 +24,11 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::decode;
 use crate::resample;
+use crate::transcript::Segment;
 use crate::SuramakError;
 
 /// Session cap on a 4 GB Android phone: 45 minutes (722 MB measured budget).
@@ -294,6 +296,185 @@ pub fn base_name(name: &str) -> String {
     stem.rsplit_once(" — Part ")
         .map(|(base, _)| base.to_string())
         .unwrap_or_else(|| name.to_string())
+}
+
+// ---- M25C: one meeting, N parts ------------------------------------------
+
+/// One transcribed part as the session timeline reads it.
+///
+/// `duration_ms` is the part's **audio** length, not its last segment's end:
+/// a part may end in silence, and the next part starts after all of it. The
+/// recording/import path supplies the duration it planned; a caller that only
+/// has segments may pass the last segment's end as an honest lower bound.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionPartInput {
+    pub transcript_id: Uuid,
+    pub title: String,
+    /// 1-based, as stored on the transcript.
+    pub part_index: u32,
+    pub part_count: u32,
+    pub duration_ms: i64,
+    pub segments: Vec<Segment>,
+}
+
+/// One part's place on the session-absolute timeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPartSpan {
+    pub transcript_id: Uuid,
+    pub title: String,
+    pub part_index: u32,
+    pub part_count: u32,
+    /// Session-absolute start of this part (sum of every earlier part's
+    /// duration). Part 1 is always 0.
+    pub offset_ms: i64,
+    pub duration_ms: i64,
+}
+
+/// The whole meeting: every part's segments on one absolute clock.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionTimeline {
+    /// Every segment, in part order, with absolute `start_ms`/`end_ms` and a
+    /// fresh contiguous `idx` (so the citation validator sees one recording).
+    pub segments: Vec<Segment>,
+    pub parts: Vec<SessionPartSpan>,
+    /// Sum of every part's duration.
+    pub total_ms: i64,
+}
+
+impl SessionTimeline {
+    /// The part a session-absolute time lands in.
+    pub fn part_at(&self, ms: i64) -> Option<&SessionPartSpan> {
+        self.parts
+            .iter()
+            .find(|part| ms >= part.offset_ms && ms < part.offset_ms + part.duration_ms)
+            .or_else(|| self.parts.last())
+    }
+}
+
+/// Turns stored transcripts into timeline inputs.
+///
+/// The part's audio header is the authoritative duration (a part can end in
+/// silence after its last word); when the file is gone or unreadable, the last
+/// segment's end is the honest lower bound. Titles are reduced to the base
+/// name so a session's parts all read as one meeting.
+pub fn session_inputs(parts: &[crate::transcript::Transcript]) -> Vec<SessionPartInput> {
+    parts
+        .iter()
+        .map(|part| {
+            let segments_end = part
+                .segments
+                .iter()
+                .map(|segment| segment.end_ms)
+                .max()
+                .unwrap_or(0);
+            let probed = part
+                .audio_path
+                .as_deref()
+                .and_then(decode::probe_duration_ms)
+                .map(|probed| i64::try_from(probed).unwrap_or(i64::MAX))
+                .unwrap_or(segments_end);
+            SessionPartInput {
+                transcript_id: part.id,
+                title: base_name(&part.title),
+                part_index: 0,
+                part_count: 0,
+                duration_ms: probed.max(segments_end).max(0),
+                segments: part.segments.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Builds the session-absolute timeline.
+///
+/// Parts are ordered by `part_index` (never by row order or title). The offset
+/// is the sum of the preceding parts' durations, so part 2 starts exactly at
+/// part 1's length — to the sample, when the caller passes the sample-exact
+/// duration. Segment `idx` is reassigned `0..n` across the whole session so a
+/// citation can never be ambiguous between two parts that both start at 0.
+pub fn session_timeline(parts: &[SessionPartInput]) -> SessionTimeline {
+    let mut ordered: Vec<&SessionPartInput> = parts.iter().collect();
+    ordered.sort_by_key(|part| part.part_index);
+
+    let mut segments = Vec::new();
+    let mut spans = Vec::with_capacity(ordered.len());
+    let mut offset_ms = 0i64;
+    let mut idx = 0u32;
+    for part in ordered {
+        spans.push(SessionPartSpan {
+            transcript_id: part.transcript_id,
+            title: part.title.clone(),
+            part_index: part.part_index,
+            part_count: part.part_count,
+            offset_ms,
+            duration_ms: part.duration_ms.max(0),
+        });
+        for segment in &part.segments {
+            segments.push(Segment {
+                idx,
+                start_ms: offset_ms + segment.start_ms,
+                end_ms: offset_ms + segment.end_ms,
+                text: segment.text.clone(),
+            });
+            idx = idx.saturating_add(1);
+        }
+        offset_ms += part.duration_ms.max(0);
+    }
+    SessionTimeline {
+        segments,
+        parts: spans,
+        total_ms: offset_ms,
+    }
+}
+
+/// `2 of 3 parts transcribed` — the one honest line for an incomplete session.
+pub fn session_incomplete_line(transcribed: usize, total: usize) -> String {
+    format!("{transcribed} of {total} parts transcribed")
+}
+
+/// The named refusal for whole-session notes over a session with a hole.
+///
+/// `None` means every part is present and the run may proceed. The reason
+/// starts with `session_incomplete` so the sheet, the log and the tests share
+/// one name; the sentence carries the actual `2 of 3` count.
+pub fn session_incomplete_refusal(transcribed: usize, total: usize) -> Option<String> {
+    if transcribed >= total {
+        return None;
+    }
+    Some(format!(
+        "session_incomplete: {} — whole-session notes need every part; \
+         transcribe the missing part or use This part",
+        session_incomplete_line(transcribed, total)
+    ))
+}
+
+/// `2 h 10 m`, `42 m`, `45 s` — the length the collapsed library row shows.
+pub fn session_length_label(total_ms: i64) -> String {
+    let total_s = total_ms.max(0) / 1000;
+    let hours = total_s / 3600;
+    let minutes = (total_s % 3600) / 60;
+    let seconds = total_s % 60;
+    if hours > 0 {
+        if minutes > 0 {
+            format!("{hours} h {minutes} m")
+        } else {
+            format!("{hours} h")
+        }
+    } else if minutes > 0 {
+        format!("{minutes} m")
+    } else {
+        format!("{seconds} s")
+    }
+}
+
+/// `3 parts · 2 h 10 m` — the collapsed library row's meta line.
+pub fn session_meta_label(part_count: usize, total_ms: i64) -> String {
+    format!(
+        "{} part{} · {}",
+        part_count,
+        if part_count == 1 { "" } else { "s" },
+        session_length_label(total_ms)
+    )
 }
 
 /// The plan for one captured buffer. `parts` always covers `0..samples.len()`

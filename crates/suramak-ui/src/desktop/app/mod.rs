@@ -22,7 +22,7 @@ use suramak_core::segment_edit::{
     EditKind, SegmentHistory, SegmentRow, SegmentSnapshot, UNDO_DEPTH,
 };
 use suramak_core::settings::{Appearance, EngineSetting, RecordSource};
-use suramak_core::store::WordAlignment;
+use suramak_core::store::{SessionIdentity, WordAlignment};
 use suramak_core::textrules::{
     CleanOptions, ExportPreview, PromptBudget, PromptMeasurement, TextSettings,
 };
@@ -1125,6 +1125,13 @@ pub struct AppState {
     pub last_insert: Option<SaveOutcome>,
     /// Microphone/system-audio recording state (M3).
     pub record: RecordState,
+    /// M25C: the session id one recording take owns, generated at Start. Every
+    /// rotated part inherits it; Stop moves the per-part identities into
+    /// `session_assignments` keyed by wav path.
+    pub record_session: Option<Uuid>,
+    /// M25C: pending `(part path, identity)` pairs. A transcript saved from one
+    /// of these paths gets the identity written in the same save.
+    pub session_assignments: Vec<(PathBuf, SessionIdentity)>,
     /// Model-manager state (M3): rows, download progress, last action.
     pub model_manager: ModelManager,
     /// Settings-form state (M3).
@@ -1316,9 +1323,15 @@ pub enum Effect {
     SaveTranscript {
         transcript: Box<Transcript>,
         words: Vec<WordTiming>,
+        /// M25C: the part's place in a multi-part session, written with the
+        /// transcript in the same save.
+        session: Option<SessionIdentity>,
     },
     /// Persist edited segment text (autosave / flush).
     SaveEdits { updates: Vec<(u32, String)> },
+    /// M25C: write a saved transcript's session identity (the journaled path
+    /// inserted the row already and only needs this one column set).
+    AssignSession { id: Uuid, identity: SessionIdentity },
     /// Load a transcript from the store into the editor.
     LoadTranscript(Box<Transcript>),
     /// Reload the library list from the store.
@@ -1500,6 +1513,8 @@ impl AppState {
             last_engine: None,
             last_insert: None,
             record: RecordState::Idle,
+            record_session: None,
+            session_assignments: Vec::new(),
             model_manager: ModelManager::default(),
             settings_form: SettingsForm::from_settings(&suramak_core::settings::Settings::default()),
             // Not probed until Settings opens (`refresh_fast_engine`).
@@ -1641,6 +1656,7 @@ impl AppState {
         self.status = None;
         self.home.error = None;
         self.last_insert = None;
+        self.record_session = Some(Uuid::new_v4());
         self.record = RecordState::Recording(Recording {
             title: format!("Recording {date}"),
             started_at: now,
@@ -1813,6 +1829,10 @@ impl AppState {
         if !keep {
             self.pending_recording_cleanup.extend(wavs.iter().cloned());
         }
+        // M25C: one recording is one session. The id was generated at Start;
+        // every part inherits it, with the numbers the file names already use.
+        let session = self.record_session.take().unwrap_or_else(Uuid::new_v4);
+        self.assign_recorded_parts(&wavs, session);
         let mut effects = self.begin_imports(wavs);
         if !deferred.is_empty() {
             effects.extend(self.begin_imports(deferred));
@@ -2493,6 +2513,82 @@ impl AppState {
         self.begin_imports(vec![input])
     }
 
+    /// M25C: records the session identity of a recording's rotated parts.
+    /// A single-part take is an ordinary transcript (no identity, no collapse).
+    fn assign_recorded_parts(&mut self, wavs: &[PathBuf], session: Uuid) {
+        let parts: Vec<(PathBuf, suramak_core::session::PartInfo)> = wavs
+            .iter()
+            .filter_map(|wav| {
+                let name = wav.file_name().and_then(|name| name.to_str())?;
+                Some((
+                    wav.clone(),
+                    suramak_core::session::PartInfo::from_name(name)?,
+                ))
+            })
+            .collect();
+        if parts.len() < 2 {
+            return;
+        }
+        let count = parts[0].1.count;
+        if parts.iter().any(|(_, part)| part.count != count) {
+            return;
+        }
+        for (path, part) in parts {
+            self.session_assignments
+                .push((path, SessionIdentity::new(session, part.index, part.count)));
+        }
+    }
+
+    /// M25C: an import that the cap split into `Part N of M` files is one
+    /// session. The files were named by `plan_split`, so the numbers are read
+    /// from the names — never invented here.
+    fn assign_split_imports(&mut self, inputs: &[PathBuf]) {
+        let mut groups: std::collections::BTreeMap<(String, u32), Vec<(PathBuf, u32)>> =
+            std::collections::BTreeMap::new();
+        for input in inputs {
+            let Some(name) = input.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(part) = suramak_core::session::PartInfo::from_name(name) else {
+                continue;
+            };
+            if part.count < 2 {
+                continue;
+            }
+            groups
+                .entry((suramak_core::session::base_name(name), part.count))
+                .or_default()
+                .push((input.clone(), part.index));
+        }
+        for ((_, count), group) in groups {
+            if group.len() < 2 {
+                continue;
+            }
+            let session = Uuid::new_v4();
+            for (path, index) in group {
+                if self
+                    .session_assignments
+                    .iter()
+                    .any(|(assigned, _)| assigned == &path)
+                {
+                    continue;
+                }
+                self.session_assignments
+                    .push((path, SessionIdentity::new(session, index, count)));
+            }
+        }
+    }
+
+    /// M25C: removes and returns the pending identity for one saved audio path.
+    fn take_session_for(&mut self, path: Option<&Path>) -> Option<SessionIdentity> {
+        let path = path?;
+        let index = self
+            .session_assignments
+            .iter()
+            .position(|(assigned, _)| assigned == path)?;
+        Some(self.session_assignments.remove(index).1)
+    }
+
     /// M16.1: imports one or more files in order.
     ///
     /// With nothing running the first file starts immediately (today's single
@@ -2514,6 +2610,9 @@ impl AppState {
         // reaches the queue — every part is a normal job. A file that cannot be
         // probed is left alone (the queue's named refusal is the safety net).
         let (inputs, split_notes) = split_over_cap_imports(inputs);
+        // M25C: a cap split is one session; each part gets the identity its
+        // name already carries.
+        self.assign_split_imports(&inputs);
         let split_note = (!split_notes.is_empty()).then(|| split_notes.join("; "));
         let starting = !matches!(self.job, Job::Running(_));
         if starting {
@@ -2817,8 +2916,23 @@ impl AppState {
                     // finished row (status, library refresh, quit-mid-recording
                     // cleanup) without a second insert.
                     effects.extend(self.on_transcript_persisted((*transcript).clone()));
+                    // M25C: the journal has no session column (and must not
+                    // grow one), so the identity is written right after the
+                    // committed row lands.
+                    if let Some(identity) = self.take_session_for(transcript.audio_path.as_deref())
+                    {
+                        effects.push(Effect::AssignSession {
+                            id: transcript.id,
+                            identity,
+                        });
+                    }
                 } else {
-                    effects.push(Effect::SaveTranscript { transcript, words });
+                    let session = self.take_session_for(transcript.audio_path.as_deref());
+                    effects.push(Effect::SaveTranscript {
+                        transcript,
+                        words,
+                        session,
+                    });
                 }
                 effects.extend(self.start_next_from_queue(true));
                 effects

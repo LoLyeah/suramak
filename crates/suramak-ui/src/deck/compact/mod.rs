@@ -171,6 +171,8 @@ pub fn ui(ctx: &egui::Context, state: &mut CompactApp) -> Vec<CompactAction> {
             chrome::sheet_sized(&mut sheet_ui, &tokens, screen, slide, 480.0)
         } else if sheet == Sheet::Notes {
             chrome::sheet_sized(&mut sheet_ui, &tokens, screen, slide, 600.0)
+        } else if sheet == Sheet::Session {
+            chrome::sheet_sized(&mut sheet_ui, &tokens, screen, slide, 560.0)
         } else {
             chrome::sheet(&mut sheet_ui, &tokens, screen, slide)
         };
@@ -190,6 +192,16 @@ pub fn ui(ctx: &egui::Context, state: &mut CompactApp) -> Vec<CompactAction> {
                     &tokens,
                     &motion,
                     state,
+                    sheet_rect,
+                ));
+            }
+            Sheet::Session => {
+                actions.extend(library::session_sheet(
+                    &mut sheet_ui,
+                    &tokens,
+                    &motion,
+                    state,
+                    now,
                     sheet_rect,
                 ));
             }

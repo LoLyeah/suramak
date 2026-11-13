@@ -27,6 +27,8 @@ use crate::deck::type_scale;
 
 use super::a11y;
 use super::chrome::{self, GUTTER, MIN_TOUCH};
+use crate::notes_sheet::NoteScope;
+
 use super::model::{
     clock, CompactAction, CompactApp, CompactExportFormat, ExportPhase, ExportSession,
 };
@@ -1666,9 +1668,83 @@ pub fn notes_sheet(
         gate_ui.label(egui::RichText::new(gate).size(12.0).color(tokens.ink_soft));
     }
 
+    // ---- M25C: the scope toggle (only when this part belongs to a session) --
+    let mut y = body.top() + 100.0;
+    if state.notes.session.is_some() {
+        let label = format!("{} · {}", "Scope", state.notes.scope.label());
+        ui.painter().text(
+            pos2(body.left() + GUTTER, y),
+            Align2::LEFT_TOP,
+            label,
+            type_scale::caption().font,
+            tokens.ink_soft,
+        );
+        let width = (body.width() - GUTTER * 2.0 - 8.0) / 2.0;
+        for (index, scope) in [NoteScope::ThisPart, NoteScope::WholeSession]
+            .into_iter()
+            .enumerate()
+        {
+            let rect = Rect::from_min_size(
+                pos2(
+                    body.left() + GUTTER + index as f32 * (width + 8.0),
+                    y + 20.0,
+                ),
+                vec2(width, 40.0),
+            );
+            let selected = state.notes.scope == scope;
+            let response = a11y::touch(
+                ui,
+                tokens,
+                rect,
+                ("notes-scope", index),
+                WidgetType::RadioButton,
+                scope.label(),
+                !state.notes.phase.is_running(),
+            );
+            ui.painter().rect(
+                rect,
+                CornerRadius::same(tokens.radius.control),
+                if selected {
+                    tokens.accent_tint
+                } else {
+                    tokens.control_fill
+                },
+                Stroke::new(
+                    1.0_f32,
+                    if selected {
+                        tokens.accent
+                    } else {
+                        tokens.hairline
+                    },
+                ),
+                StrokeKind::Inside,
+            );
+            ui.painter().text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                scope.label(),
+                type_scale::row_value().font,
+                if selected { tokens.accent } else { tokens.ink },
+            );
+            if response.clicked() {
+                state.set_notes_scope(scope);
+            }
+        }
+        y += 70.0;
+        if let Some(line) = state.notes.scope_note() {
+            ui.painter().text(
+                pos2(body.left() + GUTTER, y),
+                Align2::LEFT_TOP,
+                line,
+                type_scale::caption().font,
+                tokens.record_red_text,
+            );
+            y += 22.0;
+        }
+    }
+
     // ---- the three presets, one full-width row each -----------------------
     let row_h = 44.0;
-    let mut y = body.top() + 100.0;
     for preset in NotePreset::ALL {
         let rect = Rect::from_min_size(
             pos2(body.left() + GUTTER, y),

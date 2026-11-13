@@ -156,7 +156,13 @@ pub const WAVEFORM_BARS: usize = 28;
 ///   holding the citation-checked Markdown, the checked/removed counts, the
 ///   model and the generation time. Regenerating replaces that row. No existing
 ///   table is rebuilt.
-pub const SCHEMA_VERSION: i64 = 12;
+/// - **v13** — M25C, additive only: `transcripts.session_id` (a nullable uuid
+///   shared by every part of one meeting), `part_index` / `part_count` (the
+///   `Part N of M` numbers as columns, not title parsing), and
+///   `notes.session_id` (a whole-session note is keyed by
+///   `(session_id, preset)` via a partial unique index). Existing rows keep
+///   NULL for all four columns and render exactly as before.
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// SQLite-backed transcript library with WAL mode.
 pub struct Store {
@@ -342,8 +348,45 @@ impl JobRecord {
     }
 }
 
+/// M25C: one transcript's place in a multi-part session.
+///
+/// The identity is stored on the `transcripts` row (`session_id`, `part_index`,
+/// `part_count`) the moment the transcript is saved. A row without one is an
+/// ordinary single transcript — exactly the pre-v13 shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SessionIdentity {
+    pub session_id: Uuid,
+    /// 1-based.
+    pub part_index: u32,
+    pub part_count: u32,
+}
+
+impl SessionIdentity {
+    pub fn new(session_id: Uuid, part_index: u32, part_count: u32) -> Self {
+        Self {
+            session_id,
+            part_index,
+            part_count,
+        }
+    }
+
+    /// `Part 2 of 3` (the same words [`crate::session::PartInfo`] prints).
+    pub fn label(&self) -> String {
+        format!("Part {} of {}", self.part_index, self.part_count)
+    }
+
+    /// Whether this row is one of several parts, i.e. the library collapses it.
+    pub fn is_multi_part(&self) -> bool {
+        self.part_count >= 2
+    }
+}
+
 /// One stored note (M24B): the citation-checked Markdown for one
 /// (transcript, preset), with the validator's counts and its provenance.
+///
+/// M25C: `session_id` is `Some` when the note was written over a whole
+/// multi-part session; the row is then keyed by `(session_id, preset)` and
+/// `transcript_id` is the session's first part (the FK anchor).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteRecord {
     pub transcript_id: Uuid,
@@ -353,6 +396,7 @@ pub struct NoteRecord {
     pub citations_removed: u32,
     pub model: String,
     pub created_at: DateTime<Utc>,
+    pub session_id: Option<Uuid>,
 }
 
 impl NoteRecord {
@@ -370,13 +414,14 @@ impl NoteRecord {
     }
 }
 
-/// Decodes one `notes` row (the seven columns every query selects, in order).
+/// Decodes one `notes` row (the eight columns every query selects, in order).
 fn note_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NoteRecord> {
     let transcript: String = row.get(0)?;
     let preset: String = row.get(1)?;
     let checked: i64 = row.get(3)?;
     let removed: i64 = row.get(4)?;
     let created: String = row.get(6)?;
+    let session: Option<String> = row.get(7)?;
     Ok(NoteRecord {
         transcript_id: Uuid::parse_str(&transcript).unwrap_or(Uuid::nil()),
         // The key set is closed by this build; an unreadable key can only come
@@ -390,6 +435,7 @@ fn note_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NoteRecord> {
         created_at: DateTime::parse_from_rfc3339(&created)
             .map(|at| at.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now()),
+        session_id: session.and_then(|id| Uuid::parse_str(&id).ok()),
     })
 }
 
@@ -521,7 +567,12 @@ impl Store {
                  source_json TEXT NOT NULL,
                  model       TEXT NOT NULL,
                  language    TEXT,
-                 audio_path  TEXT
+                 audio_path  TEXT,
+                 -- M25C (schema v13): one meeting, N parts. NULL on every
+                 -- pre-v13 row (an ordinary single transcript).
+                 session_id  TEXT,
+                 part_index  INTEGER,
+                 part_count  INTEGER
              );
              CREATE TABLE IF NOT EXISTS segments (
                  transcript_id TEXT    NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
@@ -717,6 +768,8 @@ impl Store {
              -- (transcript, preset); regenerating replaces that row. `body_md`
              -- is the stored, citation-checked Markdown and the counts are the
              -- validator's own — a reloaded note never has to guess.
+             -- M25C (v13): `session_id` is set on a whole-session note; a
+             -- partial unique index keeps one row per (session, preset).
              CREATE TABLE IF NOT EXISTS notes (
                  transcript_id     TEXT NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
                  preset            TEXT NOT NULL,
@@ -725,8 +778,11 @@ impl Store {
                  citations_removed INTEGER NOT NULL DEFAULT 0,
                  model             TEXT NOT NULL DEFAULT '',
                  created_at        TEXT NOT NULL,
+                 session_id        TEXT,
                  PRIMARY KEY (transcript_id, preset)
-             );",
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS notes_session_preset
+                 ON notes(session_id, preset) WHERE session_id IS NOT NULL;",
         )?;
         self.migrate()?;
         self.recover_job_checkpoints()?;
@@ -823,6 +879,9 @@ impl Store {
         }
         if version < 12 {
             self.upgrade_to_v12()?;
+        }
+        if version < 13 {
+            self.upgrade_to_v13()?;
         }
         Ok(())
     }
@@ -1179,21 +1238,67 @@ impl Store {
         Ok(())
     }
 
+    /// v12 → v13, one transaction: session identity on the parts and on the
+    /// notes. Additive only — every existing row keeps NULL in the new columns
+    /// and the library renders exactly as it did. A fresh database already has
+    /// them from the DDL above, so a re-run is a no-op.
+    fn upgrade_to_v13(&self) -> Result<(), SuramakError> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (table, column, ddl) in [
+            ("transcripts", "session_id", "TEXT"),
+            ("transcripts", "part_index", "INTEGER"),
+            ("transcripts", "part_count", "INTEGER"),
+            ("notes", "session_id", "TEXT"),
+        ] {
+            if !Self::column_exists(&tx, table, column)? {
+                tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ddl}"))?;
+            }
+        }
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS transcripts_session
+                 ON transcripts(session_id, part_index);
+             CREATE UNIQUE INDEX IF NOT EXISTS notes_session_preset
+                 ON notes(session_id, preset) WHERE session_id IS NOT NULL;",
+        )?;
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params!["13"],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     // ---- M24B: citation-verified notes -------------------------------------
 
-    /// Inserts or replaces one (transcript, preset) note. Regenerating is a
-    /// replace: the row's body, counts, model and `created_at` all move.
+    /// Inserts or replaces one note. Regenerating is a replace: the row's
+    /// body, counts, model and `created_at` all move.
+    ///
+    /// M25C: a session note (`session_id = Some`) replaces the row keyed by
+    /// `(session, preset)`; a per-part note replaces `(transcript, preset)`.
+    /// The delete-then-insert runs in one transaction so the partial unique
+    /// index can never see two live rows for one session.
     pub fn save_note(&self, note: &NoteRecord) -> Result<(), SuramakError> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        match note.session_id {
+            Some(session_id) => {
+                tx.execute(
+                    "DELETE FROM notes WHERE session_id = ?1 AND preset = ?2",
+                    params![session_id.to_string(), note.preset.key()],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "DELETE FROM notes
+                     WHERE transcript_id = ?1 AND preset = ?2 AND session_id IS NULL",
+                    params![note.transcript_id.to_string(), note.preset.key()],
+                )?;
+            }
+        }
+        tx.execute(
             "INSERT INTO notes(transcript_id, preset, body_md, citations_checked,
-                               citations_removed, model, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(transcript_id, preset) DO UPDATE SET
-                 body_md           = excluded.body_md,
-                 citations_checked = excluded.citations_checked,
-                 citations_removed = excluded.citations_removed,
-                 model             = excluded.model,
-                 created_at        = excluded.created_at",
+                               citations_removed, model, created_at, session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 note.transcript_id.to_string(),
                 note.preset.key(),
@@ -1202,12 +1307,15 @@ impl Store {
                 i64::from(note.citations_removed),
                 note.model,
                 note.created_at.to_rfc3339(),
+                note.session_id.map(|id| id.to_string()),
             ],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
-    /// One (transcript, preset) note, or `None`.
+    /// One per-part (transcript, preset) note, or `None`. A whole-session note
+    /// is deliberately not returned here — it has its own reader.
     pub fn note(
         &self,
         transcript_id: Uuid,
@@ -1217,8 +1325,9 @@ impl Store {
             .conn
             .query_row(
                 "SELECT transcript_id, preset, body_md, citations_checked,
-                        citations_removed, model, created_at
-                 FROM notes WHERE transcript_id = ?1 AND preset = ?2",
+                        citations_removed, model, created_at, session_id
+                 FROM notes
+                 WHERE transcript_id = ?1 AND preset = ?2 AND session_id IS NULL",
                 params![transcript_id.to_string(), preset.key()],
                 note_row,
             )
@@ -1226,13 +1335,12 @@ impl Store {
         Ok(row)
     }
 
-    /// Every note for a transcript, in the product's preset order (Minutes,
-    /// Action items, Bilingual brief) — the sheet's row order.
+    /// Every per-part note for a transcript, in the product's preset order.
     pub fn notes_for(&self, transcript_id: Uuid) -> Result<Vec<NoteRecord>, SuramakError> {
         let mut statement = self.conn.prepare(
             "SELECT transcript_id, preset, body_md, citations_checked,
-                    citations_removed, model, created_at
-             FROM notes WHERE transcript_id = ?1
+                    citations_removed, model, created_at, session_id
+             FROM notes WHERE transcript_id = ?1 AND session_id IS NULL
              ORDER BY CASE preset
                  WHEN 'minutes' THEN 0
                  WHEN 'action_items' THEN 1
@@ -1241,6 +1349,46 @@ impl Store {
              END",
         )?;
         let rows = statement.query_map(params![transcript_id.to_string()], note_row)?;
+        let mut notes = Vec::new();
+        for row in rows {
+            notes.push(row?);
+        }
+        Ok(notes)
+    }
+
+    /// One whole-session (session, preset) note, or `None`.
+    pub fn session_note(
+        &self,
+        session_id: Uuid,
+        preset: NotePreset,
+    ) -> Result<Option<NoteRecord>, SuramakError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT transcript_id, preset, body_md, citations_checked,
+                        citations_removed, model, created_at, session_id
+                 FROM notes WHERE session_id = ?1 AND preset = ?2",
+                params![session_id.to_string(), preset.key()],
+                note_row,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Every whole-session note, in the product's preset order.
+    pub fn notes_for_session(&self, session_id: Uuid) -> Result<Vec<NoteRecord>, SuramakError> {
+        let mut statement = self.conn.prepare(
+            "SELECT transcript_id, preset, body_md, citations_checked,
+                    citations_removed, model, created_at, session_id
+             FROM notes WHERE session_id = ?1
+             ORDER BY CASE preset
+                 WHEN 'minutes' THEN 0
+                 WHEN 'action_items' THEN 1
+                 WHEN 'bilingual_brief' THEN 2
+                 ELSE 3
+             END",
+        )?;
+        let rows = statement.query_map(params![session_id.to_string()], note_row)?;
         let mut notes = Vec::new();
         for row in rows {
             notes.push(row?);
@@ -4982,6 +5130,128 @@ impl Store {
         Ok(result)
     }
 
+    // ---- M25C: session identity -------------------------------------------
+
+    /// Writes (or clears) one transcript's place in a session.
+    ///
+    /// `identity` is validated as `1 <= part_index <= part_count`; a caller
+    /// cannot store a part number the label could not print. Passing `None`
+    /// restores the pre-v13 single-transcript shape.
+    pub fn set_transcript_session(
+        &self,
+        id: Uuid,
+        identity: Option<SessionIdentity>,
+    ) -> Result<(), SuramakError> {
+        if let Some(identity) = identity {
+            if identity.part_count == 0
+                || identity.part_index == 0
+                || identity.part_index > identity.part_count
+            {
+                return Err(SuramakError::Schema(format!(
+                    "invalid part {}/{} for session {}",
+                    identity.part_index, identity.part_count, identity.session_id
+                )));
+            }
+        }
+        let changed = self.conn.execute(
+            "UPDATE transcripts SET session_id = ?1, part_index = ?2, part_count = ?3
+             WHERE id = ?4",
+            params![
+                identity.map(|identity| identity.session_id.to_string()),
+                identity.map(|identity| i64::from(identity.part_index)),
+                identity.map(|identity| i64::from(identity.part_count)),
+                id.to_string(),
+            ],
+        )?;
+        if changed == 0 {
+            return Err(SuramakError::TranscriptNotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// One transcript's session identity, or `None` for an ordinary row.
+    pub fn transcript_session(&self, id: Uuid) -> Result<Option<SessionIdentity>, SuramakError> {
+        let row: Option<(Option<String>, Option<i64>, Option<i64>)> = self
+            .conn
+            .query_row(
+                "SELECT session_id, part_index, part_count FROM transcripts WHERE id = ?1",
+                params![id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        Ok(row.and_then(|(session, index, count)| {
+            Some(SessionIdentity {
+                session_id: Uuid::parse_str(session.as_deref()?).ok()?,
+                part_index: u32::try_from(index?).ok()?,
+                part_count: u32::try_from(count?).ok()?,
+            })
+        }))
+    }
+
+    /// Every transcript that carries a session identity, keyed by transcript id.
+    /// One query for a whole library, so the list can group without N+1 reads.
+    pub fn session_identities(
+        &self,
+    ) -> Result<std::collections::HashMap<Uuid, SessionIdentity>, SuramakError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, part_index, part_count FROM transcripts
+             WHERE session_id IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (id, session, index, count) = row?;
+            let (Ok(id), Ok(session_id), Ok(index), Ok(count)) = (
+                Uuid::parse_str(&id),
+                Uuid::parse_str(&session),
+                u32::try_from(index),
+                u32::try_from(count),
+            ) else {
+                continue;
+            };
+            map.insert(
+                id,
+                SessionIdentity {
+                    session_id,
+                    part_index: index,
+                    part_count: count,
+                },
+            );
+        }
+        Ok(map)
+    }
+
+    /// Every part of one session, ordered by `part_index`, with its segments.
+    ///
+    /// A session with a missing part returns only the parts that exist; the
+    /// caller compares `len()` with `part_count` to say `2 of 3 parts
+    /// transcribed` instead of pretending the gap is a short meeting.
+    pub fn session_parts(&self, session_id: Uuid) -> Result<Vec<Transcript>, SuramakError> {
+        let ids: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM transcripts WHERE session_id = ?1
+                 ORDER BY part_index, created_at",
+            )?;
+            let rows = stmt.query_map(params![session_id.to_string()], |row| row.get(0))?;
+            rows.collect::<Result<Vec<String>, _>>()
+                .map_err(SuramakError::Sqlite)?
+        };
+        let mut parts = Vec::with_capacity(ids.len());
+        for raw in ids {
+            let id =
+                Uuid::parse_str(&raw).map_err(|_| SuramakError::TranscriptNotFound(raw.clone()))?;
+            parts.push(self.get_transcript(id)?);
+        }
+        Ok(parts)
+    }
+
     /// Full-text search over transcript titles, segment text and the text-rule
     /// corpus (M15.7).
     ///
@@ -8179,6 +8449,7 @@ mod tests {
             created_at: DateTime::parse_from_rfc3339(created)
                 .unwrap()
                 .with_timezone(&Utc),
+            session_id: None,
         }
     }
 

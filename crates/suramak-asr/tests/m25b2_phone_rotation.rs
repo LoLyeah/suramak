@@ -183,7 +183,15 @@ fn a_47_minute_take_rotates_once_at_the_first_silence_after_45_minutes() {
         peak_kb as f64 / 1024.0
     );
 
-    assert!(peak_kb > 0);
+    // VmHWM lives in /proc: on macOS the sampler reads nothing, and the peak-RSS
+    // figure is a LINUX measurement (the gate's numbers came from this box).
+    // The rotation itself is platform-independent — the bit-for-bit comparison
+    // above is the assertion that matters here.
+    if cfg!(target_os = "linux") {
+        assert!(peak_kb > 0, "the Linux RSS sampler must report a peak");
+    } else {
+        println!("M25B2: peak RSS is a Linux measurement — not asserted on this platform");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

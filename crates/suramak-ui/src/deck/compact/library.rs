@@ -301,12 +301,9 @@ pub fn ui(
                             index + 1 < state.rows.len(),
                         );
                         if drawn.play_clicked {
-                            actions.push(CompactAction::PlayTranscript(row.id));
+                            actions.push(open_row(row));
                         } else if drawn.response.clicked() {
-                            actions.push(CompactAction::OpenTranscript {
-                                id: row.id,
-                                segment: None,
-                            });
+                            actions.push(open_row(row));
                         }
                     }
                     // The dock floats over the list: the last row must be able
@@ -365,12 +362,9 @@ pub fn ui(
                             true,
                         );
                         if drawn.play_clicked {
-                            actions.push(CompactAction::PlayTranscript(row.id));
+                            actions.push(open_row(row));
                         } else if drawn.response.clicked() {
-                            actions.push(CompactAction::OpenTranscript {
-                                id: row.id,
-                                segment: None,
-                            });
+                            actions.push(open_row(row));
                         }
                     }
                     if !segment_hits.is_empty() {
@@ -475,6 +469,19 @@ struct DrawnLibraryRow {
     play_clicked: bool,
 }
 
+/// M25C: a collapsed row opens the session view; an ordinary row opens its
+/// transcript. A collapsed row has no single audio stream to play, so its
+/// play affordance takes the same route.
+fn open_row(row: &LibraryRow) -> CompactAction {
+    match row.session {
+        Some(summary) => CompactAction::OpenSession(summary.session_id),
+        None => CompactAction::OpenTranscript {
+            id: row.id,
+            segment: None,
+        },
+    }
+}
+
 /// Draws one full library row: the M20C press, the M22C anatomy (waveform,
 /// pips, tabular duration), the play target and the chevron. The caller owns
 /// the action mapping, so the plain list and the search's title section share
@@ -490,7 +497,10 @@ fn draw_library_row(
     selected: bool,
     divider: bool,
 ) -> DrawnLibraryRow {
-    let part_label = row.part.as_ref().map(|part| part.label());
+    let part_label = row
+        .part_chip
+        .clone()
+        .or_else(|| row.part.as_ref().map(|part| part.label()));
     let (response, scale) = chrome::row(
         ui,
         tokens,
@@ -947,6 +957,117 @@ pub fn row_meta() -> TypeToken {
 /// The app bar's serif title token.
 pub fn title() -> TypeToken {
     chrome::title_token()
+}
+
+/// M25C: the session view — every part in order, its length and one line of
+/// its opening. Tapping a part opens that part's editor (each part stays
+/// editable on its own; a session is never edited across parts).
+pub fn session_sheet(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    motion: &Motion,
+    state: &mut CompactApp,
+    now: f64,
+    body: Rect,
+) -> Vec<CompactAction> {
+    let mut actions = Vec::new();
+    let Some(view) = state.session_view.clone() else {
+        return actions;
+    };
+    let title_token = type_scale::editorial_display();
+    let mut job = egui::text::LayoutJob::default();
+    job.append(&view.title, 0.0, title_token.format(tokens.ink));
+    job.wrap.max_width = body.width() - GUTTER * 2.0;
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('…');
+    let galley = ui.painter().layout_job(job);
+    ui.painter().galley(
+        pos2(body.left() + GUTTER, body.top() + 24.0),
+        galley,
+        tokens.ink,
+    );
+    ui.painter().text(
+        pos2(body.left() + GUTTER, body.top() + 62.0),
+        Align2::LEFT_TOP,
+        view.meta(),
+        type_scale::caption().font,
+        tokens.ink_soft,
+    );
+    let export = Rect::from_min_size(
+        pos2(body.right() - GUTTER - 112.0, body.top() + 20.0),
+        vec2(112.0, 40.0),
+    );
+    if chrome::action_button(
+        ui,
+        tokens,
+        motion,
+        export,
+        "session-export",
+        "Export .md",
+        true,
+    )
+    .clicked()
+    {
+        if let Some(action) = state.session_export_action() {
+            actions.push(action);
+        }
+    }
+    let mut list_top = body.top() + 88.0;
+    if let Some(line) = view.incomplete_line() {
+        ui.painter().text(
+            pos2(body.left() + GUTTER, list_top),
+            Align2::LEFT_TOP,
+            line,
+            type_scale::caption().font,
+            tokens.record_red_text,
+        );
+        list_top += 24.0;
+    }
+    let list = Rect::from_min_max(
+        pos2(body.left(), list_top),
+        pos2(body.right(), body.bottom() - 16.0),
+    );
+    let mut list_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(list)
+            .layout(Layout::top_down(Align::Min)),
+    );
+    ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(&mut list_ui, |ui| {
+            for (index, part) in view.parts.iter().enumerate() {
+                let rect = Rect::from_min_size(
+                    pos2(list.left() + GUTTER, list.top() + index as f32 * 64.0),
+                    vec2(list.width() - GUTTER * 2.0, 64.0),
+                );
+                let title = format!(
+                    "Part {} — {}",
+                    part.part_index,
+                    suramak_core::time::fmt_plain(part.duration_ms)
+                );
+                let (response, _) = chrome::row(
+                    ui,
+                    tokens,
+                    motion,
+                    rect,
+                    ("session-part", index),
+                    &title,
+                    &part.opening,
+                    chrome::RowExtras::NONE,
+                    false,
+                    index + 1 < view.parts.len(),
+                );
+                if response.clicked() {
+                    state.close_export_sheet(now);
+                    actions.push(CompactAction::OpenTranscript {
+                        id: part.id,
+                        segment: None,
+                    });
+                }
+            }
+        });
+    actions
 }
 
 #[cfg(test)]

@@ -137,6 +137,7 @@ impl AppState {
                 citations_removed: note.citations_removed,
                 model: note.model,
                 created_at: created,
+                session_id: None,
             }),
         }]
     }

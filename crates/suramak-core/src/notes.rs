@@ -19,6 +19,7 @@ use std::collections::BTreeSet;
 
 use serde::Serialize;
 
+use crate::session::{session_incomplete_refusal, session_timeline, SessionPartInput};
 use crate::settings::PolishSettings;
 use crate::transcript::Segment;
 use crate::SuramakError;
@@ -579,6 +580,46 @@ pub fn generate_notes(
         parts: total,
         model: cfg.model.clone(),
     })
+}
+
+/// M25C: one preset's notes over a whole multi-part session.
+///
+/// The parts are put on a session-absolute timeline first (part 2 starts at
+/// part 1's duration), and the **same** absolute segments are both sent to the
+/// model and passed to [`check_notes`]. A citation that lives in part 3 is
+/// therefore checked against the timeline the model saw, not against part 1.
+///
+/// An incomplete session is refused before any request is made, with the named
+/// `session_incomplete` reason and the honest `2 of 3 parts transcribed` line.
+pub fn generate_session_notes(
+    title: &str,
+    language: Option<&str>,
+    parts: &[SessionPartInput],
+    speaker_labels: &[(u32, String)],
+    preset: NotePreset,
+    cfg: &PolishSettings,
+) -> Result<NotesOutcome, SuramakError> {
+    let total = parts
+        .first()
+        .map(|part| part.part_count as usize)
+        .unwrap_or(0);
+    if let Some(reason) = session_incomplete_refusal(parts.len(), total) {
+        return Err(SuramakError::Notes(reason));
+    }
+    let timeline = session_timeline(parts);
+    if timeline.segments.is_empty() {
+        return Err(SuramakError::Notes(
+            "the session has no segments — there is nothing to summarize".to_string(),
+        ));
+    }
+    generate_notes(
+        title,
+        language,
+        &timeline.segments,
+        speaker_labels,
+        preset,
+        cfg,
+    )
 }
 
 #[cfg(test)]

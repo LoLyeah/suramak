@@ -456,6 +456,16 @@ impl CompactShell {
             None => return,
         };
         match action {
+            CompactAction::OpenSession(session) => {
+                let reply = host.dispatch(
+                    &serde_json::json!({
+                        "op": "open_session",
+                        "session_id": session.to_string(),
+                    })
+                    .to_string(),
+                );
+                log_reply("open session", &reply);
+            }
             CompactAction::OpenTranscript { id, segment } => {
                 let reply = host.dispatch(
                     &serde_json::json!({
@@ -555,11 +565,15 @@ impl CompactShell {
             ),
             // M24B: the notes sheet's three host calls. The Rust host owns the
             // store and the polish settings, so the phone needs no second path.
-            CompactAction::LoadNotes { transcript } => {
+            CompactAction::LoadNotes {
+                transcript,
+                session,
+            } => {
                 let reply = host.dispatch(
                     &serde_json::json!({
                         "op": "notes_load",
                         "transcript_id": transcript.to_string(),
+                        "session_id": session.map(|id| id.to_string()),
                     })
                     .to_string(),
                 );
@@ -571,6 +585,8 @@ impl CompactShell {
                         "op": "notes_generate",
                         "transcript_id": request.transcript.to_string(),
                         "preset": request.preset.key(),
+                        "session_id": request.session.map(|id| id.to_string()),
+                        "scope": request.scope.label(),
                     })
                     .to_string(),
                 );
@@ -591,6 +607,22 @@ impl CompactShell {
                     .to_string(),
                 );
                 log_reply("export note", &reply);
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&reply) {
+                    if let Some(path) = value.get("path").and_then(serde_json::Value::as_str) {
+                        send_intent(ACTION_SHARE, &[("path", Extra::Str(path))]);
+                    }
+                }
+            }
+            CompactAction::ExportSession { name, markdown } => {
+                let reply = host.dispatch(
+                    &serde_json::json!({
+                        "op": "note_export",
+                        "name": name,
+                        "markdown": markdown,
+                    })
+                    .to_string(),
+                );
+                log_reply("export session", &reply);
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(&reply) {
                     if let Some(path) = value.get("path").and_then(serde_json::Value::as_str) {
                         send_intent(ACTION_SHARE, &[("path", Extra::Str(path))]);
