@@ -924,17 +924,38 @@ resting_layout_line() {
 }
 
 LINE=""
-for round in 1 2 3 4; do
+PREV=""
+for round in 1 2 3 4 5 6 7 8; do
   for _ in 1 2 3; do
     "$ADB" shell input swipe \
       "$((SCREEN_W / 2))" "$((SCREEN_H * 72 / 100))" \
       "$((SCREEN_W / 2))" "$((SCREEN_H * 28 / 100))" 200
     sleep 0.3
   done
-  if LINE="$(resting_layout_line)"; then
+  LINE="$(resting_layout_line)" || continue
+  # REST IS NOT THE END. A fling ending mid-list also produces two identical
+  # lines, so the old loop stopped while the last row was still below the
+  # viewport and then failed the clearance check on a list it had not finished
+  # scrolling (run 43409783628: quit_bottom 895.8 vs viewport 890.3, 5.5 pt —
+  # the list had not reached its end after the settings grew two rows).
+  #
+  # Keep swiping while the last control is still below the viewport AND the
+  # number is still improving; stop when it clears, or when a further round
+  # changes nothing (that is the real end, and the check below will judge it).
+  last_bottom="$(printf '%s' "$LINE" | sed -n 's/.*quit_bottom=\(-\?[0-9.]*\).*/\1/p')"
+  viewport="$(printf '%s' "$LINE" | sed -n 's/.*viewport_bottom=\(-\?[0-9.]*\).*/\1/p')"
+  if [ -n "$last_bottom" ] && [ -n "$viewport" ]; then
+    clears="$(awk -v a="$last_bottom" -v b="$viewport" 'BEGIN { print (a <= b + 0.5) ? "yes" : "no" }')"
+    [ "$clears" = yes ] && break
+    if [ "$last_bottom" = "$PREV" ]; then
+      echo "   scroll:   the list is at its end and the last row still overflows — measuring it" >&2
+      break
+    fi
+    PREV="$last_bottom"
+  else
     break
   fi
-  echo "   scroll:   list still moving after round $round — swiping again" >&2
+  echo "   scroll:   last row at ${last_bottom} pt (viewport ${viewport}) — swiping again" >&2
 done
 [ -n "$LINE" ] || fail "no resting SURAMAK-LAYOUT line after the swipes — the geometry never stopped changing (see the app log)"
 printf '%s\n' "$LINE" >"$OUT/layout.txt"
