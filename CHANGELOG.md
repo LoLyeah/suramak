@@ -4,6 +4,21 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased]
 
+## 0.7.0 - 2026-11-13
+
+### Added
+- **Long meetings, split at pauses instead of dying.** The gate measured the ceiling first: peak memory is `308 MB + 9.19 MB per audio-minute`, so 60 minutes fits (859 MB) and 90 minutes does not (1,135 MB). The app now enforces one honest cap — **45 minutes on a phone, 60 on desktop** — and, instead of refusing anything longer, records through it:
+  - **Recording rotates at a real silence** (≥ 600 ms, ≤ 120 s grace) and cuts at the least-energetic window if no pause comes, flagging that part rather than pretending. On Android the cut happens after resampling, so the parts are slices of one continuous 16 kHz stream and concatenate **bit for bit** (47-minute test: all 45,120,000 samples identical).
+  - **Imports over the cap split the same way**, with an honest `no pause found` note when a file has no quiet moment to cut at.
+  - The 30-minute diarization limit is now surfaced where it matters: "split into shorter parts to label speakers" instead of a button that does nothing.
+- **A session is one meeting.** Parts carry a session identity (schema v13), so a 90-minute recording shows as **one library row** — `3 parts · 2 h 10 m` — with an ordered session view, instead of five unrelated files.
+- **Notes over the whole meeting.** Minutes, Action items and the EN↔ID brief can run across every part on a **session-absolute timeline**: a citation that lives in part 3 still jumps to the right second, and the validator checks it there. If a part failed, the sheet says `2 of 3 parts transcribed` and refuses with `session_incomplete` rather than writing minutes over a hole.
+- **One export per session** — a single Markdown file with `## Part N — mm:ss` dividers; a single part's export stays byte-identical to before.
+
+### Fixed
+- The Android launch smoke no longer fails on the emulator's own launcher ANR: a dialog naming another package is dismissed and re-dumped, while a dialog naming Suramak still fails the run.
+- A rotation test asserted a Linux-only memory metric on macOS; the bit-for-bit comparison is the assertion, and the RSS number is now checked where it can be measured.
+
 ## 0.6.0 - 2026-11-13
 
 ### Added
