@@ -109,7 +109,16 @@ fn a_47_minute_take_rotates_once_at_the_first_silence_after_45_minutes() {
     let reference_path = dir.join("reference.wav");
 
     let started = std::time::Instant::now();
-    let mut rotating = StreamingWav::create_rotating(&path, RATE).unwrap();
+    // A pinned 45-minute cap on purpose: since M26A the shipping cap is computed
+    // from the host's memory (431 min on a 12 GB phone, 136 on a 7 GB runner), so
+    // a test that used the shipping policy would rotate on some machines and not
+    // others. This test proves the MECHANISM — one pause, one cut, exact parts.
+    let mut rotating = StreamingWav::create_with_policy(
+        &path,
+        RATE,
+        suramak_asr::capture_stream::RotationPolicy::with_cap(45 * 60 * 1000),
+    )
+    .unwrap();
     let mut reference = StreamingWav::create(&reference_path, RATE).unwrap();
 
     let seconds = TOTAL_MS / 1000;
