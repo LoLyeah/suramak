@@ -38,6 +38,8 @@ pub mod capture_android;
 pub(crate) mod capture_rt;
 pub mod engine;
 pub mod live;
+pub mod macro_chunk;
+pub mod macro_pipeline;
 pub mod mix;
 pub mod parakeet;
 pub mod pipeline;

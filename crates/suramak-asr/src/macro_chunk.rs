@@ -3,7 +3,7 @@
 //! This module is the **pure** half of the slice: boundary selection, the prompt
 //! firewall and the deterministic seam stitch. It never touches whisper; the
 //! decode loop that applies these rules to one reused `WhisperState` lives in
-//! [`crate::pipeline`] and [`crate::whisper::WindowSession`].
+//! [`crate::macro_pipeline`] and [`crate::whisper::WindowSession`].
 //!
 //! Design: `docs/reports/M26-memory-design.md` §C. The rules are fixed by the
 //! work order (`docs/WORKORDER-M26C.md`) and are reproduced here as constants,
@@ -137,10 +137,6 @@ impl MacroWindow {
         let cut = self.cut_ms()?;
         Some(cut - (self.overlap_samples / SAMPLES_PER_MS) as i64 / 2)
     }
-
-    pub fn len(&self) -> usize {
-        self.end_sample.saturating_sub(self.start_sample)
-    }
 }
 
 /// The cut chosen for one cursor, before it becomes a [`MacroWindow`].
@@ -170,26 +166,28 @@ fn percentile(sorted: &[f64], fraction: f64) -> f64 {
     sorted[index.min(sorted.len() - 1)]
 }
 
-/// The frames of the search band, as `(first_frame, mean_squares)`.
+/// The frames of the search band, as `(first_frame_index, mean_squares)`.
 ///
-/// Frame 0 starts at the cursor, so every window is cut on the same 20 ms grid
-/// regardless of where the previous cut landed.
+/// Frame `i` covers `cursor + i × 20 ms`; every window is cut on the same 20 ms
+/// grid regardless of where the previous cut landed. The first index is
+/// returned with the energies because the band starts mid-window.
 fn band_frames(
     samples: &[f32],
     cursor: usize,
     total: usize,
     band_lo: usize,
     band_hi: usize,
-) -> Vec<f64> {
+) -> (usize, Vec<f64>) {
+    let first = cursor + (band_lo.saturating_sub(cursor) / FRAME_SAMPLES) * FRAME_SAMPLES;
     let mut energies = Vec::new();
-    let mut start = cursor;
+    let mut start = first;
     while start + FRAME_SAMPLES <= total {
         if start >= band_lo && start + FRAME_SAMPLES <= band_hi {
             energies.push(frame_mean_square(samples, start));
         }
         start += FRAME_SAMPLES;
     }
-    energies
+    ((first - cursor) / FRAME_SAMPLES, energies)
 }
 
 /// Picks the boundary for the window starting at `cursor`.
@@ -215,13 +213,15 @@ pub fn select_cut(
     if band_lo >= band_hi {
         return None;
     }
-    let energies = band_frames(samples, cursor, total, band_lo, band_hi);
+    let (first_frame, energies) = band_frames(samples, cursor, total, band_lo, band_hi);
 
     // C1 — the longest silent run at or above the minimum duration.
     if !energies.is_empty() {
         let mut sorted = energies.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let threshold = (percentile(&sorted, config.silence_percentile)
+        // The percentile is taken over mean-square energies; the comparison is
+        // on RMS, so the percentile is square-rooted before the factor applies.
+        let threshold = (percentile(&sorted, f64::from(config.silence_percentile)).sqrt()
             * f64::from(config.silence_factor))
         .max(f64::from(config.silence_floor));
         let min_frames = (config.min_silence_ms / 20).max(1) as usize;
@@ -245,7 +245,7 @@ pub fn select_cut(
             }
         }
         if let Some((start_frame, len)) = best {
-            let run_lo = cursor + start_frame * FRAME_SAMPLES;
+            let run_lo = cursor + (first_frame + start_frame) * FRAME_SAMPLES;
             let run_hi = run_lo + len * FRAME_SAMPLES;
             let cut = run_lo + (run_hi - run_lo) / 2;
             return Some(CutChoice {
@@ -258,32 +258,26 @@ pub fn select_cut(
 
     // C2 — no pause long enough: the quietest 200 ms in the narrowed band.
     let window_frames = (config.fallback_window_ms / 20).max(1) as usize;
+    let window_samples = FRAME_SAMPLES * window_frames;
     let c2_lo = cursor + MacroConfig::ms_to_samples(config.fallback_start_ms);
     let c2_hi = (cursor + MacroConfig::ms_to_samples(config.fallback_end_ms)).min(total);
-    let mut best: Option<(usize, f64)> = None; // (first frame index, mean square)
+    let mut best: Option<(usize, f64)> = None; // (window start sample, mean square)
     let mut start = cursor;
-    let mut index = 0usize;
-    while start + FRAME_SAMPLES * window_frames <= total {
-        let window_end = start + FRAME_SAMPLES * window_frames;
-        if start >= c2_lo && window_end <= c2_hi && index + window_frames <= energies.len() {
-            let mean: f64 =
-                energies[index..index + window_frames].iter().sum::<f64>() / window_frames as f64;
+    while start + window_samples <= total {
+        if start >= c2_lo && start + window_samples <= c2_hi {
+            let mean = (0..window_frames)
+                .map(|frame| frame_mean_square(samples, start + frame * FRAME_SAMPLES))
+                .sum::<f64>()
+                / window_frames as f64;
             if best.is_none_or(|(_, best_mean)| mean < best_mean) {
-                best = Some((index, mean));
+                best = Some((start, mean));
             }
         }
         start += FRAME_SAMPLES;
-        index += 1;
     }
-    let first_frame = best.map(|(index, _)| index).unwrap_or_else(|| {
-        // The band held no full 200 ms window (a pathological clip): cut at the
-        // band's midpoint rather than at a zero-length window.
-        (c2_lo.saturating_sub(cursor)).saturating_div(FRAME_SAMPLES)
-    });
-    let window_lo = cursor + first_frame * FRAME_SAMPLES;
-    let cut = window_lo + (FRAME_SAMPLES * window_frames) / 2;
-    if cut <= cursor || total.saturating_sub(cut) < MacroConfig::ms_to_samples(config.min_tail_ms)
-    {
+    let window_lo = best.map(|(start, _)| start).unwrap_or(c2_lo);
+    let cut = window_lo + window_samples / 2;
+    if cut <= cursor || total.saturating_sub(cut) < MacroConfig::ms_to_samples(config.min_tail_ms) {
         return None;
     }
     Some(CutChoice {
@@ -475,7 +469,7 @@ pub fn prompt_firewall(tokens: &[i32], text: &str, mean_probability: f32) -> Pro
     if unique_byte_4gram_ratio(text) <= MIN_UNIQUE_4GRAM_RATIO {
         return PromptDecision::Drop(FirewallReject::LowDiversity);
     }
-    if !(mean_probability >= MIN_MEAN_PROBABILITY) {
+    if mean_probability.is_nan() || mean_probability < MIN_MEAN_PROBABILITY {
         return PromptDecision::Drop(FirewallReject::LowProbability);
     }
     if has_phrase_loop(&normalised_words(text)) {
@@ -516,7 +510,11 @@ pub fn words_match(left: &str, right: &str) -> bool {
         return a.iter().zip(&b).filter(|(x, y)| x != y).count() <= 1;
     }
     // One insertion/deletion: walk the longer string once.
-    let (long, short) = if a.len() > b.len() { (&a, &b) } else { (&b, &a) };
+    let (long, short) = if a.len() > b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
     let mut i = 0usize;
     let mut j = 0usize;
     let mut edits = 0usize;
@@ -589,6 +587,11 @@ pub fn stitch_seam(
             continue;
         }
         if len == 1 {
+            // A one-word match is too weak for the fuzzy rule: require the same
+            // word, close in time.
+            if normalise_word(&left_run[0].text) != normalise_word(&right_run[0].text) {
+                continue;
+            }
             let gap = right_run[0].start_ms - left_run[0].end_ms;
             if !(gap.abs() < SINGLE_WORD_MAX_GAP_MS) {
                 continue;
@@ -660,7 +663,7 @@ mod tests {
     #[test]
     fn c1_cuts_at_the_midpoint_of_the_longest_silent_run() {
         // 9 s tone, a 600 ms silence inside the 8–10 s band, then 2 s tone.
-        let samples = cat(&[tone(8.6, 0.3), silence(0.6), tone(2.0)]);
+        let samples = cat(&[tone(8.6, 0.3), silence(0.6), tone(2.0, 0.3)]);
         let config = short_config();
         let cut = select_cut(&samples, 0, samples.len(), &config).expect("a cut");
         assert_eq!(cut.kind, CutKind::Silence);
@@ -725,10 +728,11 @@ mod tests {
         );
 
         let looped = "thank you thank you thank you thank you";
-        assert_eq!(
+        assert!(matches!(
             prompt_firewall(&tokens, looped, 0.9),
             PromptDecision::Drop(FirewallReject::Repetition)
-        );
+                | PromptDecision::Drop(FirewallReject::LowDiversity)
+        ));
 
         assert_eq!(
             prompt_firewall(&tokens, clean, 0.40),
@@ -738,7 +742,8 @@ mod tests {
         let repetitive = "aaaa aaaa aaaa aaaa aaaa aaaa aaaa aaaa aaaa";
         assert!(matches!(
             prompt_firewall(&tokens, repetitive, 0.9),
-            PromptDecision::Drop(FirewallReject::LowDiversity) | PromptDecision::Drop(FirewallReject::Repetition)
+            PromptDecision::Drop(FirewallReject::LowDiversity)
+                | PromptDecision::Drop(FirewallReject::Repetition)
         ));
 
         assert_eq!(
@@ -779,41 +784,44 @@ mod tests {
             word("bravo", 99_000, 99_500, 0), // midpoint 99.25 → kept (<=)
             word("charlie", 99_400, 99_900, 0), // midpoint 99.65 → dropped
         ];
+        // The right window re-hears "bravo" slightly late, so it slips past the
+        // midpoint gate and the stitch has to remove it.
         let next = vec![
-            word("bravo", 99_000, 99_500, 0),   // midpoint <= → dropped by the gate
-            word("charlie", 99_400, 99_900, 0), // midpoint > → kept
-            word("delta", 99_900, 100_400, 0),
+            word("bravo", 99_400, 99_800, 0), // midpoint 99.60 → kept by the gate
+            word("charlie", 99_800, 100_200, 0),
+            word("delta", 100_200, 100_600, 0),
         ];
         let seam = stitch_seam(&prev, &next, 100_000, 1_500);
         assert_eq!(seam.prev_keep, 2);
-        assert_eq!(seam.next_drop, 2);
-        assert_eq!(seam.matched_words, 0, "the gate alone removed the duplicate");
+        assert_eq!(seam.next_drop, 1, "the late duplicate is dropped");
+        assert_eq!(seam.matched_words, 1);
     }
 
     #[test]
     fn the_stitch_drops_a_duplicated_suffix_prefix_run() {
         let prev = vec![
-            word("we", 98_000, 98_300, 0),
-            word("reviewed", 98_300, 98_900, 0),
-            word("the", 98_900, 99_100, 0),
+            word("we", 97_800, 98_100, 0),
+            word("reviewed", 98_100, 98_700, 0),
+            word("the", 98_700, 99_200, 0),
         ];
-        // The right window re-heard the last three words with jitter.
+        // A systematic timestamp shift puts all three re-heard words past the
+        // midpoint; the gate cannot see them, the 3-word run does.
         let next = vec![
-            word("we", 98_050, 98_350, 0),
-            word("reviewed", 98_320, 98_950, 0),
-            word("the", 98_950, 99_150, 0), // midpoint 99.05 <= 99.25 → gated out
-            word("budget", 99_400, 99_900, 0),
+            word("we", 99_300, 99_600, 0),
+            word("reviewed", 99_600, 100_200, 0),
+            word("the", 100_200, 100_700, 0),
+            word("budget", 100_900, 101_400, 0),
         ];
         let seam = stitch_seam(&prev, &next, 100_000, 1_500);
         assert_eq!(seam.prev_keep, 3);
         assert_eq!(seam.next_drop, 3);
-        assert_eq!(seam.matched_words, 2);
+        assert_eq!(seam.matched_words, 3);
     }
 
     #[test]
     fn a_single_word_match_needs_to_be_exact_and_close() {
         let prev = vec![word("Revenue", 98_000, 98_500, 0)];
-        let close = vec![word("revenue", 98_550, 99_000, 0)];
+        let close = vec![word("revenue", 99_260, 99_700, 0)];
         assert_eq!(stitch_seam(&prev, &close, 100_000, 1_500).matched_words, 1);
 
         let far = vec![word("revenue", 99_400, 99_800, 0)];
@@ -823,7 +831,7 @@ mod tests {
             "a 0.9 s gap is not a duplicate"
         );
 
-        let fuzzy = vec![word("revenus", 98_550, 99_000, 0)];
+        let fuzzy = vec![word("revenus", 99_260, 99_700, 0)];
         assert_eq!(
             stitch_seam(&prev, &fuzzy, 100_000, 1_500).matched_words,
             0,

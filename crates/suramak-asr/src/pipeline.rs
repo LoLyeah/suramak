@@ -224,6 +224,43 @@ pub fn transcribe_file(
     // the model to re-emit committed words, which is exactly the duplication the
     // checkpoint contract forbids.
     let prompt = if from_ms > 0 { None } else { initial_prompt };
+
+    // M26C: a slice longer than the 15-minute window target is decoded as
+    // silence-aligned macro-windows; at or below it, the single call below is
+    // untouched (the byte-identical guarantee).
+    if crate::macro_pipeline::applies(samples.len()) {
+        let outcome = crate::macro_pipeline::transcribe_macro(
+            ctx,
+            model_path,
+            &samples,
+            lang,
+            prompt,
+            n_threads,
+            plan,
+            cancel,
+            from_ms,
+            next_idx,
+            &mut on_progress,
+            stream,
+        )?;
+        stage_check(cancel)?;
+        let mut segments = committed;
+        segments.extend(outcome.segments);
+        debug_assert!(
+            segments
+                .iter()
+                .enumerate()
+                .all(|(i, seg)| seg.idx as usize == i),
+            "a macro-window transcript must have a contiguous idx sequence"
+        );
+        return Ok(PipelineOutcome {
+            transcript: transcript_for(input, model_id, lang, segments),
+            words: outcome.words,
+            engine_used: outcome.engine_used,
+            warnings: outcome.warnings,
+        });
+    }
+
     let outcome = whisper::transcribe(
         ctx,
         model_path,

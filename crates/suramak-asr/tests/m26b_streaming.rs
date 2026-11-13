@@ -8,6 +8,9 @@
 
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+// The child-process RSS harness is unix-only (/proc); Windows clippy compiles
+// this file and flagged the import as unused before it was gated.
+#[cfg(unix)]
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
