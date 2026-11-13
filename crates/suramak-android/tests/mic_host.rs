@@ -18,7 +18,7 @@ use suramak_android::mic::{
     CaptureSpawner, CaptureThread, InboxFn, Meter, MicDirs, MicHost, MicJournal, MicSession,
     SessionState, StartedTake, StopReason,
 };
-use suramak_asr::capture_stream::{StreamedWav, StreamingWav};
+use suramak_asr::capture_stream::{RotationPolicy, StreamedWav, StreamingWav};
 use suramak_asr::{EngineId, FileDecoder, InferenceBackend, Job, ThreadedPrefetch, WorkerEvent};
 use suramak_core::store::Store;
 use suramak_core::transcript::{Segment, Source, Transcript};
@@ -95,6 +95,60 @@ fn writer_spawner(samples: Vec<f32>, rate: u32) -> CaptureSpawner {
             stop, ready_rx, handle, error, finished, meter,
         ))
     })
+}
+
+/// A capture thread that streams through the **rotating** writer and opens the
+/// microphone before pushing, so a test can observe the part counter and the
+/// ceiling failure the way the phone's consumer thread does.
+fn rotating_spawner(
+    samples: Vec<f32>,
+    rate: u32,
+    policy: RotationPolicy,
+) -> (CaptureSpawner, Arc<AtomicBool>) {
+    let pushed = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&pushed);
+    let spawner: CaptureSpawner = Arc::new(move |path: PathBuf, stop: Arc<AtomicBool>| {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let error = Arc::new(Mutex::new(None));
+        let finished = Arc::new(AtomicBool::new(false));
+        let meter = Arc::new(Meter::default());
+        let thread_meter = Arc::clone(&meter);
+        let samples = samples.clone();
+        let thread_stop = Arc::clone(&stop);
+        let thread_finished = Arc::clone(&finished);
+        let thread_flag = Arc::clone(&flag);
+        let handle = std::thread::Builder::new()
+            .name("synthetic-rotating-mic".to_string())
+            .spawn(move || {
+                let result = (|| -> Result<StreamedWav, String> {
+                    let mut wav = StreamingWav::create_with_policy(&path, rate, policy)
+                        .map_err(|err| err.to_string())?;
+                    let _ = ready_tx.send(Ok(StartedTake {
+                        device_name: "Synthetic rotating AAudio".to_string(),
+                        sample_rate: rate,
+                    }));
+                    for chunk in samples.chunks(4800) {
+                        wav.push(chunk).map_err(|err| err.to_string())?;
+                        thread_meter.set_part(wav.part_index());
+                    }
+                    thread_flag.store(true, Ordering::Release);
+                    while !thread_stop.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    wav.finish().map_err(|err| err.to_string())
+                })();
+                if result.is_err() {
+                    thread_flag.store(true, Ordering::Release);
+                }
+                thread_finished.store(true, Ordering::Release);
+                result
+            })
+            .unwrap();
+        Ok(CaptureThread::from_parts(
+            stop, ready_rx, handle, error, finished, meter,
+        ))
+    });
+    (spawner, Arc::clone(&pushed))
 }
 
 /// A spawner whose capture ends on its own right after opening (the stream-
@@ -678,5 +732,105 @@ fn a_recording_hands_off_bytes_identical_to_an_import() {
         1,
         "the recording and the import share the one inference slot"
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// M25B2 — the phone rotates its recording
+// ---------------------------------------------------------------------------
+
+/// A take longer than the (test) cap lands as several parts, each one its own
+/// ordinary job; the first keeps the reserved key, the rest are suffixed.
+#[test]
+fn a_rotated_take_hands_off_every_part_as_its_own_job() {
+    let (root, mic_dirs, _) = dirs("rotate-handoff");
+    let log = Arc::new(InboxLog::default());
+    let samples = sine(16_000, 3.2, 220.0);
+    let policy = RotationPolicy {
+        cap_ms: 1_000,
+        grace_ms: 1_000,
+        silence_ms: 600,
+    };
+    let (spawner, pushed) = rotating_spawner(samples.clone(), 16_000, policy);
+    let host = MicHost::with_parts(mic_dirs, spawner, log_inbox(Arc::clone(&log)));
+    host.start(true, true, "Rotated take", "tiny", "auto")
+        .unwrap();
+    wait_until("the synthetic push", || pushed.load(Ordering::Acquire));
+    std::thread::sleep(Duration::from_millis(20));
+    let live = host.status();
+    assert!(
+        live.part >= 2,
+        "the status (the foreground notification's source) names the current part, got {}",
+        live.part
+    );
+
+    let stopped = host.stop(StopReason::User).unwrap();
+    let recording = stopped.last_stop.expect("stop record");
+    assert!(recording.handed_off, "every part was queued");
+    assert_eq!(recording.frames, samples.len() as u64);
+
+    let calls = log.calls.lock().unwrap().clone();
+    assert!(
+        calls.len() >= 2,
+        "a take over the cap must land as more than one part"
+    );
+    assert_eq!(calls[0].0, recording.id, "part 1 keeps the reserved key");
+    for (index, (key, title, path)) in calls.iter().enumerate() {
+        assert_eq!(title, "Rotated take");
+        assert!(path.is_file(), "{} is missing", path.display());
+        if index > 0 {
+            assert_eq!(key, &format!("{}-p{}", recording.id, index + 1));
+            let name = path.file_name().unwrap().to_str().unwrap();
+            assert!(
+                name.contains(&format!("Part {} of {}", index + 1, calls.len())),
+                "{name} must carry its part label"
+            );
+        }
+    }
+    let total: u64 = calls
+        .iter()
+        .map(|(_, _, path)| {
+            let bytes = std::fs::metadata(path).unwrap().len();
+            (bytes - 44) / 2
+        })
+        .sum();
+    assert_eq!(total, samples.len() as u64, "the parts cover the take once");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The 12-part ceiling: the recorder stops with the honest sentence, and the
+/// twelve parts it did write are still repaired and handed off — the message
+/// is not paid for with nine hours of audio.
+#[test]
+fn a_take_that_hits_the_part_ceiling_keeps_every_part_and_says_why() {
+    let (root, mic_dirs, _) = dirs("rotate-ceiling");
+    let log = Arc::new(InboxLog::default());
+    let samples = sine(16_000, 5.0, 220.0);
+    let policy = RotationPolicy {
+        cap_ms: 300,
+        grace_ms: 100,
+        silence_ms: 600,
+    };
+    let (spawner, pushed) = rotating_spawner(samples, 16_000, policy);
+    let host = MicHost::with_parts(mic_dirs, spawner, log_inbox(Arc::clone(&log)));
+    host.start(true, true, "Marathon", "tiny", "auto").unwrap();
+    wait_until("the ceiling refusal", || pushed.load(Ordering::Acquire));
+    std::thread::sleep(Duration::from_millis(20));
+
+    let stopped = host.stop(StopReason::User).unwrap();
+    let recording = stopped.last_stop.expect("stop record");
+    assert!(
+        recording.note.contains("session_too_long") && recording.note.contains("12 parts"),
+        "the stop carries the honest ceiling sentence: {}",
+        recording.note
+    );
+    let calls = log.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 12, "exactly the twelve parts that exist");
+    assert!(recording.handed_off);
+    for (_, _, path) in &calls {
+        assert!(path.is_file());
+        let bytes = std::fs::metadata(path).unwrap().len();
+        assert!(bytes > 44, "{} must hold audio", path.display());
+    }
     let _ = std::fs::remove_dir_all(&root);
 }

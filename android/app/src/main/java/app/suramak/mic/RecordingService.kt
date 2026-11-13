@@ -71,6 +71,8 @@ class RecordingService : Service() {
     private var currentTitle = ""
     private var startedDevice = ""
     private var lastIdle = false
+    /// M25B2: the part the rotating writer is on (1-based).
+    private var lastPart = 1
 
     override fun onCreate() {
         super.onCreate()
@@ -136,11 +138,13 @@ class RecordingService : Service() {
         currentTitle = getString(R.string.mic_title_prefix, stamp)
         startedWallMs = System.currentTimeMillis()
         lastIdle = false
+        lastPart = 1
         val notification = Notify.recording(
             this,
             currentTitle,
             startedWallMs,
             getString(R.string.mic_locked_screen_body),
+            part = 1,
         )
         try {
             startForeground(
@@ -251,8 +255,12 @@ class RecordingService : Service() {
         val handed = stopped?.optBoolean("handed_off") == true
         val frames = stopped?.optLong("frames", 0) ?: 0
         val reasonText = reasonText(reason)
+        val note = stopped?.optString("note").orEmpty()
         val body = when {
             frames == 0L -> getString(R.string.mic_saved_empty, reasonText)
+            // M25B2: the 12-part ceiling is a named refusal; show its sentence
+            // rather than hiding it behind "saved".
+            note.contains("session_too_long") -> note
             handed -> getString(R.string.mic_saved_queued, reasonText)
             else -> getString(R.string.mic_saved, reasonText)
         }
@@ -312,6 +320,11 @@ class RecordingService : Service() {
                     stopCapture(REASON_CALL)
                     return
                 }
+                val part = status.optInt("part", 1)
+                if (part != lastPart && part > 0) {
+                    lastPart = part
+                    updateNotification()
+                }
                 val idle = getSystemService(PowerManager::class.java)?.isDeviceIdleMode == true
                 if (idle != lastIdle) {
                     lastIdle = idle
@@ -335,7 +348,7 @@ class RecordingService : Service() {
         Notify.show(
             this,
             Notify.RECORDING_ID,
-            Notify.recording(this, currentTitle, startedWallMs, body),
+            Notify.recording(this, currentTitle, startedWallMs, body, part = lastPart),
         )
     }
 

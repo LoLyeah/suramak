@@ -164,10 +164,9 @@ Covered by name:
   have to re-create the resampler at the cut and would break the byte-for-byte
   tail contract the desktop/Android writers currently share.
 * **Android's streaming capture** (`AndroidRecorder` → one `StreamingWav`) is
-  unchanged. A take longer than 45 minutes reaches the queue as one file and is
-  refused by name; the splitting path covers desktop recordings and imports.
-  Wiring the streaming recorder to rotate files is a separate change because
-  the resampler state crosses the cut.
+  closed by §10 (M25B2): the writer now rotates **after** the resampler, so a
+  take longer than 45 minutes lands as `Part N of M` and is never refused by
+  the cap. Resampler state does not cross the cut.
 * A pause-aligned part can run into the 120 s grace (at most cap + 120 s); the
   queue accepts a `Part N of M` up to that bound. The no-pause fallback stays
   at or under the cap.
@@ -191,3 +190,108 @@ cargo test -p suramak-asr --test m25b_session_split -- --ignored --nocapture
 # UI line/rotation/library/diarization
 cargo test -p suramak-ui --bin suramak
 ```
+
+## 10. Phone rotation (M25B2)
+
+**Status:** implemented. No commits, no pushes, no CI changes.
+**Mechanism:** `PartRotator` in `crates/suramak-asr/src/capture_stream.rs`,
+between the resampler output and the WAV files.
+
+### 10.1 How the cut works
+
+* The Android consumer pushes device-rate mono blocks through the unchanged
+  `FftFixedIn` resampler; its **16 kHz output** goes to the rotator. A cut is a
+  sample index on that one continuous stream: the open part is truncated at the
+  cut and the already-written tail bytes are copied into the next part. PCM16 is
+  per-sample, so the parts concatenate to exactly the uninterrupted 16 kHz
+  take — **bit for bit by construction**. No resampler state ever crosses a cut.
+* The rule is the desktop rule of `suramak_core::session`, applied live:
+  * at the phone cap (45:00) a rotation becomes pending; the writer keeps
+    writing while it looks for the cut;
+  * the cut is the first ≥ 600 ms silence at or after the cap;
+  * a pause that straddles the cap cuts **exactly at the cap**;
+  * if no pause completes inside the ≤ 120 s grace, the cut is the
+    least-energetic 50 ms window **after the cap** in the last five seconds, and
+    the part is flagged `no_pause` (`cut_without_pause()`);
+  * every cut is clamped to the grace edge, so every part is ≤ cap + grace. A
+    take that stops in the sub-frame gap past the grace edge is split once at
+    stop for the same reason.
+* Silence is an RMS gate over 50 ms windows. The threshold is **three times the
+  take's own noise floor** (the quietest 50 ms frame of the first two seconds),
+  clamped to 0.0005–0.01 RMS (≈ −66…−40 dBFS), and logged once per part
+  (`tracing` target `suramak::capture::parts`, part number, start clock and the
+  threshold used).
+* Stop flushes the rotator. A take that fits keeps its reserved name, exactly
+  as before; a rotated take is renamed to `{stem} — Part N of M.wav`. The mic
+  host adopts **each part as its own ordinary job** (part 1 keeps the reserved
+  key, parts 2…N get `{id}-pN`), and the foreground notification reads the
+  live part counter from the host status (`Recording · part 2`).
+* The 45-minute cap **never refuses a phone take now**: it rotates. The
+  `session_too_long` refusal remains for imports that cannot be split and for
+  the **12-part ceiling** (`MAX_PARTS = 12`, 12 × 45 min = 9 h):
+  `session_too_long: this take is longer than 9 hours — a recording stops at 12
+  parts of 45:00 each; start a new recording`. The twelve parts written before
+  the ceiling are repaired and handed off anyway; the stop note carries the
+  sentence into the status surface.
+
+### 10.2 The measured 47-minute take
+
+Test: `crates/suramak-asr/tests/m25b2_phone_rotation.rs`, run with
+`--ignored --nocapture`. Fixture: synthesised 47:00 at 16 kHz, one 1 s pause at
+45:10 (the first real pause after the cap), 45,120,000 samples.
+
+| part | samples | length | file bytes |
+|---|---:|---:|---:|
+| `Part 1 of 2` | 43,360,000 | **2,710,000 ms (45:10)** | 86,720,044 |
+| `Part 2 of 2` | 1,760,000 | **110,000 ms (1:50)** | 3,520,044 |
+| **total** | **45,120,000** | **47:00** | 90,240,044 |
+
+* exactly **one** rotation, at the first silence after 45:00 (45:10.000);
+* all 45,120,000 samples (90,240,000 data bytes) compared against the same
+  take written as one WAV: **identical byte for byte**;
+* **peak RSS (VmHWM): 6.6 MiB** (6,580–6,796 KB = 6.4–6.6 MiB across runs) —
+  the streaming rotator never holds the take. (M25B's buffer-then-split 50-minute run peaked at 520.6 MiB; this
+  path removes that copy entirely.)
+* wall time in the debug test: 6.8 s (not a product number — the fixture is
+  generated and pushed in the same process).
+
+### 10.3 Tests and gates
+
+| gate | result |
+|---|---|
+| `cargo test -p suramak-asr --lib capture_stream::` | **21 passed** (9 pre-M25B2 + 12 rotation) |
+| `cargo test -p suramak-android --test mic_host` | **11 passed** (2 new: multi-part hand-off, ceiling keeps 12 parts) |
+| `cargo test -p suramak-asr --test m25b2_phone_rotation -- --ignored --nocapture` | **1 passed**, parts and peak above |
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| NDK check + clippy (`cargo ndk -t arm64-v8a --platform 29`, both Android crates) | clean |
+| `cargo test --workspace` | **1,478 passed, 0 failed, 13 ignored** (baseline 1,461; +17) |
+
+Covered by name: a 47-minute take rotates once at the first silence after
+45 minutes; a pause after the cap cuts there; a long **pre-cap** silence does
+not rotate early; a no-pause take cuts at the least-energetic 50 ms window and
+is flagged; three parts are named `Part N of 3` and the provisional name is
+gone; no rotation ever emits a zero-length part; a take ending exactly at the
+cap stays one file; a sub-frame stop past the grace edge still lands inside
+cap + grace; the 12-part ceiling refuses with the one sentence and keeps the
+twelve parts; the threshold is 3 × the first-two-seconds floor; `repair_take`
+finds every provisional part of a killed take; a rotated take hands off every
+part as its own job.
+
+### 10.4 Limits / notes
+
+* **A process death mid-rotated-take recovers part 1 through the existing
+  single-path mic journal.** Later parts are already playable WAVs in
+  `files/media` (their headers are repaired on demand), but the launch replay
+  does not yet adopt them automatically; that needs a parts list in the mic
+  journal (a separate slice, and the queue journal/resume is untouched).
+* The notification's part line is Kotlin (`RecordingService` → `Notify`), built
+  only in the app build, which this box does not run; the Rust status field it
+  reads (`MicStatus.part`, fed by the capture thread's `Meter`) is host-tested.
+* A pause-aligned part may use the 120 s grace (≤ 45:02:00), exactly like the
+  desktop parts; the queue accepts a `Part N of M` up to that bound. The
+  no-pause fallback is clamped to the same bound, including at stop.
+* Part 1 is renamed at stop; if the process dies before stop, the provisional
+  name (`{stem} — Part 2.wav`, no `of M`) is what remains on disk. `PartInfo`
+  needs both numbers, so a recovered part's label is only reconstructed by
+  `repair_take`, not by the library row.

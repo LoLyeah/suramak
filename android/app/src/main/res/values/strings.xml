@@ -72,6 +72,9 @@
     <string name="mic_channel">Recording</string>
     <string name="mic_channel_desc">The microphone foreground service: elapsed time and Stop</string>
     <string name="mic_recording_title">Recording</string>
+    <!-- M25B2: the take rotates at 45 minutes; the foreground notification
+         names the part it is writing now. -->
+    <string name="mic_recording_part">Recording · part %1$d</string>
     <string name="mic_title_prefix">Recording %1$s</string>
     <string name="mic_stop">Stop</string>
     <string name="quit_action">Quit</string>

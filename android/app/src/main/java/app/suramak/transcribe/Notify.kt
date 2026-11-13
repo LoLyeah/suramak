@@ -184,10 +184,18 @@ object Notify {
         title: String,
         startedWallMs: Long,
         body: String,
+        part: Int = 1,
     ): Notification {
+        // M25B2: a take over 45 minutes lands as several parts; the persistent
+        // notification names the one being written now.
+        val heading = if (part > 1) {
+            context.getString(R.string.mic_recording_part, part)
+        } else {
+            context.getString(R.string.mic_recording_title)
+        }
         val builder = Notification.Builder(context, CHANNEL_RECORDING)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-            .setContentTitle(context.getString(R.string.mic_recording_title))
+            .setContentTitle(heading)
             .setContentText(body)
             .setSubText(title)
             .setWhen(startedWallMs)

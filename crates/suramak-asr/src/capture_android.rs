@@ -7,7 +7,9 @@
 //! * a non-RT consumer thread drains the ring into
 //!   [`crate::capture_stream::StreamingWav`], which cuts the take into the same
 //!   1024-sample chunks the desktop `to_16khz_mono` uses and appends the 16 kHz
-//!   PCM16 output to the WAV as it arrives.
+//!   PCM16 output to the WAV as it arrives. M25B2: the writer rotates at the
+//!   45-minute cap after resampling, so a long take becomes `Part N of M` with
+//!   no cut inside the resampler and no refused phone recording.
 //!
 //! Why streaming instead of the desktop's buffer-then-stop: a locked-screen
 //! phone take is thirty minutes or longer (≈345 MB of 48 kHz f32 if buffered),
@@ -58,6 +60,8 @@ pub struct AndroidRecorder {
     consumer_stop: Arc<AtomicBool>,
     consumer: Option<std::thread::JoinHandle<Result<StreamedWav, String>>>,
     rms_bits: Arc<AtomicU32>,
+    /// 1-based part the writer is on (M25B2: the notification names it).
+    part_bits: Arc<AtomicU32>,
     dropped: Arc<AtomicU64>,
     error: Arc<Mutex<Option<String>>>,
     device_name: String,
@@ -86,12 +90,15 @@ impl AndroidRecorder {
         let sample_format = supported.sample_format();
         let config: StreamConfig = supported.into();
         let sample_rate = config.sample_rate.0;
-        let wav = StreamingWav::create(path, sample_rate)?;
+        // M25B2: the phone's take rotates at its own cap; the queue's
+        // 45-minute refusal is then never the thing that ends a recording.
+        let wav = StreamingWav::create_rotating(path, sample_rate)?;
         let channels = config.channels as usize;
         let window = ((u128::from(sample_rate) * 100) / 1000).max(1) as usize; // 100 ms
 
         let (producer, consumer) = RingBuffer::new(ring_capacity(sample_rate));
         let rms_bits = Arc::new(AtomicU32::new(0));
+        let part_bits = Arc::new(AtomicU32::new(1));
         let dropped = Arc::new(AtomicU64::new(0));
         let consumer_stop = Arc::new(AtomicBool::new(false));
         let teardown = Arc::new(AtomicBool::new(false));
@@ -100,9 +107,10 @@ impl AndroidRecorder {
         let consumer_handle = {
             let stop = Arc::clone(&consumer_stop);
             let rms = Arc::clone(&rms_bits);
+            let part = Arc::clone(&part_bits);
             std::thread::Builder::new()
                 .name("suramak-android-capture".to_string())
-                .spawn(move || consume(consumer, wav, rms, stop, window))
+                .spawn(move || consume(consumer, wav, rms, part, stop, window))
                 .map_err(|err| {
                     AsrError::Capture(format!(
                         "could not start the audio capture consumer thread: {err}"
@@ -147,6 +155,7 @@ impl AndroidRecorder {
             consumer_stop,
             consumer: Some(consumer_handle),
             rms_bits,
+            part_bits,
             dropped,
             error,
             device_name,
@@ -168,6 +177,11 @@ impl AndroidRecorder {
     /// Live rolling RMS (100 ms window) of the capture.
     pub fn rms(&self) -> f32 {
         f32::from_bits(self.rms_bits.load(Ordering::Relaxed))
+    }
+
+    /// The part the writer is currently on (1 until the take rotates).
+    pub fn part(&self) -> u32 {
+        self.part_bits.load(Ordering::Relaxed)
     }
 
     /// Samples the ring had to drop (only non-zero when the consumer thread
@@ -319,6 +333,7 @@ fn consume(
     mut ring: Consumer<f32>,
     mut wav: StreamingWav,
     rms_bits: Arc<AtomicU32>,
+    part_bits: Arc<AtomicU32>,
     stop: Arc<AtomicBool>,
     window: usize,
 ) -> Result<StreamedWav, String> {
@@ -340,6 +355,7 @@ fn consume(
                     }
                     rolling.push_block(&block);
                     rms_bits.store(rolling.value().to_bits(), Ordering::Relaxed);
+                    part_bits.store(wav.part_index(), Ordering::Relaxed);
                     continue;
                 }
                 Err(_) => break,

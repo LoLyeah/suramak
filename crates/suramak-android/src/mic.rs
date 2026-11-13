@@ -639,15 +639,37 @@ pub struct StartedTake {
 }
 
 /// The live meter, shared between the capture thread and status calls.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Meter {
     rms_bits: AtomicU32,
+    /// M25B2: the part the rotating writer is on (1 until the take rotates).
+    part_bits: AtomicU32,
     dropped: AtomicU64,
+}
+
+impl Default for Meter {
+    fn default() -> Self {
+        Self {
+            rms_bits: AtomicU32::new(0),
+            part_bits: AtomicU32::new(1),
+            dropped: AtomicU64::new(0),
+        }
+    }
 }
 
 impl Meter {
     pub fn rms(&self) -> f32 {
         f32::from_bits(self.rms_bits.load(Ordering::Relaxed))
+    }
+
+    /// 1-based part of the live take (`2` after the first rotation).
+    pub fn part(&self) -> u32 {
+        self.part_bits.load(Ordering::Relaxed)
+    }
+
+    /// Mirrors the writer's part counter for the status/notification.
+    pub fn set_part(&self, part: u32) {
+        self.part_bits.store(part, Ordering::Relaxed);
     }
 
     pub fn dropped(&self) -> u64 {
@@ -772,6 +794,7 @@ pub fn android_spawner() -> CaptureSpawner {
                         thread_meter
                             .rms_bits
                             .store(recorder.rms().to_bits(), Ordering::Relaxed);
+                        thread_meter.set_part(recorder.part());
                         thread_meter
                             .dropped
                             .store(recorder.dropped(), Ordering::Relaxed);
@@ -878,6 +901,9 @@ pub struct MicStatus {
     pub sample_rate: u32,
     pub bytes: u64,
     pub rms: f32,
+    /// M25B2: the part being written (`0` when no take is live; `2` after the
+    /// first rotation). The foreground notification names it.
+    pub part: u32,
     pub dropped: u64,
     pub title: String,
     pub last_stop: Option<StoppedTake>,
@@ -921,16 +947,17 @@ struct Inner {
 
 impl Inner {
     fn status(&self) -> MicStatus {
-        let (elapsed_ms, rms, dropped, bytes) = if let Some(started) = self.started {
+        let (elapsed_ms, rms, part, dropped, bytes) = if let Some(started) = self.started {
             let capture = self.capture.as_ref();
             (
                 started.elapsed().as_millis() as u64,
                 capture.map(|thread| thread.meter().rms()).unwrap_or(0.0),
+                capture.map(|thread| thread.meter().part()).unwrap_or(0),
                 capture.map(|thread| thread.meter().dropped()).unwrap_or(0),
                 self.bytes,
             )
         } else {
-            (0, 0.0, 0, self.bytes)
+            (0, 0.0, 0, 0, self.bytes)
         };
         MicStatus {
             phase: self.machine.phase().as_str().to_string(),
@@ -941,6 +968,7 @@ impl Inner {
             sample_rate: self.sample_rate,
             bytes,
             rms,
+            part,
             dropped,
             title: self
                 .session
@@ -1230,7 +1258,10 @@ impl MicHost {
                         .map(|session| session.path.clone())
                         .unwrap_or_default()
                 };
-                (capture_stream::repair(&path).ok(), Some(err))
+                // M25B2: a take that hit the 12-part ceiling (or died after a
+                // rotation) still has every part on disk; repair the whole set
+                // so the honest message is not paid for with the audio.
+                (capture_stream::repair_take(&path).ok(), Some(err))
             }
             None => (
                 None,
@@ -1243,8 +1274,6 @@ impl MicHost {
         let mut note = reason.note().to_string();
         if let Some(wav) = &outcome {
             if wav.frames > 0 {
-                let source_name = format!("{title}.wav");
-                let path = wav.path.clone();
                 let model = {
                     let inner = self.inner.lock().expect("mic state lock");
                     inner
@@ -1261,14 +1290,46 @@ impl MicHost {
                         .map(|session| session.language.clone())
                         .unwrap_or_else(|| "auto".to_string())
                 };
-                match (self.inbox)(&id, &title, &source_name, &path, &model, &language) {
-                    Ok(()) => handed_off = true,
-                    Err(err) => {
-                        handoff_error = Some(err.clone());
-                        note =
-                            format!("{note} It could not be queued for transcription yet: {err}");
+                // M25B2: every part is its own ordinary job. A one-part take
+                // keeps exactly the M13F hand-off (the reserved key and name);
+                // a rotated take gives each part a distinct key and the part
+                // file name, so the library can read `Part N of M` from it.
+                let handoffs: Vec<(String, String, PathBuf)> = if wav.parts.len() <= 1 {
+                    vec![(id.clone(), format!("{title}.wav"), wav.path.clone())]
+                } else {
+                    wav.parts
+                        .iter()
+                        .enumerate()
+                        .map(|(index, part)| {
+                            let key = if index == 0 {
+                                id.clone()
+                            } else {
+                                format!("{id}-p{}", index + 1)
+                            };
+                            let source_name = part
+                                .path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| format!("{title} — {}", part.info.label()));
+                            (key, source_name, part.path.clone())
+                        })
+                        .collect()
+                };
+                let handoff_total = handoffs.len();
+                let mut adopted = 0usize;
+                for (key, source_name, path) in handoffs {
+                    match (self.inbox)(&key, &title, &source_name, &path, &model, &language) {
+                        Ok(()) => adopted += 1,
+                        Err(err) => {
+                            handoff_error = Some(err.clone());
+                            note = format!(
+                                "{note} It could not be queued for transcription yet: {err}"
+                            );
+                        }
                     }
                 }
+                handed_off = adopted == handoff_total;
             } else {
                 note = format!("{}. Nothing was captured.", reason.note());
             }
@@ -1296,10 +1357,15 @@ impl MicHost {
             handed_off,
             &note,
         );
-        let final_path = inner
-            .session
+        let final_path = outcome
             .as_ref()
-            .map(|session| session.path.display().to_string())
+            .map(|wav| wav.path.display().to_string())
+            .or_else(|| {
+                inner
+                    .session
+                    .as_ref()
+                    .map(|session| session.path.display().to_string())
+            })
             .unwrap_or_default();
         let (frames, bytes) = outcome
             .as_ref()
