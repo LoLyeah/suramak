@@ -15,6 +15,22 @@ use suramak_core::diarization::{Diarization, SegmentSpeaker, Speaker};
 use suramak_core::transcript::Segment;
 use suramak_core::Uuid;
 
+/// M25B: diarization's own 30-minute limit, surfaced with the honest route.
+/// `None` when the audio fits. The wording is the existing named refusal plus
+/// the one action that actually works — split the session into shorter parts.
+pub fn length_refusal(audio_ms: i64) -> Option<String> {
+    if audio_ms <= suramak_asr::diarization::MAX_AUDIO_MS {
+        return None;
+    }
+    let refusal = suramak_asr::diarization::DiarizationError::TooLong {
+        audio_ms,
+        cap_ms: suramak_asr::diarization::MAX_AUDIO_MS,
+    };
+    Some(format!(
+        "{refusal} — split into shorter parts to label speakers"
+    ))
+}
+
 /// The rename-in-place draft: the badge becomes a text field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenameDraft {
@@ -646,5 +662,28 @@ mod tests {
         assert_eq!(next_count(0), 2);
         assert_eq!(next_count(5), 6);
         assert_eq!(next_count(6), 0);
+    }
+
+    /// M25B: a part over diarization's 30-minute limit is refused with the
+    /// existing named reason *and* the one route that works.
+    #[test]
+    fn a_long_part_names_the_diarization_limit_and_the_route() {
+        let cap = suramak_asr::diarization::MAX_AUDIO_MS;
+        assert!(length_refusal(cap).is_none());
+        let refusal = length_refusal(cap + 1).expect("1 ms over the limit");
+        assert!(refusal.contains("30 min"), "{refusal}");
+        assert!(refusal.contains("capped at 30 min"), "{refusal}");
+        assert!(
+            refusal.ends_with("split into shorter parts to label speakers"),
+            "{refusal}"
+        );
+        // The status line shows it as a note, not a hard error.
+        let state = DiarizationState {
+            note: Some((refusal, false)),
+            ..Default::default()
+        };
+        let (line, error) = state.status_line().expect("status");
+        assert!(line.contains("split into shorter parts"), "{line}");
+        assert!(!error);
     }
 }

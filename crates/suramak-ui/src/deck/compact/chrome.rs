@@ -298,6 +298,8 @@ pub struct RowExtras<'a> {
     pub speakers: usize,
     /// The transcript's duration, painted on the tabular grid.
     pub duration_ms: i64,
+    /// M25B: `Part 2 of 3` for a split session's row; `None` otherwise.
+    pub part: Option<&'a str>,
 }
 
 impl RowExtras<'_> {
@@ -306,6 +308,7 @@ impl RowExtras<'_> {
         waveform: &[],
         speakers: 0,
         duration_ms: 0,
+        part: None,
     };
 }
 
@@ -452,14 +455,19 @@ pub fn row(
         meta_left += shown as f32 * pip_gap + 4.0 * scale;
     }
 
-    if !meta.is_empty() {
+    if !meta.is_empty() || extras.part.is_some() {
         // The pips are a separate fact from the date; a middle dot keeps the
         // overflow (`+1`) from reading as part of `12 Nov` (M22C).
-        let meta_text = if extras.speakers > 0 {
-            format!("· {meta}")
-        } else {
-            meta.to_string()
-        };
+        let mut meta_text = String::new();
+        if let Some(part) = extras.part {
+            meta_text.push_str(part);
+            meta_text.push_str(" · ");
+        }
+        if extras.speakers > 0 {
+            meta_text.push_str("· ");
+        }
+        meta_text.push_str(meta);
+        let meta_text = meta_text.trim_end_matches([' ', '·']).to_string();
         let meta_token = scaled(&type_scale::caption(), scale);
         let mut job = egui::text::LayoutJob::default();
         job.append(&meta_text, 0.0, meta_token.format(tokens.ink_soft));

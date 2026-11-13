@@ -490,6 +490,7 @@ fn draw_library_row(
     selected: bool,
     divider: bool,
 ) -> DrawnLibraryRow {
+    let part_label = row.part.as_ref().map(|part| part.label());
     let (response, scale) = chrome::row(
         ui,
         tokens,
@@ -502,6 +503,7 @@ fn draw_library_row(
             waveform: &row.waveform,
             speakers: row.speakers,
             duration_ms: row.duration_ms,
+            part: part_label.as_deref(),
         },
         selected,
         divider,

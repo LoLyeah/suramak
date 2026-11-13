@@ -23,7 +23,10 @@ use crate::motion::{self, Motion};
 use crate::theme::Tokens;
 
 use super::views::{paint_card, pane_caption, pane_title, PANE_PAD_X};
-use super::{format_elapsed, AppState, Effect, RecordState, RecordingSource, RECORD_WAVEFORM_BARS};
+use super::{
+    format_elapsed, part_status_line, AppState, Effect, RecordState, RecordingSource,
+    RECORD_WAVEFORM_BARS,
+};
 
 /// M9d item 2: the living dot's opacity-breath period (seconds). Subtle and
 /// slow — well above the 1 s floor, so it reads as "alive", never as a blink.
@@ -63,6 +66,9 @@ pub fn ui(
             let arrivals = recording.provisional_arrivals.clone();
             let provisional_skipped = recording.provisional_skipped;
             let stopping = recording.stopping;
+            let part_line =
+                part_status_line(recording.elapsed, recording.part_index, recording.cap_ms);
+            let part_note = recording.part_note.as_ref().map(|(note, _)| note.clone());
             recording_body(
                 ui,
                 tokens,
@@ -82,6 +88,8 @@ pub fn ui(
                 &arrivals,
                 provisional_skipped,
                 stopping,
+                part_line.as_deref(),
+                part_note.as_deref(),
             );
         }
         RecordState::Failed { message } => {
@@ -139,6 +147,8 @@ fn recording_body(
     arrivals: &[std::time::Instant],
     provisional_skipped: u64,
     stopping: bool,
+    part_line: Option<&str>,
+    part_note: Option<&str>,
 ) {
     let painter = ui.painter().clone();
 
@@ -227,6 +237,19 @@ fn recording_body(
         dot_color.gamma_multiply(breath),
     );
     painter.galley(pos2(status_left, status_top), status_galley, status_color);
+
+    // M25B: the quiet part line, past 80 % of the cap. One line at the card's
+    // right edge, under the status word — a read-out, never a warning. A fresh
+    // rotation's note replaces it for a few seconds (the counter just reset).
+    if let Some(text) = part_note.or(part_line) {
+        painter.text(
+            pos2(card.right() - 22.0, card.top() + 54.0),
+            Align2::RIGHT_TOP,
+            text,
+            FontId::new(12.0, FontFamily::Monospace),
+            tokens.ink_soft,
+        );
+    }
 
     // RMS meter.
     let meter_label = pos2(card.left() + 22.0, card.top() + 66.0);

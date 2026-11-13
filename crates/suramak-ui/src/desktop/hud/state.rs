@@ -780,6 +780,9 @@ mod tests {
             provisional_skipped: 0,
             provisional_arrivals: Vec::new(),
             stopping: false,
+            cap_ms: suramak_core::session::SESSION_CAP_DESKTOP_MS,
+            part_index: 1,
+            part_note: None,
         })
     }
 

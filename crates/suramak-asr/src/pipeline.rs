@@ -105,11 +105,14 @@ fn transcript_for(
     lang: &LangMode,
     segments: Vec<Segment>,
 ) -> Transcript {
-    let title = input
+    let raw_title = input
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("transcript")
         .to_string();
+    // M25B: a `… — Part 2 of 3.wav` transcript keeps the base title; the part
+    // label is metadata beside it, never repeated in the title.
+    let title = suramak_core::session::base_name(&raw_title);
     let language = match lang {
         LangMode::Auto => None,
         LangMode::Fixed(code) => Some(code.clone()),

@@ -472,6 +472,36 @@ impl<B: InferenceBackend, P: Prefetcher> QueueDriver<B, P> {
             .collect()
     }
 
+    /// M25B: accepts a user import, splitting it at pauses when it is over the
+    /// platform cap. Every part is a normal queue item (and a normal journal
+    /// row), so the batch runs on the existing one-slot machinery.
+    ///
+    /// Returns one id per queued item. `Err` only when the file cannot be
+    /// decoded to find its cuts; the caller shows that message verbatim.
+    pub fn enqueue_import(&mut self, input: PathBuf, parts_dir: &Path) -> Result<Vec<u64>, String> {
+        self.enqueue_import_with_cap(input, parts_dir, suramak_core::session::session_cap_ms())
+    }
+
+    /// [`Self::enqueue_import`] with an explicit cap (the test seam; production
+    /// always reads the platform cap).
+    pub fn enqueue_import_with_cap(
+        &mut self,
+        input: PathBuf,
+        parts_dir: &Path,
+        cap_ms: i64,
+    ) -> Result<Vec<u64>, String> {
+        let split = suramak_core::session::split_audio_file(&input, parts_dir, cap_ms)
+            .map_err(|err| format!("could not split the import: {err}"))?;
+        match split {
+            None => Ok(vec![self.enqueue(input)]),
+            Some(output) => Ok(output
+                .parts
+                .iter()
+                .map(|part| self.enqueue(part.path.clone()))
+                .collect()),
+        }
+    }
+
     /// Accepts a file with the host's display identity (M22A2).
     ///
     /// The journal row cannot carry a title (its schema is M22A's and does not
@@ -917,6 +947,54 @@ impl<B: InferenceBackend, P: Prefetcher> QueueDriver<B, P> {
         let Some(ticket) = self.queue.next_inference() else {
             return false;
         };
+        // M25B: the session cap is checked **before** a job starts. A file over
+        // the platform cap is refused by name (`session_too_long`) with the
+        // measured budget — never fed to the in-memory path where the phone's
+        // LMKD would kill the app. Imports over the cap are split by the host
+        // before they reach this queue; this is the safety net for every other
+        // submitter (and the honest refusal for a recording that somehow grew
+        // past its part).
+        if let Some(duration) = decode::probe_duration_ms(&ticket.input) {
+            let duration = duration as i64;
+            // A deliberate `Part N of M` may run up to the cap **plus the
+            // rotation grace** (the recorder keeps writing until the next real
+            // pause). Any other file has the hard cap — 1 ms over is refused.
+            let is_part = ticket
+                .input
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(suramak_core::session::PartInfo::from_name)
+                .is_some();
+            let limit = if is_part {
+                suramak_core::session::session_cap_ms() + suramak_core::session::SPLIT_GRACE_MS
+            } else {
+                suramak_core::session::session_cap_ms()
+            };
+            if let Some(refusal) = suramak_core::session::cap_refusal_for(
+                duration,
+                suramak_core::session::SessionPlatform::host(),
+            )
+            .filter(|_| duration > limit)
+            {
+                let reason = refusal.reason();
+                if let (Some(store), Some(job_id)) = (
+                    self.journal.as_ref(),
+                    self.durable_ids.get(&ticket.id).copied(),
+                ) {
+                    let _ = store.set_job_status(job_id, JobStatus::Failed, Some(&reason));
+                }
+                self.queue.on_failed(ticket.id, reason.clone());
+                self.tokens.remove(&ticket.id);
+                self.samples.remove(&ticket.id);
+                self.events.push(QueueEvent::Failed {
+                    id: ticket.id,
+                    seq: ticket.seq,
+                    input: ticket.input,
+                    reason,
+                });
+                return true;
+            }
+        }
         // M22A: build (or resume) the durable run before submitting. A job whose
         // inputs are gone fails here by name — the slot never opens for it.
         let durable = match self.begin_durable(&ticket) {
@@ -1813,5 +1891,202 @@ mod tests {
         assert!(driver.queue().item(1).unwrap().state.is_terminal());
         assert_eq!(driver.queue().item(2).unwrap().state, ItemState::Done);
         assert!(driver.queue().running().is_none());
+    }
+
+    /// Writes a WAV of exactly `ms` at `rate` (silence) for the cap probes.
+    fn wav_of_ms(path: &Path, ms: i64, rate: u32) {
+        let n = (ms as i128 * i128::from(rate) / 1000) as usize;
+        suramak_core::decode::write_wav_i16(path, &vec![0.0; n], rate, 1).expect("write fixture");
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "suramak-driver-{}-{name}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir
+    }
+
+    /// M25B: a job 1 ms over the platform cap is refused by name before the
+    /// backend ever sees it; the reason carries the measured budget.
+    #[test]
+    fn a_session_one_millisecond_over_the_cap_is_refused_before_it_starts() {
+        let dir = scratch("cap");
+        let over = dir.join("over.wav");
+        // 8 kHz keeps the fixture small; the probe reads the header only.
+        wav_of_ms(&over, suramak_core::session::session_cap_ms() + 1, 8_000);
+        let mut driver = QueueDriver::new(
+            InstantBackend::new(&[]),
+            ManualPrefetch::default(),
+            options(),
+        );
+        driver.enqueue(over);
+        let events = drain_until_idle(&mut driver);
+        let reason = events
+            .iter()
+            .find_map(|event| match event {
+                QueueEvent::Failed { reason, .. } => Some(reason.clone()),
+                _ => None,
+            })
+            .expect("the refusal event");
+        assert!(reason.starts_with("session_too_long:"), "{reason}");
+        assert!(reason.contains("split it into shorter parts"), "{reason}");
+        assert_eq!(
+            driver.backend.submitted.len(),
+            0,
+            "the cap is checked before the inference slot opens"
+        );
+        assert!(
+            driver.prefetch.tasks.is_empty(),
+            "nothing was decoded ahead"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M25B: a file exactly at the cap is not refused (the queue accepts it and
+    /// the pipeline runs).
+    #[test]
+    fn a_session_exactly_at_the_cap_is_accepted() {
+        let dir = scratch("at-cap");
+        let exact = dir.join("exact.wav");
+        wav_of_ms(&exact, suramak_core::session::session_cap_ms(), 8_000);
+        let mut driver = QueueDriver::new(
+            InstantBackend::new(&[]),
+            InstantPrefetch::default(),
+            options(),
+        );
+        driver.enqueue(exact);
+        let events = drain_until_idle(&mut driver);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, QueueEvent::Started { .. })));
+        assert_eq!(driver.backend.submitted.len(), 1);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, QueueEvent::Failed { .. })));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M25B: a deliberate part may run past the cap into the rotation grace
+    /// (the recorder kept writing to the next pause) — it is not refused.
+    #[test]
+    fn a_part_inside_the_rotation_grace_is_accepted() {
+        let dir = scratch("part-grace");
+        let part = dir.join("Recording — Part 2 of 2.wav");
+        wav_of_ms(
+            &part,
+            suramak_core::session::session_cap_ms() + suramak_core::session::SPLIT_GRACE_MS / 2,
+            8_000,
+        );
+        let mut driver = QueueDriver::new(
+            InstantBackend::new(&[]),
+            InstantPrefetch::default(),
+            options(),
+        );
+        driver.enqueue(part);
+        let events = drain_until_idle(&mut driver);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, QueueEvent::Finished { .. })));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, QueueEvent::Failed { .. })));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M25B: an import over the cap becomes two normal queue rows, named
+    /// `Part 1 of 2` / `Part 2 of 2`, both under the cap.
+    #[test]
+    fn an_over_cap_import_splits_into_two_queued_parts() {
+        let dir = scratch("import2");
+        let input = dir.join("Interview.wav");
+        // 9.7 s speech, a 0.7 s pause straddling 10 s, then 5 s more.
+        let rate = 16_000;
+        let mut samples = vec![0.0f32; (9_700 * rate / 1000) as usize];
+        for (index, sample) in samples.iter_mut().enumerate() {
+            *sample = 0.4 * (index as f32 * 0.08).sin();
+        }
+        samples.extend(std::iter::repeat_n(0.0, (700 * rate / 1000) as usize));
+        let tail_start = samples.len();
+        samples.resize(tail_start + (5_000 * rate / 1000) as usize, 0.0);
+        for (index, sample) in samples[tail_start..].iter_mut().enumerate() {
+            *sample = 0.4 * (index as f32 * 0.08).sin();
+        }
+        suramak_core::decode::write_wav_i16(&input, &samples, rate, 1).expect("write");
+
+        let mut driver = QueueDriver::new(
+            InstantBackend::new(&[]),
+            ManualPrefetch::default(),
+            options(),
+        );
+        let ids = driver
+            .enqueue_import_with_cap(input, &dir.join("parts"), 10_000)
+            .expect("split");
+        assert_eq!(ids.len(), 2);
+        let items: Vec<_> = ids
+            .iter()
+            .map(|id| driver.queue().item(*id).expect("queued"))
+            .collect();
+        assert_eq!(
+            suramak_core::session::PartInfo::from_name(&items[0].name()),
+            Some(suramak_core::session::PartInfo::new(1, 2))
+        );
+        assert_eq!(
+            suramak_core::session::PartInfo::from_name(&items[1].name()),
+            Some(suramak_core::session::PartInfo::new(2, 2))
+        );
+        for (index, item) in items.iter().enumerate() {
+            assert!(item.input.is_file(), "part {index} exists");
+            assert!(
+                suramak_core::decode::probe_duration_ms(&item.input).unwrap() <= 10_000,
+                "part {index} is under the cap"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M25B: a far-over-cap import becomes three queued parts with dense
+    /// `Part N of 3` metadata.
+    #[test]
+    fn an_over_cap_import_splits_into_three_queued_parts() {
+        let dir = scratch("import3");
+        let input = dir.join("All hands.wav");
+        let rate = 16_000;
+        let mut samples = Vec::new();
+        for (speech_ms, silence_ms) in [(9_800, 600), (9_200, 1_000), (7_400, 0)] {
+            let start = samples.len();
+            samples.resize(start + (speech_ms * rate / 1000) as usize, 0.0);
+            for (index, sample) in samples[start..].iter_mut().enumerate() {
+                *sample = 0.4 * (index as f32 * 0.08).sin();
+            }
+            samples.extend(std::iter::repeat_n(
+                0.0,
+                (silence_ms * rate / 1000) as usize,
+            ));
+        }
+        suramak_core::decode::write_wav_i16(&input, &samples, rate, 1).expect("write");
+
+        let mut driver = QueueDriver::new(
+            InstantBackend::new(&[]),
+            ManualPrefetch::default(),
+            options(),
+        );
+        let ids = driver
+            .enqueue_import_with_cap(input, &dir.join("parts"), 10_000)
+            .expect("split");
+        assert_eq!(ids.len(), 3);
+        for (index, id) in ids.iter().enumerate() {
+            let item = driver.queue().item(*id).expect("queued");
+            assert_eq!(
+                suramak_core::session::PartInfo::from_name(&item.name()),
+                Some(suramak_core::session::PartInfo::new(index as u32 + 1, 3))
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

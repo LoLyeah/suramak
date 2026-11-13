@@ -33,20 +33,52 @@ const HEADER: &str = "suramak-pending-transcription v1";
 pub struct PendingTranscription {
     pub title: String,
     pub wav: PathBuf,
+    /// M25B: the other parts of a split recording (empty for a single file).
+    /// The first part is always `wav`; this list holds parts 2..N so a quit
+    /// after a long recording resumes the whole session, not just part 1.
+    pub parts: Vec<PathBuf>,
     pub created: u64,
 }
 
 impl PendingTranscription {
     /// A fresh entry for `title` + `wav`, stamped now.
+    #[allow(dead_code)] // the single-file constructor; tests and future callers
     pub fn new(title: impl Into<String>, wav: PathBuf) -> Self {
         Self {
             title: title.into(),
             wav,
+            parts: Vec::new(),
             created: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
         }
+    }
+
+    /// A fresh entry for a recording that was split into `parts` (one or more).
+    pub fn new_parts(title: impl Into<String>, mut parts: Vec<PathBuf>) -> Self {
+        let first = if parts.is_empty() {
+            PathBuf::new()
+        } else {
+            parts.remove(0)
+        };
+        Self {
+            title: title.into(),
+            wav: first,
+            parts,
+            created: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        }
+    }
+
+    /// Every file the entry needs transcribed, in part order.
+    pub fn all_parts(&self) -> Vec<PathBuf> {
+        let mut all = Vec::with_capacity(self.parts.len() + 1);
+        all.push(self.wav.clone());
+        all.extend(self.parts.iter().cloned());
+        all
     }
 }
 
@@ -128,12 +160,16 @@ pub fn clear() {
 
 /// The entry's text form (pure; round-trip tested).
 pub fn encode(entry: &PendingTranscription) -> String {
-    format!(
-        "{HEADER}\ntitle={}\nwav={}\ncreated={}\n",
+    let mut text = format!(
+        "{HEADER}\ntitle={}\nwav={}\n",
         escape(&entry.title),
         escape(&entry.wav.to_string_lossy()),
-        entry.created
-    )
+    );
+    for part in &entry.parts {
+        text.push_str(&format!("part={}\n", escape(&part.to_string_lossy())));
+    }
+    text.push_str(&format!("created={}\n", entry.created));
+    text
 }
 
 /// The reverse of [`encode`]; `None` for anything that is not a well-formed
@@ -145,12 +181,14 @@ pub fn decode(text: &str) -> Option<PendingTranscription> {
     }
     let mut title = None;
     let mut wav = None;
+    let mut parts = Vec::new();
     let mut created = None;
     for line in lines {
         let (key, value) = line.split_once('=')?;
         match key {
             "title" => title = Some(unescape(value)?),
             "wav" => wav = Some(PathBuf::from(unescape(value)?)),
+            "part" => parts.push(PathBuf::from(unescape(value)?)),
             "created" => created = value.parse::<u64>().ok(),
             _ => {} // forward-compatible: unknown keys are ignored
         }
@@ -158,6 +196,7 @@ pub fn decode(text: &str) -> Option<PendingTranscription> {
     Some(PendingTranscription {
         title: title?,
         wav: wav?,
+        parts,
         created: created?,
     })
 }
@@ -203,6 +242,7 @@ mod tests {
         let entry = PendingTranscription {
             title: "Recording 2026-10-14 09:41:02".to_string(),
             wav: PathBuf::from("/home/u/.local/share/suramak/recordings/Recording 09-41-02.wav"),
+            parts: Vec::new(),
             created: 1_770_000_000,
         };
         let text = encode(&entry);
@@ -215,6 +255,7 @@ mod tests {
         let entry = PendingTranscription {
             title: "line\nbreak \\ back".to_string(),
             wav: PathBuf::from("/tmp/a=b\\c\n.wav"),
+            parts: Vec::new(),
             created: 7,
         };
         let text = encode(&entry);
@@ -240,6 +281,7 @@ mod tests {
             Some(PendingTranscription {
                 title: "x".to_string(),
                 wav: PathBuf::from("/x"),
+                parts: Vec::new(),
                 created: 1,
             }),
             "unknown keys are ignored (forward-compatible)"
@@ -248,6 +290,21 @@ mod tests {
             decode(&format!("{HEADER}\ntitle=a\\q\nwav=/x\ncreated=1\n")),
             None
         );
+    }
+
+    #[test]
+    fn a_split_recording_round_trips_all_of_its_parts() {
+        let parts = vec![
+            PathBuf::from("/rec/Meeting — Part 1 of 3.wav"),
+            PathBuf::from("/rec/Meeting — Part 2 of 3.wav"),
+            PathBuf::from("/rec/Meeting — Part 3 of 3.wav"),
+        ];
+        let entry = PendingTranscription::new_parts("Meeting", parts.clone());
+        assert_eq!(entry.wav, parts[0]);
+        assert_eq!(entry.parts, parts[1..].to_vec());
+        assert_eq!(entry.all_parts(), parts);
+        let text = encode(&entry);
+        assert_eq!(decode(&text), Some(entry));
     }
 
     #[test]

@@ -108,6 +108,7 @@ pub const RECORD_WAVEFORM_BARS: usize = 96;
 
 /// Recording state machine (M3) — **pure**; the runtime owns the cpal session.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)] // M25B's part fields push Recording past the lint's line; it is one live value, never an array
 pub enum RecordState {
     Idle,
     Recording(Recording),
@@ -147,6 +148,14 @@ pub struct Recording {
     pub provisional_arrivals: Vec<Instant>,
     /// Set while the runtime is finalising the wav (Stop pressed once).
     pub stopping: bool,
+    /// M25B: the platform session cap (45 min Android / 60 min desktop) — the
+    /// quiet `of 45:00` half of the part line.
+    pub cap_ms: i64,
+    /// M25B: 1-based part the recorder is currently writing.
+    pub part_index: u32,
+    /// M25B: a one-line note shown for a few seconds after a rotation (the
+    /// counter just reset; nothing modal).
+    pub part_note: Option<(String, Instant)>,
 }
 
 /// One live recording source shown in the record view (M6).
@@ -203,6 +212,33 @@ pub fn format_elapsed(elapsed: Duration) -> String {
     format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
+/// M25B: the record view's quiet part line, shown once the current part is past
+/// 80 % of the cap. `44:12 of 45:00` — minutes may exceed 59 (a 60-minute cap
+/// reads `60:00`), hours never fold in here.
+pub fn part_status_line(elapsed: Duration, part_index: u32, cap_ms: i64) -> Option<String> {
+    if cap_ms <= 0 {
+        return None;
+    }
+    let elapsed_ms = i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX);
+    if elapsed_ms.saturating_mul(100) < cap_ms.saturating_mul(80) {
+        return None;
+    }
+    Some(format!(
+        "Part {part_index} · {} of {}",
+        clock_ms(elapsed_ms),
+        clock_ms(cap_ms)
+    ))
+}
+
+/// `mm:ss`, minutes folded no further (the cap's own clock).
+pub fn clock_ms(ms: i64) -> String {
+    let total = (ms.max(0) + 500) / 1000;
+    format!("{}:{:02}", total / 60, total % 60)
+}
+
+/// How long the rotation note stays on screen.
+pub const PART_NOTE_HOLD: Duration = Duration::from_secs(6);
+
 /// `mm:ss.mmm` transport readout for the deck (`01:02.480`; hours fold into
 /// minutes). The brief's one-time-format system: recordings use `hh:mm:ss`
 /// elapsed, the transport uses `mm:ss.mmm`, and nothing else shows a clock.
@@ -230,6 +266,48 @@ pub fn file_label(input: &Path) -> String {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| input.display().to_string())
+}
+
+/// M25B: expands imports that are over the session cap into `Part N of M` files
+/// cut at real pauses. A file at/under the cap (or one whose header cannot be
+/// probed) passes through unchanged; the queue refuses an over-cap file by name
+/// if a split could not be produced, so nothing silently proceeds.
+fn split_over_cap_imports(inputs: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<String>) {
+    let cap = suramak_core::session::session_cap_ms();
+    let mut expanded = Vec::with_capacity(inputs.len());
+    let mut notes = Vec::new();
+    for input in inputs {
+        let over = suramak_core::decode::probe_duration_ms(&input)
+            .is_some_and(|duration| duration as i64 > cap);
+        if !over {
+            expanded.push(input);
+            continue;
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir()
+            .join("suramak-session-parts")
+            .join(stamp.to_string());
+        match suramak_core::session::split_audio_file(&input, &dir, cap) {
+            Ok(Some(output)) => {
+                notes.push(output.plan.summary());
+                expanded.extend(output.parts.into_iter().map(|part| part.path));
+            }
+            Ok(None) => expanded.push(input),
+            Err(err) => {
+                // Leave the over-cap file for the queue's named refusal; the
+                // user sees `session_too_long`, not a decode detail.
+                tracing::warn!(
+                    path = %input.display(),
+                    "could not split an over-cap import: {err}"
+                );
+                expanded.push(input);
+            }
+        }
+    }
+    (expanded, notes)
 }
 
 /// The caret a split uses when no row has focus: the byte offset of the
@@ -1064,7 +1142,9 @@ pub struct AppState {
     /// Process-listing problem (macOS-only; shown as a note in the picker).
     pub audio_processes_error: Option<String>,
     /// A temp recording to delete once its transcript is saved (`keep_audio` off).
-    pub pending_recording_cleanup: Option<PathBuf>,
+    /// M25B: a split recording has one entry per part; each part is discarded
+    /// when *its own* transcript is saved, never before the later parts run.
+    pub pending_recording_cleanup: Vec<PathBuf>,
     /// Whether this build has capture compiled in — the record control's enable
     /// (set from [`capture::CAPTURE_COMPILED`] at startup; a field so the state
     /// machine is testable headless on Linux builds).
@@ -1428,7 +1508,7 @@ impl AppState {
             audio_devices_error: None,
             audio_processes: Vec::new(),
             audio_processes_error: None,
-            pending_recording_cleanup: None,
+            pending_recording_cleanup: Vec::new(),
             capture_available: capture::CAPTURE_COMPILED,
             polish: PolishState::Idle,
             polish_undo: None,
@@ -1573,15 +1653,30 @@ impl AppState {
             provisional_skipped: 0,
             provisional_arrivals: Vec::new(),
             stopping: false,
+            cap_ms: suramak_core::session::session_cap_ms(),
+            part_index: 1,
+            part_note: None,
         });
         self.route = Route::Record;
         effects.push(Effect::StartCapture);
         effects
     }
 
+    /// M25B: the recorder crossed a real pause and opened the next part. The
+    /// counter resets and a one-line note appears for [`PART_NOTE_HOLD`]; no
+    /// dialog, no interruption.
+    pub fn record_rotated(&mut self, now: Instant) {
+        if let RecordState::Recording(recording) = &mut self.record {
+            recording.part_index = recording.part_index.saturating_add(1);
+            recording.part_note = Some((
+                format!("Part {} · started at a pause", recording.part_index),
+                now,
+            ));
+        }
+    }
+
     /// Runtime: capture is live on these sources (M6) — the record view shows
     /// one row per source; gains start at unity, nothing muted.
-    ///
     /// The labels' order is the runtime's recorder order; the runtime reads the
     /// gains back from here at stop.
     pub fn record_sources(&mut self, labels: Vec<String>) {
@@ -1692,22 +1787,33 @@ impl AppState {
     /// `keep == false` → the temp file is remembered and deleted once the transcript
     /// was saved (see [`AppState::on_transcript_saved`]); on a failed save it stays
     /// for a retry.
+    #[allow(dead_code)] // the single-part wrapper; the runtime calls the parts form
     pub fn on_recording_stopped(&mut self, wav: PathBuf, keep: bool) -> Vec<Effect> {
+        self.on_recording_stopped_parts(vec![wav], keep)
+    }
+
+    /// M25B: a stopped recording, already split into one WAV per part (the
+    /// runtime writes `Part N of M` files at the pause boundaries). The parts
+    /// enter the ordinary import batch: the first starts now, the rest follow
+    /// on the one inference slot.
+    pub fn on_recording_stopped_parts(&mut self, wavs: Vec<PathBuf>, keep: bool) -> Vec<Effect> {
         self.record = RecordState::Idle;
         // M24A: files the watcher found while the recording owned the audio
         // session queue now, through the ordinary import path (behind the
         // recording's own job).
         let deferred = std::mem::take(&mut self.watch_deferred);
-        if !wav.is_file() {
-            self.record_failed(format!("recording file missing: {}", wav.display()));
+        if let Some(missing) = wavs.iter().find(|wav| !wav.is_file()) {
+            self.record_failed(format!("recording file missing: {}", missing.display()));
             let mut effects = Vec::new();
             if !deferred.is_empty() {
                 effects.extend(self.begin_imports(deferred));
             }
             return effects;
         }
-        self.pending_recording_cleanup = if keep { None } else { Some(wav.clone()) };
-        let mut effects = self.begin_import(wav);
+        if !keep {
+            self.pending_recording_cleanup.extend(wavs.iter().cloned());
+        }
+        let mut effects = self.begin_imports(wavs);
         if !deferred.is_empty() {
             effects.extend(self.begin_imports(deferred));
         }
@@ -1920,7 +2026,7 @@ impl AppState {
         entry: &crate::pending_transcription::PendingTranscription,
     ) -> Vec<Effect> {
         self.resumed_pending = Some(entry.wav.clone());
-        let effects = self.begin_import(entry.wav.clone());
+        let effects = self.begin_imports(entry.all_parts());
         if effects.is_empty() {
             self.resumed_pending = None;
             return effects;
@@ -1975,8 +2081,8 @@ impl AppState {
         ];
         self.record = RecordState::Recording(Recording {
             title: "Recording 2026-10-14 09:41:02".to_string(),
-            started_at: now - Duration::from_millis(42_600),
-            elapsed: Duration::from_millis(42_600),
+            started_at: now - Duration::from_millis(2_556_000),
+            elapsed: Duration::from_millis(2_556_000),
             rms: 0.62,
             waveform,
             device: Some(
@@ -1998,6 +2104,9 @@ impl AppState {
             provisional_skipped: 0,
             provisional_arrivals,
             stopping: false,
+            cap_ms: suramak_core::session::SESSION_CAP_ANDROID_MS,
+            part_index: 1,
+            part_note: None,
         });
         self.route = Route::Record;
     }
@@ -2401,6 +2510,11 @@ impl AppState {
             return Vec::new();
         }
         self.home.error = None;
+        // M25B: an import over the session cap is cut at real pauses before it
+        // reaches the queue — every part is a normal job. A file that cannot be
+        // probed is left alone (the queue's named refusal is the safety net).
+        let (inputs, split_notes) = split_over_cap_imports(inputs);
+        let split_note = (!split_notes.is_empty()).then(|| split_notes.join("; "));
         let starting = !matches!(self.job, Job::Running(_));
         if starting {
             self.status = None;
@@ -2420,6 +2534,9 @@ impl AppState {
         }
         if starting {
             effects.extend(self.start_next_from_queue(false));
+            if let Some(note) = split_note {
+                self.set_status(note, false);
+            }
         } else {
             let noun = count_noun(names.len(), "file");
             self.set_status(format!("added {noun} to the queue"), false);
@@ -2783,10 +2900,16 @@ impl AppState {
         });
         let mut effects = vec![Effect::RefreshLibrary];
         // keep_audio off: the temp recording goes now that its transcript
-        // is safely in the library (a failed save keeps it for a retry).
-        if let Some(path) = self.pending_recording_cleanup.clone() {
-            if transcript.audio_path.as_deref() == Some(path.as_path()) {
-                self.pending_recording_cleanup = None;
+        // is safely in the library (a failed save keeps it for a retry). A
+        // split recording has one entry per part and only the part this
+        // transcript was made from is discarded.
+        if let Some(path) = transcript.audio_path.as_deref() {
+            if let Some(index) = self
+                .pending_recording_cleanup
+                .iter()
+                .position(|pending| pending.as_path() == path)
+            {
+                let path = self.pending_recording_cleanup.remove(index);
                 effects.push(Effect::DiscardRecording { path });
             }
         }
@@ -2968,6 +3091,11 @@ impl AppState {
         let mut effects = Vec::new();
         if let RecordState::Recording(recording) = &mut self.record {
             recording.elapsed = now.saturating_duration_since(recording.started_at);
+            if let Some((_, at)) = &recording.part_note {
+                if now.saturating_duration_since(*at) >= PART_NOTE_HOLD {
+                    recording.part_note = None;
+                }
+            }
         }
         // M15.7: the search debounce runs with or without an open editor.
         effects.extend(self.poll_search(now));
@@ -4295,10 +4423,7 @@ mod tests {
         assert!(matches!(effects.as_slice(), [Effect::SubmitJob { .. }]));
         assert_eq!(state.route, Route::Transcribe);
         assert!(matches!(state.job, Job::Running(_)));
-        assert_eq!(
-            state.pending_recording_cleanup.as_deref(),
-            Some(wav.as_path())
-        );
+        assert_eq!(state.pending_recording_cleanup, vec![wav.clone()]);
         assert!(matches!(state.record, RecordState::Idle));
         // The file stem is the title (the transcript title comes from it).
         assert_eq!(
@@ -4497,10 +4622,7 @@ mod tests {
             Err("database is locked".to_string()),
         );
         assert!(effects.is_empty());
-        assert_eq!(
-            state.pending_recording_cleanup.as_deref(),
-            Some(wav.as_path())
-        );
+        assert_eq!(state.pending_recording_cleanup, vec![wav.clone()]);
 
         // A successful save discards it.
         let effects =
@@ -4510,7 +4632,7 @@ mod tests {
             Effect::DiscardRecording { path } => assert_eq!(path, &wav),
             other => panic!("expected a discard effect, got {other:?}"),
         }
-        assert!(state.pending_recording_cleanup.is_none());
+        assert!(state.pending_recording_cleanup.is_empty());
 
         // keep_audio on → nothing is discarded.
         let kept = temp_wav("kept-record");
@@ -4518,7 +4640,7 @@ mod tests {
         state.start_recording(Instant::now(), "2026-10-13 14:05:33");
         state.stop_recording();
         state.on_recording_stopped(kept.clone(), true);
-        assert!(state.pending_recording_cleanup.is_none());
+        assert!(state.pending_recording_cleanup.is_empty());
         let effects =
             state.on_transcript_saved(transcript_with_audio("Recording y.wav", &kept), Ok(()));
         assert_eq!(effects.len(), 1, "only the library refresh");
@@ -6634,5 +6756,81 @@ mod tests {
         assert_eq!(state.queue.item(2).unwrap().input, second);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M25B: the record view's quiet line appears only past 80 % of the cap and
+    /// reads exactly `Part 1 · 44:12 of 45:00`.
+    #[test]
+    fn the_part_line_appears_past_eighty_percent_and_names_the_cap() {
+        let cap = 45 * 60 * 1000;
+        assert_eq!(
+            part_status_line(Duration::from_millis(2_652_000), 1, cap).as_deref(),
+            Some("Part 1 · 44:12 of 45:00")
+        );
+        // 36:00 is exactly 80 % — the line starts there.
+        assert_eq!(
+            part_status_line(Duration::from_millis(2_160_000), 1, cap).as_deref(),
+            Some("Part 1 · 36:00 of 45:00")
+        );
+        assert!(part_status_line(Duration::from_millis(2_159_999), 1, cap).is_none());
+        assert_eq!(
+            part_status_line(Duration::from_millis(2_700_000), 2, cap).as_deref(),
+            Some("Part 2 · 45:00 of 45:00")
+        );
+        // The desktop cap reads 60:00, not 01:00:00.
+        assert_eq!(
+            part_status_line(Duration::from_millis(3_540_000), 1, 3_600_000).as_deref(),
+            Some("Part 1 · 59:00 of 60:00")
+        );
+    }
+
+    /// M25B: a rotation resets the counter and leaves a one-line note, then the
+    /// note clears on its own — nothing is modal.
+    #[test]
+    fn the_rotation_resets_the_counter_and_the_note_clears() {
+        let mut state = recording_state();
+        let now = Instant::now();
+        state.start_recording(now, "2026-10-13 14:05:33");
+        assert_eq!(
+            match &state.record {
+                RecordState::Recording(recording) => recording.part_index,
+                _ => panic!("recording"),
+            },
+            1
+        );
+        state.record_rotated(now + Duration::from_secs(2_700));
+        match &state.record {
+            RecordState::Recording(recording) => {
+                assert_eq!(recording.part_index, 2);
+                let (note, _) = recording.part_note.as_ref().expect("rotation note");
+                assert!(note.starts_with("Part 2"), "{note}");
+            }
+            _ => panic!("recording"),
+        }
+        // Six seconds later the note is gone.
+        state.tick(now + Duration::from_secs(2_700) + PART_NOTE_HOLD);
+        match &state.record {
+            RecordState::Recording(recording) => assert!(recording.part_note.is_none()),
+            _ => panic!("recording"),
+        }
+    }
+
+    /// M25B: parts are ordinary transcripts whose title/audio name carries
+    /// `Part N of M`; the library row exposes that metadata.
+    #[test]
+    fn a_library_row_shows_part_metadata_beside_the_title() {
+        let transcript = transcript_with_audio(
+            "Meeting — Part 2 of 3.wav",
+            &PathBuf::from("/tmp/Meeting — Part 2 of 3.wav"),
+        );
+        let row = suramak_ui::deck::compact::model::LibraryRow::from_transcript(&transcript);
+        assert_eq!(
+            row.part.as_ref().map(|part| part.label()).as_deref(),
+            Some("Part 2 of 3")
+        );
+        let plain = suramak_ui::deck::compact::model::LibraryRow::from_transcript(
+            &transcript_with_audio("Notes.wav", &PathBuf::from("/tmp/Notes.wav")),
+        );
+        assert!(plain.part.is_none());
     }
 }

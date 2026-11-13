@@ -418,6 +418,26 @@ impl Runtime {
             ));
             return;
         };
+        // M25B: diarization's own 30-minute limit is surfaced **before** the
+        // job starts, with the honest route — split the session into shorter
+        // parts first. No new behaviour, just the existing named refusal.
+        let audio_ms = suramak_core::decode::probe_duration_ms(&audio)
+            .map(|ms| ms as i64)
+            .or_else(|| {
+                transcript
+                    .segments
+                    .iter()
+                    .map(|segment| segment.end_ms)
+                    .max()
+            })
+            .unwrap_or(0);
+        if audio_ms > asr_diarization::MAX_AUDIO_MS {
+            state.diarization.note = Some((
+                diarization::length_refusal(audio_ms).expect("over the 30-minute limit"),
+                false,
+            ));
+            return;
+        }
         if !audio.is_file() {
             state.diarization.note = Some((
                 format!("the recording is missing at {}", audio.display()),
@@ -749,7 +769,7 @@ impl Runtime {
     /// honest status — the resume never fabricates work for audio that is gone.
     pub fn pending_transcription(&mut self) -> Option<PendingResume> {
         let entry = pending_transcription::read()?;
-        if !entry.wav.is_file() {
+        if !entry.all_parts().iter().all(|part| part.is_file()) {
             tracing::warn!(
                 wav = %entry.wav.display(),
                 "pending transcription: the saved recording's audio is missing — clearing the entry"
@@ -1746,6 +1766,10 @@ impl Runtime {
             published_revision: 0,
             published_skipped: 0,
             published_this_step: false,
+            rotator: suramak_core::session::LiveSplitTracker::new(
+                resample::TARGET_RATE,
+                suramak_core::session::session_cap_ms(),
+            ),
         });
     }
 
@@ -1817,7 +1841,10 @@ impl Runtime {
 
         // 3. Flush the accumulated chunk through the one mixing engine.
         if live.should_flush() {
-            live.flush(state);
+            let rotations = live.flush(state);
+            for _ in 0..rotations {
+                state.record_rotated(Instant::now());
+            }
         }
 
         // 4. Publish to the record view when the provisional content or the
@@ -1853,7 +1880,7 @@ impl Runtime {
         }
         let keep = self.settings.storage.keep_audio;
         match self.finalize_capture(title, keep, state) {
-            Ok(Some(path)) => state.on_recording_stopped(path, keep),
+            Ok(Some(paths)) => state.on_recording_stopped_parts(paths, keep),
             Ok(None) => {
                 state.record_failed("no recording in progress".to_string());
                 Vec::new()
@@ -1878,7 +1905,7 @@ impl Runtime {
         title: &str,
         keep: bool,
         state: &mut AppState,
-    ) -> Result<Option<PathBuf>, String> {
+    ) -> Result<Option<Vec<PathBuf>>, String> {
         let Some(session) = self.session.take() else {
             return Ok(None);
         };
@@ -1952,10 +1979,36 @@ impl Runtime {
             std::env::temp_dir().join(RECORDINGS_TEMP_DIR)
         };
         let stem = app::recording_file_stem(title);
-        let path = dir.join(format!("{stem}.wav"));
-        capture::write_recording_wav(&path, &outcome.samples, resample::TARGET_RATE)
-            .map_err(|err| format!("could not write the recording: {err}"))?;
-        Ok(Some(path))
+        // M25B: one capture buffer, split at real pauses when it is over the
+        // platform cap. Each part is a slice of the same mixed samples, so the
+        // files concatenate to the uninterrupted capture sample for sample.
+        let split = suramak_core::session::write_split_wavs(
+            &outcome.samples,
+            resample::TARGET_RATE,
+            suramak_core::session::session_cap_ms(),
+            &dir,
+            &stem,
+        )
+        .map_err(|err| format!("could not write the recording: {err}"))?;
+        for part in &split.parts {
+            tracing::info!(
+                path = %part.path.display(),
+                part = %part.span.info.label(),
+                samples = part.span.samples(),
+                ms = part.span.duration_ms(resample::TARGET_RATE),
+                "recording part written"
+            );
+        }
+        if !split.plan.is_single() {
+            tracing::info!(
+                parts = split.parts.len(),
+                summary = %split.plan.summary(),
+                "the recording passed the session cap — split at pauses"
+            );
+        }
+        Ok(Some(
+            split.parts.iter().map(|part| part.path.clone()).collect(),
+        ))
     }
 
     /// M9e (P1-1): **Stop & Save** at quit — the bounded save.
@@ -1982,26 +2035,27 @@ impl Runtime {
             _ => "Recording".to_string(),
         };
         let wav = self.finalize_capture(&title, true, state)?;
-        let wav = match wav {
-            Some(path) => path,
+        let parts = match wav {
+            Some(parts) => parts,
             None => {
                 tracing::warn!(
                     "quit: stop & save with no live capture session — writing the \
                      pending entry without audio"
                 );
                 let stem = app::recording_file_stem(&title);
-                paths::recordings_dir()
+                vec![paths::recordings_dir()
                     .map(|dir| dir.join(format!("{stem}.wav")))
-                    .map_err(|err| err.to_string())?
+                    .map_err(|err| err.to_string())?]
             }
         };
-        let entry = PendingTranscription::new(title, wav.clone());
+        let entry = PendingTranscription::new_parts(title, parts);
         pending_transcription::write(&entry)?;
         tracing::info!(
-            wav = %wav.display(),
+            wav = %entry.wav.display(),
+            parts = entry.parts.len() + 1,
             "quit: stop & save — recording preserved, pending transcription written"
         );
-        Ok(Some(wav))
+        Ok(Some(entry.wav))
     }
 
     /// Starts the background download for `id` (one at a time).
@@ -2424,6 +2478,8 @@ struct LiveCapture {
     /// [`Runtime::live_tick`] returns it so the frame loop can repaint on the
     /// arrival (a discrete change) without a periodic cadence.
     published_this_step: bool,
+    /// M25B: watches the live 16 kHz mix for the pause where a part rotates.
+    rotator: suramak_core::session::LiveSplitTracker,
 }
 
 /// One source's pending device-rate audio (M7).
@@ -2452,7 +2508,7 @@ impl LiveCapture {
     /// Per-source gain/mute come from the record view's rows, exactly like the
     /// final mix; a source with nothing pending contributes nothing (a few ms
     /// of sub-tick skew at most — the final mix stays the authoritative one).
-    fn flush(&mut self, state: &AppState) {
+    fn flush(&mut self, state: &AppState) -> usize {
         let (gains, mutes) = live_gains(state, self.pending.len());
         let tracks: Vec<mix::MixTrack<'_>> = self
             .pending
@@ -2473,12 +2529,13 @@ impl LiveCapture {
                 for slot in &mut self.pending {
                     slot.samples.clear();
                 }
-                return;
+                return 0;
             }
         };
         for slot in &mut self.pending {
             slot.samples.clear();
         }
+        let rotations = usize::from(self.rotator.push(&mixed).is_some());
 
         let skipped_before = self.session.skipped_windows();
         let busy = self.decoder.is_decoding();
@@ -2498,6 +2555,7 @@ impl LiveCapture {
                 "live: backlog — the previous decode was still running; the skipped window merged into the next"
             );
         }
+        rotations
     }
 }
 

@@ -145,7 +145,8 @@ pub fn ui(
                                 item.id,
                                 item.title.clone(),
                                 format!(
-                                    "{} · {}",
+                                    "{}{} · {}",
+                                    part_prefix(item),
                                     item.created_at.format("%d %b %Y %H:%M"),
                                     super::model_manager::display_name(&item.model)
                                 ),
@@ -165,7 +166,8 @@ pub fn ui(
                         let row = &state.library.leaving[leaving_index];
                         let title = row.item.title.clone();
                         let meta = format!(
-                            "{} · {}",
+                            "{}{} · {}",
+                            part_prefix(&row.item),
                             row.item.created_at.format("%d %b %Y %H:%M"),
                             super::model_manager::display_name(&row.item.model)
                         );
@@ -178,6 +180,17 @@ pub fn ui(
                 }
             }
         });
+}
+
+/// M25B: `Part 2 of 3 · ` when the row's audio is one part, else empty.
+fn part_prefix(transcript: &suramak_core::transcript::Transcript) -> String {
+    transcript
+        .audio_path
+        .as_deref()
+        .and_then(|path| path.file_name().and_then(|name| name.to_str()))
+        .and_then(suramak_core::session::PartInfo::from_name)
+        .map(|part| format!("{} · ", part.label()))
+        .unwrap_or_default()
 }
 
 /// The library search box (M15.7).

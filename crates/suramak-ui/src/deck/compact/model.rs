@@ -66,6 +66,8 @@ pub struct LibraryRow {
     /// M22C: down-sampled RMS bars (`0..=1`) for the 28 px mini-waveform.
     /// Empty means no stored peaks: the row draws its flat baseline.
     pub waveform: Vec<f32>,
+    /// M25B: `Part 2 of 3` when this row is one part of a split session.
+    pub part: Option<suramak_core::session::PartInfo>,
 }
 
 impl LibraryRow {
@@ -85,6 +87,12 @@ impl LibraryRow {
             language: transcript.language.clone(),
             speakers: 0,
             waveform: Vec::new(),
+            part: transcript
+                .audio_path
+                .as_deref()
+                .and_then(|path| path.file_name().and_then(|name| name.to_str()))
+                .and_then(suramak_core::session::PartInfo::from_name)
+                .or_else(|| suramak_core::session::PartInfo::from_name(&transcript.title)),
         }
     }
 

@@ -18,6 +18,7 @@ pub mod polish;
 pub mod resample;
 pub mod search;
 pub mod segment_edit;
+pub mod session;
 pub mod settings;
 pub mod store;
 pub mod textrules;
