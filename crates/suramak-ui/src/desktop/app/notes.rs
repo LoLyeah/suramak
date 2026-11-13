@@ -19,12 +19,36 @@ impl AppState {
             return Vec::new();
         };
         let id = editor.transcript.id;
-        self.notes
-            .open(self.polish_configured, Vec::new(), &editor.transcript);
+        let session = self.editor_session;
+        self.notes.open_with_session(
+            self.polish_configured,
+            Vec::new(),
+            &editor.transcript,
+            session,
+        );
         self.notes.dest = self.note_dest();
         // Seed from what we already hold so a reopen never flashes empty while
         // the store read lands.
-        vec![Effect::LoadNotes { transcript: id }]
+        vec![Effect::LoadNotes {
+            transcript: id,
+            session: session.map(|(session, _, _)| session),
+        }]
+    }
+
+    /// M25C: switches `This part` / `Whole session` and re-reads the rows for
+    /// that timeline (the two scopes keep separate (session, preset) rows).
+    pub fn set_notes_scope(&mut self, scope: crate::notes_sheet::NoteScope) -> Vec<Effect> {
+        self.notes.set_scope(scope);
+        let Some(id) = self.notes.transcript else {
+            return Vec::new();
+        };
+        let session = (scope == crate::notes_sheet::NoteScope::WholeSession)
+            .then_some(self.notes.session)
+            .flatten();
+        vec![Effect::LoadNotes {
+            transcript: id,
+            session,
+        }]
     }
 
     /// The suggested `Export .md` path in the user's home directory.
@@ -88,6 +112,10 @@ impl AppState {
             transcript: Box::new(transcript),
             preset,
             speakers,
+            session: (self.notes.scope == crate::notes_sheet::NoteScope::WholeSession)
+                .then_some(self.notes.session)
+                .flatten(),
+            scope: self.notes.scope,
         }]
     }
 
@@ -128,6 +156,9 @@ impl AppState {
             .map(|at| at.with_timezone(&suramak_core::Utc))
             .unwrap_or_else(|_| suramak_core::Utc::now());
         self.set_status(format!("{} ready", note.preset.label()), false);
+        let session_id = (self.notes.scope == crate::notes_sheet::NoteScope::WholeSession)
+            .then_some(self.notes.session)
+            .flatten();
         vec![Effect::SaveNote {
             note: Box::new(NoteRecord {
                 transcript_id: id,
@@ -137,7 +168,7 @@ impl AppState {
                 citations_removed: note.citations_removed,
                 model: note.model,
                 created_at: created,
-                session_id: None,
+                session_id,
             }),
         }]
     }
@@ -256,6 +287,47 @@ fn contents(
     if let Some(gate) = state.notes_gate_note() {
         ui.label(egui::RichText::new(gate).size(12.0).color(tokens.ink_soft));
         ui.add_space(tokens.space.m);
+    }
+
+    // ---- M25C: the scope toggle (only inside a session) ---------------------
+    if state.notes.session.is_some() {
+        ui.label(
+            egui::RichText::new(format!("Scope · {}", state.notes.scope.label()))
+                .size(11.5)
+                .color(tokens.ink_soft),
+        );
+        ui.horizontal(|ui| {
+            for scope in [
+                crate::notes_sheet::NoteScope::ThisPart,
+                crate::notes_sheet::NoteScope::WholeSession,
+            ] {
+                let selected = state.notes.scope == scope;
+                let response = controls::button(
+                    ui,
+                    tokens,
+                    motion,
+                    ("notes-scope", scope.label()),
+                    scope.label(),
+                    if selected {
+                        Tier::Primary
+                    } else {
+                        Tier::Secondary
+                    },
+                    !state.notes.phase.is_running(),
+                );
+                if response.clicked() {
+                    effects.extend(state.set_notes_scope(scope));
+                }
+            }
+        });
+        if let Some(line) = state.notes.scope_note() {
+            ui.label(
+                egui::RichText::new(line)
+                    .size(11.5)
+                    .color(tokens.record_red_text),
+            );
+        }
+        ui.add_space(tokens.space.s);
     }
 
     // ---- the three presets --------------------------------------------------

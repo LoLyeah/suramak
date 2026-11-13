@@ -671,4 +671,37 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn a_session_sheet_has_two_scopes_and_refuses_an_incomplete_whole_run() {
+        assert_eq!(NoteScope::LABELS, ["This part", "Whole session"]);
+        let part = transcript(40);
+        let session = Uuid::new_v4();
+        let mut sheet = NotesSheet::new();
+        sheet.open_with_session(true, Vec::new(), &part, Some((session, 3, 2)));
+        assert_eq!(
+            sheet.scope,
+            NoteScope::WholeSession,
+            "default is the meeting"
+        );
+        assert_eq!(sheet.scope.label(), "Whole session");
+        assert_eq!(
+            sheet.scope_note().as_deref(),
+            Some("2 of 3 parts transcribed")
+        );
+        let refusal = sheet.start().expect_err("whole-session run refuses");
+        assert!(refusal.starts_with("session_incomplete:"), "{refusal}");
+        assert!(refusal.contains("2 of 3 parts transcribed"));
+        assert!(!sheet.phase.is_running());
+
+        sheet.set_scope(NoteScope::ThisPart);
+        assert_eq!(sheet.scope.label(), "This part");
+        assert!(sheet.start().is_ok(), "the part itself is complete");
+
+        // An ordinary transcript has no toggle state and keeps today's scope.
+        let mut plain = NotesSheet::new();
+        plain.open(true, Vec::new(), &part);
+        assert_eq!(plain.scope, NoteScope::ThisPart);
+        assert!(plain.scope_note().is_none());
+    }
 }

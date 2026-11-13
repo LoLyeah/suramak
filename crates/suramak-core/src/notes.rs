@@ -857,4 +857,48 @@ mod tests {
         }
         assert_eq!(seen, (0..10).collect::<Vec<_>>(), "order and coverage");
     }
+
+    #[test]
+    fn a_citation_in_part_three_is_checked_against_the_absolute_timeline() {
+        // Part 1 is 45:00 and part 2 is 5:00, so part 3 starts at 50:00. The
+        // citation names that start; the validator must match part 3's first
+        // row, not remove it as past the end of part 1.
+        let part =
+            |index: u32, duration: i64, starts: &[(i64, i64)]| crate::session::SessionPartInput {
+                transcript_id: uuid::Uuid::new_v4(),
+                title: format!("Meeting — Part {index} of 3"),
+                part_index: index,
+                part_count: 3,
+                duration_ms: duration,
+                segments: starts
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, (start, end))| Segment {
+                        idx: idx as u32,
+                        start_ms: *start,
+                        end_ms: *end,
+                        text: format!("part {index} row {idx}"),
+                    })
+                    .collect(),
+            };
+        let parts = vec![
+            part(1, 2_700_000, &[(0, 2_700_000)]),
+            part(2, 300_000, &[(0, 300_000)]),
+            part(3, 120_000, &[(0, 120_000)]),
+        ];
+        let timeline = session_timeline(&parts);
+        let check = check_notes(
+            "## Decisions\n\n- Ship on Friday [50:00].",
+            &timeline.segments,
+        );
+        assert_eq!(check.citations_checked, 1);
+        assert_eq!(check.citations_removed, 0, "{:?}", check.breakdown);
+        assert!(check.body_md.contains("[50:00]"), "{}", check.body_md);
+        // The same citation against part 3 alone is a real time, but against
+        // part 1 alone it is past the end — proving the timeline is the gate.
+        assert_eq!(
+            check_notes("- ship [50:00]", &parts[0].segments).citations_removed,
+            1
+        );
+    }
 }

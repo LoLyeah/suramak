@@ -1268,4 +1268,73 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    fn part_input(
+        index: u32,
+        count: u32,
+        duration_ms: i64,
+        starts: &[(i64, i64)],
+    ) -> SessionPartInput {
+        SessionPartInput {
+            transcript_id: Uuid::new_v4(),
+            title: format!("Meeting — Part {index} of {count}"),
+            part_index: index,
+            part_count: count,
+            duration_ms,
+            segments: starts
+                .iter()
+                .enumerate()
+                .map(|(idx, (start, end))| Segment {
+                    idx: idx as u32,
+                    start_ms: *start,
+                    end_ms: *end,
+                    text: format!("part {index} row {idx}"),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn absolute_times_accumulate_the_exact_part_durations() {
+        // Part 1 is 45:00, part 2 is 5:00; part 3 starts at 50:00 exactly.
+        let parts = vec![
+            part_input(1, 3, 2_700_000, &[(0, 12_000), (2_688_000, 2_700_000)]),
+            part_input(2, 3, 300_000, &[(0, 6_000)]),
+            part_input(3, 3, 60_000, &[(500, 1_500)]),
+        ];
+        let timeline = session_timeline(&parts);
+        assert_eq!(timeline.parts[0].offset_ms, 0);
+        assert_eq!(timeline.parts[1].offset_ms, 2_700_000);
+        assert_eq!(timeline.parts[2].offset_ms, 3_000_000);
+        assert_eq!(timeline.total_ms, 3_060_000);
+        // Segment times are part start + absolute offset, exactly.
+        assert_eq!(timeline.segments[0].start_ms, 0);
+        assert_eq!(timeline.segments[1].start_ms, 2_688_000);
+        assert_eq!(timeline.segments[2].start_ms, 2_700_000);
+        assert_eq!(timeline.segments[3].start_ms, 3_000_500);
+        // The reindexed rows are contiguous across the session.
+        assert_eq!(
+            timeline.segments.iter().map(|s| s.idx).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(timeline.part_at(2_700_000).unwrap().part_index, 2);
+        assert_eq!(timeline.part_at(3_000_500).unwrap().part_index, 3);
+    }
+
+    #[test]
+    fn an_incomplete_session_refuses_whole_session_notes_by_name() {
+        assert_eq!(session_incomplete_refusal(3, 3), None);
+        let reason = session_incomplete_refusal(2, 3).expect("2 of 3 refuses");
+        assert!(reason.starts_with("session_incomplete:"));
+        assert!(reason.contains("2 of 3 parts transcribed"), "{reason}");
+        assert_eq!(session_incomplete_line(2, 3), "2 of 3 parts transcribed");
+    }
+
+    #[test]
+    fn the_collapsed_row_meta_is_parts_then_length() {
+        assert_eq!(session_meta_label(3, 7_800_000), "3 parts · 2 h 10 m");
+        assert_eq!(session_meta_label(2, 2_520_000), "2 parts · 42 m");
+        assert_eq!(session_meta_label(1, 45_000), "1 part · 45 s");
+        assert_eq!(session_meta_label(2, 3_600_000), "2 parts · 1 h");
+    }
 }

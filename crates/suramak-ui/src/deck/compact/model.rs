@@ -160,7 +160,7 @@ impl LibraryRow {
 
     /// M25C: the one collapsed row for a whole session. `parts` is already
     /// ordered by `part_index`; `transcribed` counts the rows that exist.
-    pub fn from_session(session_id: Uuid, parts: &[&Transcript], summary: SessionSummary) -> Self {
+    pub fn from_session(parts: &[&Transcript], summary: SessionSummary) -> Self {
         let first = parts.first().copied();
         let newest = parts
             .iter()
@@ -190,8 +190,15 @@ impl LibraryRow {
 
     /// `"12 Mar · 21 segments"` — the phone row's meta line. The duration
     /// lives in the row's tabular right-hand column (M22C), so it is not
-    /// repeated here.
+    /// repeated here. M25C: a collapsed session row says `3 parts · 2 h 10 m`
+    /// instead — one meeting, not a count of its parts' segments.
     pub fn meta(&self) -> String {
+        if let Some(session) = self.session {
+            return suramak_core::session::session_meta_label(
+                session.part_count as usize,
+                session.total_ms,
+            );
+        }
         format!(
             "{} · {}",
             self.created_at.format("%-d %b"),
@@ -2154,11 +2161,7 @@ impl CompactApp {
                         transcribed: present as u32,
                         total_ms,
                     };
-                    rows.push(LibraryRow::from_session(
-                        identity.session_id,
-                        &parts,
-                        summary,
-                    ));
+                    rows.push(LibraryRow::from_session(&parts, summary));
                     continue;
                 }
             }
@@ -3309,6 +3312,7 @@ pub fn bytes_label(bytes: u64) -> String {
 mod tests {
     use super::*;
     use suramak_core::device::{DeviceProfile, PhoneTier};
+    use suramak_core::store::SessionIdentity;
 
     fn transcript(title: &str, texts: &[&str]) -> Transcript {
         let segments = texts
@@ -4462,5 +4466,130 @@ mod tests {
         let (text, error) = app.status.as_ref().expect("the refusal is named");
         assert!(text.contains("not configured"));
         assert!(error);
+    }
+
+    fn session_parts() -> (
+        Uuid,
+        Vec<Transcript>,
+        std::collections::HashMap<Uuid, SessionIdentity>,
+    ) {
+        let session = Uuid::new_v4();
+        let mut parts = Vec::new();
+        for index in 1..=3u32 {
+            let mut part = transcript(&format!("Meeting — Part {index} of 3"), &["opening line"]);
+            part.segments[0].end_ms = match index {
+                1 => 2_700_000,
+                2 => 300_000,
+                _ => 4_800_000,
+            };
+            parts.push(part);
+        }
+        let identities = parts
+            .iter()
+            .enumerate()
+            .map(|(index, part)| (part.id, SessionIdentity::new(session, index as u32 + 1, 3)))
+            .collect();
+        (session, parts, identities)
+    }
+
+    #[test]
+    fn a_multi_part_session_is_one_row_with_its_meta_and_chip() {
+        let (session, parts, identities) = session_parts();
+        let mut app = CompactApp::new(CompactSettings::default());
+        // Newest-first order from the store is part 3, 2, 1.
+        app.set_library_with_sessions(
+            vec![parts[2].clone(), parts[1].clone(), parts[0].clone()],
+            identities,
+        );
+        assert_eq!(app.rows.len(), 1, "three parts collapse into one row");
+        let row = &app.rows[0];
+        assert_eq!(row.title, "Meeting", "the Part N suffix is gone");
+        assert_eq!(row.meta(), "3 parts · 2 h 10 m");
+        assert_eq!(row.part_chip.as_deref(), Some("3 parts"));
+        assert_eq!(row.session.map(|summary| summary.session_id), Some(session));
+
+        // A NULL-session row renders exactly as before.
+        let plain = LibraryRow::from_transcript(&transcript("Old note", &["one"]));
+        assert!(plain.session.is_none());
+        assert!(plain.part_chip.is_none());
+        assert!(plain.meta().contains("1 segment"));
+    }
+
+    #[test]
+    fn the_session_view_lists_the_parts_in_part_index_order() {
+        let (session, parts, identities) = session_parts();
+        let mut app = CompactApp::new(CompactSettings::default());
+        app.set_library_with_sessions(
+            vec![parts[2].clone(), parts[0].clone(), parts[1].clone()],
+            identities,
+        );
+        app.open_session(session, 1.0);
+        let view = app.session_view.clone().expect("session view");
+        assert_eq!(
+            view.parts
+                .iter()
+                .map(|part| part.part_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(view.parts[0].opening, "opening line");
+        assert_eq!(view.meta(), "3 parts · 2 h 10 m");
+        assert_eq!(view.incomplete_line(), None);
+    }
+
+    #[test]
+    fn an_incomplete_session_says_two_of_three_and_refuses_whole_notes() {
+        let (session, parts, mut identities) = session_parts();
+        // Part 2 failed: remove it from the library and the identity map.
+        identities.remove(&parts[1].id);
+        let mut app = CompactApp::new(CompactSettings::default());
+        app.set_library_with_sessions(vec![parts[2].clone(), parts[0].clone()], identities);
+        assert_eq!(app.rows.len(), 1);
+        let view_row = &app.rows[0];
+        assert_eq!(view_row.session.unwrap().transcribed, 2);
+        app.open_session(session, 1.0);
+        assert_eq!(
+            app.session_view
+                .as_ref()
+                .unwrap()
+                .incomplete_line()
+                .as_deref(),
+            Some("2 of 3 parts transcribed")
+        );
+
+        app.notes_configured = true;
+        app.open_editor(parts[0].clone(), 1.0);
+        app.open_notes_sheet(2.0);
+        assert_eq!(app.notes.scope, crate::notes_sheet::NoteScope::WholeSession);
+        assert_eq!(
+            app.notes.scope_note().as_deref(),
+            Some("2 of 3 parts transcribed")
+        );
+        assert!(app.start_note().is_none());
+        let (message, error) = app.status.as_ref().unwrap();
+        assert!(message.starts_with("session_incomplete:"), "{message}");
+        assert!(message.contains("2 of 3 parts transcribed"));
+        assert!(error);
+        // Switching to This part runs on the part's own timeline.
+        app.set_notes_scope(crate::notes_sheet::NoteScope::ThisPart);
+        assert!(app.start_note().is_some());
+    }
+
+    #[test]
+    fn a_session_export_is_one_markdown_file_with_dividers() {
+        let (session, parts, identities) = session_parts();
+        let mut app = CompactApp::new(CompactSettings::default());
+        app.set_library_with_sessions(parts, identities);
+        app.open_session(session, 1.0);
+        let action = app.session_export_action().expect("export action");
+        match action {
+            CompactAction::ExportSession { name, markdown } => {
+                assert_eq!(name, "Meeting.md");
+                assert!(markdown.contains("## Part 1 — 00:00"), "{markdown}");
+                assert!(markdown.contains("## Part 2 — 45:00"), "{markdown}");
+                assert!(markdown.contains("## Part 3 — 50:00"), "{markdown}");
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
     }
 }

@@ -43,7 +43,7 @@ use suramak_asr::queue::driver::{
 };
 use suramak_asr::worker::{Job, JobStage, Worker, WorkerEvent};
 use suramak_core::models as core_models;
-use suramak_core::notes::{generate_notes, NotePreset, NotesOutcome};
+use suramak_core::notes::{generate_notes, generate_session_notes, NotePreset, NotesOutcome};
 use suramak_core::paths;
 use suramak_core::polish::{OpenAiCompat, PolishBackend, PolishOutcome};
 use suramak_core::resample;
@@ -1024,6 +1024,9 @@ impl Runtime {
                         let id = transcript.id;
                         let translations = self.translations_of(id);
                         queue.extend(state.on_transcript_loaded(transcript));
+                        // M25C: the notes scope toggle needs the session id and
+                        // the honest present/total part count.
+                        state.set_editor_session(self.session_info(id));
                         state.on_translations_loaded(id, &translations);
                         state.on_word_alignment_loaded(id, self.alignment_of(id));
                         queue.push_back(Effect::RefreshDiarization { id });
@@ -1363,12 +1366,19 @@ impl Runtime {
                         queue.extend(state.on_polish_done(Err(err)));
                     }
                 }
-                Effect::LoadNotes { transcript } => {
+                Effect::LoadNotes {
+                    transcript,
+                    session,
+                } => {
                     let result = match &self.store {
-                        Some(store) => store
-                            .notes_for(transcript)
-                            .map(|rows| rows.iter().map(NoteRecord::stored).collect())
-                            .map_err(|err| err.to_string()),
+                        Some(store) => {
+                            let rows = match session {
+                                Some(session) => store.notes_for_session(session),
+                                None => store.notes_for(transcript),
+                            };
+                            rows.map(|rows| rows.iter().map(NoteRecord::stored).collect())
+                                .map_err(|err| err.to_string())
+                        }
                         None => Err("library database unavailable".to_string()),
                     };
                     state.on_notes_loaded(transcript, result);
@@ -1377,8 +1387,12 @@ impl Runtime {
                     transcript,
                     preset,
                     speakers,
+                    session,
+                    scope,
                 } => {
-                    if let Err(err) = self.start_notes(*transcript, preset, speakers) {
+                    if let Err(err) =
+                        self.start_notes(*transcript, preset, speakers, session, scope)
+                    {
                         queue.extend(state.on_notes_done(Err(err)));
                     }
                 }
@@ -1520,6 +1534,8 @@ impl Runtime {
         transcript: Transcript,
         preset: NotePreset,
         speakers: Vec<(u32, String)>,
+        session: Option<Uuid>,
+        scope: crate::notes_sheet::NoteScope,
     ) -> Result<(), String> {
         if self.notes.is_some() {
             return Err("a notes run is already in progress".to_string());
@@ -1530,9 +1546,61 @@ impl Runtime {
             model: config.model,
             send_audio: false,
         };
-        let title = transcript.title;
-        let language = transcript.language;
-        let segments = transcript.segments;
+        // M25C: whole-session notes read every part in order and put them on
+        // the session-absolute clock before the request (the validator uses the
+        // same timeline). A missing part refuses before any HTTP call.
+        let (title, language, segments, session_parts) =
+            if scope == crate::notes_sheet::NoteScope::WholeSession {
+                if let Some(session) = session {
+                    let store = self
+                        .store
+                        .as_ref()
+                        .ok_or_else(|| "library database unavailable".to_string())?;
+                    let parts = store
+                        .session_parts(session)
+                        .map_err(|err| err.to_string())?;
+                    let identities = store.session_identities().unwrap_or_default();
+                    let mut inputs = suramak_core::session::session_inputs(&parts);
+                    for input in &mut inputs {
+                        if let Some(identity) = identities.get(&input.transcript_id) {
+                            input.part_index = identity.part_index;
+                            input.part_count = identity.part_count;
+                        }
+                    }
+                    if let Some(reason) = suramak_core::session::session_incomplete_refusal(
+                        parts.len(),
+                        inputs
+                            .first()
+                            .map(|input| input.part_count as usize)
+                            .unwrap_or(0),
+                    ) {
+                        return Err(reason);
+                    }
+                    let title = parts
+                        .first()
+                        .map(|part| suramak_core::session::base_name(&part.title))
+                        .unwrap_or_else(|| transcript.title.clone());
+                    let language = parts
+                        .first()
+                        .and_then(|part| part.language.clone())
+                        .or(transcript.language.clone());
+                    (title, language, Vec::new(), Some(inputs))
+                } else {
+                    (
+                        transcript.title.clone(),
+                        transcript.language.clone(),
+                        transcript.segments.clone(),
+                        None,
+                    )
+                }
+            } else {
+                (
+                    transcript.title.clone(),
+                    transcript.language.clone(),
+                    transcript.segments.clone(),
+                    None,
+                )
+            };
         let result: Arc<Mutex<Option<Result<NotesOutcome, String>>>> = Arc::new(Mutex::new(None));
         let slot = Arc::clone(&result);
         let ctx = self.ctx.clone();
@@ -1540,20 +1608,31 @@ impl Runtime {
             endpoint = %cfg.base_url,
             model = %cfg.model,
             segments = segments.len(),
+            whole_session = session_parts.is_some(),
             preset = preset.key(),
             "notes: starting the background run"
         );
         let spawned = thread::Builder::new()
             .name("suramak-notes".to_string())
             .spawn(move || {
-                let run = generate_notes(
-                    &title,
-                    language.as_deref(),
-                    &segments,
-                    &speakers,
-                    preset,
-                    &cfg,
-                )
+                let run = match &session_parts {
+                    Some(parts) => generate_session_notes(
+                        &title,
+                        language.as_deref(),
+                        parts,
+                        &[],
+                        preset,
+                        &cfg,
+                    ),
+                    None => generate_notes(
+                        &title,
+                        language.as_deref(),
+                        &segments,
+                        &speakers,
+                        preset,
+                        &cfg,
+                    ),
+                }
                 .map_err(|err| error_chain(&err));
                 match &run {
                     Ok(outcome) => tracing::info!(
@@ -2316,6 +2395,18 @@ impl Runtime {
                 .map_err(|err| err.to_string())?;
         }
         Ok(())
+    }
+
+    /// M25C: the open transcript's session id, total parts and present parts.
+    /// `None` for an ordinary single transcript.
+    fn session_info(&self, id: Uuid) -> Option<(Uuid, u32, u32)> {
+        let store = self.store.as_ref()?;
+        let identity = store.transcript_session(id).ok().flatten()?;
+        if !identity.is_multi_part() {
+            return None;
+        }
+        let transcribed = store.session_parts(identity.session_id).ok()?.len() as u32;
+        Some((identity.session_id, identity.part_count, transcribed))
     }
 
     /// A transcript's stored word timing (M15.6), best-effort: a library that

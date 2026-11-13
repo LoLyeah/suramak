@@ -300,9 +300,7 @@ pub fn ui(
                             selected,
                             index + 1 < state.rows.len(),
                         );
-                        if drawn.play_clicked {
-                            actions.push(open_row(row));
-                        } else if drawn.response.clicked() {
+                        if drawn.play_clicked || drawn.response.clicked() {
                             actions.push(open_row(row));
                         }
                     }
@@ -361,9 +359,7 @@ pub fn ui(
                             selected,
                             true,
                         );
-                        if drawn.play_clicked {
-                            actions.push(open_row(row));
-                        } else if drawn.response.clicked() {
+                        if drawn.play_clicked || drawn.response.clicked() {
                             actions.push(open_row(row));
                         }
                     }

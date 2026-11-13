@@ -180,9 +180,10 @@ fn opening_a_populated_v1_library_upgrades_it_in_place_without_losing_text() {
     // M15.6 word-timing table) → v7 (M16I's diarization tables) → v8 (M22A's
     // v9 (M22C's segment index/waveforms) → v10 (M23A's manual
     // speaker edit stamp) → v11 (M24A's watched-files ledger) → v12 (M24B's
-    // notes table): the upgrade walks the whole chain in one open.
+    // notes table) → v13 (M25C's session identity): the upgrade walks the whole
+    // chain in one open.
     assert_eq!(
-        SCHEMA_VERSION, 12,
+        SCHEMA_VERSION, 13,
         "a new migration must be recorded here and in the store's history — \
          this line is the one place that notices a forgotten bump"
     );

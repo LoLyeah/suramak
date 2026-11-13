@@ -768,8 +768,10 @@ impl Store {
              -- (transcript, preset); regenerating replaces that row. `body_md`
              -- is the stored, citation-checked Markdown and the counts are the
              -- validator's own — a reloaded note never has to guess.
-             -- M25C (v13): `session_id` is set on a whole-session note; a
-             -- partial unique index keeps one row per (session, preset).
+             -- M25C (v13): `session_id` is set on a whole-session note; the
+             -- key includes it so a part can keep its own note and the session
+             -- can keep the meeting's. Two partial unique indexes keep one row
+             -- per (session, preset) and one per-part row.
              CREATE TABLE IF NOT EXISTS notes (
                  transcript_id     TEXT NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
                  preset            TEXT NOT NULL,
@@ -779,10 +781,8 @@ impl Store {
                  model             TEXT NOT NULL DEFAULT '',
                  created_at        TEXT NOT NULL,
                  session_id        TEXT,
-                 PRIMARY KEY (transcript_id, preset)
-             );
-             CREATE UNIQUE INDEX IF NOT EXISTS notes_session_preset
-                 ON notes(session_id, preset) WHERE session_id IS NOT NULL;",
+                 PRIMARY KEY (transcript_id, preset, session_id)
+             );",
         )?;
         self.migrate()?;
         self.recover_job_checkpoints()?;
@@ -1254,9 +1254,43 @@ impl Store {
                 tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ddl}"))?;
             }
         }
+        // M24B's notes key was (transcript_id, preset). A session note and a
+        // part note may share the anchor transcript, so the key becomes
+        // (transcript_id, preset, session_id). Rebuilding the small notes table
+        // is the only way SQLite can change a primary key; every row is copied
+        // before the old table is dropped.
+        let notes_key_columns: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('notes') WHERE pk > 0",
+            [],
+            |row| row.get(0),
+        )?;
+        if notes_key_columns == 2 {
+            tx.execute_batch(
+                "CREATE TABLE notes_v13 (
+                     transcript_id     TEXT NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
+                     preset            TEXT NOT NULL,
+                     body_md           TEXT NOT NULL,
+                     citations_checked INTEGER NOT NULL DEFAULT 0,
+                     citations_removed INTEGER NOT NULL DEFAULT 0,
+                     model             TEXT NOT NULL DEFAULT '',
+                     created_at        TEXT NOT NULL,
+                     session_id        TEXT,
+                     PRIMARY KEY (transcript_id, preset, session_id)
+                 );
+                 INSERT INTO notes_v13(transcript_id, preset, body_md, citations_checked,
+                                       citations_removed, model, created_at, session_id)
+                     SELECT transcript_id, preset, body_md, citations_checked,
+                            citations_removed, model, created_at, session_id
+                     FROM notes;
+                 DROP TABLE notes;
+                 ALTER TABLE notes_v13 RENAME TO notes;",
+            )?;
+        }
         tx.execute_batch(
             "CREATE INDEX IF NOT EXISTS transcripts_session
                  ON transcripts(session_id, part_index);
+             CREATE UNIQUE INDEX IF NOT EXISTS notes_transcript_preset
+                 ON notes(transcript_id, preset) WHERE session_id IS NULL;
              CREATE UNIQUE INDEX IF NOT EXISTS notes_session_preset
                  ON notes(session_id, preset) WHERE session_id IS NOT NULL;",
         )?;
@@ -7283,6 +7317,22 @@ mod tests {
                 .unwrap();
             rows.collect::<Result<Vec<_>, _>>().unwrap()
         }
+        fn dump_segments_of(conn: &Connection, table: &str, columns: &str) -> Vec<String> {
+            let sql = format!("SELECT {columns} FROM {table} ORDER BY 1, 2");
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let width = stmt.column_count();
+            let rows = stmt
+                .query_map([], |row| {
+                    let mut values = Vec::new();
+                    for index in 0..width {
+                        let value: rusqlite::types::Value = row.get(index)?;
+                        values.push(format!("{value:?}"));
+                    }
+                    Ok(values.join("|"))
+                })
+                .unwrap();
+            rows.collect::<Result<Vec<_>, _>>().unwrap()
+        }
         fn dump_segments(conn: &Connection, columns: &str) -> Vec<String> {
             let sql = format!("SELECT {columns} FROM segments ORDER BY idx");
             let mut stmt = conn.prepare(&sql).unwrap();
@@ -7357,8 +7407,16 @@ mod tests {
             assert_eq!(count, 0);
 
             // The rows the old schema carried are still there, value for value.
+            // Compared through the v1 column list: the live table gained
+            // session_id/part_index/part_count in v13 and a wider row must not
+            // masquerade as a loss (the same rule `projection` applies to
+            // segments).
             assert_eq!(
-                dump_table(&store, "transcripts"),
+                dump_segments_of(
+                    &store.conn,
+                    "transcripts",
+                    "id, title, created_at, updated_at, source_json, model, language, audio_path",
+                ),
                 transcripts,
                 "v{version}: transcripts"
             );
@@ -8481,7 +8539,7 @@ mod tests {
             .unwrap();
         }
         let store = Store::open(&path).expect("v11 must upgrade");
-        assert_eq!(store.schema_version().unwrap(), 12);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(store.list_transcripts().unwrap().len(), 1, "rows survive");
         assert_eq!(store.watched_import_count().unwrap(), 1, "ledger survives");
         assert!(store.notes_for(id).unwrap().is_empty());
@@ -8498,9 +8556,9 @@ mod tests {
             .unwrap();
         assert_eq!(store.notes_for(id).unwrap().len(), 1);
         drop(store);
-        // Idempotent: a second open is still v12.
+        // Idempotent: a second open is still the current schema.
         let again = Store::open(&path).expect("reopen");
-        assert_eq!(again.schema_version().unwrap(), 12);
+        assert_eq!(again.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(again.notes_for(id).unwrap().len(), 1);
         drop(again);
         let _ = std::fs::remove_dir_all(&dir);
@@ -8624,5 +8682,170 @@ mod tests {
         assert!(store.notes_for(id).unwrap().is_empty());
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_v12_library_upgrades_to_v13_and_keeps_its_rows_null() {
+        let dir = std::env::temp_dir().join(format!("suramak-v12v13-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v12.db");
+        let id = Uuid::new_v4();
+        let note_id = Uuid::new_v4();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta VALUES ('schema_version', '12');
+                 CREATE TABLE transcripts (
+                     id TEXT PRIMARY KEY, title TEXT NOT NULL,
+                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                     source_json TEXT NOT NULL, model TEXT NOT NULL,
+                     language TEXT, audio_path TEXT
+                 );
+                 CREATE TABLE segments (
+                     transcript_id TEXT NOT NULL, idx INTEGER NOT NULL,
+                     start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL,
+                     text TEXT NOT NULL, source_text TEXT, derived TEXT NOT NULL DEFAULT '',
+                     translation TEXT, translation_model TEXT, translation_at TEXT,
+                     translation_sources TEXT, translation_stale INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY (transcript_id, idx)
+                 );
+                 CREATE TABLE notes (
+                     transcript_id TEXT NOT NULL, preset TEXT NOT NULL,
+                     body_md TEXT NOT NULL,
+                     citations_checked INTEGER NOT NULL DEFAULT 0,
+                     citations_removed INTEGER NOT NULL DEFAULT 0,
+                     model TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+                     PRIMARY KEY (transcript_id, preset)
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO transcripts VALUES (?1, 'old meeting', '2026-01-01T00:00:00+00:00',
+                    '2026-01-01T00:00:00+00:00', '{\"type\":\"file\",\"name\":\"old.wav\"}',
+                    'tiny', 'en', 'old.wav')",
+                params![id.to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO segments(transcript_id, idx, start_ms, end_ms, text, source_text)
+                 VALUES (?1, 0, 0, 1200, 'hello', 'hello')",
+                params![id.to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO notes VALUES (?1, 'minutes', '# Minutes\n\n- old note', 1, 0, 'tiny',
+                    '2026-01-01T00:00:00+00:00')",
+                params![id.to_string()],
+            )
+            .unwrap();
+            let _ = note_id;
+        }
+        let store = Store::open(&path).expect("v12 upgrades");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 13);
+        // The existing row is untouched and still has no session.
+        let old = store.get_transcript(id).unwrap();
+        assert_eq!(old.title, "old meeting");
+        assert_eq!(old.segments.len(), 1);
+        assert_eq!(store.transcript_session(id).unwrap(), None);
+        // Its per-part note still reads and is not a session note.
+        let notes = store.notes_for(id).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].body_md, "# Minutes\n\n- old note");
+        assert_eq!(notes[0].session_id, None);
+        assert!(store.notes_for_session(Uuid::new_v4()).unwrap().is_empty());
+        // The new columns accept an identity without touching the old data.
+        let session = Uuid::new_v4();
+        store
+            .set_transcript_session(id, Some(SessionIdentity::new(session, 2, 3)))
+            .unwrap();
+        assert_eq!(
+            store.transcript_session(id).unwrap(),
+            Some(SessionIdentity::new(session, 2, 3))
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_session_is_ordered_by_part_index_and_its_notes_replace_per_session() {
+        let store = Store::open_in_memory().unwrap();
+        let session = Uuid::new_v4();
+        let mut parts = Vec::new();
+        // Insert out of order: 3, 1, 2.
+        for index in [3u32, 1, 2] {
+            let mut transcript = sample(&format!("Meeting — Part {index} of 3.wav"));
+            transcript.segments[0].text = format!("part {index}");
+            transcript.segments[1].text = format!("part {index} second");
+            store.insert_transcript(&transcript).unwrap();
+            store
+                .set_transcript_session(
+                    transcript.id,
+                    Some(SessionIdentity::new(session, index, 3)),
+                )
+                .unwrap();
+            parts.push(transcript);
+        }
+        let ordered = store.session_parts(session).unwrap();
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|part| store
+                    .transcript_session(part.id)
+                    .unwrap()
+                    .unwrap()
+                    .part_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let identities = store.session_identities().unwrap();
+        assert_eq!(identities.len(), 3);
+
+        let anchor = parts[1].id;
+        let mut first = note_for(
+            anchor,
+            NotePreset::Minutes,
+            "# Minutes\n\n- first [00:01]",
+            1,
+            0,
+            "m",
+            "2026-01-01T00:00:00Z",
+        );
+        first.session_id = Some(session);
+        store.save_note(&first).unwrap();
+        let mut second = note_for(
+            anchor,
+            NotePreset::Minutes,
+            "# Minutes\n\n- regenerated [45:00]",
+            1,
+            0,
+            "m",
+            "2026-01-02T00:00:00Z",
+        );
+        second.session_id = Some(session);
+        store.save_note(&second).unwrap();
+
+        let notes = store.notes_for_session(session).unwrap();
+        assert_eq!(notes.len(), 1, "one row per (session, preset)");
+        assert_eq!(notes[0].body_md, "# Minutes\n\n- regenerated [45:00]");
+        assert_eq!(notes[0].created_at, second.created_at);
+        // The per-part reader does not see the whole-session row.
+        assert!(store.notes_for(anchor).unwrap().is_empty());
+        // A per-part note can coexist with the session note.
+        store
+            .save_note(&note_for(
+                anchor,
+                NotePreset::Minutes,
+                "# Minutes\n\n- this part",
+                0,
+                0,
+                "m",
+                "2026-01-03T00:00:00Z",
+            ))
+            .unwrap();
+        assert_eq!(store.notes_for(anchor).unwrap().len(), 1);
+        assert_eq!(store.notes_for_session(session).unwrap().len(), 1);
     }
 }

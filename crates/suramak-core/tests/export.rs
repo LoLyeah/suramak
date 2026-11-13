@@ -3,11 +3,12 @@ use suramak_core::diagnostics::SubtitleLimits;
 use suramak_core::diarization::SpeakerTurn;
 use suramak_core::export::{
     bilingual_advisories, bilingual_cues, to_ass, to_ass_bilingual, to_ass_with, to_json,
-    to_markdown, to_markdown_with_speakers, to_srt, to_srt_bilingual,
+    to_markdown, to_markdown_with_speakers, to_session_markdown, to_srt, to_srt_bilingual,
     to_srt_bilingual_with_speakers, to_srt_with_speakers, to_tsv, to_txt, to_vtt, to_vtt_bilingual,
     to_vtt_bilingual_with_speakers, to_vtt_with_speakers, AssOptions, ExportSpeakers, ZeroDuration,
     ASS_ONE_FRAME_MS, BILINGUAL_LINE_BUDGET_CPL,
 };
+use suramak_core::session::{session_timeline, SessionPartInput};
 use suramak_core::transcript::{Segment, Source, Transcript};
 use suramak_core::translate::TranslationRecord;
 use uuid::Uuid;
@@ -739,4 +740,65 @@ fn bilingual_exports_prefix_only_the_primary_line() {
         vtt.contains("<v Speaker 1>Hello world.\nHalo dunia."),
         "{vtt}"
     );
+}
+
+#[test]
+fn a_session_export_has_part_dividers_and_keeps_part_export_byte_identical() {
+    let mut part1 = fixed_transcript();
+    part1.title = "Meeting — Part 1 of 3".to_string();
+    part1.segments = vec![Segment {
+        idx: 0,
+        start_ms: 0,
+        end_ms: 2400,
+        text: "Part one starts.".to_string(),
+    }];
+    let part2 = SessionPartInput {
+        transcript_id: Uuid::new_v4(),
+        title: "Meeting".to_string(),
+        part_index: 2,
+        part_count: 3,
+        duration_ms: 300_000,
+        segments: vec![Segment {
+            idx: 0,
+            start_ms: 0,
+            end_ms: 1500,
+            text: "Part two begins.".to_string(),
+        }],
+    };
+    let input1 = SessionPartInput {
+        transcript_id: part1.id,
+        title: "Meeting".to_string(),
+        part_index: 1,
+        part_count: 3,
+        duration_ms: 2_700_000,
+        segments: part1.segments.clone(),
+    };
+    let timeline = session_timeline(&[input1, part2]);
+
+    let markdown = to_session_markdown(
+        "Meeting",
+        part1.created_at,
+        &part1.source,
+        &part1.model,
+        part1.language.as_deref(),
+        &timeline,
+    );
+    assert!(markdown.starts_with("# Meeting\n\n"), "{markdown}");
+    assert!(markdown.contains("## Part 1 — 00:00"), "{markdown}");
+    assert!(markdown.contains("## Part 2 — 45:00"), "{markdown}");
+    assert!(markdown.contains("[00:00:00.000 → 00:00:02.400] Part one starts."));
+    assert!(markdown.contains("[00:45:00.000 → 00:45:01.500] Part two begins."));
+
+    // The per-part export is exactly today's Markdown: same header, same
+    // `## Transcript` section, no divider and no absolute offset.
+    let per_part = to_markdown(&part1).unwrap();
+    let expected = "# Meeting — Part 1 of 3\n\n\
+                    - Date: 2024-01-15 10:00:00 UTC\n\
+                    - Source: intro.mp3\n\
+                    - Model: turbo-q5-0\n\
+                    - Language: id\n\n\
+                    ## Transcript\n\n\
+                    [00:00:00.000 → 00:00:02.400] Part one starts.\n\n";
+    assert_eq!(per_part, expected);
+    assert!(!per_part.contains("## Part 1 —"));
 }

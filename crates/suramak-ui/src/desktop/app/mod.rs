@@ -1271,6 +1271,9 @@ pub struct AppState {
     watch_deferred: Vec<PathBuf>,
     /// M24B: the citation-verified notes sheet (shared with the phone).
     pub notes: crate::notes_sheet::NotesSheet,
+    /// M25C: the open editor's session (session id, part count, transcribed
+    /// parts), read by the runtime when the transcript is loaded.
+    pub editor_session: Option<(Uuid, u32, u32)>,
 }
 
 /// M24A: what the Library's watch row says.
@@ -1406,7 +1409,12 @@ pub enum Effect {
     /// (core's client is blocking HTTP; never the ASR worker). M4.
     PolishTranscript { transcript: Box<Transcript> },
     /// M24B: read the open transcript's stored notes (the sheet's open path).
-    LoadNotes { transcript: Uuid },
+    /// M25C: read the open transcript's stored notes (whole-session rows when
+    /// `session` is set).
+    LoadNotes {
+        transcript: Uuid,
+        session: Option<Uuid>,
+    },
     /// M24B: generate one preset's notes through the polish client's own
     /// endpoint. `speakers` are the segment labels the diarization view knows
     /// (empty on a plain transcript).
@@ -1414,6 +1422,9 @@ pub enum Effect {
         transcript: Box<Transcript>,
         preset: NotePreset,
         speakers: Vec<(u32, String)>,
+        /// M25C: the whole-session timeline, when that scope is selected.
+        session: Option<Uuid>,
+        scope: crate::notes_sheet::NoteScope,
     },
     /// M24B: persist one citation-checked note (one row per preset).
     SaveNote {
@@ -1574,6 +1585,7 @@ impl AppState {
             watch: None,
             watch_deferred: Vec::new(),
             notes: crate::notes_sheet::NotesSheet::new(),
+            editor_session: None,
         }
     }
 
@@ -3117,6 +3129,7 @@ impl AppState {
     /// Transcript loaded from the store.
     pub fn on_transcript_loaded(&mut self, transcript: Transcript) -> Vec<Effect> {
         let id = transcript.id;
+        self.editor_session = None;
         let mut effects = self.open_editor(transcript);
         // M15.7: a clicked search result asked for this transcript — park the
         // playhead now that the transport has been rebuilt for it.
@@ -3127,6 +3140,12 @@ impl AppState {
             }
         }
         effects
+    }
+
+    /// M25C: the runtime read the open transcript's session identity (and how
+    /// many of its parts exist) — the Notes sheet's scope toggle needs both.
+    pub fn set_editor_session(&mut self, info: Option<(Uuid, u32, u32)>) {
+        self.editor_session = info;
     }
 
     /// Trash confirmed in the editor header (M4.5): delete the open transcript.
@@ -4485,6 +4504,57 @@ mod tests {
         let mut t = transcript(title);
         t.audio_path = Some(path.to_path_buf());
         t
+    }
+
+    #[test]
+    fn a_recording_assigns_one_session_to_its_rotated_parts() {
+        let mut state = recording_state();
+        state.start_recording(Instant::now(), "2026-11-13 09:00:00");
+        let session = state.record_session.expect("a session id at Start");
+        state.assign_recorded_parts(
+            &[
+                PathBuf::from("/tmp/Meeting — Part 1 of 2.wav"),
+                PathBuf::from("/tmp/Meeting — Part 2 of 2.wav"),
+            ],
+            session,
+        );
+        let identities: Vec<_> = state
+            .session_assignments
+            .iter()
+            .map(|(_, identity)| *identity)
+            .collect();
+        assert_eq!(identities.len(), 2);
+        assert!(identities
+            .iter()
+            .all(|identity| identity.session_id == session && identity.part_count == 2));
+        assert_eq!(
+            identities
+                .iter()
+                .map(|identity| identity.part_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        // One file is an ordinary take, not a one-part session.
+        let mut single = recording_state();
+        single.assign_recorded_parts(&[PathBuf::from("/tmp/Meeting.wav")], Uuid::new_v4());
+        assert!(single.session_assignments.is_empty());
+
+        // A cap split reads the numbers from the names and shares one id.
+        let mut import = recording_state();
+        import.assign_split_imports(&[
+            PathBuf::from("/inbox/Standup — Part 1 of 3.wav"),
+            PathBuf::from("/inbox/Standup — Part 2 of 3.wav"),
+            PathBuf::from("/inbox/Standup — Part 3 of 3.wav"),
+        ]);
+        let identities: Vec<_> = import
+            .session_assignments
+            .iter()
+            .map(|(_, identity)| *identity)
+            .collect();
+        assert_eq!(identities.len(), 3);
+        assert!(identities.iter().all(|identity| identity.part_count == 3));
+        assert_eq!(identities[0].session_id, identities[2].session_id);
     }
 
     #[test]
