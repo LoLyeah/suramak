@@ -31,8 +31,8 @@ android {
         // MINOR*100 + PATCH; 0.4.1 → 401) and is kept in sync with
         // packaging/Info.plist by `scripts/bump_version.py` — monotonic for
         // future releases, always above the M13x debug sequence.
-        versionCode = 700
-        versionName = "0.7.0"
+        versionCode = 800
+        versionName = "0.8.0"
 
         // arm64-v8a is what ships; x86_64 is the M13I emulator variant (a
         // debug, CI-only artifact). Gradle excludes every other ABI's jniLibs,

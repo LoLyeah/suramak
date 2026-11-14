@@ -4,6 +4,18 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased]
 
+## 0.8.0 - 2026-11-13
+
+### Changed
+- **The session limit is computed from your device, not from mine.** The old 45/60-minute caps came from measurements on a 3.7 GiB 2-core box; the app now asks the OS how much memory it has and derives the limit, with a model-fit gate. On a 12 GB phone that is **431 minutes with tiny** (was 45) and 309 with turbo; a 16 GB Mac gets the 8-hour ceiling. On a 4 GB phone the limit is 58–77 minutes, and **turbo-q5-0 is refused up front** — it needs ~1,039 MB before a single minute of audio, which that device cannot spare.
+- **Audio is streamed to disk and mapped, not held in memory.** Decoding writes a temp `.pcm32` in bounded chunks and reads it through `mmap` (windowed reads on Windows); our own 16 kHz recordings are mapped directly without re-decoding. A 30-minute 48 kHz stereo import peaked at **578 MiB instead of 1,105 MiB** — and the transcripts are **byte-identical** to the old path (same digests on en, id and a 20-minute file).
+
+### Added
+- **Quarantine instead of a crash loop**: a job re-seen after two OS kills is marked `killed_by_os` rather than resumed forever — the failure mode that removing the hard cap would otherwise create.
+
+### Investigated, not shipped
+- **15-minute macro-windows** (silence-aligned cuts, prompt firewall, seam stitch) were built and measured: zero repetition loops and flat memory, but **|ΔWER| 0.62 pt** (it was slightly *better*) with a **−7.1 % segment-count shift** and a 552.8 MB peak against a 450 MB ceiling. The path ships **disabled**; the device-derived cap stands. The report is `docs/reports/M26c-macro-windows.md`.
+
 ## 0.7.0 - 2026-11-13
 
 ### Added
