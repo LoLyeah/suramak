@@ -41,6 +41,8 @@ use suramak_android_spike::ui::SpikeState;
 
 /// How often the model job's progress is read while a card is on screen.
 const DOWNLOAD_POLL: Duration = Duration::from_millis(500);
+/// How often the Library compares what is stored with what it is showing.
+const LIBRARY_POLL: Duration = Duration::from_millis(900);
 
 /// The intent actions `MainActivity` answers (constants mirrored there).
 const ACTION_IMPORT: &str = "app.suramak.action.COMPACT_IMPORT";
@@ -99,6 +101,8 @@ pub struct CompactShell {
     last_model_header: Option<String>,
     last_model_can_record: Option<bool>,
     last_model_rows: std::collections::BTreeMap<String, String>,
+    /// When the library's stored-vs-shown count was last compared.
+    last_library_poll: Option<Instant>,
     /// M22B: whether the voice-note sheet's "shown" line was logged for the
     /// current offer (the emulator smoke's witness that the sheet painted).
     logged_voice_note_sheet: bool,
@@ -135,6 +139,7 @@ impl CompactShell {
             last_model_header: None,
             last_model_can_record: None,
             last_model_rows: std::collections::BTreeMap::new(),
+            last_library_poll: None,
             logged_voice_note_sheet: false,
             logged_settings_point: false,
         }
@@ -448,6 +453,40 @@ impl CompactShell {
         }
         self.poll_download();
         self.poll_recording();
+        self.poll_library_freshness();
+    }
+
+    /// Reloads the library when the store has moved under the screen.
+    ///
+    /// The compact app holds the rows it last read; only `op: library`
+    /// re-reads them, and nothing was calling it after a job completed — so a
+    /// finished transcription stayed invisible while the banner still said
+    /// "Transcribing 1 file with small" and the screen said "No transcripts
+    /// yet". The row was in the database the whole time; only a relaunch read
+    /// it back.
+    ///
+    /// A count comparison, once a second, is the cheap honest trigger: it fires
+    /// on any change to the store (a finished job, a watched import, a delete
+    /// made elsewhere in the app) and never per frame.
+    fn poll_library_freshness(&mut self) {
+        let Some(host) = crate::compact_host() else {
+            return;
+        };
+        let now = Instant::now();
+        if self
+            .last_library_poll
+            .is_some_and(|last| now.duration_since(last) < LIBRARY_POLL)
+        {
+            return;
+        }
+        self.last_library_poll = Some(now);
+        let shown = host.with_app(|app| app.rows.len()).unwrap_or(0);
+        let stored = host.stored_transcript_count();
+        if stored != shown {
+            let reply = host.dispatch(r#"{"op":"library"}"#);
+            log::info!("library moved ({shown} shown, {stored} stored); rows re-read");
+            log_reply("library refresh", &reply);
+        }
     }
 
     fn dispatch_one(&mut self, action: CompactAction) {

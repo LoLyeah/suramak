@@ -115,6 +115,23 @@ impl CompactHost {
         }
     }
 
+    /// How many transcripts the store holds, read without loading any of them.
+    ///
+    /// The shell compares this with the rows the app is showing: a difference
+    /// means a job finished (or the store changed elsewhere) and the screen is
+    /// stale. A count is one indexed query; the list query behind
+    /// `reload_library` is what the caller runs only when they differ.
+    pub fn stored_transcript_count(&self) -> usize {
+        let Ok(inner) = self.inner.lock() else {
+            return 0;
+        };
+        Store::open(&inner.dirs.db_path)
+            .ok()
+            .and_then(|store| store.list_transcripts().ok())
+            .map(|items| items.len())
+            .unwrap_or(0)
+    }
+
     /// Runs `f` against the one app state (the Android shell draws it directly;
     /// the JNI ops mutate the same object, so the phone never has two routes).
     pub fn with_app<R>(&self, f: impl FnOnce(&mut CompactApp) -> R) -> Option<R> {
