@@ -4,7 +4,7 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased]
 
-## 0.8.1 - 2026-11-15
+## [0.8.1] - 2026-11-15
 
 ### Fixed
 - **Every import, recording and resume on Android 12+ crashed the app.** The
@@ -21,7 +21,7 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
   The smoke now asks the app to **build** the job request and throw it away
   (`DEBUG_JOB_REQUEST`), so a request the platform rejects fails the build.
 
-## 0.8.0 - 2026-11-13
+## [0.8.0] - 2026-11-13
 
 ### Changed
 - **The session limit is computed from your device, not from mine.** The old 45/60-minute caps came from measurements on a 3.7 GiB 2-core box; the app now asks the OS how much memory it has and derives the limit, with a model-fit gate. On a 12 GB phone that is **431 minutes with tiny** (was 45) and 309 with turbo; a 16 GB Mac gets the 8-hour ceiling. On a 4 GB phone the limit is 58–77 minutes, and **turbo-q5-0 is refused up front** — it needs ~1,039 MB before a single minute of audio, which that device cannot spare.
@@ -33,7 +33,7 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 ### Investigated, not shipped
 - **15-minute macro-windows** (silence-aligned cuts, prompt firewall, seam stitch) were built and measured: zero repetition loops and flat memory, but **|ΔWER| 0.62 pt** (it was slightly *better*) with a **−7.1 % segment-count shift** and a 552.8 MB peak against a 450 MB ceiling. The path ships **disabled**; the device-derived cap stands. The report is `docs/reports/M26c-macro-windows.md`.
 
-## 0.7.0 - 2026-11-13
+## [0.7.0] - 2026-11-13
 
 ### Added
 - **Long meetings, split at pauses instead of dying.** The gate measured the ceiling first: peak memory is `308 MB + 9.19 MB per audio-minute`, so 60 minutes fits (859 MB) and 90 minutes does not (1,135 MB). The app now enforces one honest cap — **45 minutes on a phone, 60 on desktop** — and, instead of refusing anything longer, records through it:
@@ -48,7 +48,7 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 - The Android launch smoke no longer fails on the emulator's own launcher ANR: a dialog naming another package is dismissed and re-dumped, while a dialog naming Suramak still fails the run.
 - A rotation test asserted a Linux-only memory metric on macOS; the bit-for-bit comparison is the assertion, and the RSS number is now checked where it can be measured.
 
-## 0.6.0 - 2026-11-13
+## [0.6.0] - 2026-11-13
 
 ### Added
 - **The watched inbox**: point Suramak at a folder once — a phone sync folder, a recorder's output, a colleague's drop — and every audio file that finishes landing there imports itself. A 5 s poll (3 levels deep, 200 entries per scan), a 2 s size-settle gate so half-written files wait, `.part`/`.crdownload` blocked by name and sibling, and sha256 dedupe through a new ledger, so the same file copied twice transcribes once. It rides the existing queue, and the Library says `Watching · 3 imports` — or names the failure when the folder disappears.
@@ -58,7 +58,7 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 ### Fixed
 - A removed citation no longer leaves its separator behind: "approved [13:00]." becomes "approved.", not "approved ." — pinned for end-of-line, mid-line and sentence-final cases.
 
-## 0.5.0 - 2026-11-12
+## [0.5.0] - 2026-11-12
 
 ### Added
 - **The UI refresh (M20A–E)** — the five slices the owner asked for ("dated, no motion, too barebones"), with Liquid Glass kept and real AppKit glass used on macOS:
@@ -77,7 +77,7 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 - **macOS CI**: a restored `target/` made the sherpa build script count as fresh and skip copying its dylibs, so bundling failed; the bundler now recovers the pinned files from sherpa-rs's own cache and still verifies every sha256.
 - The smoke's clearance assertion now asks the right question: the Quit row must sit above the viewport edge (which already excludes the gesture inset), not have its own trailing padding visible.
 
-## 0.4.3 - 2026-11-11
+## [0.4.3] - 2026-11-11
 
 ### Fixed
 - **Android: the compact Library comes up.** The library host was registered in one `OnceLock` while the shell read a second, never-set one, so the app opened and stayed on the "Opening the library…" splash forever. One host accessor now backs both sides — the Library, its model card, its empty state and the Import/Record bar draw on a cold launch (proven on a real Android 15 emulator in CI, screenshot-inspected).
@@ -86,7 +86,7 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 - **CI: an Android launch smoke** now boots an x86_64 emulator on every push and asserts the chain the owner reported broken: install → cold launch → Library renders → Back → clean exit → fresh-process relaunch → Library renders → a bounded monkey pass with the app still alive. Screenshots, logcat, uiautomator dumps and the platform's exit-info are uploaded as artifacts on every run.
 - CI: the apt-dependent jobs retry with backoff (GitHub's mirror DNS outages were failing jobs before they started); the emulator job no longer touches apt (cmake/ninja ship with the runner image).
 
-## 0.4.2 - 2026-11-11
+## [0.4.2] - 2026-11-11
 
 ### Added
 - **Speaker diarization (M16.6)** — the editor can label who spoke, entirely offline:
@@ -99,7 +99,7 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 ### Fixed
 - The dylib-resolution gate's rpath checks no longer mis-report matching rpaths as failures (a SIGPIPE + pipefail trap caught three times across the packaging scripts).
 
-## 0.4.1 - 2026-11-11
+## [0.4.1] - 2026-11-11
 
 ### Added
 - **Android is a product (M13c–h)** — the phone app the milestone plan promised, release-signed:
@@ -112,7 +112,7 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 - **M16B (macOS) — global hotkey + floating dictation HUD**: Carbon hotkey (zero permission prompts), six-state HUD card, Accessibility-gated insertion with a Copy-first fallback.
 - **M16.4 feasibility**: Silero VAD chunked long-recording capture is a GO gated into five slices (VAD ≈ 0.53% of transcription CPU; report `docs/reports/M16d-vad-feasibility.md`) — integration starts post-release.
 
-## 0.4.0 - 2026-11-10
+## [0.4.0] - 2026-11-10
 
 ### Added
 - **M15 Transcript Workbench (all eight slices)** — the transcript correction/search/export surface becomes a real workbench:

@@ -351,8 +351,20 @@ jobs:
       - name: Extract release notes from CHANGELOG
         run: |
           TAG="${GITHUB_REF_NAME#v}"
-          awk -v ver="$TAG" 'BEGIN{f=0} $0 ~ "^## \\[" ver "\\]" {f=1; next} /^## \[/ {if (f) exit} f {print}' CHANGELOG.md > RELEASE-NOTES.md
-          if [ ! -s RELEASE-NOTES.md ]; then echo "See CHANGELOG.md." > RELEASE-NOTES.md; fi
+          # The summary is the "what this release is" paragraph a reader needs
+          # before the itemised list; the changelog section supplies the list.
+          # Both, in that order, every time.
+          : > RELEASE-NOTES.md
+          if [ -f "docs/releases/$GITHUB_REF_NAME.md" ]; then
+            cat "docs/releases/$GITHUB_REF_NAME.md" >> RELEASE-NOTES.md
+            printf '\n\n## Changelog\n\n' >> RELEASE-NOTES.md
+          fi
+          awk -v ver="$TAG" 'BEGIN{f=0} $0 ~ "^## \\[" ver "\\]" {f=1; next} /^## \[/ {if (f) exit} f {print}' CHANGELOG.md > CHANGELOG-SECTION.md
+          if [ -s CHANGELOG-SECTION.md ]; then
+            cat CHANGELOG-SECTION.md >> RELEASE-NOTES.md
+          else
+            echo "The changelog section for $TAG is missing from CHANGELOG.md." >> RELEASE-NOTES.md
+          fi
           {
             echo
             echo "---"
