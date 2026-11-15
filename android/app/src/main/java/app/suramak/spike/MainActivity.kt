@@ -340,6 +340,13 @@ class MainActivity : GameActivity() {
          * app: it hands one `content://` uri and its own reply `PendingIntent`,
          * and gets a broadcast — never a sheet.
          */
+        /**
+         * CI only: builds the transcription job request and throws it away, so
+         * a request the platform rejects fails the smoke instead of a phone.
+         * `validateRequest` neither schedules nor copies anything.
+         */
+        const val ACTION_DEBUG_JOB_REQUEST = "app.suramak.action.DEBUG_JOB_REQUEST"
+
         const val ACTION_TRANSCRIBE = OpenTranscribe.ACTION
         const val ACTION_TRANSCRIBE_RESULT = OpenTranscribe.ACTION_RESULT
         private const val EXTRA_OPEN_TRANSCRIBE_LANGUAGE = OpenTranscribe.EXTRA_LANGUAGE
@@ -599,6 +606,10 @@ class MainActivity : GameActivity() {
                 }
             }
             ACTION_IMPORT_AUDIO -> importLauncher.launch(arrayOf("audio/*", "video/*"))
+            ACTION_DEBUG_JOB_REQUEST -> {
+                val outcome = TranscriptionJobService.validateRequest(this)
+                logToRust("debug job request: $outcome")
+            }
             ACTION_TRANSCRIBE -> acceptOpenTranscribe(intent)
             Notify.ACTION_OPEN_TRANSCRIPT -> {
                 val id = intent.getStringExtra(Notify.EXTRA_TRANSCRIPT_ID)

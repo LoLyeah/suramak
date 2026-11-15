@@ -748,6 +748,27 @@ else
   echo "   gear:     no position marker in the log — falling back to dp guesses"
 fi
 
+# v0.8.0 shipped a job request the platform rejects ("An expedited job cannot
+# have a deadline" on API 31+) and every import, recording and resume on a real
+# phone crashed in the picker callback. CI was green because the flow that
+# builds that request is skipped when no model is installed. Ask the app to
+# build the request and throw it away: no scheduling, no side effects, and a
+# rejection now fails HERE instead of on a phone.
+"$ADB" shell am start -a app.suramak.action.DEBUG_JOB_REQUEST -n "$ACTIVITY" >/dev/null 2>&1 || true
+JOB_REQUEST=""
+deadline=$((SECONDS + 15))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  JOB_REQUEST="$(timeout 10 "$ADB" logcat -d 2>/dev/null \
+    | sed -n 's/.*debug job request: \([a-z]*\).*/\1/p' | tail -1)"
+  [ -n "$JOB_REQUEST" ] && break
+  sleep 1
+done
+if [ "$JOB_REQUEST" != "ok" ]; then
+  timeout 30 "$ADB" logcat -d >"$OUT/logcat-job-request.txt" 2>/dev/null || true
+  fail "the transcription job request is ${JOB_REQUEST:-never reported} on this API level — an import would crash the app (see $OUT/logcat-job-request.txt)"
+fi
+echo "   job:      request builds (API $("$ADB" shell getprop ro.build.version.sdk | tr -d '\r'))"
+
 # Clear logcat so a route marker seen below is one THIS tap produced (the first
 # launch already logged "compact route: Library").
 "$ADB" logcat -c 2>/dev/null || true

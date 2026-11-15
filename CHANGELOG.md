@@ -4,6 +4,23 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased]
 
+## 0.8.1 - 2026-11-15
+
+### Fixed
+- **Every import, recording and resume on Android 12+ crashed the app.** The
+  job request asked the scheduler for an *expedited* job **and** a zero
+  deadline, which `JobInfo.enforceValidity` rejects with
+  `IllegalArgumentException: An expedited job cannot have a deadline`. The
+  exception surfaced on the main thread inside the file-picker callback, so the
+  process died before anything was queued — exactly the three reports: import a
+  WAV, record then leave the app, tap resume. The two requests (import and
+  resume) now set expedited **or** the deadline, never both, and a rejected
+  request is a logged failure instead of a crash.
+- CI could not have caught it before: the emulator smoke skipped the share
+  flow whenever no model was installed, and the picker path was never driven.
+  The smoke now asks the app to **build** the job request and throw it away
+  (`DEBUG_JOB_REQUEST`), so a request the platform rejects fails the build.
+
 ## 0.8.0 - 2026-11-13
 
 ### Changed

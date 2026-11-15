@@ -701,22 +701,71 @@ class TranscriptionJobService : JobService() {
                 putString(KEY_SENDER, sender)
                 putString(KEY_REPLY, reply)
             }
+            val job = request(context, transient, extras) ?: return false
+            val scheduler = context.getSystemService(JobScheduler::class.java) ?: return false
+            return scheduler.schedule(job) == JobScheduler.RESULT_SUCCESS
+        }
+
+        /**
+         * The job request, built exactly as [enqueue] sends it — and `null` when
+         * the platform rejects it.
+         *
+         * Split out so a dry run can exercise the same `build()` without
+         * scheduling anything: `build()` is where `JobInfo.enforceValidity`
+         * throws, and that throw reached the UI thread in v0.8.0.
+         */
+        private fun request(
+            context: Context,
+            transient: Bundle,
+            extras: PersistableBundle,
+        ): JobInfo? {
             val builder = JobInfo.Builder(
                 NEXT_JOB_ID.getAndIncrement(),
                 ComponentName(context, TranscriptionJobService::class.java),
             )
                 .setTransientExtras(transient)
                 .setExtras(extras)
-                .setOverrideDeadline(0)
-            // A share must start now, not at the next scheduler batch: from
-            // API 31 the job is expedited (the app is in the foreground at share
-            // time, so the quota is not the constraint). Below 31 a job with no
-            // constraints is eligible immediately, which is the best the
-            // platform offers.
-            if (Build.VERSION.SDK_INT >= 31) builder.setExpedited(true)
-            val job = builder.build()
-            val scheduler = context.getSystemService(JobScheduler::class.java) ?: return false
-            return scheduler.schedule(job) == JobScheduler.RESULT_SUCCESS
+            // A share must start now, not at the next scheduler batch. The two
+            // ways to ask for that are MUTUALLY EXCLUSIVE, and the platform
+            // enforces it at build() with an unchecked exception:
+            // "An expedited job cannot have a deadline" (JobInfo.enforceValidity).
+            //
+            // v0.8.0 set both whenever SDK_INT >= 31, so every import, recording
+            // and resume on Android 12+ threw IllegalArgumentException on the
+            // main thread and took the app down (the owner's report: import a
+            // WAV -> crash, record then leave -> crash, resume -> crash). CI
+            // never saw it because the share flow that calls this is skipped
+            // when no model is installed.
+            if (Build.VERSION.SDK_INT >= 31) {
+                builder.setExpedited(true)
+            } else {
+                builder.setOverrideDeadline(0)
+            }
+            // A scheduler refusal must be a named failure, never a crash in the
+            // picker callback: `build()` validates the request and can throw.
+            return try {
+                builder.build()
+            } catch (error: IllegalArgumentException) {
+                Log.w(TAG, "job: the platform rejected the request — ${error.message}")
+                null
+            }
+        }
+
+        /**
+         * Builds one request and throws it away: the CI smoke calls this on the
+         * emulator so a request the platform rejects fails a build instead of a
+         * phone. Returns `"ok"` or the rejection, and never schedules anything.
+         */
+        fun validateRequest(context: Context): String {
+            val transient = Bundle().apply {
+                putParcelableArrayList(KEY_URIS, arrayListOf(Uri.parse("file:///dev/null")))
+            }
+            val extras = PersistableBundle().apply {
+                putString(KEY_MODE, MODE_IMPORT)
+                putString(KEY_LANGUAGE, "auto")
+                putString(KEY_KIND, "debug")
+            }
+            return if (request(context, transient, extras) != null) "ok" else "rejected"
         }
 
         /**
@@ -743,14 +792,10 @@ class TranscriptionJobService : JobService() {
                 putString(KEY_MODE, MODE_RESUME)
                 putString(KEY_LANGUAGE, "auto")
             }
-            val builder = JobInfo.Builder(
-                NEXT_JOB_ID.getAndIncrement(),
-                ComponentName(context, TranscriptionJobService::class.java),
-            )
-                .setExtras(extras)
-                .setOverrideDeadline(0)
-            if (Build.VERSION.SDK_INT >= 31) builder.setExpedited(true)
-            val job = builder.build()
+            // The same request rule as `enqueue`: expedited XOR deadline. This
+            // second copy of the bug is what crashed record-then-leave and
+            // resume on API 31+ — the two paths the owner reported.
+            val job = request(context, Bundle(), extras) ?: return false
             val scheduler = context.getSystemService(JobScheduler::class.java) ?: return false
             return scheduler.schedule(job) == JobScheduler.RESULT_SUCCESS
         }
