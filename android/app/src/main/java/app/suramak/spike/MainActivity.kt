@@ -607,8 +607,11 @@ class MainActivity : GameActivity() {
             }
             ACTION_IMPORT_AUDIO -> importLauncher.launch(arrayOf("audio/*", "video/*"))
             ACTION_DEBUG_JOB_REQUEST -> {
+                // Log.i, not logToRust: this arrives on a COLD start, before the
+                // Rust host has attached, so the bridge would drop it (the first
+                // smoke run of this check failed for exactly that reason).
                 val outcome = TranscriptionJobService.validateRequest(this)
-                logToRust("debug job request: $outcome")
+                Log.i("SuramakSpike", "debug job request: $outcome")
             }
             ACTION_TRANSCRIBE -> acceptOpenTranscribe(intent)
             Notify.ACTION_OPEN_TRANSCRIPT -> {
