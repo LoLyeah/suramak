@@ -719,7 +719,23 @@ pub fn transcribe(
     if let Some(warning) = &plan.warning {
         warnings.push(warning.clone());
     }
+    // These four lines are the only way to tell WHERE an Android job stops:
+    // the progress percentage cannot move until whisper's first callback, so a
+    // job before that point looks identical whether it is loading a model,
+    // refusing one, or wedged inside whisper_full (the owner's 0 % report,
+    // reproduced on the emulator in run 43797393466).
+    tracing::info!(
+        target: "suramak_asr::whisper",
+        samples = samples.len(),
+        threads = n_threads,
+        "whisper: loading the model"
+    );
     let (mut state, engine_used) = create_state_for_plan(ctx, model_path, plan, &mut warnings)?;
+    tracing::info!(
+        target: "suramak_asr::whisper",
+        engine = engine_used.as_str(),
+        "whisper: model ready"
+    );
 
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     params.set_n_threads(n_threads);
@@ -786,7 +802,18 @@ pub fn transcribe(
         .saturating_mul(16);
     let samples = samples.as_slice().get(start_sample..).unwrap_or(&[]);
 
+    tracing::info!(
+        target: "suramak_asr::whisper",
+        start_sample,
+        run_samples = samples.len(),
+        "whisper: full start"
+    );
     let full = state.full(params, samples);
+    tracing::info!(
+        target: "suramak_asr::whisper",
+        ok = full.is_ok(),
+        "whisper: full returned"
+    );
     // A cancelled run surfaces as a whisper error (the engine aborted the
     // compute graph); the honest answer is `Cancelled`, checked before the
     // error is interpreted. No segments are read either way — the partial
