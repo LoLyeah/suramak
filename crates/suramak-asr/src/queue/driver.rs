@@ -138,7 +138,18 @@ impl ThreadedPrefetch {
             .name("suramak-decode-ahead".to_string())
             .spawn(move || {
                 while let Ok(task) = task_rx.recv() {
+                    // The decode-ahead thread is invisible otherwise: a job that
+                    // never prints these two lines is stuck BEFORE the engine,
+                    // which is what the Android emulator shows (percent 0, no
+                    // whisper line at all).
+                    tracing::info!(target: "suramak_asr::queue", id = task.id, "decode-ahead: start");
                     let result = decoder.decode(&task.input, &task.cancel);
+                    tracing::info!(
+                        target: "suramak_asr::queue",
+                        id = task.id,
+                        ok = result.is_ok(),
+                        "decode-ahead: done"
+                    );
                     if done_tx
                         .send(DecodeDone {
                             id: task.id,
