@@ -41,9 +41,9 @@ pub use model::{
     bytes_label, clock, count_noun, row_key, sanitise_stem, snippet, word_at, CompactAction,
     CompactApp, CompactEditor, CompactExportFormat, CompactRoute, CompactSetting, CompactSettings,
     CompactSpeakers, CrashBanner, DiagnosticsView, DownloadState, DownloadView, ExportPhase,
-    ExportSession, FlingProbe, Insets, JobView, LibraryFacets, LibraryHit, LibraryRow, ModelRow,
-    ModelState, SegmentEdit, Sheet, SpeakerSheetState, TurnScope, TurnStripState, UndoToast,
-    VoiceNoteView, WatchView, UNDO_TOAST_SECS,
+    ExportSession, FlingProbe, Insets, JobView, LastJobLine, LibraryFacets, LibraryHit, LibraryRow,
+    ModelRow, ModelState, SegmentEdit, Sheet, SpeakerSheetState, TurnScope, TurnStripState,
+    UndoToast, VoiceNoteView, WatchView, UNDO_TOAST_SECS,
 };
 
 /// Paints one frame of the compact app and returns everything the host must do.

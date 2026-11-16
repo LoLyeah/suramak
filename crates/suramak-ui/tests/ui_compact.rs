@@ -25,8 +25,8 @@ use suramak_core::store::WordAlignment;
 use suramak_core::transcript::{Segment, Source, Transcript, WordTiming};
 use suramak_ui::deck::compact::{
     self, a11y, chrome, first_run, library, CompactAction, CompactApp, CompactRoute,
-    CompactSettings, CrashBanner, DiagnosticsView, DownloadState, Insets, LibraryFacets,
-    LibraryHit, Sheet, VoiceNoteView,
+    CompactSettings, CrashBanner, DiagnosticsView, DownloadState, Insets, LastJobLine,
+    LibraryFacets, LibraryHit, Sheet, VoiceNoteView,
 };
 use suramak_ui::deck::snapshot;
 use suramak_ui::deck::theme::{self, AppTheme};
@@ -1698,6 +1698,12 @@ fn the_diagnostics_card_keeps_the_four_checks_and_the_crash_banner() {
             live: false,
             text: "=== Suramak spike crash #1 ===\nwhen: 2026-11-11\nwhere: src/app.rs:10:5\npanic: rotation probe\n--- last 3 platform events ---\n[0.10s] info onCreate"
                 .to_string(),
+        }),
+        last_job: Some(LastJobLine {
+            phase: "transcribing".to_string(),
+            percent: 37,
+            title: "Lecture 4".to_string(),
+            reason: String::new(),
         }),
     });
     let shot = render(&mut app, "diagnostics");

@@ -852,6 +852,25 @@ pub struct DiagnosticsView {
     pub back_presses: u32,
     /// The last crash (this session's or the previous launch's).
     pub crash: Option<CrashBanner>,
+    /// The last (or current) transcription job, as the host sees it.
+    ///
+    /// The notification is transient and the Library only shows successes, so
+    /// a job that stalled or failed left nothing readable on the phone. This is
+    /// that missing sentence: the phase it reached, how far, and — when it
+    /// failed — the host's own reason.
+    pub last_job: Option<LastJobLine>,
+}
+
+/// One line of the "Last job" card in Diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastJobLine {
+    /// `idle` (finished), `copying`, `decoding`, `transcribing`, `paused`,
+    /// `failed`, `cancelled` — the host's own phase word.
+    pub phase: String,
+    pub percent: u8,
+    pub title: String,
+    /// The failure reason, verbatim; empty when the job has not failed.
+    pub reason: String,
 }
 
 /// A transcript edit the host persists.
@@ -4350,8 +4369,21 @@ mod tests {
                 live: false,
                 text: "panic: boom".to_string(),
             }),
+            last_job: Some(super::LastJobLine {
+                phase: "failed".to_string(),
+                percent: 0,
+                title: "Lec 3".to_string(),
+                reason: "the import stopped before its copy finished".to_string(),
+            }),
         });
         assert_eq!(app.diagnostics.text_chars, 42);
+        assert_eq!(
+            app.diagnostics
+                .last_job
+                .as_ref()
+                .map(|job| job.phase.as_str()),
+            Some("failed")
+        );
         assert_eq!(
             app.diagnostics.crash.as_ref().unwrap().title(),
             "CRASH — LAST LAUNCH (read from the crash file)"

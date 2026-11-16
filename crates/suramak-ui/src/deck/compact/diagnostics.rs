@@ -66,6 +66,8 @@ pub fn model_file_lines(models: &[ModelRow], selected: &str) -> Vec<ModelFileLin
 const PAD: f32 = 16.0;
 /// One evidence row: an 11 pt CAPS label and a two-line caption.
 const EVIDENCE_ROW: f32 = 72.0;
+/// The "Last job" card: a headline row and up to two lines of detail.
+const JOB_CARD_H: f32 = 66.0;
 /// One fact row in the model/engine card.
 const FACT_ROW: f32 = 56.0;
 /// The gap between sections.
@@ -129,6 +131,47 @@ pub fn ui(
                 "{} inset pushes · top {:.0} pt / bottom {:.0} pt · {} back",
                 view.inset_updates, view.inset_top, view.inset_bottom, view.back_presses
             );
+            // The last job, before the counters: when something misbehaves this
+            // is the line the owner reads (and the one they can quote back).
+            if let Some(job) = &view.last_job {
+                y = section_label(ui, tokens, x, y, "Last job");
+                let card = Rect::from_min_size(pos2(x, y), vec2(width, JOB_CARD_H));
+                material::frosted_panel(ui, tokens, card, tokens.radius.card, Plane::Card);
+                let headline = if job.reason.is_empty() {
+                    format!("{} · {}%", job.phase, job.percent)
+                } else {
+                    format!("{} · {}% · failed", job.phase, job.percent)
+                };
+                ui.painter().text(
+                    pos2(card.left() + PAD, card.top() + 18.0),
+                    Align2::LEFT_CENTER,
+                    headline,
+                    type_scale::row_title().font,
+                    if job.reason.is_empty() {
+                        tokens.ink
+                    } else {
+                        tokens.record_red_text
+                    },
+                );
+                let detail = if job.reason.is_empty() {
+                    job.title.clone()
+                } else {
+                    job.reason.clone()
+                };
+                if !detail.is_empty() {
+                    paint_wrapped(
+                        ui,
+                        pos2(card.left() + PAD, card.top() + 34.0),
+                        &detail,
+                        &type_scale::caption(),
+                        tokens.ink_soft,
+                        width - PAD * 2.0,
+                        2,
+                    );
+                }
+                y = card.bottom() + SECTION_GAP;
+            }
+
             let checks: [(&str, &str); CHECK_COUNT] = [
                 ("Text input", &text_group),
                 ("Lifecycle", &lifecycle),

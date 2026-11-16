@@ -1028,8 +1028,41 @@ impl CompactShell {
                 live: view.live,
                 text: view.text,
             }),
+            last_job: crate::jobs_host().map(last_job_line).unwrap_or(None),
         }
     }
+}
+
+/// The Diagnostics "Last job" card's content, straight from the job host.
+///
+/// A running job names its phase and percentage; a failure carries the host's
+/// own reason sentence (the same one the notification uses); a finished job is
+/// `done · 100%`. Nothing is invented: what the host does not report, the card
+/// does not claim.
+fn last_job_line(jobs: &crate::jobs::AndroidJobHost) -> Option<compact::LastJobLine> {
+    let status = jobs.status();
+    if let Some(failed) = status.last_failed {
+        return Some(compact::LastJobLine {
+            phase: "failed".to_string(),
+            percent: 0,
+            title: failed.title,
+            reason: failed.reason,
+        });
+    }
+    if status.running {
+        return Some(compact::LastJobLine {
+            phase: status.current_phase,
+            percent: status.percent,
+            title: status.current_title,
+            reason: String::new(),
+        });
+    }
+    status.last.map(|completed| compact::LastJobLine {
+        phase: "done".to_string(),
+        percent: 100,
+        title: completed.title,
+        reason: String::new(),
+    })
 }
 
 /// A resume offer read from `CompactHost::download_state`.
