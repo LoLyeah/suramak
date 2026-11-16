@@ -1190,6 +1190,14 @@ else
   wait_for_log "voice note sheet: shown" \
     || fail "the share did not open the voice-note micro-sheet"
   echo "   sheet:    shown for an audio share"
+  # The sheet is a 1.2 s OFFER: nothing is transcribed until it is accepted.
+  # Without a model this step only asserted the sheet, so the accept was never
+  # sent and the emulator never ran a job (runs 43780856181/43782230969 died
+  # "the notification never logged its job key"). This is the same action the
+  # sheet's Transcribe button sends.
+  "$ADB" shell am start -a app.suramak.action.VOICE_NOTE_ACCEPT -n "$ACTIVITY" \
+    >"$OUT/voice-note-accept.txt" 2>&1 || fail "the accept intent was refused"
+  sleep 2
   KEY=""
   DEADLINE=$((SECONDS + 120))
   while [ "$SECONDS" -lt "$DEADLINE" ]; do
