@@ -134,8 +134,13 @@ object TranscribeBridge {
         dispatch(JSONObject().put("op", "open_transcribe_failure").put("reason", reason))
 
     /** M22B — the live notification's one honest sentence. */
-    fun progressText(percent: Int): JSONObject =
-        dispatch(JSONObject().put("op", "progress_text").put("percent", percent))
+    fun progressText(percent: Int, phase: String = ""): JSONObject =
+        dispatch(
+            JSONObject()
+                .put("op", "progress_text")
+                .put("percent", percent)
+                .put("phase", phase),
+        )
 
     /**
      * The foreground-service type for an API level, selected in Rust (the rule

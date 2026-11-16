@@ -1428,7 +1428,15 @@ impl<B: InferenceBackend + Send + 'static, P: Prefetcher + Send + 'static> JobHo
             }
             "progress_text" => {
                 let percent = number("percent").min(100) as u8;
-                json!({ "ok": true, "text": crate::voice_note::progress_text(percent) }).to_string()
+                // The Kotlin pump already reads the phase for its own copy; it
+                // sends it here so the notification's line says what the job is
+                // doing ("Preparing the audio…") instead of "0 %" for minutes.
+                let phase = text("phase").to_string();
+                json!({
+                    "ok": true,
+                    "text": crate::voice_note::progress_text_for(percent, &phase)
+                })
+                .to_string()
             }
             "discard" => {
                 self.discard(text("key"));

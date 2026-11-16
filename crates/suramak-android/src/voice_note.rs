@@ -111,8 +111,25 @@ pub fn sender_from_intent(raw: Option<&str>) -> Option<String> {
 /// The live notification's one line. Deliberately not a partial transcript:
 /// whisper decodes in 30-second windows and any "growing text" would be a
 /// retroactive rewrite pretending to be a stream.
+///
+/// The PHASE matters as much as the number: a job that is still preparing its
+/// audio shows 0 %, and "Transcribing… 0 %" for two minutes reads as a hang.
+/// The owner hit exactly that. So the copy names what the job is doing.
 pub fn progress_text(percent: u8) -> String {
-    format!("Transcribing… {}%", percent.min(100))
+    progress_text_for(percent, "")
+}
+
+/// [`progress_text`] with the host's current phase (`copying`, `decoding`,
+/// `transcribing`, …). Unknown or absent phases fall back to the plain line.
+pub fn progress_text_for(percent: u8, phase: &str) -> String {
+    let percent = percent.min(100);
+    match phase {
+        "copying" => format!("Preparing the file… {percent}%"),
+        "decoding" => "Preparing the audio…".to_string(),
+        "transcribing" if percent == 0 => "Transcribing…".to_string(),
+        "transcribing" => format!("Transcribing… {percent}%"),
+        _ => format!("Transcribing… {percent}%"),
+    }
 }
 
 /// A failure exactly as the queue reported it.
@@ -580,6 +597,11 @@ mod tests {
     #[test]
     fn progress_is_the_queue_percent_and_never_a_partial_transcript() {
         assert_eq!(progress_text(62), "Transcribing… 62%");
+        assert_eq!(progress_text_for(0, "copying"), "Preparing the file… 0%");
+        assert_eq!(progress_text_for(0, "decoding"), "Preparing the audio…");
+        assert_eq!(progress_text_for(0, "transcribing"), "Transcribing…");
+        assert_eq!(progress_text_for(62, "transcribing"), "Transcribing… 62%");
+        assert_eq!(progress_text_for(0, ""), "Transcribing… 0%");
         assert_eq!(progress_text(0), "Transcribing… 0%");
         assert_eq!(progress_text(140), "Transcribing… 100%");
     }

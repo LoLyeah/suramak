@@ -291,7 +291,8 @@ class TranscriptionJobService : JobService() {
                             this,
                             notificationId,
                             title,
-                            TranscribeBridge.progressText(percent).optString("text"),
+                            TranscribeBridge.progressText(percent, status.optString("current_phase"))
+                                .optString("text"),
                             percent,
                             key,
                         ),
@@ -614,7 +615,7 @@ class TranscriptionJobService : JobService() {
                 this,
                 notificationId,
                 getString(R.string.transcribe_unnamed),
-                TranscribeBridge.progressText(percent).optString("text"),
+                TranscribeBridge.progressText(percent, "").optString("text"),
                 percent,
                 key,
             )
