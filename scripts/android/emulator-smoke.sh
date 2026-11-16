@@ -1117,8 +1117,10 @@ VOICE_FIXTURE="$VOICE_DIR/smoke-voice-note.wav"
 VOICE_LONG="$VOICE_DIR/smoke-voice-note-long.wav"
 mkdir -p "$OUT"
 "$ADB" push "$REPO_ROOT/fixtures/audio/en.wav" "$VOICE_FIXTURE" >/dev/null
-# A 90 s loop of the same sentence: long enough to observe the progress
-# notification and cancel it on a fast emulator.
+# 9 minutes of the same sentence. 90 s was not enough: on the emulator tiny
+# finishes it in seconds, so the Cancel broadcast arrived after the job had
+# already completed and the smoke failed waiting for "Transcription cancelled"
+# (run 43791028639). Long enough that the cancel always lands mid-run.
 python3 - "$REPO_ROOT/fixtures/audio/en.wav" "$OUT/smoke-voice-note-long.wav" <<'PY'
 import sys, wave
 source, dest = sys.argv[1], sys.argv[2]
@@ -1127,7 +1129,7 @@ with wave.open(source, "rb") as src:
     frames = src.readframes(src.getnframes())
 with wave.open(dest, "wb") as out:
     out.setparams(params)
-    for _ in range(10):
+    for _ in range(60):
         out.writeframes(frames)
 PY
 "$ADB" push "$OUT/smoke-voice-note-long.wav" "$VOICE_LONG" >/dev/null
