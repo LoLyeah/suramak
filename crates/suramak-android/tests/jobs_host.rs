@@ -567,7 +567,7 @@ fn a_recovered_job_can_be_discarded() {
 /// An import cut off before the copy finished cannot be resumed — the SAF grant
 /// died with the process — and the prompt says exactly that.
 #[test]
-fn an_interrupted_copy_is_offered_as_discard_only() {
+fn an_unfinished_copy_is_a_named_failure() {
     let dirs = dirs("interrupted-copy");
     let dest;
     {
@@ -589,13 +589,26 @@ fn an_interrupted_copy_is_offered_as_discard_only() {
         ThreadedPrefetch::new(Box::new(FileDecoder)),
         dirs.clone(),
     );
+    // v0.8.2: an unfinished copy is a FAILURE, not a resume the host would
+    // refuse. Offering it left a row in `copying` that `status()` reported as
+    // `running: true, percent: 0` forever — the owner's 0 % hang — and the
+    // half-written prefix stayed on disk.
     let offered = host.recover();
-    assert_eq!(offered.len(), 1);
-    assert!(!offered[0].resumable);
-    assert!(offered[0].reason.contains("had not finished copying"));
-    assert!(host.resume(&offered[0].key).is_err());
-    host.discard(&offered[0].key);
-    assert!(!dest.exists());
+    assert!(
+        offered.is_empty(),
+        "an unfinished copy must not be offered for resume: {offered:?}"
+    );
+    let status = host.status();
+    assert_eq!(
+        status.failed, 1,
+        "the interrupted import is a named failure"
+    );
+    assert!(
+        status.message.contains("copy finished") || status.message.contains("import"),
+        "the failure says what happened: {}",
+        status.message
+    );
+    assert!(!dest.exists(), "the half-written copy is removed");
 }
 
 /// A model that is not installed is refused before a byte is copied.

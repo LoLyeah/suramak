@@ -629,6 +629,25 @@ fn load_journal(path: &Path) -> Vec<JobRecord> {
         .iter()
         .filter_map(|entry| serde_json::from_value::<JobRecord>(entry.clone()).ok())
         .map(|mut job| {
+            // A copy that never finished cannot be resumed: the SAF grant that
+            // made the bytes readable died with the process, so the file on
+            // disk is a prefix and nothing can extend it.
+            //
+            // v0.8.1 kept such a row as `Paused`, which offered a Resume the
+            // host then refused, and — worse — a row left in `Copying` by the
+            // 0.8.0 crashes made `status()` report `running: true, percent: 0`
+            // for a job with no copier, so the service's poll loop waited on it
+            // forever (the owner's "stuck at 0 %" report). It is a failure, and
+            // it says so.
+            if !job.copy_complete && job.phase != Phase::Failed {
+                job.phase = Phase::Failed;
+                job.message = "the import stopped before its copy finished; import the file again"
+                    .to_string();
+                // The prefix cannot be completed or played: it is not the
+                // user's file any more, it is this app's half-written copy.
+                let _ = fs::remove_file(&job.media_path);
+                return job;
+            }
             // Anything live on disk was cut by process death: it is a pause now,
             // not a run this process owns.
             if job.phase.is_live() {
@@ -688,6 +707,21 @@ impl<B: InferenceBackend + Send + 'static, P: Prefetcher + Send + 'static> JobHo
         let _ = dirs.ensure();
         let recovered = load_journal(&dirs.journal_path);
         let mut state = InnerState::new();
+        // A row the journal marked failed is still a failure this process did
+        // not perform: count it, so `status()` does not report a failure with
+        // `failed: 0` (the notification and the Library both read that count).
+        state.failed = recovered
+            .iter()
+            .filter(|job| job.phase == Phase::Failed)
+            .count();
+        if let Some(failed) = recovered
+            .iter()
+            .find(|job| job.phase == Phase::Failed && !job.message.is_empty())
+        {
+            // The status line is what the notification and the Library show;
+            // a failure the journal recorded must be readable there too.
+            state.message = failed.message.clone();
+        }
         state.jobs = recovered;
         let shared = Arc::new(Shared {
             dirs,

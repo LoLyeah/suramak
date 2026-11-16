@@ -1123,11 +1123,17 @@ with wave.open(dest, "wb") as out:
 PY
 "$ADB" push "$OUT/smoke-voice-note-long.wav" "$VOICE_LONG" >/dev/null
 
-MODEL_FILE="$VOICE_DIR/models/ggml-tiny.bin"
+# The app selects its model from the device's RAM (8 GB emulator -> `small`),
+# so the share flow needs THAT file, not tiny. Pushing tiny left the app on
+# "small · not downloaded" and the voice-note job was refused for a missing
+# model — the emulator never transcribed anything (run 43780856181).
+MODEL_ID="${SURAMAK_SMOKE_MODEL_ID:-small}"
+MODEL_FILE="$VOICE_DIR/models/ggml-$MODEL_ID.bin"
 MODEL_PRESENT="$("$ADB" shell "[ -f '$MODEL_FILE' ] && echo yes || echo no" | tr -d '\r')"
 if [ "$MODEL_PRESENT" != "yes" ] && [ -n "${SURAMAK_SMOKE_MODEL:-}" ] && [ -f "${SURAMAK_SMOKE_MODEL:-}" ]; then
   "$ADB" shell mkdir -p "$VOICE_DIR/models" >/dev/null 2>&1 || true
   "$ADB" push "$SURAMAK_SMOKE_MODEL" "$MODEL_FILE" >/dev/null
+  "$ADB" shell ls -l "$VOICE_DIR/models" >&2 || true
   MODEL_PRESENT="yes"
 fi
 

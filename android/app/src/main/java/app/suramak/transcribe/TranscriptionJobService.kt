@@ -263,6 +263,8 @@ class TranscriptionJobService : JobService() {
         var lastPercent = -1
         var lastWaiting = -1
         var lastKey: String? = null
+        var lastSignal = ""
+        var lastSignalAt = 0L
         while (!stopped) {
             val status = TranscribeBridge.status()
             val running = status.optBoolean("running", false)
@@ -310,6 +312,26 @@ class TranscriptionJobService : JobService() {
             }
             if (!running && waiting == 0) {
                 return true
+            }
+            // A job that stops moving must become a NAMED failure, never an
+            // endless 0 %. v0.8.1 sat at "Starting… 0 %" forever when the host
+            // reported a job in `copying` with no copier: this loop only exits
+            // on !running && waiting == 0, so nothing ever surfaced it.
+            val signal = "$key:$percent:${status.optString("current_phase")}"
+            if (signal != lastSignal) {
+                lastSignal = signal
+                lastSignalAt = System.currentTimeMillis()
+            } else if (lastSignalAt > 0) {
+                val phase = status.optString("current_phase")
+                val limit = if (phase == "copying") COPY_STALL_MS else JOB_STALL_MS
+                val idleFor = System.currentTimeMillis() - lastSignalAt
+                if (idleFor > limit) {
+                    val stalled = key ?: status.optString("current_key")
+                    val reason = "the job stopped responding in %s at %d%%".format(phase, percent)
+                    Log.w(TAG, "stalled: $reason (key=$stalled, ${idleFor}ms)")
+                    if (stalled.isNotEmpty()) TranscribeBridge.importFailed(stalled, reason)
+                    return false
+                }
             }
             try {
                 Thread.sleep(POLL_MS)
@@ -672,6 +694,10 @@ class TranscriptionJobService : JobService() {
         private const val COPY_CHUNK = 64 * 1024
         private const val PROGRESS_STEP = 256 * 1024L
         private const val POLL_MS = 300L
+        /** A copy that shows no byte progress this long is dead, not slow. */
+        private const val COPY_STALL_MS = 120_000L
+        /** Any other phase frozen this long is a stall, not a long segment. */
+        private const val JOB_STALL_MS = 600_000L
         private const val WAKE_TAG = "suramak:transcribe"
         private const val MAX_WAKE_MS = 6 * 60 * 60 * 1000L
 

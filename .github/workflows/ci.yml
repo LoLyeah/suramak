@@ -800,16 +800,21 @@ jobs:
       # this the emulator never exercised a real transcription — the gap that
       # let "import enqueues but nothing ever transcribes" ship in v0.8.x.
       # tiny (77 MB) is enough: the path is the same for every model.
-      - name: Fetch the tiny model for the smoke's share flow
+      - name: Fetch the model the app selects (small) for the smoke's share flow
         run: |
-          curl -sSL -o "$RUNNER_TEMP/ggml-tiny.bin" \
-            https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin
-          echo "sha256 $(sha256sum "$RUNNER_TEMP/ggml-tiny.bin" | cut -d' ' -f1)"
+          # The emulator has 8 GB, so the app picks `small`; pushing tiny left it
+          # on "small · not downloaded" and refused the job.
+          curl -sSL -o "$RUNNER_TEMP/ggml-small.bin" \
+            https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin
+          echo "sha256 $(sha256sum "$RUNNER_TEMP/ggml-small.bin" | cut -d' ' -f1)"
+          test "$(sha256sum "$RUNNER_TEMP/ggml-small.bin" | cut -d' ' -f1)" = \
+            1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b
 
       - name: Emulator launch smoke (install → launch → Library renders → monkey)
         timeout-minutes: 30
         env:
-          SURAMAK_SMOKE_MODEL: ${{ runner.temp }}/ggml-tiny.bin
+          SURAMAK_SMOKE_MODEL: ${{ runner.temp }}/ggml-small.bin
+          SURAMAK_SMOKE_MODEL_ID: small
         run: bash scripts/android/emulator-smoke.sh
 
       - name: Upload the smoke evidence (screencap, uiautomator dump, logcat)
