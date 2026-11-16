@@ -1140,12 +1140,16 @@ if [ "$MODEL_PRESENT" != "yes" ]; then
     --es model "$MODEL_ID" --es language auto -n "$ACTIVITY" \
     >"$OUT/model-download.txt" 2>&1 || fail "the download action was refused"
   echo "   model:    downloading $MODEL_ID through the app"
-  # The file appearing IS the condition: the downloader writes it only after the
-  # sha256 verifies, so a partial file never satisfies this.
+  # The APP's own marker is the witness, never `[ -f ]`: on Android 13+ adb
+  # cannot even stat inside /sdcard/Android/data, so the file test reports
+  # "missing" for a model that is installed and in use (run 43786771022
+  # downloaded `small`, logged state=in_use, and the smoke called it missing).
   DOWNLOAD_DEADLINE=$((SECONDS + 900))
   while [ "$SECONDS" -lt "$DOWNLOAD_DEADLINE" ]; do
-    MODEL_PRESENT="$("$ADB" shell "[ -f '$MODEL_FILE' ] && echo yes || echo no" | tr -d '\r')"
-    [ "$MODEL_PRESENT" = "yes" ] && break
+    if app_log | grep -qE "SURAMAK-MODEL row=$MODEL_ID state=(in_use|verified)"; then
+      MODEL_PRESENT="yes"
+      break
+    fi
     sleep 5
   done
   [ "$MODEL_PRESENT" = "yes" ] || fail "the app did not download $MODEL_ID (see $OUT/model-download.txt and logcat)"
