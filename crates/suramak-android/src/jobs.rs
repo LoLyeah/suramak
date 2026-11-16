@@ -1938,6 +1938,10 @@ fn fail(shared: &Arc<Shared>, key: &str, reason: &str) {
 fn apply_event(shared: &Arc<Shared>, store: &mut Option<Store>, event: QueueEvent) {
     match event {
         QueueEvent::Started { id, .. } => {
+            // The Android logger is the `log` facade; suramak-asr's `tracing`
+            // events never reach logcat, so the host must say where a job is.
+            // Without this a job frozen before the engine is silent.
+            log::info!("job {id}: the queue started it (decoding)");
             let mut state = shared.state.lock().expect("job state lock");
             if let Some(job) = state.by_queue_mut(id) {
                 if job.phase == Phase::Queued {
@@ -1947,6 +1951,7 @@ fn apply_event(shared: &Arc<Shared>, store: &mut Option<Store>, event: QueueEven
             shared.persist(&state);
         }
         QueueEvent::Stage { id, stage, .. } => {
+            log::info!("job {id}: stage {stage:?}");
             let mut state = shared.state.lock().expect("job state lock");
             if let Some(job) = state.by_queue_mut(id) {
                 job.phase = match stage {
@@ -1968,6 +1973,9 @@ fn apply_event(shared: &Arc<Shared>, store: &mut Option<Store>, event: QueueEven
             }
         }
         QueueEvent::Progress { id, pct, .. } => {
+            if pct % 25 == 0 {
+                log::info!("job {id}: {pct}%");
+            }
             let mut state = shared.state.lock().expect("job state lock");
             let mut persist = false;
             if let Some(job) = state.by_queue_mut(id) {
