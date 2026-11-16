@@ -1130,22 +1130,26 @@ PY
 MODEL_ID="${SURAMAK_SMOKE_MODEL_ID:-small}"
 MODEL_FILE="$VOICE_DIR/models/ggml-$MODEL_ID.bin"
 MODEL_PRESENT="$("$ADB" shell "[ -f '$MODEL_FILE' ] && echo yes || echo no" | tr -d '\r')"
-if [ "$MODEL_PRESENT" != "yes" ] && [ -n "${SURAMAK_SMOKE_MODEL:-}" ] && [ -f "${SURAMAK_SMOKE_MODEL:-}" ]; then
-  # Android 13+ blocks `adb push` into /sdcard/Android/data (scoped storage), so
-  # the model goes to /data/local/tmp and the APP's own uid copies it into its
-  # external files dir. The earlier `mkdir + push` printed nothing and left the
-  # app on "small · not downloaded" — the emulator never had a model at all.
-  STAGE="/data/local/tmp/suramak-model-$MODEL_ID.bin"
-  "$ADB" push "$SURAMAK_SMOKE_MODEL" "$STAGE" >"$OUT/model-push.txt" 2>&1 \
-    || fail "the model could not be staged on the device (see $OUT/model-push.txt)"
-  "$ADB" shell run-as "$PACKAGE" mkdir -p "$VOICE_DIR/models" >>"$OUT/model-push.txt" 2>&1 || true
-  "$ADB" shell run-as "$PACKAGE" cp "$STAGE" "$MODEL_FILE" >>"$OUT/model-push.txt" 2>&1 \
-    || fail "the app could not copy the model into its files dir (see $OUT/model-push.txt)"
-  "$ADB" shell run-as "$PACKAGE" ls -l "$VOICE_DIR/models" >>"$OUT/model-push.txt" 2>&1 || true
-  "$ADB" shell rm -f "$STAGE" >/dev/null 2>&1 || true
-  MODEL_PRESENT="$("$ADB" shell "[ -f '$MODEL_FILE' ] && echo yes || echo no" | tr -d '\r')"
-  [ "$MODEL_PRESENT" = "yes" ] || fail "the model is still not in $MODEL_FILE (see $OUT/model-push.txt)"
-  echo "   model:    pushed $(basename "$MODEL_FILE") for this run"
+if [ "$MODEL_PRESENT" != "yes" ]; then
+  # The model cannot be pushed: Android 13+ blocks adb (and run-as) from writing
+  # /sdcard/Android/data, which is where the app keeps it. Use the app's OWN
+  # downloader instead — the same action the settings card's Download sends, so
+  # the smoke also exercises the pinned download and its sha256 check.
+  "$ADB" logcat -c 2>/dev/null || true
+  "$ADB" shell am start -a app.suramak.action.COMPACT_DOWNLOAD \
+    --es model "$MODEL_ID" --es language auto -n "$ACTIVITY" \
+    >"$OUT/model-download.txt" 2>&1 || fail "the download action was refused"
+  echo "   model:    downloading $MODEL_ID through the app"
+  # The file appearing IS the condition: the downloader writes it only after the
+  # sha256 verifies, so a partial file never satisfies this.
+  DOWNLOAD_DEADLINE=$((SECONDS + 900))
+  while [ "$SECONDS" -lt "$DOWNLOAD_DEADLINE" ]; do
+    MODEL_PRESENT="$("$ADB" shell "[ -f '$MODEL_FILE' ] && echo yes || echo no" | tr -d '\r')"
+    [ "$MODEL_PRESENT" = "yes" ] && break
+    sleep 5
+  done
+  [ "$MODEL_PRESENT" = "yes" ] || fail "the app did not download $MODEL_ID (see $OUT/model-download.txt and logcat)"
+  echo "   model:    $MODEL_ID downloaded by the app"
 fi
 
 share_voice_note() {
