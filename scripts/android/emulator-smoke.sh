@@ -124,6 +124,16 @@ case "$AVD_LIST" in
       --package "$SYSTEM_IMAGE" \
       --device "$AVD_DEVICE" \
       --force </dev/null
+    # 4 GB, not the profile's 8: the app picks its model from the device's RAM,
+    # and at 8 GB it picks `small`, which needs ~5 minutes for 90 s of audio on
+    # this 2-vCPU emulator (measured: 0 % at 04:49:34, 30 % at 04:54:23 in run
+    # 43805346350). At 4 GB it picks `tiny` and the same job finishes inside the
+    # smoke's window — and the low-RAM budget path is exercised too.
+    AVD_INI="${ANDROID_AVD_HOME:-$HOME/.android/avd}/$AVD_NAME.avd/config.ini"
+    if [ -f "$AVD_INI" ]; then
+      sed -i.bak 's/^hw.ramSize=.*/hw.ramSize=4096/' "$AVD_INI" || true
+      grep -q '^hw.ramSize=' "$AVD_INI" || echo 'hw.ramSize=4096' >>"$AVD_INI"
+    fi
     ;;
 esac
 

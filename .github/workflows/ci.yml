@@ -806,7 +806,10 @@ jobs:
       - name: Emulator launch smoke (install → launch → Library renders → monkey)
         timeout-minutes: 30
         env:
-          SURAMAK_SMOKE_MODEL_ID: small
+          # The AVD is 4 GB, so the app picks `tiny` itself; `small` needs ~5
+          # minutes for 90 s of audio here and the smoke would time out on a
+          # job that is working fine.
+          SURAMAK_SMOKE_MODEL_ID: tiny
         run: bash scripts/android/emulator-smoke.sh
 
       - name: Upload the smoke evidence (screencap, uiautomator dump, logcat)
