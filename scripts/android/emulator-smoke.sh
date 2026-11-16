@@ -1266,7 +1266,10 @@ else
   # Run 2 — the finished transcript. The 9 s fixture says the fox sentence;
   # its first segment must appear in the notification body.
   share_voice_note "smoke-voice-note.wav" "en" "ready"
-  READY_DEADLINE=$((SECONDS + 180))
+  # `small` on a 2-vCPU emulator with llvmpipe is slow: 90 s of audio can take
+  # several minutes, and a 3-minute wait read "no Transcript ready" as a stall
+  # (run 43803861459 shows the job entering Transcribing and still working).
+  READY_DEADLINE=$((SECONDS + 900))
   while [ "$SECONDS" -lt "$READY_DEADLINE" ]; do
     "$ADB" shell dumpsys notification --noredact >"$OUT/voice-note-ready.txt" 2>&1 || true
     if grep -q "Transcript ready" "$OUT/voice-note-ready.txt"; then break; fi
