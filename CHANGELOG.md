@@ -4,6 +4,34 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-11-16
+
+### Fixed
+- **A job that stopped moving sat at 0 % forever and said nothing.** Two causes,
+  both now named failures instead of a silent hang:
+  - a journal row whose copy never finished (an import interrupted by a crash or
+    a kill) came back as a *Pause* the host refuses to resume, and while it sat
+    in `copying` the status line reported `running: true, percent: 0` for a job
+    with no copier — the service waited on it indefinitely. It is now marked
+    failed with "the import stopped before its copy finished; import the file
+    again", and the half-written file is deleted.
+  - the service now fails a copy that shows no byte progress for two minutes, or
+    any phase frozen for ten, with the phase and percentage in the message.
+- **The Library shows a finished job without a relaunch.** Only `op: library`
+  re-reads the rows, and nothing called it when a job completed, so a saved
+  transcript could stay invisible behind "No transcripts yet". The shell now
+  compares the stored count with the rows on screen once a second and reloads
+  when they differ.
+
+### Testing
+- The emulator smoke now installs a **real model** by asking the app to download
+  it (Android 13+ blocks `adb push` into the app's files dir, so earlier runs
+  had no model at all), accepts the voice-note offer, and asserts a job key and
+  progress. On run 43793094496 the job is observed at `percent=100` (copied)
+  then `percent=0` (transcribing) — the Android job path runs end to end.
+- A Linux repro harness drives `JobHost::production` with the real `small`
+  model: a fresh import and a kill-then-resume both reach `done` in ~44 s.
+
 ## [0.8.1] - 2026-11-15
 
 ### Fixed
