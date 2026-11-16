@@ -24,7 +24,9 @@ fn scratch(name: &str) -> PathBuf {
     // never ran before, and the setup panicked on line 46).
     let dir = std::env::var_os("SURAMAK_REPRO_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("suramak-{name}-{}", std::process::id())));
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("suramak-{name}-{}", std::process::id()))
+        });
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -47,8 +49,13 @@ fn an_import_of_the_two_minute_wav_reaches_done() {
     std::fs::create_dir_all(&dirs.models_dir).unwrap();
     println!("model  = {}", model.display());
     println!("models = {}", dirs.models_dir.display());
-    std::fs::copy(&model, dirs.models_dir.join("ggml-small.bin"))
-        .unwrap_or_else(|err| panic!("copy {} -> {}: {err}", model.display(), dirs.models_dir.display()));
+    std::fs::copy(&model, dirs.models_dir.join("ggml-small.bin")).unwrap_or_else(|err| {
+        panic!(
+            "copy {} -> {}: {err}",
+            model.display(),
+            dirs.models_dir.display()
+        )
+    });
 
     let host = JobHost::production(dirs.clone());
     // Default to the committed fixture; WAV_SOURCE points at a longer file.
@@ -60,7 +67,13 @@ fn an_import_of_the_two_minute_wav_reaches_done() {
         .unwrap_or_else(|err| panic!("the audio to import ({}): {err}", source.display()))
         .len();
     let (key, dest) = host
-        .begin_import("suramak-test-en-2min.wav", "audio/wav", size, "small", "auto")
+        .begin_import(
+            "suramak-test-en-2min.wav",
+            "audio/wav",
+            size,
+            "small",
+            "auto",
+        )
         .expect("accepted");
 
     // The service's copy loop, byte for byte.
@@ -111,7 +124,10 @@ fn an_import_of_the_two_minute_wav_reaches_done() {
         println!("{entry:?}");
     }
     assert_eq!(status.failed, 0, "the job failed: {}", status.message);
-    assert_eq!(status.done, 1, "the job never finished (see the journal above)");
+    assert_eq!(
+        status.done, 1,
+        "the job never finished (see the journal above)"
+    );
 }
 
 #[test]
@@ -139,7 +155,9 @@ fn a_job_interrupted_mid_transcription_resumes_to_done() {
     std::fs::create_dir_all(&dirs.models_dir).unwrap();
     std::fs::copy(&model, dirs.models_dir.join("ggml-small.bin")).unwrap();
     let default = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/audio/en.wav");
-    let source = std::env::var_os("WAV_SOURCE").map(PathBuf::from).unwrap_or(default);
+    let source = std::env::var_os("WAV_SOURCE")
+        .map(PathBuf::from)
+        .unwrap_or(default);
     let size = std::fs::metadata(&source).unwrap().len();
 
     // First process: import, start, then "die" mid-transcription.
@@ -178,8 +196,13 @@ fn a_job_interrupted_mid_transcription_resumes_to_done() {
         let status = host.status();
         let line = format!(
             "running={} phase={} percent={} waiting={} done={} failed={} msg={}",
-            status.running, status.current_phase, status.percent, status.waiting,
-            status.done, status.failed, status.message
+            status.running,
+            status.current_phase,
+            status.percent,
+            status.waiting,
+            status.done,
+            status.failed,
+            status.message
         );
         if line != last {
             println!("{line}");
@@ -191,7 +214,14 @@ fn a_job_interrupted_mid_transcription_resumes_to_done() {
         std::thread::sleep(Duration::from_millis(200));
     }
     let status = host.status();
-    println!("--- journal after resume ---\n{}", std::fs::read_to_string(&dirs.journal_path).unwrap_or_default());
-    assert_eq!(status.failed, 0, "the resumed job failed: {}", status.message);
+    println!(
+        "--- journal after resume ---\n{}",
+        std::fs::read_to_string(&dirs.journal_path).unwrap_or_default()
+    );
+    assert_eq!(
+        status.failed, 0,
+        "the resumed job failed: {}",
+        status.message
+    );
     assert_eq!(status.done, 1, "the resumed job never finished: {last}");
 }
