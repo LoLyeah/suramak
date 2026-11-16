@@ -1069,10 +1069,19 @@ sleep 2
 timeout 30 "$ADB" logcat -d >"$OUT/logcat-full.txt" 2>/dev/null || true
 "$ADB" shell dumpsys activity exit-info "$PACKAGE" >"$OUT/exit-info.txt" 2>&1 || true
 
-if grep -qE "FATAL EXCEPTION|ANR in $PACKAGE|Force finishing activity $PACKAGE|Process $PACKAGE .* has died" "$OUT/logcat-full.txt"; then
-  grep -nE "FATAL EXCEPTION|ANR in $PACKAGE|Force finishing activity $PACKAGE|Process $PACKAGE .* has died" \
-    "$OUT/logcat-full.txt" >&2 || true
+# A death the platform reports as `cch+5 CEM` (or any `cch`/`lowmem` reason) is
+# the OS reclaiming a CACHED process, not a crash: the monkey leaves the app in
+# the background and the emulator reaps it. Only a fatal exception, an ANR, or a
+# forced finish is ours (run 43789494199 failed on the reclaim).
+CRASH_PATTERN="FATAL EXCEPTION|ANR in $PACKAGE|Force finishing activity $PACKAGE"
+if grep -qE "$CRASH_PATTERN" "$OUT/logcat-full.txt"; then
+  grep -nE "$CRASH_PATTERN" "$OUT/logcat-full.txt" >&2 || true
   fail "the monkey pass crashed $PACKAGE"
+fi
+if grep -qE "Process $PACKAGE .* has died" "$OUT/logcat-full.txt" \
+  && ! grep -qE "Process $PACKAGE .* has died: (cch|lowmem|empty)" "$OUT/logcat-full.txt"; then
+  grep -nE "Process $PACKAGE .* has died" "$OUT/logcat-full.txt" >&2 || true
+  fail "the monkey pass killed $PACKAGE with a non-reclaim reason"
 fi
 
 PID="$("$ADB" shell pidof "$PACKAGE" 2>/dev/null | tr -d '\r' || true)"
