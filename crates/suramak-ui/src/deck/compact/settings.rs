@@ -74,7 +74,7 @@ const ROW_H: f32 = 64.0;
 /// One model row: tier name (plus the optional badge) and one guidance line.
 const MODEL_ROW_H: f32 = 80.0;
 /// The device card's facts block (version, memory, the disk-truth note).
-const DEVICE_FACTS_H: f32 = 80.0;
+const DEVICE_FACTS_H: f32 = 96.0;
 /// The model action pill's painted height (its hit area is 48).
 const ACTION_H: f32 = 36.0;
 /// The model action column's width.
@@ -500,8 +500,33 @@ pub fn ui(
             type_scale::caption().font,
             tokens.ink_soft,
         );
+        // The session limit the app actually enforces, with the model it was
+        // computed for. It is derived from this device's memory (M26A), so it
+        // is a fact about the phone, not a constant: showing it is the only way
+        // the owner can tell "45 minutes" from "431 minutes".
+        let limits = suramak_core::session::session_limits();
+        let limit_note = match limits.reason {
+            suramak_core::limits::CapReason::ModelTooLarge => format!(
+                "Session limit · {} min — {} does not fit on this device",
+                limits.max_minutes, state.settings.model_id
+            ),
+            suramak_core::limits::CapReason::Fallback => {
+                format!("Session limit · {} min (conservative)", limits.max_minutes)
+            }
+            _ => format!(
+                "Session limit · {} min with {}",
+                limits.max_minutes, state.settings.model_id
+            ),
+        };
         ui.painter().text(
             pos2(device_card.left() + CARD_PAD, device_card.top() + 60.0),
+            Align2::LEFT_CENTER,
+            limit_note,
+            type_scale::caption().font,
+            tokens.ink_soft,
+        );
+        ui.painter().text(
+            pos2(device_card.left() + CARD_PAD, device_card.top() + 78.0),
             Align2::LEFT_CENTER,
             DEVICE_NOTE,
             type_scale::caption().font,

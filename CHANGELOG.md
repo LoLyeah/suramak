@@ -4,6 +4,14 @@ All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased]
 
+### Added
+- **The session limit is on the Device card.** The number the app enforces —
+  derived from this device's memory with the model it was computed for — is now
+  a line in Settings: `Session limit · 431 min with tiny`. When the selected
+  model cannot fit it says so instead ("… — turbo-q5-0 does not fit on this
+  device"), and the conservative no-probe fallback is labelled rather than
+  presented as a measurement.
+
 ## [0.8.2] - 2026-11-16
 
 ### Fixed
