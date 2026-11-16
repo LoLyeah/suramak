@@ -1131,10 +1131,21 @@ MODEL_ID="${SURAMAK_SMOKE_MODEL_ID:-small}"
 MODEL_FILE="$VOICE_DIR/models/ggml-$MODEL_ID.bin"
 MODEL_PRESENT="$("$ADB" shell "[ -f '$MODEL_FILE' ] && echo yes || echo no" | tr -d '\r')"
 if [ "$MODEL_PRESENT" != "yes" ] && [ -n "${SURAMAK_SMOKE_MODEL:-}" ] && [ -f "${SURAMAK_SMOKE_MODEL:-}" ]; then
-  "$ADB" shell mkdir -p "$VOICE_DIR/models" >/dev/null 2>&1 || true
-  "$ADB" push "$SURAMAK_SMOKE_MODEL" "$MODEL_FILE" >/dev/null
-  "$ADB" shell ls -l "$VOICE_DIR/models" >&2 || true
-  MODEL_PRESENT="yes"
+  # Android 13+ blocks `adb push` into /sdcard/Android/data (scoped storage), so
+  # the model goes to /data/local/tmp and the APP's own uid copies it into its
+  # external files dir. The earlier `mkdir + push` printed nothing and left the
+  # app on "small · not downloaded" — the emulator never had a model at all.
+  STAGE="/data/local/tmp/suramak-model-$MODEL_ID.bin"
+  "$ADB" push "$SURAMAK_SMOKE_MODEL" "$STAGE" >"$OUT/model-push.txt" 2>&1 \
+    || fail "the model could not be staged on the device (see $OUT/model-push.txt)"
+  "$ADB" shell run-as "$PACKAGE" mkdir -p "$VOICE_DIR/models" >>"$OUT/model-push.txt" 2>&1 || true
+  "$ADB" shell run-as "$PACKAGE" cp "$STAGE" "$MODEL_FILE" >>"$OUT/model-push.txt" 2>&1 \
+    || fail "the app could not copy the model into its files dir (see $OUT/model-push.txt)"
+  "$ADB" shell run-as "$PACKAGE" ls -l "$VOICE_DIR/models" >>"$OUT/model-push.txt" 2>&1 || true
+  "$ADB" shell rm -f "$STAGE" >/dev/null 2>&1 || true
+  MODEL_PRESENT="$("$ADB" shell "[ -f '$MODEL_FILE' ] && echo yes || echo no" | tr -d '\r')"
+  [ "$MODEL_PRESENT" = "yes" ] || fail "the model is still not in $MODEL_FILE (see $OUT/model-push.txt)"
+  echo "   model:    pushed $(basename "$MODEL_FILE") for this run"
 fi
 
 share_voice_note() {
