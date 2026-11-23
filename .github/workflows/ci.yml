@@ -415,6 +415,16 @@ jobs:
           unzip -q "$RUNNER_TEMP/android-ndk-r27d-linux.zip" -d "$HOME/android-ndk"
           rm "$RUNNER_TEMP/android-ndk-r27d-linux.zip"
 
+      # CMake 4.5 needs a Ninja it can version-probe (the NDK toolchain defaults
+      # to Ninja); the image's copy reported "" and the build died inside
+      # opusic-sys. Install one explicitly rather than relying on the image.
+      - name: Ninja for the NDK's CMake generator
+        run: |
+          if ! ninja --version >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq ninja-build
+          fi
+          ninja --version
+
       # `bash` (not a bare `./scripts/...` path) so the job never depends on the
       # committed exec bit surviving; the script is +x on disk either way.
       - name: Cross-build both ABIs (scripts/android/build.sh)
@@ -478,7 +488,21 @@ jobs:
         # suramak-ui is included on purpose: its cfg(windows) guard tests
         # (instance_windows: ERROR_ALREADY_EXISTS path, event round-trip) and
         # the %LOCALAPPDATA% path rule only execute on this target.
-        run: cargo test -p suramak-core -p suramak-asr -p suramak-cli -p suramak-playback -p suramak-ui
+        #
+        # Retried once: `sherpa-rs-sys`'s build script copies its DLLs into
+        # target\debug\deps, and a DLL still mapped by a process from an earlier
+        # step makes that copy fail with no code of ours involved ("Failed to
+        # copy ... cargs.dll to ...", run 45096567259).
+        shell: bash
+        run: |
+          for attempt in 1 2; do
+            if cargo test -p suramak-core -p suramak-asr -p suramak-cli -p suramak-playback -p suramak-ui; then
+              exit 0
+            fi
+            echo "attempt $attempt failed; sleeping 5s and retrying once" >&2
+            sleep 5
+          done
+          exit 1
 
       - name: Parakeet feature — compile check only (not packaged on Windows)
         run: cargo check -p suramak-asr --features parakeet

@@ -1246,8 +1246,12 @@ else
   done
   [ -n "$KEY" ] || fail "the progress notification never logged its job key — the cancel step cannot name the job"
   "$ADB" shell dumpsys notification --noredact >"$OUT/voice-note-progress.txt" 2>&1 || true
-  grep -q "Transcribing…" "$OUT/voice-note-progress.txt" \
-    || fail "no 'Transcribing…' voice-note notification while the job ran"
+  # The line names the phase: "Preparing the file… 40 %", "Preparing the
+  # audio…", then "Transcribing… 12 %". Any of them means the notification is
+  # live; requiring the word "Transcribing" specifically failed a run whose job
+  # was still copying (43803861459's successor).
+  grep -qE "Preparing the (file|audio)|Transcribing…" "$OUT/voice-note-progress.txt" \
+    || fail "no progress line in the voice-note notification while the job ran"
   "$ADB" shell am broadcast -a app.suramak.transcribe.CANCEL \
     -n "$PACKAGE/.transcribe.CancelTranscriptionReceiver" \
     --es app.suramak.transcribe.KEY "$KEY" >"$OUT/voice-note-cancel.txt" 2>&1 \
