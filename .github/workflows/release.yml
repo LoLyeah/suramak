@@ -17,6 +17,27 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
+      # The CI macOS job restores this archive; without it the build script
+      # re-downloads the runtime and the linker is handed a search path that
+      # does not exist ("ld: library 'onnxruntime.1.17.1' not found", release run
+      # 45122178895). Same archive, same validation as CI.
+      - name: Restore the sherpa-onnx prebuilt runtime
+        uses: actions/cache@v6
+        with:
+          path: ~/Library/Caches/sherpa-rs
+          key: sherpa-rs-v1.12.9-osx-universal2-b
+
+      - name: Validate the sherpa runtime cache
+        run: |
+          set -uo pipefail
+          LIB="$(find "$HOME/Library/Caches/sherpa-rs" -name 'libonnxruntime*.dylib' -size +1M 2>/dev/null | head -1 || true)"
+          if [ -z "$LIB" ]; then
+            echo "sherpa cache is missing or incomplete — dropping it so the build re-fetches" >&2
+            rm -rf "$HOME/Library/Caches/sherpa-rs"
+          else
+            ls -l "$LIB"
+          fi
+
       # sherpa-rs-sys hard-links its dylibs out of a cache (across volumes that
       # fails) and then fs::copy panics with no errno when target/release/deps
       # does not exist yet — the state during a build script that runs before
