@@ -88,16 +88,14 @@ export CMAKE_TOOLCHAIN_FILE="$REPO_ROOT/scripts/android/ndk-toolchain.cmake"
 # build stopped at `opusic-sys` with "Compatibility with CMake < 3.5 has been
 # removed" (run 45095791638).
 export CMAKE_POLICY_VERSION_MINIMUM=3.5
-# The NDK's toolchain file defaults CMake's generator to Ninja, and CMake 4.5
-# refuses a Ninja whose version it cannot read ("" < 1.3) — which is what the
-# CI image produced ("CMAKE_C_COMPILER not set", "detected version of Ninja ()
-# is less than ... 1.3"). Point CMake at a ninja we can see, or fall back to
-# Makefiles when there is none.
-if NINJA_BIN="$(command -v ninja 2>/dev/null)"; then
-  export CMAKE_MAKE_PROGRAM="$NINJA_BIN"
-else
-  export CMAKE_GENERATOR="Unix Makefiles"
-fi
+# CMake 4.5's Ninja support rejects the runner's `ninja` even when the binary
+# answers `--version` ("The detected version of Ninja () is less than ... 1.3"),
+# and opusic-sys passes `-G Ninja` explicitly whenever the cmake crate finds
+# one. The cmake crate honours CMAKE_GENERATOR, so pin Makefiles for the
+# Android cross-build: the NDK supports it, the build is a one-off CMake
+# project (libopus), and it removes the version probe from the path entirely.
+export CMAKE_GENERATOR="Unix Makefiles"
+unset CMAKE_MAKE_PROGRAM
 
 echo "== Suramak Android cross-build =="
 echo "   NDK:      $NDK (r27d, $NDK_REVISION)"
