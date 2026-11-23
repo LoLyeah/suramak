@@ -3144,3 +3144,27 @@ fn the_notes_sheet_paints_the_presets_the_gate_and_the_result_line() {
         "the gate sentence is painted"
     );
 }
+
+/// A running job is not an empty library. The strip (which existed since M16.1
+/// and was never fed on Android) must paint the host's phase and percentage,
+/// and the empty state must not be painted underneath it.
+#[test]
+fn a_running_job_paints_the_strip_and_hides_the_empty_state() {
+    let mut app = seeded_app();
+    app.set_library(Vec::new());
+    app.on_job("Transcribing", 42, 100, 0.0);
+    app.advance(1.0);
+    let (_ctx, output) = editor_frame(&mut app);
+    let texts: Vec<String> = painted_texts(&output)
+        .into_iter()
+        .map(|(text, ..)| text)
+        .collect();
+    assert!(
+        texts.iter().any(|text| text.contains("Transcribing · 42%")),
+        "the strip names the phase and the percentage: {texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|text| text.contains("No transcripts yet")),
+        "the empty state must not contradict a running job: {texts:?}"
+    );
+}
