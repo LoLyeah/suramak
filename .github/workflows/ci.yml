@@ -211,7 +211,7 @@ jobs:
           # re-runs its download, so OUT_DIR/lib stays empty and the link dies
           # on onnxruntime.1.17.1. A new key forces the build scripts to run
           # once with a cache dir that now exists (the step below).
-          key: sherpa-runtime-2
+          key: sherpa-runtime-3
 
       # M16F follow-up: sherpa-rs-sys downloads its prebuilt runtime into
       # ~/Library/Caches/sherpa-rs on first build. rust-cache can restore a
@@ -223,10 +223,35 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/Library/Caches/sherpa-rs
-          key: sherpa-rs-v1.12.9-osx-universal2
+          key: sherpa-rs-v1.12.9-osx-universal2-b
+
+      # A cache entry that restored a zero-length or missing dylib made
+      # sherpa-rs-sys's build script fail its copy ("Failed to copy ...
+      # libonnxruntime.1.17.1.dylib", run 45103598211). Validate the archive
+      # before trusting it; a bad one is dropped so the build script fetches it.
+      - name: Validate the sherpa runtime cache
+        run: |
+          set -euo pipefail
+          LIB="$(find "$HOME/Library/Caches/sherpa-rs" -name 'libonnxruntime*.dylib' -size +1M 2>/dev/null | head -1)"
+          if [ -z "$LIB" ]; then
+            echo "sherpa cache is missing or incomplete — dropping it so the build re-fetches" >&2
+            rm -rf "$HOME/Library/Caches/sherpa-rs"
+          else
+            ls -l "$LIB"
+          fi
 
       - name: Build workspace (release, Metal)
+        continue-on-error: true
+        id: mac-build
         run: cargo build --release --workspace
+
+      # Same failure, one retry: a partially fetched runtime is re-fetched the
+      # second time (the build script's copy runs again once it has failed).
+      - name: Build workspace (retry after a broken runtime fetch)
+        if: steps.mac-build.outcome == 'failure'
+        run: |
+          rm -rf "$HOME/Library/Caches/sherpa-rs"
+          cargo build --release --workspace
 
       # M10B: compile the `speech-transcriber` feature on a real Mac — the
       # `speech` crate's Swift bridge (`swift build` via its build.rs) is the one
@@ -480,10 +505,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Same partial-cache failure as macOS (run 45103598211): the build script's
+      # DLL copy into target\debug\deps fails when the cached download is
+      # incomplete. Start from a clean cache and let it fetch.
+      - name: Fresh sherpa-rs cache
+        shell: bash
+        run: rm -rf "$LOCALAPPDATA/sherpa-rs"
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: windows
+          key: windows-2
 
       - name: Format check
         run: cargo fmt --all --check
