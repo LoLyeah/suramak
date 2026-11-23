@@ -418,6 +418,18 @@ jobs:
       # CMake 4.5 needs a Ninja it can version-probe (the NDK toolchain defaults
       # to Ninja); the image's copy reported "" and the build died inside
       # opusic-sys. Install one explicitly rather than relying on the image.
+      # The image moved to CMake 4.5, which refuses the NDK's Ninja probe and
+      # leaves CMAKE_C_COMPILER unset inside opusic-sys's libopus configure
+      # ("The detected version of Ninja () is less than the version of Ninja
+      # required by CMake (1.3)", runs 45099418676 / 45100882866). Pin the CMake
+      # the release has always built with; migrating the Android build to CMake
+      # 4 is its own task, not a thing to discover while cutting a release.
+      - name: Pin CMake 3.31 for the Android cross-build
+        run: |
+          python3 -m pip install --user --quiet "cmake==3.31.6"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/cmake" --version | head -1
+
       - name: Ninja for the NDK's CMake generator
         run: |
           if ! ninja --version >/dev/null 2>&1; then
