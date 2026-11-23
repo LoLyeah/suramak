@@ -2,6 +2,20 @@
 
 All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelog.com/); versioning per `docs/VERSIONING.md` (semver).
 
+## [0.8.4] - 2026-11-23
+
+### Fixed
+- **The release workflow now builds.** v0.8.3's tag produced no assets: the macOS
+  job hit the sherpa-rs-sys dylib copy (its `fs::copy` panics with no errno when
+  `target/release/deps` does not exist yet), then the linker was handed a runtime
+  search path that did not exist because the job never restored the sherpa
+  cache. The Android job hit the image's CMake 4.5 (refuses the NDK's Ninja
+  version probe, leaving `CMAKE_C_COMPILER` unset in libopus) and then JDK 25
+  (Gradle 8.9 cannot run on it). All three fixes had landed in CI and not in the
+  release workflow; both workflows now agree.
+
+Everything in 0.8.3 is in this build.
+
 ## [0.8.3] - 2026-11-23
 
 ### Fixed
