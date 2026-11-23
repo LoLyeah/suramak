@@ -2,7 +2,52 @@
 
 All notable changes to Suramak. Format: [Keep a Changelog](https://keepachangelog.com/); versioning per `docs/VERSIONING.md` (semver).
 
-## [Unreleased]
+## [0.8.3] - 2026-11-23
+
+### Fixed
+- **A finished job appears without a relaunch.** egui only repaints on input, so
+  with the phone idle the Library's store-vs-shown check never ran: a completed
+  transcription could sit invisible behind "No transcripts yet" until the app was
+  restarted or Settings was opened and closed. The surface now wakes once a
+  second, and returning to the Library re-reads it.
+- **Progress is in the app, not only in the notification.** The Library's job
+  strip existed since M16.1 and nothing on Android ever fed it. It now shows the
+  host's phase and percentage (`Preparing the file · 40 %`, `Preparing the
+  audio`, `Transcribing · 42 %`), pushes the list down, and hides the empty state
+  while a job is in flight.
+- **A failure stays on screen until dismissed.** A red strip with the job's name
+  and the host's own sentence, plus one Dismiss button — instead of a strip that
+  vanished and left only a notification.
+- **The Editor's bottom bar no longer collides.** It was laid out with fixed x
+  offsets, so `0:00 / 2:00` painted through "Tag speakers". It is allocated from
+  the right edge inward with measured widths, and the timecode ellipsises inside
+  its own clipped box on a narrow phone.
+- **`Line length 165` is gone.** The subtitle-readability advisory is a
+  professional tool's metric; on a phone it was the most visible jargon on the
+  reading surface.
+- **The word strip no longer paints over the rows below.** It wrapped to as many
+  lines as it needed while the row reserved one strip of height; it is now one
+  clipped line that follows the spoken word, with a `…`.
+- **The notification's progress line names the phase**, so a job preparing its
+  audio no longer looks frozen at 0 %.
+
+### Added
+- **The session limit is on the Device card**: `Session limit · 431 min with
+  tiny`, with the model it was computed for, a refusal sentence when the model
+  cannot fit, and a label on the conservative fallback.
+- **Diagnostics has a "Last job" card** — phase, percentage and the host's
+  failure sentence, so a stuck or failed job is readable on the phone.
+
+### Testing
+- The emulator smoke installs a real model (the app downloads it: Android 13+
+  blocks `adb push` into its files dir), accepts the voice-note offer, and
+  asserts a real transcription — "Transcript ready" carrying the actual words.
+  Getting there exposed four harness faults, not product faults.
+- The Windows and macOS jobs stop depending on a restored `target/` having a
+  `deps/` directory before a build script runs: sherpa-rs-sys hard-links its
+  runtime and panics without an errno when that directory is missing.
+- The Android cross-build pins CMake 3.31: the runner's CMake 4.5 refuses the
+  NDK's Ninja version probe and leaves `CMAKE_C_COMPILER` unset inside libopus.
 
 ### Added
 - **The session limit is on the Device card.** The number the app enforces —
