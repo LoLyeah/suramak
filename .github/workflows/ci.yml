@@ -232,7 +232,10 @@ jobs:
       - name: Validate the sherpa runtime cache
         run: |
           set -euo pipefail
-          LIB="$(find "$HOME/Library/Caches/sherpa-rs" -name 'libonnxruntime*.dylib' -size +1M 2>/dev/null | head -1)"
+          # `|| true`: under pipefail a `find` on a missing directory makes the
+          # substitution fail and takes the step with it (the first version of
+          # this check failed exactly there, before its own `if`).
+          LIB="$(find "$HOME/Library/Caches/sherpa-rs" -name 'libonnxruntime*.dylib' -size +1M 2>/dev/null | head -1 || true)"
           if [ -z "$LIB" ]; then
             echo "sherpa cache is missing or incomplete — dropping it so the build re-fetches" >&2
             rm -rf "$HOME/Library/Caches/sherpa-rs"
@@ -510,7 +513,12 @@ jobs:
       # incomplete. Start from a clean cache and let it fetch.
       - name: Fresh sherpa-rs cache
         shell: bash
-        run: rm -rf "$LOCALAPPDATA/sherpa-rs"
+        run: |
+          rm -rf "$LOCALAPPDATA/sherpa-rs"
+          # The build script copies its DLLs into target\debug\deps; create the
+          # directory up front so the copy has somewhere to land even when the
+          # script runs before cargo has materialised that folder.
+          mkdir -p target/debug/deps target/release/deps
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
