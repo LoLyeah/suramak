@@ -17,6 +17,16 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
+      # sherpa-rs-sys hard-links its dylibs out of a cache (across volumes that
+      # fails) and then fs::copy panics with no errno when target/release/deps
+      # does not exist yet — the state during a build script that runs before
+      # cargo creates it. Create it and drop stale destinations a restored
+      # target/ may have left behind (release run 45116362640).
+      - name: Prepare the dylib destination
+        run: |
+          mkdir -p target/release/deps
+          rm -f target/release/deps/libonnxruntime*.dylib target/release/deps/libsherpa* || true
+
       - name: Build release binaries
         # M10B: SpeechTranscriber is compiled into the macOS artifact (behind
         # the default-OFF "Fast engine" setting). Swift bridge = Xcode on the
@@ -185,6 +195,17 @@ jobs:
         run: |
           cargo install cargo-ndk --version 4.1.2 --locked
           rustup target add aarch64-linux-android x86_64-linux-android
+
+      # The image's CMake 4.5 refuses the NDK's Ninja version probe and leaves
+      # CMAKE_C_COMPILER unset inside libopus's configure (runs 45099418676,
+      # 45116362640). Pin the CMake the release has always built with; the CMake
+      # 4 migration is its own task, not something to discover while cutting a
+      # release.
+      - name: Pin CMake 3.31 for the Android build
+        run: |
+          python3 -m pip install --user --quiet "cmake==3.31.6"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/cmake" --version | head -1
 
       - name: Build the release APK (scripts/android/build-apk.sh, release mode)
         env:
