@@ -247,8 +247,13 @@ pub fn ui(
 
     if state.library_query.trim().is_empty() {
         if state.rows.is_empty() {
-            let empty_bottom = dock.top() - if show_reason { REASON_CHIP + 8.0 } else { 0.0 };
-            empty_library(ui, tokens, list_rect, empty_bottom);
+            // A job in flight is not an empty library: the strip above says what
+            // is happening, and "No transcripts yet" underneath it would
+            // contradict it (the owner's screenshot showed exactly that pair).
+            if state.job.is_none() {
+                let empty_bottom = dock.top() - if show_reason { REASON_CHIP + 8.0 } else { 0.0 };
+                empty_library(ui, tokens, list_rect, empty_bottom);
+            }
         } else {
             let now = ui.input(|input| input.time);
             let keys = state.library_keys();

@@ -268,6 +268,27 @@ impl CompactShell {
             app.clearance_floor = compact::settings::ANDROID_MIN_CLEARANCE;
             app.reduce_motion = platform_reduce_motion();
             app.set_diagnostics(diagnostics);
+            // The Library's job strip (M16.1's surface) existed in the UI from
+            // the start and NOTHING on Android ever fed it — which is why a
+            // running job was visible only in the notification shade while the
+            // Library behind it said "No transcripts yet" (the owner's
+            // screenshot). The host's own status is the source; the label is the
+            // phase word, because "Transcribing · 42%" is the sentence.
+            if let Some(jobs) = crate::jobs_host() {
+                let status = jobs.status();
+                if status.running {
+                    let label = match status.current_phase.as_str() {
+                        "copying" => "Preparing the file",
+                        "decoding" => "Preparing the audio",
+                        "transcribing" => "Transcribing",
+                        "paused" => "Paused",
+                        _ => "Working",
+                    };
+                    app.on_job(label, u32::from(status.percent), 100, now);
+                } else if app.job.is_some() {
+                    app.job_finished();
+                }
+            }
             // M24A: the watched inbox's switch, folder and status row. The
             // poll thread publishes through the host; this is a cheap mutex
             // read and a no-op when the value has not changed.
