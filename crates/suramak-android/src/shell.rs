@@ -217,6 +217,13 @@ impl CompactShell {
             compact::input::apply_touch_options(ctx);
         }
         self.ppp = ctx.pixels_per_point();
+        // egui only repaints when something asks it to. A job finishing is not
+        // an input event, so with the phone idle the app drew no frame at all —
+        // and the Library's store-vs-shown comparison (and the "Last job" card)
+        // never ran, which is why a finished transcription stayed invisible
+        // until a relaunch. One wake-up per second is enough for a poll, and it
+        // costs nothing when there is nothing to read.
+        ctx.request_repaint_after(std::time::Duration::from_secs(1));
         // A touch that was live when the Activity went away never gets its
         // End/Cancel; holding the old id would make every later Start look like
         // a second finger. A resume is the edge that proves it is gone.
