@@ -188,6 +188,14 @@ jobs:
           SURAMAK_ANDROID_KEYSTORE_B64: ${{ secrets.SURAMAK_ANDROID_KEYSTORE_B64 }}
           SURAMAK_ANDROID_KEYSTORE_PASS: ${{ secrets.SURAMAK_ANDROID_KEYSTORE_PASS }}
 
+      # The runner image now defaults to JDK 25, which Gradle 8.9 cannot use
+      # ("What went wrong: 25.0.5" — release run 45120616476). Pin the JDK the
+      # Android build has always used, exactly as the CI jobs do.
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
       - name: Rust cache (android targets)
         uses: Swatinem/rust-cache@v2
 
