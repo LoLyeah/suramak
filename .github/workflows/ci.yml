@@ -488,8 +488,19 @@ jobs:
       - name: Format check
         run: cargo fmt --all --check
 
+      # Retried once: `sherpa-rs-sys`'s build script extracts its DLLs and copies
+      # them into target\debug\deps on FIRST BUILD; on this image that copy can
+      # fail with the destination briefly locked ("Failed to copy ... cargs.dll
+      # to ...", run 45102238530) and takes the whole compile with it.
       - name: Clippy (warnings are errors)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        shell: bash
+        run: |
+          for attempt in 1 2; do
+            if cargo clippy --workspace --all-targets -- -D warnings; then exit 0; fi
+            echo "clippy attempt $attempt failed; retrying in 10s" >&2
+            sleep 10
+          done
+          exit 1
 
       # `suramak-taps` is macOS-only and compiles its no-op stub here; the
       # Sparkle (`updates`) and SpeechTranscriber features are off — the
