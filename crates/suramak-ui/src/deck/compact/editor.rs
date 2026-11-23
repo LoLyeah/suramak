@@ -14,7 +14,6 @@ use egui::{
     Stroke, StrokeKind, Ui, WidgetType,
 };
 
-use suramak_core::diagnostics::{diagnose, Level, SubtitleLimits};
 use suramak_core::diarization::SpeakerTurn;
 use suramak_core::notes::NotePreset;
 
@@ -297,11 +296,10 @@ pub fn ui(
                 && !words.is_empty()
                 && (selected || (editor.playing && editor.playhead_segment() == Some(segment.idx)));
             let text = editor.text(&segment);
-            // The line-length advisory belongs to the segment being worked on,
-            // not to every row: the desktop can badge a whole column because
-            // its reader is a subtitle editor; on the phone one quiet read-out
-            // on the selected row is enough. It is also spoken with the row.
-            let advisory = advisory_for_row(selected, &text, segment.start_ms, segment.end_ms);
+            // No readability advisory on the phone. `Line length 165` is a
+            // subtitle editor's metric: it means nothing to someone reading a
+            // transcript, and it was the most visible piece of jargon left on
+            // the reading surface.
 
             // Geometry: the speaker lane keeps its 8 px strip above; inside a
             // row the badge sits in the leading gutter and the header band
@@ -334,11 +332,7 @@ pub fn ui(
                     + if show_words { WORD_STRIP } else { 0.0 }
             };
             let (rect, _) = ui.allocate_exact_size(vec2(list_rect.width(), row_h), Sense::hover());
-            let mut label = format!("Segment {} · {}", segment.idx + 1, truncate(&text, 96));
-            if let Some(advisory) = &advisory {
-                label.push_str(" · ");
-                label.push_str(advisory);
-            }
+            let label = format!("Segment {} · {}", segment.idx + 1, truncate(&text, 96));
             let response = a11y::touch(
                 ui,
                 tokens,
@@ -460,15 +454,6 @@ pub fn ui(
             );
 
             let play_center = pos2(rect.right() - GUTTER - 12.0, header_center);
-            let advisory_right = play_center.x - 28.0;
-            // M23A2: the advisory is a quiet caption chip at the row's trailing
-            // edge, in the helper tone — never an orange inline label that
-            // reads as stray debug output. It exists only on the selected row
-            // and only when a value is outside its target band (the `advisory`
-            // above already gates both).
-            let advisory_left = advisory
-                .as_deref()
-                .map(|text| advisory_chip(ui, tokens, advisory_right, header_center, text));
 
             // The turn's name, at the type scale's row title (15/20), always
             // present on a labelled row (M23A2). The pencil beside it is its
@@ -481,7 +466,7 @@ pub fn ui(
                     .map(|view| view.label(primary.expect("named turn")))
                     .unwrap_or_default();
                 let name_x = text_left + time_width + 10.0;
-                let name_right = advisory_left.map_or(play_center.x - 24.0, |left| left - 8.0);
+                let name_right = play_center.x - 24.0;
                 let mut job = egui::text::LayoutJob::default();
                 job.append(&name, 0.0, type_scale::row_title().format(tokens.ink));
                 job.wrap.max_width = (name_right - name_x).max(40.0);
@@ -809,9 +794,35 @@ pub fn ui(
         let playing = editor.playing;
         actions.push(CompactAction::Playback { playing });
     }
+    // The transport read-out is measured, never assumed. It used to start at a
+    // fixed offset with a fixed 96 pt box while the label beside it started at
+    // another fixed offset, so `0:00 / 2:00` painted straight through
+    // "Tag speakers" on a 411 pt phone (the owner's screenshot). The bar is
+    // allocated from the right edge inward, and the timecode gets whatever is
+    // left between the play button and the speakers control.
+    let speakers_btn = {
+        let label = editor
+            .speakers
+            .as_ref()
+            .filter(|view| !view.speakers.is_empty())
+            .map(|view| format!("Speakers · {}", view.speakers.len()))
+            .unwrap_or_else(|| "Tag speakers".to_string());
+        let galley =
+            ui.painter()
+                .layout_no_wrap(label.clone(), type_scale::row_value().font, tokens.ink);
+        let width = (galley.size().x + 32.0).max(96.0);
+        let export_left = bar.right() - GUTTER - 76.0 - 8.0;
+        Rect::from_min_size(
+            pos2(export_left - 8.0 - width, bar.center().y - 22.0),
+            vec2(width, 44.0),
+        )
+    };
     let time_rect = Rect::from_min_size(
-        pos2(bar.left() + GUTTER + 64.0, bar.center().y - 10.0),
-        vec2(96.0, 20.0),
+        pos2(play_rect.right() + 12.0, bar.center().y - 10.0),
+        vec2(
+            (speakers_btn.left() - 12.0 - (play_rect.right() + 12.0)).max(48.0),
+            20.0,
+        ),
     );
     a11y::describe(
         ui,
@@ -820,23 +831,36 @@ pub fn ui(
     );
     // The live transport read-out is the one numeral a reader watches tick:
     // both runs and the separator sit on fixed cells, so the bar does not
-    // twitch at 0:09 → 0:10.
-    type_scale::paint_tabular(
-        ui.painter(),
-        pos2(bar.left() + GUTTER + 64.0, bar.center().y),
-        Align2::LEFT_CENTER,
-        &format!("{} / {}", clock(editor.playhead_ms), clock(duration)),
-        &type_scale::numerals().font,
-        tokens.ink_soft,
-    );
+    // twitch at 0:09 → 0:10. It is clipped to its own box: a narrow phone
+    // ellipsises rather than colliding.
+    {
+        let painter = ui
+            .painter()
+            .with_clip_rect(time_rect.expand2(vec2(0.0, 6.0)));
+        let mut job = egui::text::LayoutJob::default();
+        job.append(
+            &format!("{} / {}", clock(editor.playhead_ms), clock(duration)),
+            0.0,
+            egui::TextFormat {
+                font_id: type_scale::numerals().font.clone(),
+                color: tokens.ink_soft,
+                ..Default::default()
+            },
+        );
+        job.wrap.max_width = time_rect.width();
+        job.wrap.max_rows = 1;
+        job.wrap.overflow_character = Some('…');
+        let galley = ui.painter().layout_job(job);
+        painter.galley(
+            pos2(time_rect.left(), bar.center().y - galley.size().y / 2.0),
+            galley,
+            tokens.ink_soft,
+        );
+    }
     // M23A: the Speakers button. It reads `Tag speakers` until the transcript
     // has a label, then `Speakers · N` — the label is the control, the count is
     // the secondary line, never a sentence. The sheet behind it is the only
     // door to Add/Clear.
-    let speakers_btn = Rect::from_min_size(
-        pos2(bar.left() + GUTTER + 166.0, bar.center().y - 22.0),
-        vec2(100.0, 44.0),
-    );
     let speakers_label = editor
         .speakers
         .as_ref()
@@ -940,23 +964,66 @@ fn word_strip(
     words: &[suramak_core::transcript::WordTiming],
     actions: &mut Vec<CompactAction>,
 ) {
+    // ONE line, clipped. The strip used to wrap every word onto as many lines as
+    // it needed while the row reserved a single `WORD_STRIP` of height, so a
+    // long segment painted its chips straight over the rows below it (the
+    // owner's screenshot: words at body size across three lines). A window that
+    // follows the spoken word is enough to seek by; the rest is a `…`.
     let current = editor.current_word(segment.idx);
     let playing = editor.playing;
     let caption = type_scale::caption();
-    let mut x = text_left;
-    let mut y = top;
     let max_x = rect.right() - GUTTER - 8.0;
-    let line_start = x;
-    for (word_index, word) in words.iter().enumerate() {
+    let strip = Rect::from_min_size(
+        pos2(text_left, top),
+        vec2((max_x - text_left).max(0.0), 18.0),
+    );
+    let painter = ui.painter().with_clip_rect(strip);
+
+    let width_of = |ui: &Ui, text: &str| {
+        ui.painter()
+            .layout_no_wrap(text.to_string(), caption.font.clone(), tokens.ink_soft)
+            .size()
+            .x
+            + 14.0
+    };
+    let ellipsis = width_of(ui, "…");
+
+    // The window starts at the spoken word (walking back while it still fits),
+    // or at the first word when nothing is playing.
+    let mut start = 0usize;
+    if let (true, Some(index)) = (playing, current) {
+        start = index;
+        let mut used = 0.0;
+        while start > 0 {
+            let w = width_of(ui, &words[start - 1].text);
+            if used + w + 4.0 > strip.width() - ellipsis * 2.0 {
+                break;
+            }
+            used += w + 4.0;
+            start -= 1;
+        }
+    }
+
+    let mut x = strip.left();
+    let mut painted = 0usize;
+    for (word_index, word) in words.iter().enumerate().skip(start) {
         let galley =
             ui.painter()
                 .layout_no_wrap(word.text.clone(), caption.font.clone(), tokens.ink_soft);
         let width = galley.size().x + 14.0;
-        if x + width > max_x && x > line_start {
-            x = line_start;
-            y += 22.0;
+        let more_after = words.len() > word_index + 1;
+        let reserve = if more_after { ellipsis } else { 0.0 };
+        if x + width + reserve > strip.right() {
+            painter.text(
+                pos2(x, strip.top() + 1.0),
+                Align2::LEFT_TOP,
+                "…",
+                caption.font.clone(),
+                tokens.ink_soft,
+            );
+            break;
         }
-        let chip = Rect::from_min_size(pos2(x, y), vec2(width, 18.0));
+        let chip = Rect::from_min_size(pos2(x, strip.top()), vec2(width, 18.0));
         let id = egui::Id::new(("compact-word", segment.idx, word_index));
         let highlight = motion.factor(
             ui.ctx(),
@@ -974,7 +1041,7 @@ fn word_strip(
             true,
         );
         if highlight > 0.01 {
-            ui.painter().rect_filled(
+            painter.rect_filled(
                 chip,
                 CornerRadius::same(4),
                 motion::tint_over(egui::Color32::TRANSPARENT, tokens.accent_tint, highlight),
@@ -983,13 +1050,13 @@ fn word_strip(
                 pos2(chip.center().x, chip.bottom() + 0.5),
                 vec2(chip.width() * highlight, 2.0),
             );
-            ui.painter().rect_filled(
+            painter.rect_filled(
                 bar,
                 CornerRadius::same(1),
                 tokens.accent.gamma_multiply(highlight),
             );
         }
-        ui.painter().galley(
+        painter.galley(
             pos2(chip.left() + 7.0, chip.top() + 1.0),
             galley,
             motion::lerp_color(tokens.ink_soft, tokens.ink, highlight),
@@ -1002,65 +1069,9 @@ fn word_strip(
             });
         }
         x += width + 4.0;
+        painted += 1;
     }
-}
-
-/// The phone's advisory read for one segment, in human words.
-///
-/// The desktop editor keeps the trade shorthand (`CPL 44 · CPS 21.3`) because
-/// its audience is subtitle editors; the phone says **Line length** and
-/// **Pace**. Only crossed dimensions appear, exactly like `Metrics::badge`.
-/// Thresholds are the documented defaults (37/42 and 17/20); the phone has no
-/// settings surface for them.
-fn advisory_for(text: &str, start_ms: i64, end_ms: i64) -> Option<String> {
-    let metrics = diagnose(text, start_ms, end_ms, &SubtitleLimits::default());
-    let mut parts = Vec::new();
-    if metrics.cpl_level != Level::Ok {
-        parts.push(format!("Line length {}", metrics.longest_line));
-    }
-    if metrics.cps_level != Level::Ok {
-        parts.push(format!("Pace {:.1}", metrics.cps));
-    }
-    (!parts.is_empty()).then(|| parts.join(" · "))
-}
-
-/// The chip's whole condition: the row is being worked on **and** one of its
-/// metrics is outside the target band. One function so the two halves cannot
-/// drift apart (an unselected long row must stay quiet; a selected clean row
-/// must stay chip-less).
-fn advisory_for_row(selected: bool, text: &str, start_ms: i64, end_ms: i64) -> Option<String> {
-    selected
-        .then(|| advisory_for(text, start_ms, end_ms))
-        .flatten()
-}
-
-/// M23A2: the advisory as a quiet caption chip, right-aligned at `right` on the
-/// row's header band. Returns its left edge so the speaker name can stop short
-/// of it. The chip is the helper tone (`ink_soft` on a control wash) — the
-/// advisory is a read-out, not an alarm; the record red belongs to failures.
-fn advisory_chip(ui: &Ui, tokens: &Tokens, right: f32, center_y: f32, text: &str) -> f32 {
-    let caption = type_scale::caption();
-    let galley =
-        ui.painter()
-            .layout_no_wrap(text.to_owned(), caption.font.clone(), tokens.ink_soft);
-    let width = galley.size().x + 16.0;
-    let chip = Rect::from_min_size(pos2(right - width, center_y - 10.0), vec2(width, 20.0));
-    ui.painter().rect(
-        chip,
-        CornerRadius::same(10),
-        tokens.control_fill,
-        Stroke::new(1.0_f32, tokens.hairline),
-        StrokeKind::Inside,
-    );
-    ui.painter().galley(
-        pos2(chip.left() + 8.0, center_y - galley.size().y / 2.0),
-        galley,
-        tokens.ink_soft,
-    );
-    // The chip is a caption, not a control; record it so the frame's audit can
-    // say what the selected row is reading out.
-    a11y::describe(ui, chip, text);
-    chip.left()
+    let _ = painted;
 }
 
 /// M23A2: the stretches of the recording no turn covers, clipped to the audio
@@ -1939,57 +1950,6 @@ pub fn notes_sheet(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The phone names the metric. `CPL` is trade shorthand the review flagged;
-    /// the read-out says **Line length** (and Pace for the other dimension).
-    #[test]
-    fn the_advisory_speaks_line_length_not_cpl() {
-        let long = "a".repeat(48);
-        let advisory = advisory_for(&long, 0, 4_000).expect("48 graphemes crosses 42");
-        assert!(advisory.starts_with("Line length 48"), "{advisory}");
-        assert!(!advisory.contains("CPL"), "{advisory}");
-        assert!(!advisory.contains("CPS"), "{advisory}");
-
-        // A clean line has no advisory at all.
-        assert!(advisory_for("A short line.", 0, 4_000).is_none());
-
-        // A dense segment crosses pace only: each hard line stays under the
-        // line-length threshold, so the read-out says Pace and nothing else.
-        let dense = "word word word word\n".repeat(8);
-        let advisory = advisory_for(&dense, 0, 2_000).expect("40 CPS crosses 17");
-        assert!(advisory.starts_with("Pace "), "{advisory}");
-    }
-
-    /// Both numerals in the advisory sit on fixed cells: the widening from
-    /// `99` to `100` is the only change, never a digit swap.
-    #[test]
-    fn the_advisory_numerals_are_tabular() {
-        let size = type_scale::numerals().size();
-        assert_eq!(
-            type_scale::tabular_width("Line length 44", size),
-            type_scale::tabular_width("Line length 84", size)
-        );
-    }
-
-    /// M23A2 fix 1: the chip's condition is selected **and** outside the band.
-    /// Inside the band the selected row shows nothing; outside it, only the
-    /// selected row shows the read-out.
-    #[test]
-    fn the_advisory_chip_needs_a_selected_row_and_a_crossed_band() {
-        let long = "a".repeat(48);
-        // Selected + outside the band → the chip exists.
-        assert!(advisory_for_row(true, &long, 0, 4_000).is_some());
-        // Selected + inside the band → no chip.
-        assert!(advisory_for_row(true, "A short line.", 0, 4_000).is_none());
-        // Outside the band + not selected → no chip (the row is not being read).
-        assert!(advisory_for_row(false, &long, 0, 4_000).is_none());
-        // Pace crosses on its own and is equally gated.
-        let dense = "word word word word\n".repeat(8);
-        assert!(advisory_for_row(true, &dense, 0, 2_000)
-            .expect("pace out of band")
-            .starts_with("Pace "));
-        assert!(advisory_for_row(false, &dense, 0, 2_000).is_none());
-    }
 
     /// M23A2 fix 2: the lane's unlabelled stretches are the complement of the
     /// turns over the whole recording — head, tail, between turns, and the

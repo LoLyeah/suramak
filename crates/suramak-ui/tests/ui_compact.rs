@@ -474,38 +474,12 @@ fn editor_frame(app: &mut CompactApp) -> (egui::Context, egui::FullOutput) {
     (ctx, output)
 }
 
-/// M23A2 fix 1: the advisory is a quiet caption chip on the selected row, and
-/// only when a value is outside its target band. Inside the band there is no
-/// chip at all; outside it the text is the helper tone (`ink_soft`), never the
-/// warn amber that read as debug output.
+/// The phone shows no layout metrics at all. `Line length 165` / `Pace 21.3`
+/// are a subtitle editor's numbers: on a phone they were the most visible
+/// piece of jargon on the reading surface (the owner's screenshot), so the
+/// advisory is gone from every row — selected, long, dense or clean.
 #[test]
-fn the_advisory_chip_appears_only_on_a_selected_row_outside_the_band() {
-    // Inside both bands: selecting the row shows nothing.
-    let mut short_app = seeded_app();
-    let short = transcript("Short take", "en", &["A short line."], 0);
-    short_app.set_library(vec![short.clone()]);
-    short_app.open_editor(short, 0.0);
-    short_app.advance(10.0);
-    short_app.editor.as_mut().expect("editor").select(0);
-    let (ctx, output) = editor_frame(&mut short_app);
-    let labels = a11y::controls(&ctx)
-        .into_iter()
-        .map(|control| control.label)
-        .collect::<Vec<_>>();
-    assert!(
-        !labels
-            .iter()
-            .any(|label| label.contains("Line length") || label.contains("Pace")),
-        "a clean selected row must show no chip: {labels:?}"
-    );
-    assert!(
-        !painted_texts(&output)
-            .iter()
-            .any(|(text, ..)| text.contains("Line length") || text.contains("Pace")),
-        "no advisory text is painted on a clean row"
-    );
-
-    // Outside the band on the selected row: the chip exists, in the helper tone.
+fn the_phone_shows_no_layout_metrics_on_a_row() {
     let mut app = seeded_app();
     let target = app.transcripts[0].clone();
     app.open_editor(target, 0.0);
@@ -517,23 +491,19 @@ fn the_advisory_chip_appears_only_on_a_selected_row_outside_the_band() {
         .map(|control| control.label)
         .collect::<Vec<_>>();
     assert!(
-        labels.iter().any(|label| label.starts_with("Line length ")),
-        "the selected long row reads its line length: {labels:?}"
+        !labels.iter().any(|label| label.contains("Line length")
+            || label.contains("Pace")
+            || label.contains("CPL")),
+        "no layout metric reaches the reading surface: {labels:?}"
     );
-    let tokens = theme::tokens(AppTheme::Dark);
-    let (_, colour, size) = painted_texts(&output)
-        .into_iter()
-        .find(|(text, ..)| text.starts_with("Line length "))
-        .expect("the chip is painted");
-    assert_eq!(colour, tokens.ink_soft, "the chip is the helper tone");
-    assert_ne!(colour, tokens.warn, "the chip is never the warn amber");
-    assert_eq!(
-        size, 12.5,
-        "the chip is the caption size, not a numeral run"
+    assert!(
+        !painted_texts(&output)
+            .iter()
+            .any(|(text, ..)| text.contains("Line length")
+                || text.contains("Pace")
+                || text.contains("CPL")),
+        "nothing of the sort is painted either"
     );
-
-    let shot = render(&mut app, "editor-advisory-chip");
-    assert!(shot.painted_fraction(egui::Color32::BLACK) > 0.5);
 }
 
 /// M23A2 fix 3: an unassigned row keeps the rail column but breaks it into
