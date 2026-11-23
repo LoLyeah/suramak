@@ -248,8 +248,17 @@ jobs:
       # libonnxruntime.1.17.1.dylib to .../target/release/deps/...", runs
       # 45105856723 and 45107331028). Drop the destinations; the build script
       # recreates them from the cache it just fetched.
-      - name: Clear stale sherpa dylib destinations
-        run: rm -f target/release/deps/libonnxruntime*.dylib target/release/deps/libsherpa* || true
+      - name: Prepare the dylib destination and clear stale copies
+        run: |
+          # The build script hard-links into target/release/deps (fails across
+          # volumes), then falls back to fs::copy — and panics with no errno if
+          # the DESTINATION DIRECTORY does not exist yet, which is exactly what
+          # happens while a build script runs before cargo has created deps/
+          # ("Failed to copy ... libonnxruntime.1.17.1.dylib", runs 45105856723,
+          # 45107331028, 45109379946). Create it, and drop stale destinations a
+          # restored target/ may have left behind.
+          mkdir -p target/release/deps target/debug/deps
+          rm -f target/release/deps/libonnxruntime*.dylib target/release/deps/libsherpa* || true
 
       - name: Build workspace (release, Metal)
         continue-on-error: true
