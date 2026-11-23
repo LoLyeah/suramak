@@ -200,6 +200,71 @@ pub fn ui(
         list_top = rect.bottom() + SECTION_GAP;
     }
 
+    // --- failure strip ------------------------------------------------------
+    // A failed job keeps its sentence on screen until it is dismissed: the
+    // notification is easy to miss and the Library is where the user is
+    // looking. The tone is the text-safe record red; the reason is the host's
+    // own words, never a paraphrase.
+    if let Some(failure) = state.job_failure.clone() {
+        let rect = Rect::from_min_size(
+            pos2(bands.content.left() + GUTTER, list_top),
+            vec2(bands.content.width() - GUTTER * 2.0, JOB_STRIP),
+        );
+        let content = material::card(ui, tokens, rect, None);
+        ui.painter().rect_stroke(
+            rect,
+            tokens.radius.card,
+            Stroke::new(1.0_f32, tokens.record_red),
+            StrokeKind::Inside,
+        );
+        let title = if failure.title.is_empty() {
+            "Transcription failed".to_string()
+        } else {
+            failure.title.clone()
+        };
+        ui.painter().text(
+            pos2(content.left(), rect.top() + 16.0),
+            Align2::LEFT_CENTER,
+            &title,
+            type_scale::row_value().font,
+            tokens.record_red_text,
+        );
+        let mut job = egui::text::LayoutJob::default();
+        job.append(
+            &failure.reason,
+            0.0,
+            type_scale::caption().format(tokens.ink_soft),
+        );
+        job.wrap.max_width = (content.width() - 76.0).max(60.0);
+        job.wrap.max_rows = 1;
+        job.wrap.overflow_character = Some('…');
+        let reason = ui.painter().layout_job(job);
+        ui.painter().galley(
+            pos2(content.left(), rect.top() + 30.0),
+            reason,
+            tokens.ink_soft,
+        );
+        let dismiss = Rect::from_min_size(
+            pos2(content.right() - 64.0, rect.top() + 8.0),
+            vec2(64.0, 40.0),
+        );
+        if chrome::action_button(
+            ui,
+            tokens,
+            motion,
+            dismiss,
+            "job-failure-dismiss",
+            "Dismiss",
+            false,
+        )
+        .clicked()
+        {
+            actions.push(CompactAction::DismissJobFailure);
+        }
+        a11y::describe(ui, rect, &format!("{title} · {}", failure.reason));
+        list_top = rect.bottom() + 8.0;
+    }
+
     // --- job strip ----------------------------------------------------------
     if let Some(job) = state.job.clone() {
         let rect = Rect::from_min_size(

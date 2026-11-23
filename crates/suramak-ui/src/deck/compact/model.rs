@@ -861,6 +861,17 @@ pub struct DiagnosticsView {
     pub last_job: Option<LastJobLine>,
 }
 
+/// A job the host reported as failed, kept on the Library until dismissed.
+///
+/// A failure used to vanish: the strip disappeared, and the only trace was a
+/// notification the user may never have seen. It stays, in the error tone, with
+/// the host's own sentence and one way out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobFailure {
+    pub title: String,
+    pub reason: String,
+}
+
 /// One line of the "Last job" card in Diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LastJobLine {
@@ -900,6 +911,9 @@ pub enum CompactAction {
     },
     /// Re-read the library after a load error.
     ReloadLibrary,
+    /// The Library's failure strip was dismissed (UI-local: the host keeps its
+    /// record for Diagnostics).
+    DismissJobFailure,
     /// Persist one edited segment (the desktop's update path, one row).
     SaveSegment(SegmentEdit),
     /// Write an export through `ACTION_CREATE_DOCUMENT`.
@@ -1660,6 +1674,8 @@ pub struct CompactApp {
     pub list_anim: ListAnim,
     /// The running job, as last reported by the host.
     pub job: Option<JobView>,
+    /// A job the host reported as failed (cleared by Dismiss).
+    pub job_failure: Option<JobFailure>,
     /// The job's eased progress fill.
     pub job_progress: ProgressAnim,
     /// A job event landed and the host should wake the surface exactly once.
@@ -1763,7 +1779,8 @@ impl CompactApp {
             sheet_anim: SheetAnim::closed(),
             list_anim: ListAnim::new(),
             job: None,
-            job_progress: ProgressAnim::new(),
+            job_progress: ProgressAnim::default(),
+            job_failure: None,
             frame_request: false,
             fling_probe: None,
             fling: FlingTracker::default(),
@@ -2624,6 +2641,28 @@ impl CompactApp {
         self.job_progress.set(percent, now);
         self.frame_request = true;
         true
+    }
+
+    /// The host reported a failure: keep it until the user dismisses it.
+    ///
+    /// The same failure repeated by a poll is a no-op (the view is compared),
+    /// so the strip does not flicker while the host keeps reporting it.
+    pub fn on_job_failure(&mut self, title: impl Into<String>, reason: impl Into<String>) {
+        let next = JobFailure {
+            title: title.into(),
+            reason: reason.into(),
+        };
+        if self.job_failure.as_ref() != Some(&next) {
+            self.job_failure = Some(next);
+            self.frame_request = true;
+        }
+    }
+
+    /// The user dismissed the failure strip.
+    pub fn dismiss_job_failure(&mut self) {
+        if self.job_failure.take().is_some() {
+            self.frame_request = true;
+        }
     }
 
     /// The job ended (success, failure or cancellation): drop the strip and

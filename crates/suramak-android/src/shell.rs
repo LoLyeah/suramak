@@ -103,6 +103,8 @@ pub struct CompactShell {
     last_model_rows: std::collections::BTreeMap<String, String>,
     /// When the library's stored-vs-shown count was last compared.
     last_library_poll: Option<Instant>,
+    /// Whether the previous poll saw the Library route (a return is a reload).
+    last_route_was_library: bool,
     /// M22B: whether the voice-note sheet's "shown" line was logged for the
     /// current offer (the emulator smoke's witness that the sheet painted).
     logged_voice_note_sheet: bool,
@@ -140,6 +142,7 @@ impl CompactShell {
             last_model_can_record: None,
             last_model_rows: std::collections::BTreeMap::new(),
             last_library_poll: None,
+            last_route_was_library: false,
             logged_voice_note_sheet: false,
             logged_settings_point: false,
         }
@@ -287,6 +290,9 @@ impl CompactShell {
                     app.on_job(label, u32::from(status.percent), 100, now);
                 } else if app.job.is_some() {
                     app.job_finished();
+                }
+                if let Some(failed) = status.last_failed.clone() {
+                    app.on_job_failure(failed.title, failed.reason);
                 }
             }
             // M24A: the watched inbox's switch, folder and status row. The
@@ -508,6 +514,18 @@ impl CompactShell {
             return;
         }
         self.last_library_poll = Some(now);
+        // Coming BACK to the Library is itself a reason to re-read: the owner
+        // worked around the stale list by opening Settings and returning, which
+        // is the app telling us the rows were only fetched on entry.
+        let on_library =
+            host.with_app(|app| app.nav.current() == compact::CompactRoute::Library) == Some(true);
+        if on_library && !self.last_route_was_library {
+            self.last_route_was_library = true;
+            let reply = host.dispatch(r#"{"op":"library"}"#);
+            log_reply("library refresh (route)", &reply);
+            return;
+        }
+        self.last_route_was_library = on_library;
         let shown = host.with_app(|app| app.rows.len()).unwrap_or(0);
         let stored = host.stored_transcript_count();
         if stored != shown {
@@ -559,6 +577,10 @@ impl CompactShell {
                 );
                 log_reply("play transcript", &reply);
                 host.with_app(|app| app.start_playback());
+            }
+            CompactAction::DismissJobFailure => {
+                host.with_app(|app| app.dismiss_job_failure());
+                log::info!("job failure strip dismissed");
             }
             CompactAction::ReloadLibrary => {
                 let reply = host.dispatch(r#"{"op":"library"}"#);

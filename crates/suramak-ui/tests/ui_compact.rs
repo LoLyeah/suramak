@@ -3168,3 +3168,45 @@ fn a_running_job_paints_the_strip_and_hides_the_empty_state() {
         "the empty state must not contradict a running job: {texts:?}"
     );
 }
+
+/// A failed job keeps its sentence on the Library until it is dismissed.
+#[test]
+fn a_failed_job_keeps_a_red_strip_until_dismissed() {
+    let mut app = seeded_app();
+    app.set_library(Vec::new());
+    app.on_job_failure(
+        "Lecture 4",
+        "the import stopped before its copy finished; import the file again",
+    );
+    let (ctx, output) = editor_frame(&mut app);
+    let texts: Vec<String> = painted_texts(&output)
+        .into_iter()
+        .map(|(text, ..)| text)
+        .collect();
+    assert!(
+        texts.iter().any(|text| text.contains("Lecture 4")),
+        "the strip names the job: {texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.contains("the import stopped before its copy finished")),
+        "the host's own sentence is shown: {texts:?}"
+    );
+    assert!(
+        a11y::controls(&ctx)
+            .iter()
+            .any(|control| control.label == "Dismiss"),
+        "there is one way out of it"
+    );
+    app.dismiss_job_failure();
+    let (_ctx, output) = editor_frame(&mut app);
+    let texts: Vec<String> = painted_texts(&output)
+        .into_iter()
+        .map(|(text, ..)| text)
+        .collect();
+    assert!(
+        !texts.iter().any(|text| text.contains("Lecture 4")),
+        "Dismiss removes it: {texts:?}"
+    );
+}
