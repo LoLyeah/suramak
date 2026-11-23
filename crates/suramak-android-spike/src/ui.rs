@@ -1564,8 +1564,13 @@ mod tests {
     fn a_panicking_tab_is_disabled_without_taking_the_others_down() {
         let mut state = SpikeState::default();
         // Simulate what `draw_tab` does on a panic, without an egui context.
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| panic!("draw blew up")));
+        // The closure's return type is spelled out: without it the compiler
+        // infers `!` for a body that only panics, `Result<!, _>` makes the `Ok`
+        // arm uninhabited, and `if let Err(..)` becomes an irrefutable pattern
+        // (clippy's `irrefutable-let-patterns`, which CI turns into an error).
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> () {
+            panic!("draw blew up")
+        }));
         if let Err(payload) = result {
             state.tab_errors[Tab::Text.index()] = Some(crate::diag::payload_text(payload.as_ref()));
         }

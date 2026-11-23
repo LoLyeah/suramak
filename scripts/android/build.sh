@@ -82,6 +82,12 @@ export ANDROID_NDK_ROOT="$NDK"
 # ANDROID_PLATFORM env into CMake variables and includes the NDK's official
 # android.toolchain.cmake (see the shim's header for the full why).
 export CMAKE_TOOLCHAIN_FILE="$REPO_ROOT/scripts/android/ndk-toolchain.cmake"
+# CMake 4 removed compatibility with projects that declare `cmake_minimum_required`
+# below 3.5, and libopus (via opusic-sys) still declares one. The policy floor is
+# the documented escape hatch; CI's image moved to CMake 4.5 and the Android
+# build stopped at `opusic-sys` with "Compatibility with CMake < 3.5 has been
+# removed" (run 45095791638).
+export CMAKE_POLICY_VERSION_MINIMUM=3.5
 
 echo "== Suramak Android cross-build =="
 echo "   NDK:      $NDK (r27d, $NDK_REVISION)"
