@@ -243,6 +243,14 @@ jobs:
             ls -l "$LIB"
           fi
 
+      # A restored target/ can leave the copy DESTINATION as a dangling symlink or
+      # a stale file the build script then cannot overwrite ("Failed to copy ...
+      # libonnxruntime.1.17.1.dylib to .../target/release/deps/...", runs
+      # 45105856723 and 45107331028). Drop the destinations; the build script
+      # recreates them from the cache it just fetched.
+      - name: Clear stale sherpa dylib destinations
+        run: rm -f target/release/deps/libonnxruntime*.dylib target/release/deps/libsherpa* || true
+
       - name: Build workspace (release, Metal)
         continue-on-error: true
         id: mac-build
@@ -516,9 +524,11 @@ jobs:
         run: |
           rm -rf "$LOCALAPPDATA/sherpa-rs"
           # The build script copies its DLLs into target\debug\deps; create the
-          # directory up front so the copy has somewhere to land even when the
-          # script runs before cargo has materialised that folder.
+          # directory up front and clear stale destinations (a restored target/
+          # can leave a file the copy then cannot overwrite).
           mkdir -p target/debug/deps target/release/deps
+          rm -f target/debug/deps/cargs.dll target/debug/deps/sherpa-onnx-c-api.dll \
+                target/release/deps/cargs.dll target/release/deps/sherpa-onnx-c-api.dll || true
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
